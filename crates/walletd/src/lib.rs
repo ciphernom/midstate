@@ -22,6 +22,8 @@ pub mod dex;
 pub mod evm;
 pub mod ledger;
 pub mod mining;
+pub mod mwb;
+pub mod mwb_link;
 pub mod node_host;
 pub mod restore;
 pub mod sendplan;

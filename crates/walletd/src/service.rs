@@ -925,8 +925,13 @@ impl Service {
         // this account reachable from MetaMask with the same words.
         if let Ok(k) = crate::evm::EvmKey::from_mnemonic(phrase) {
             wallet.data.evm_secret = Some(k.secret_bytes());
-            wallet.save()?;
         }
+        // The midwimble account likewise, derived as midwimble's own wallets
+        // derive it, so the same words restore it there. One MSS tree of work.
+        if let Ok(k) = crate::mwb::keys_from_mnemonic(phrase) {
+            wallet.data.mwb_keys = Some(k.to_bytes());
+        }
+        wallet.save()?;
         // A fresh phrase has no history to find: no restore scan, and nothing
         // left over from a wallet that used to live at this path.
         RestoreScan::clear(&self.wallet_path);
@@ -998,6 +1003,9 @@ impl Service {
             }
             if let Ok(k) = crate::evm::EvmKey::from_mnemonic(phrase) {
                 wallet.data.evm_secret = Some(k.secret_bytes());
+            }
+            if let Ok(k) = crate::mwb::keys_from_mnemonic(phrase) {
+                wallet.data.mwb_keys = Some(k.to_bytes());
             }
             wallet.save()?;
             Ok(wallet)

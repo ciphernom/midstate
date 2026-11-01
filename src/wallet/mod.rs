@@ -147,6 +147,15 @@ pub struct WalletData {
     #[serde(default)]
     pub evm_secret: Option<[u8; 32]>,
 
+    /// Midwimble account for the MWB leg of cross-chain swaps: scan secret,
+    /// spend secret and recovery public key, as midwimble's own wallets
+    /// derive them from the same BIP39 seed (walletd `mwb::keys_from_mnemonic`),
+    /// so the phrase restores this account there too. Stored instead of the
+    /// seed, which would also open every other account the phrase controls.
+    /// `None` for wallets created before this existed.
+    #[serde(default)]
+    pub mwb_keys: Option<[[u8; 32]; 3]>,
+
     // ── Pruning Licenses (Phase 1) ────────────────────────────────────────
     /// Plaintext metadata for licenses this wallet owns.
     /// Stored as Vec of (coin_id, metadata) tuples.
@@ -170,6 +179,7 @@ impl WalletData {
             next_wots_index: 0,
             next_mss_index: 0,
             evm_secret: None,
+            mwb_keys: None,
             license_metadata: Vec::new(),
         }
     }

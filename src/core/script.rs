@@ -964,6 +964,187 @@ pub fn compile_limit_order_covenant(
     bc
 }
 
+// ── Midwimble swap locks ───────────────────────────────────────────────────
+//
+// The midstate leg of an MDS <-> MWB atomic swap. Midwimble releases a swap
+// secret as a scalar (an adaptor signature on a kernel); this VM can only
+// check hash preimages. The two are tied off chain: the secret holder splits
+// the scalar k ways, commits to every half by BLAKE3, and the counterparty
+// opens one half of each pair at random. The hashes of the unopened halves
+// are what these locks check. Which lock goes with which direction is forced
+// by that proof, not chosen (walletd's `mwb_link` module):
+//
+//   * secret revealed on midwimble first -> OR lock: any ONE unopened half;
+//   * secret revealed on midstate first  -> AND lock: EVERY unopened half.
+//
+// Both claim branches check the receiver's signature, as `compile_htlc` does:
+// a signature covers inputs, outputs and salt, so once the preimages are
+// public nobody can redirect or skim the coins. The fee comes out of the
+// locked value. To consensus these are ordinary script coins.
+
+/// Most preimages an AND lock can take: its claim witness is the preimages,
+/// a signature and a branch selector, and the stack holds `MAX_STACK_DEPTH`.
+pub const MAX_MWB_AND_PREIMAGES: usize = MAX_STACK_DEPTH - 2;
+
+/// OR lock: claimable with any one preimage whose hash is a leaf of the tree
+/// with root `root`, plus the receiver's signature.
+///
+/// ```text
+/// IF
+///     SIZE 32 EQUALVERIFY                 the preimage is exactly 32 bytes
+///     HASH SWAP MERKLE_ROOT               fold its hash up the supplied path
+///     <root> EQUALVERIFY
+///     <receiver_pk> CHECKSIGVERIFY
+/// ELSE
+///     <timeout_height> CHECKTIMEVERIFY
+///     <refund_pk> CHECKSIGVERIFY
+/// ENDIF
+/// 1
+/// ```
+///
+/// Witnesses (pushed bottom -> top):
+///   claim : [sig, proof, preimage, 0x01]      proof: 33-byte records, leaf up
+///   refund: [refund_sig, 0x00]
+///
+/// # Reasoning
+/// When the swap secret comes out on midwimble, the counterparty derives
+/// every unopened half from it and needs only one to be good, so one leaf
+/// must suffice. A Merkle root keeps the script at 131 bytes and the claim at
+/// a 7-level path for the 128 leaves the link uses.
+///
+/// The size check is load-bearing. An inner node is the hash of its two
+/// children, 64 bytes the receiver already knows, so without it the receiver
+/// could present `left ‖ right` as a preimage, with the path from that node,
+/// and claim without the secret. Leaves hash 32-byte strings; the check keeps
+/// inner nodes out.
+///
+/// # Formal Specification
+///
+/// ```text
+/// Pre:
+///   - root = the OP_MERKLE_ROOT fold of leaves ⟨BLAKE3(u_0), …, BLAKE3(u_n)⟩, #u_j = 32
+/// Post (executed at height h, signing commitment c):
+///   claim  ⟨sig, proof, p, 1⟩ succeeds ⇔ #p = 32 ∧ fold(BLAKE3(p), proof) = root
+///                                        ∧ verify(sig, c, receiver_pk)
+///   refund ⟨sig, 0⟩           succeeds ⇔ h ≥ timeout_height ∧ verify(sig, c, refund_pk)
+/// ```
+///
+/// # Safety / Invariants
+/// - **Receiver only.** The claim checks the receiver's signature over the
+///   commitment, which binds inputs, outputs and salt: a public preimage lets
+///   nobody else take or redirect the coins.
+/// - **No inner nodes.** The size check, above.
+/// - **Consensus-gated.** `OP_MERKLE_ROOT` is `InvalidOpcode` below
+///   `V6_ACTIVATION_HEIGHT`, so the lock is unspendable before it.
+pub fn compile_mwb_or_lock(
+    root: &[u8; 32],
+    receiver_pk: &[u8; 32],
+    timeout_height: u64,
+    refund_pk: &[u8; 32],
+) -> Vec<u8> {
+    let mut bc = Vec::new();
+    bc.push(OP_IF);
+        bc.push(OP_SIZE);
+        push_int(&mut bc, 32);
+        bc.push(OP_EQUALVERIFY);
+        bc.push(OP_HASH);
+        bc.push(OP_SWAP);
+        bc.push(OP_MERKLE_ROOT);
+        push_data(&mut bc, root);
+        bc.push(OP_EQUALVERIFY);
+        push_data(&mut bc, receiver_pk);
+        bc.push(OP_CHECKSIGVERIFY);
+    bc.push(OP_ELSE);
+        push_int(&mut bc, timeout_height);
+        bc.push(OP_CHECKTIMEVERIFY);
+        push_data(&mut bc, refund_pk);
+        bc.push(OP_CHECKSIGVERIFY);
+    bc.push(OP_ENDIF);
+    push_int(&mut bc, 1);
+    bc
+}
+
+/// AND lock: claimable only with all `k` preimages, in order, plus the
+/// receiver's signature. `acc` is the hash chain over their hashes:
+/// `acc_0 = h_0`, `acc_j = BLAKE3(acc_{j-1} ‖ h_j)`.
+///
+/// ```text
+/// IF
+///     HASH                                h_0
+///     SWAP HASH CONCAT HASH               (k - 1 times)
+///     <acc> EQUALVERIFY
+///     <receiver_pk> CHECKSIGVERIFY
+/// ELSE
+///     <timeout_height> CHECKTIMEVERIFY
+///     <refund_pk> CHECKSIGVERIFY
+/// ENDIF
+/// 1
+/// ```
+///
+/// `None` unless `1 <= k <= MAX_MWB_AND_PREIMAGES`. Uses only first-version
+/// opcodes.
+///
+/// Witnesses (pushed bottom -> top):
+///   claim : [sig, u_{k-1}, ..., u_1, u_0, 0x01]
+///   refund: [refund_sig, 0x00]
+///
+/// # Reasoning
+/// When the swap secret comes out on midstate, the claim must publish every
+/// unopened half: the counterparty needs one that matches its opened partner,
+/// and a claimant choosing which halves to publish would publish a bad one.
+/// No loops, so the chain is unrolled: four bytes per preimage, 311 bytes at
+/// the link's k = 48.
+///
+/// # Formal Specification
+///
+/// ```text
+/// Pre:
+///   - 1 ≤ k ≤ MAX_MWB_AND_PREIMAGES
+///   - acc = acc_{k-1}, where acc_0 = h_0 and acc_j = BLAKE3(acc_{j-1} ⌢ h_j)
+/// Post (executed at height h, signing commitment c):
+///   claim  ⟨sig, p_{k-1}, …, p_0, 1⟩ succeeds ⇔ ∀ j • BLAKE3(p_j) = h_j
+///                                               ∧ verify(sig, c, receiver_pk)
+///   refund ⟨sig, 0⟩                    succeeds ⇔ h ≥ timeout_height ∧ verify(sig, c, refund_pk)
+/// ```
+///
+/// (`∀ j • BLAKE3(p_j) = h_j` follows from the accumulator matching unless
+/// BLAKE3 collides: each 64-byte link fixes the one below it.)
+///
+/// # Safety / Invariants
+/// - **Receiver only**, as for the OR lock.
+/// - **Fits the VM.** At `MAX_MWB_AND_PREIMAGES` the claim fills the stack
+///   exactly and the script stays under `MAX_SCRIPT_SIZE`.
+pub fn compile_mwb_and_lock(
+    acc: &[u8; 32],
+    k: usize,
+    receiver_pk: &[u8; 32],
+    timeout_height: u64,
+    refund_pk: &[u8; 32],
+) -> Option<Vec<u8>> {
+    if !(1..=MAX_MWB_AND_PREIMAGES).contains(&k) {
+        return None;
+    }
+    let mut bc = Vec::new();
+    bc.push(OP_IF);
+        bc.push(OP_HASH);
+        for _ in 1..k {
+            bc.extend_from_slice(&[OP_SWAP, OP_HASH, OP_CONCAT, OP_HASH]);
+        }
+        push_data(&mut bc, acc);
+        bc.push(OP_EQUALVERIFY);
+        push_data(&mut bc, receiver_pk);
+        bc.push(OP_CHECKSIGVERIFY);
+    bc.push(OP_ELSE);
+        push_int(&mut bc, timeout_height);
+        bc.push(OP_CHECKTIMEVERIFY);
+        push_data(&mut bc, refund_pk);
+        bc.push(OP_CHECKSIGVERIFY);
+    bc.push(OP_ENDIF);
+    push_int(&mut bc, 1);
+    debug_assert!(bc.len() <= MAX_SCRIPT_SIZE);
+    Some(bc)
+}
+
 pub fn compile_multisig_2of2(pk1: &[u8; 32], pk2: &[u8; 32]) -> Vec<u8> {
     let mut bc = Vec::new();
     push_data(&mut bc, pk2);
@@ -1877,5 +2058,163 @@ mod tests {
 
         // Malformed push (declared length runs past end) fails closed (true).
         assert!(reads_per_input_context(&[OP_PUSH_DATA, 0x10, 0x00, 0x00]));
+    }
+
+    // ── Midwimble swap locks ────────────────────────────────────────────
+
+    fn lock_ctx(commitment: &[u8; 32], height: u64) -> ExecContext<'_> {
+        ExecContext {
+            commitment,
+            height,
+            outputs: &[],
+            input_value: 0,
+            input_state: None,
+            this_address: [0u8; 32],
+            sum_input_value: 0,
+        }
+    }
+
+    fn wots_key(b: u8) -> ([u8; 32], [u8; 32]) {
+        let seed = [b; 32];
+        (seed, wots::keygen(&seed))
+    }
+
+    fn sign(seed: &[u8; 32], commitment: &[u8; 32]) -> Vec<u8> {
+        wots::sig_to_bytes(&wots::sign(seed, commitment))
+    }
+
+    /// Four leaves; the path for leaf 2 is [h3 on the right, n01 on the left].
+    struct Tree {
+        preimages: [[u8; 32]; 4],
+        leaves: [[u8; 32]; 4],
+        n01: [u8; 32],
+        n23: [u8; 32],
+        root: [u8; 32],
+    }
+
+    fn tree() -> Tree {
+        let preimages = [[10u8; 32], [11; 32], [12; 32], [13; 32]];
+        let leaves = preimages.map(|p| hash(&p));
+        let n01 = crate::core::types::hash_concat(&leaves[0], &leaves[1]);
+        let n23 = crate::core::types::hash_concat(&leaves[2], &leaves[3]);
+        let root = crate::core::types::hash_concat(&n01, &n23);
+        Tree { preimages, leaves, n01, n23, root }
+    }
+
+    fn record(sibling: &[u8; 32], sibling_on_left: bool) -> Vec<u8> {
+        let mut r = sibling.to_vec();
+        r.push(sibling_on_left as u8);
+        r
+    }
+
+    #[test]
+    fn mwb_or_lock_claims_with_any_leaf_and_refunds_after_its_height() {
+        let t = tree();
+        let (rx_seed, rx_pk) = wots_key(1);
+        let (refund_seed, refund_pk) = wots_key(2);
+        let (other_seed, _) = wots_key(3);
+        let at = crate::core::types::V6_ACTIVATION_HEIGHT;
+        let timeout = at + 500;
+        let bc = compile_mwb_or_lock(&t.root, &rx_pk, timeout, &refund_pk);
+        let c = [9u8; 32];
+
+        let proof = [record(&t.leaves[3], false), record(&t.n01, true)].concat();
+        let claim = |sig: Vec<u8>| vec![sig, proof.clone(), t.preimages[2].to_vec(), vec![1]];
+        assert!(execute_script(&bc, &claim(sign(&rx_seed, &c)), &lock_ctx(&c, at)).is_ok());
+        // Knowing a preimage is not enough: the receiver must sign.
+        assert!(execute_script(&bc, &claim(sign(&other_seed, &c)), &lock_ctx(&c, at)).is_err());
+        // A preimage that is not a leaf folds to some other root.
+        let bad = vec![sign(&rx_seed, &c), proof.clone(), [99u8; 32].to_vec(), vec![1]];
+        assert!(execute_script(&bc, &bad, &lock_ctx(&c, at)).is_err());
+
+        // The refund waits for its height, and fails for that reason alone.
+        let refund = vec![sign(&refund_seed, &c), vec![0]];
+        assert_eq!(
+            execute_script(&bc, &refund, &lock_ctx(&c, timeout - 1)),
+            Err(ScriptError::VerifyFailed)
+        );
+        assert!(execute_script(&bc, &refund, &lock_ctx(&c, timeout)).is_ok());
+
+        // OP_MERKLE_ROOT does not exist before V6, so below it the whole
+        // script is invalid: neither branch can run.
+        assert_eq!(
+            execute_script(&bc, &refund, &lock_ctx(&c, at - 1)),
+            Err(ScriptError::InvalidOpcode(OP_MERKLE_ROOT))
+        );
+    }
+
+    /// The receiver knows every leaf. An inner node is the hash of two of
+    /// them, so `left ‖ right` would open it, and the path above it would
+    /// reach the root. The 32-byte size check is all that refuses it.
+    #[test]
+    fn mwb_or_lock_refuses_an_inner_node_as_its_preimage() {
+        let t = tree();
+        let (rx_seed, rx_pk) = wots_key(1);
+        let bc = compile_mwb_or_lock(&t.root, &rx_pk, 500, &[2; 32]);
+        let c = [9u8; 32];
+        let forged: Vec<u8> = [t.leaves[0], t.leaves[1]].concat();
+        let path = record(&t.n23, false);
+
+        // Without the check this witness would hold: it folds to the root.
+        assert_eq!(hash(&forged), t.n01);
+        assert_eq!(crate::core::types::hash_concat(&t.n01, &t.n23), t.root);
+
+        let witness = vec![sign(&rx_seed, &c), path, forged, vec![1]];
+        let at = crate::core::types::V6_ACTIVATION_HEIGHT;
+        assert_eq!(execute_script(&bc, &witness, &lock_ctx(&c, at)), Err(ScriptError::VerifyFailed));
+
+        // Remove `SIZE 32 EQUALVERIFY` (the six bytes after IF) and the same
+        // witness takes the coins.
+        assert_eq!(&bc[1..7], &[OP_SIZE, OP_PUSH_DATA, 1, 0, 32, OP_EQUALVERIFY]);
+        let mut unchecked = vec![bc[0]];
+        unchecked.extend_from_slice(&bc[7..]);
+        assert!(execute_script(&unchecked, &witness, &lock_ctx(&c, at)).is_ok());
+    }
+
+    #[test]
+    fn mwb_and_lock_needs_every_preimage_in_order() {
+        let preimages: Vec<[u8; 32]> = (0..5u8).map(|i| [20 + i; 32]).collect();
+        let hashes: Vec<[u8; 32]> = preimages.iter().map(|p| hash(p)).collect();
+        let acc = hashes[1..]
+            .iter()
+            .fold(hashes[0], |a, h| crate::core::types::hash_concat(&a, h));
+        let (rx_seed, rx_pk) = wots_key(1);
+        let (refund_seed, refund_pk) = wots_key(2);
+        let bc = compile_mwb_and_lock(&acc, 5, &rx_pk, 500, &refund_pk).unwrap();
+        let c = [9u8; 32];
+
+        let claim = |u: &[[u8; 32]]| {
+            let mut w = vec![sign(&rx_seed, &c)];
+            w.extend(u.iter().rev().map(|p| p.to_vec()));
+            w.push(vec![1]);
+            w
+        };
+        assert!(execute_script(&bc, &claim(&preimages), &lock_ctx(&c, 1)).is_ok());
+
+        let mut wrong = preimages.clone();
+        wrong[2][0] ^= 1;
+        assert!(execute_script(&bc, &claim(&wrong), &lock_ctx(&c, 1)).is_err());
+        let mut swapped = preimages.clone();
+        swapped.swap(1, 3);
+        assert!(execute_script(&bc, &claim(&swapped), &lock_ctx(&c, 1)).is_err());
+        assert!(execute_script(&bc, &claim(&preimages[..4]), &lock_ctx(&c, 1)).is_err());
+
+        let refund = vec![sign(&refund_seed, &c), vec![0]];
+        assert_eq!(execute_script(&bc, &refund, &lock_ctx(&c, 499)), Err(ScriptError::VerifyFailed));
+        assert!(execute_script(&bc, &refund, &lock_ctx(&c, 500)).is_ok());
+    }
+
+    #[test]
+    fn mwb_locks_fit_the_consensus_limits() {
+        // Sizes at a realistic (three-byte) height.
+        assert_eq!(compile_mwb_or_lock(&[1; 32], &[2; 32], 450_280, &[3; 32]).len(), 131);
+        assert_eq!(compile_mwb_and_lock(&[1; 32], 48, &[2; 32], 450_120, &[3; 32]).unwrap().len(), 311);
+
+        // The largest AND lock validates, and its claim fills the stack exactly.
+        let max = compile_mwb_and_lock(&[1; 32], MAX_MWB_AND_PREIMAGES, &[2; 32], 1, &[3; 32]).unwrap();
+        assert!(validate_structure(&max, 0).is_ok());
+        assert_eq!(MAX_MWB_AND_PREIMAGES + 2, MAX_STACK_DEPTH);
+        assert!(compile_mwb_and_lock(&[1; 32], MAX_MWB_AND_PREIMAGES + 1, &[2; 32], 1, &[3; 32]).is_none());
+        assert!(compile_mwb_and_lock(&[1; 32], 0, &[2; 32], 1, &[3; 32]).is_none());
     }
 }
