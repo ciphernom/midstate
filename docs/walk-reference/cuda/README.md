@@ -46,7 +46,9 @@ no longer builds for Maxwell, Pascal or Volta, so use a 12.x toolkit for those.
 2. **Sweep.** It times more and more walks in flight, from one warp up, until
    the rate stops growing. The first rows show how long one walk takes on its
    own; the rate stops growing when the GPU's memory can't serve any more
-   random accesses.
+   random accesses. One row has as many walks as the GPU's L2 cache holds
+   scratchpads (384 on an RTX 5090), which measures keeping them all on chip
+   instead. The table marks the rows whose scratchpads fit in L2.
 3. **Sustained run.** It runs the fewest walks that reach full speed for 30 s
    (`--seconds`), reading the board's power, clocks and temperature through
    NVML.
@@ -83,8 +85,10 @@ known answers are wrong, 4 if the CPU check finds wrong walks.
   out, not measured. At full speed a GPU's rate is set by how many random
   accesses its memory can serve. The percentage shows how much of the
   memory's peak (streaming) bandwidth that comes to. Random access only ever
-  gets a fraction of it. A Quadro M6000 does 854 attempts/s: 57 GB/s, 18% of
-  its 317 GB/s.
+  gets a fraction of it: 17–23% on every card measured so far, from a 2015
+  Quadro to an H100 (the spec's GPU section has the numbers). When every
+  scratchpad fits in L2, the report says so instead, since that traffic
+  hardly reaches memory.
 - **Power** is the board's average draw over the sustained run, from NVML. It
   is not measured at the wall. **attempts per joule** is the efficiency number
   to set against a CPU's.
@@ -129,8 +133,10 @@ known answers are wrong, 4 if the CPU check finds wrong walks.
 ## Limits
 
 - The 64-bit division is the compiler's routine. A hand-written 64-by-32-bit
-  division would shorten each step a little. At full speed a GPU waits on
-  memory, so this mostly affects the first rows of the sweep.
+  division would shorten each step a little. Streaming at full speed, a GPU
+  waits on memory, so this matters only when the scratchpads sit in L2. There
+  the step's own work sets the pace, but halving it would still leave the
+  RTX 5090's L2 run (1,664 attempts/s) well short of streaming (5,378).
 - Built and tested on Linux. NVML is loaded at run time, so a machine without
   it builds and runs and just reports no power.
 - Profilers: Nsight Compute handles Volta and newer GPUs; Maxwell and Pascal

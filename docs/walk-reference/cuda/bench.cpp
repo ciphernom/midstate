@@ -301,16 +301,19 @@ int main(int argc, char** argv) {
   printf("GPU %d       %s · compute %d.%d · %d SMs · %.1f MiB L2 · %.1f GiB (%.1f GiB free)\n", o.device,
          info.name, info.major, info.minor, info.sms, info.l2_bytes / 1048576.0, info.total_mem / gib,
          info.free_mem / gib);
-  printf("            memory %d-bit at %.1f GT/s: %.0f GB/s peak · %s%s driver, %d.%d runtime\n", info.bus_width_bits,
-         2.0 * info.mem_clock_khz / 1e6, peak_gbs, power.driver().empty() ? "" : (driver + " · ").c_str(),
-         cuda.c_str(), info.runtime_version / 1000, info.runtime_version % 1000 / 10);
+  printf("            memory %d-bit at %.1f GT/s: %s GB/s peak · %s%s driver, %d.%d runtime\n", info.bus_width_bits,
+         2.0 * info.mem_clock_khz / 1e6, group((uint64_t)std::llround(peak_gbs)).c_str(),
+         power.driver().empty() ? "" : (driver + " · ").c_str(), cuda.c_str(), info.runtime_version / 1000,
+         info.runtime_version % 1000 / 10);
   if (info.watchdog) printf("            drives a display: every launch is kept short, well inside its watchdog\n");
   printf("Kernel      %d registers a thread, %s · %u threads a block · %s walks fit in flight at once\n", ki.regs,
          ki.local_bytes ? fmt("%d bytes of local memory a thread", ki.local_bytes).c_str() : "no local memory",
          o.block, group(ki.resident_walks).c_str());
 
   // ── Room ──
-  const double walk_bytes = (double)p.lines * 64 + 8 * 8 + 8 + 4 + 8 + 32 + 32;
+  const uint64_t pad_bytes = (uint64_t)p.lines * 64;
+  const uint32_t l2_walks = (uint32_t)((uint64_t)info.l2_bytes / pad_bytes);  // scratchpads the L2 holds
+  const double walk_bytes = (double)pad_bytes + 8 * 8 + 8 + 4 + 8 + 32 + 32;
   const uint64_t fits = (uint64_t)(0.85 * (double)info.free_mem / walk_bytes);
   if (fits < 3) die("not enough free GPU memory");
   if (o.batch > fits)
@@ -363,15 +366,20 @@ int main(int argc, char** argv) {
   uint32_t walks = o.batch;
   if (o.sweep) {
     printf("\nWalks in flight   attempts/s   a walk takes   memory traffic (implied)\n");
-    std::vector<uint32_t> sizes{std::min<uint32_t>(32, capacity)};
-    for (uint64_t w = (uint64_t)info.sms * 32; w < capacity; w *= 2)
-      if (w > sizes.back()) sizes.push_back((uint32_t)w);
-    if (sizes.back() != capacity) sizes.push_back(capacity);
+    // One warp, then a warp per SM doubling up to what fits, plus as many walks
+    // as the L2 cache holds scratchpads for: that row measures keeping them on
+    // chip instead of streaming them from memory.
+    std::vector<uint32_t> sizes{std::min<uint32_t>(32, capacity), capacity};
+    for (uint64_t w = (uint64_t)info.sms * 32; w < capacity; w *= 2) sizes.push_back((uint32_t)w);
+    if (l2_walks > 32 && l2_walks < capacity) sizes.push_back(l2_walks);
+    std::sort(sizes.begin(), sizes.end());
+    sizes.erase(std::unique(sizes.begin(), sizes.end()), sizes.end());
     std::vector<Point> points;
     for (const uint32_t w : sizes) {
       const Point pt = measure(ctx, p, w, chunk, o);
-      printf("%15s   %10s   %12s   %5.1f GB/s\n", group(w).c_str(), rate_text(pt.rate).c_str(),
-             seconds_text(pt.walk_seconds).c_str(), implied_gbs(p, pt.rate));
+      printf("%15s   %10s   %12s   %5.1f GB/s%s\n", group(w).c_str(), rate_text(pt.rate).c_str(),
+             seconds_text(pt.walk_seconds).c_str(), implied_gbs(p, pt.rate),
+             w <= l2_walks ? "   (scratchpads fit in L2)" : "");
       // Stop once doubling the walks gains less than 5%.
       const bool level = points.size() >= 2 && pt.rate < 1.05 * points.back().rate;
       points.push_back(pt);
@@ -449,9 +457,16 @@ int main(int argc, char** argv) {
          group(batches).c_str(), group(walks).c_str());
   printf("            a walk takes %s in flight; the GPU finishes one every %s\n", seconds_text(slowest).c_str(),
          seconds_text(1 / rate).c_str());
-  printf("Memory      implied %.2f billion random 32-byte transfers a second, %.0f GB/s: %.0f%% of the %.0f GB/s peak\n",
-         rate * p.steps * 8 / 1e9, implied_gbs(p, rate), 100 * implied_gbs(p, rate) / peak_gbs, peak_gbs);
-  printf("            (if each step reads 4 random sectors and writes 4 back, as the walk is designed to make it)\n");
+  if (walks <= l2_walks) {
+    printf("Memory      all %s scratchpads fit in the %.0f MiB L2 cache, so this run measures keeping them on chip,\n",
+           group(walks).c_str(), info.l2_bytes / 1048576.0);
+    printf("            not streaming them from memory\n");
+  } else {
+    printf("Memory      implied %.2f billion random 32-byte transfers a second, %.0f GB/s: %.0f%% of the %s GB/s peak\n",
+           rate * p.steps * 8 / 1e9, implied_gbs(p, rate), 100 * implied_gbs(p, rate) / peak_gbs,
+           group((uint64_t)std::llround(peak_gbs)).c_str());
+    printf("            (if each step reads 4 random sectors and writes 4 back, as the walk is designed to make it)\n");
+  }
   if (ps.available && ps.avg_watts > 0) {
     printf("Power       %.0f W average, %.0f W peak%s, from %s → %.1f attempts per joule\n", ps.avg_watts, ps.max_watts,
            ps.limit_watts ? fmt(", %u W limit", ps.limit_watts).c_str() : "",

@@ -77,45 +77,59 @@ Measured so far, the CPUs with `midstate bench-pow`:
 
 | Machine | Attempts/s | |
 |---|---|---|
-| Quadro M6000 GPU (Maxwell, 2015) | 854 | 129 W board power: 6.6 attempts per joule |
-| Raspberry Pi 5, 4 cores at 3.1 GHz | 1,545 | Overclocked, with the active cooler |
-| Xeon E5-1650 v3, 12 threads | 1,761 | |
+| EPYC 9554, 64 threads | 17,359 | Server, Zen 4 |
+| Zen 4, 16 cores, 32 threads | 13,004 | Desktop |
+| H100 SXM GPU (Hopper, 2022) | 11,418 | 332 W board power: 34.4 attempts per joule |
+| RTX 5090 GPU (Blackwell, 2025) | 5,378 | 256 W board power: 21.0 attempts per joule |
+| EPYC 7713, 15 threads | 5,217 | A 15-CPU container on a 128-core server |
+| A100 SXM GPU (Ampere, 2020) | 5,080 | 205 W board power: 24.8 attempts per joule |
 | Ryzen 7 5800X3D, 16 threads | 4,164 | |
-| Zen 4, 16 cores, 32 threads | 13,004 | |
+| Xeon E5-1650 v3, 12 threads | 1,761 | |
+| Raspberry Pi 5, 4 cores at 3.1 GHz | 1,545 | Overclocked, with the active cooler |
+| Quadro M6000 GPU (Maxwell, 2015) | 854 | 129 W board power: 6.6 attempts per joule |
 
-What the GPU run shows:
+What the GPU runs show:
 
-- **Memory sets the rate.** The rate stops growing at about 1,500 walks in
-  flight. Earlier runs showed it makes no difference how many of the GPU's 24
-  multiprocessors they are spread over. Each step reads four random 32-byte
-  sectors and writes four back, so 854 attempts/s is 1.79 billion random
-  transfers a second: 57 GB/s, 18% of the card's 317 GB/s peak. The card ran
-  100% busy at 129 W, half its 250 W limit. It spends its time waiting on
-  memory.
-- **One walk takes 0.67 s** (2.6 µs a step), against 2.6 ms on a Pi 5 core.
-  Cutting the kernel from 205 registers a thread to 64, with no local memory
-  left, didn't change that.
-- **Per joule it isn't close.** A Pi 5 would have to draw 234 W at 1,545
-  attempts/s to be as inefficient. Its power supply is rated 27 W.
+- **Memory bandwidth sets the rate.** Each step reads four random 32-byte
+  sectors and writes four back, so an attempt moves 64 MiB. Every card tops
+  out at 17–23% of its peak bandwidth in random transfers, GDDR and HBM
+  alike: 18% on the M6000, 20% on the 5090, 17% on the A100, 23% on the H100.
+  All four ran 100% busy at about half their power limit, waiting on memory.
+  The H100 is fastest because it has the most bandwidth, 3.35 TB/s.
+- **Keeping scratchpads in L2 loses.** The 5090's 96 MiB L2 holds 384 of
+  them. Run that way, it did 1,664 attempts/s: under a third of streaming, at
+  10.8 attempts per joule.
+- **A lone walk costs about 1,800 clock cycles a step** with its scratchpad in
+  L2, on the A100, the 5090 and the H100 alike: 0.16 s a walk on the 5090,
+  against 2.6 ms on a Pi 5 core. The same count on all three points to the
+  walk's own work, its diverging programs and emulated operations, rather
+  than to memory.
+- **Per joule a Pi 5 wins.** Even drawing its power supply's full 27 W, a Pi 5
+  at 1,545 attempts/s does 57 attempts per joule. The best GPU, the H100,
+  does 34.
 
 On the BLAKE3 chain, GPUs were orders of magnitude ahead.
 
-The estimate made before any GPU was measured, recalibrated by this one:
+The estimate made before any GPU was measured, against the measurements:
 
-- Once a GPU runs more walks than its L2 holds, its rate is its random 32-byte
-  transfers a second divided by 2,097,152 (8 a step × 2^18 steps).
-- The model assumed an RTX 4090 gets random traffic at about 40% of peak.
-  This card gets 18%. At 18%, a 4090's 1,008 GB/s streams about 2.7K
-  attempts/s from VRAM, not the estimated 6K.
-- The model's other 4090 strategy, pads parked in its 72 MB L2 (an estimated
-  5K attempts/s, latency-bound), needs a current card to measure.
-- Cards with HBM (H100, MI300) have many more independent memory channels
-  than GDDR cards, so they are the other ones worth measuring.
+- It put an RTX 4090 level with a 16-core desktop. The 5090, a bigger card,
+  does 41% of one, and the H100 88%.
+- Streaming from memory, it assumed random traffic at 40% of peak; it is
+  17–23%. A GPU's rate is about a fifth of its peak bandwidth divided by
+  64 MiB: about 3K attempts/s for a 4090.
+- With the scratchpads in L2, it estimated 5K attempts/s for a 4090, which
+  needs a step every 220 ns. The 5090 takes 880 ns with its L2 full.
 
-The knobs, if a GPU comes out better than that:
+Because bandwidth sets the rate, the newest HBM cards should be faster still.
+By the same rule an H200 (4.8 TB/s) would do about 14K attempts/s, and a B200
+(8 TB/s) 20–27K, more than a 16-core desktop per card. Those are predictions,
+not measurements.
+
+The knobs, if that margin needs widening:
+- Loads per step: a GPU pays for every load in memory traffic, while a CPU
+  core overlaps them in its L2.
 - `WALK_LINES`: a bigger pad pushes GPUs out of L2, but must still fit a
   Pi 5's 512 KiB L2.
-- Loads per step: more loads add VRAM traffic.
 - The operation mix.
 
 ## What changed in consensus
@@ -205,10 +219,10 @@ outlived their template.
    - Set `WALK_TARGET_SHIFT = round(log2(chain rate ÷ walk rate))`.
    - At ~9.2M chain attempts/s (height ~354,000), 3 assumes ~1.1M Walk
      attempts/s.
-2. **Benchmark a GPU port.**
-   [`docs/walk-reference/cuda/`](walk-reference/cuda/README.md) does it in
-   one command. A Quadro M6000 is measured (see [GPUs](#gpus)). Still wanted:
-   a current card, for the L2-resident case.
+2. ~~**Benchmark a GPU port.**~~ Done with
+   [`docs/walk-reference/cuda/`](walk-reference/cuda/README.md) on four GPUs,
+   the fastest an H100 (see [GPUs](#gpus)). The newest HBM cards (H200,
+   B200) are predicted, not measured.
 3. ~~**Run `midstate bench-pow` on a Pi 5.**~~ Done: 1,545 attempts/s on four
    cores at 3.1 GHz (1,383 at 2.8 GHz).
 4. **Confirm `WALK_ACTIVATION_HEIGHT`** leaves operators enough time.
