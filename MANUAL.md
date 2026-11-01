@@ -137,13 +137,15 @@ CoinJoin (`wallet mix`) operates in phases: `Collecting`, `Signing`, and `Commit
 
 ## 5. Midstate Axe & Hardware Operations
 
-Midstate is engineered to run on bare-metal ARM hardware (e.g., Raspberry Pi Zero 2 W).
+Midstate runs on bare-metal ARM hardware. The MidstateAxe is a **Raspberry Pi 5** (or a Pi 500 or Compute Module 5): from block 420,000 the proof of work is Midstate Walk, which wants AES instructions, and the Pi 5 is the first Pi that has them. In testing, a Pi 5 at 3.1 GHz with an active cooler made 1,545 Walk attempts a second; at the stock 2.4 GHz expect about 1,200. A Pi 4, Pi 3 or Zero 2 W has no AES instructions: it still runs a full node well, but it mines the Walk at a few percent of a Pi 5.
 
 When the node is running, you can access the local hardware dashboard by navigating a browser to:
 `http://127.0.0.1:8545/axe` (or the IP of the device on your local network).
 
 From the dashboard, you can:
 
-1. Reconfigure network Wi-Fi settings (Captive Portal).
-2. Toggle between Solo Mining and Decentralized Pool Mining.
-3. Apply hardware-level overclocks. **Warning: Do not apply the 'Force Turbo' overclock without a physical copper/aluminum heatsink attached to the SoC, or thermal throttling will severely degrade node performance and potentially damage the board.**
+1. Reconfigure network Wi-Fi settings (Captive Portal). On Raspberry Pi OS, which runs its network with NetworkManager, the dashboard joins the network through `nmcli`; Buildroot images use `wpa_supplicant`.
+2. Toggle between Solo Mining and Decentralized Pool Mining, with a midwimble address for a pool that merge-mines midwimble.
+3. See the board, whether it has the AES instructions the Walk needs, and whether its power supply keeps up (`vcgencmd get_throttled`). Under-voltage holds a Pi 5's clock down without saying so anywhere else: use the official 27 W supply.
+4. Overclock. The dashboard offers presets for the board it runs on, and limits for its family: 1,500–3,200 MHz and up to +100 mV (`over_voltage_delta`) on a Pi 5, smaller ranges and `over_voltage` up to 6 on older Pis. It writes them to a marked `[all]` block at the end of `config.txt` and reboots. It never sets `force_turbo`, which with any `over_voltage` permanently sets an older Pi's warranty bit. **Fit an active cooler before going past the stock clock.**
+5. **Test this unit.** Every core checks it computes the Walk's known answers, counts attempts for five seconds, then checks again while hot. A core that gets one wrong is past what it can do: it would lose shares, which the pool re-checks, and waste power. Test after every overclock. `midstate bench-pow` does the same check from the command line ("known answers: correct on all 4 threads").

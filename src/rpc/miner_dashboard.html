@@ -78,6 +78,10 @@ function toggleTheme(){var d=document.documentElement,n=d.getAttribute('data-the
                     <label>Worker Name (optional)</label>
                     <input type="text" id="worker-name" placeholder="Rig name for pool stats, e.g. axe-garage">
                 </div>
+                <div class="field-group">
+                    <label>Midwimble Address (optional)</label>
+                    <input type="text" id="mw-addr" placeholder="mw1… to be paid in midwimble too, on a merge-mining pool">
+                </div>
             </div>
 
             <button onclick="saveConfig()">Apply Config</button>
@@ -85,25 +89,27 @@ function toggleTheme(){var d=document.documentElement,n=d.getAttribute('data-the
 
         <div class="sidebar-section" id="hw-oc-panel">
             <div class="title">Hardware &amp; Overclock</div>
-            <div class="metric"><span class="k">Board</span><span class="v">Pi Zero 2 W</span></div>
-            <div class="metric"><span class="k">Arch</span><span class="v">ARMv8 NEON</span></div>
-            <div class="metric"><span class="k">Base Clock</span><span class="v">1000 MHz</span></div>
-            <div style="margin-top: 10px;"></div>
-            <div class="field-group">
-                <label>Target Frequency</label>
-                <select id="cpu-freq">
-                    <option value="1000">1000 MHz (Stock)</option>
-                    <option value="1100">1100 MHz (Light)</option>
-                    <option value="1200" selected>1200 MHz (Turbo)</option>
-                    <option value="1300">1300 MHz (Aggressive)</option>
-                    <option value="1400">1400 MHz (Max — needs active cooling)</option>
-                </select>
+            <div class="metric"><span class="k">Board</span><span class="v" id="hw-board">—</span></div>
+            <div class="metric"><span class="k">Walk AES</span><span class="v" id="hw-aes">—</span></div>
+            <div class="metric"><span class="k">Stock Clock</span><span class="v" id="hw-stock">—</span></div>
+            <div class="metric"><span class="k">Power</span><span class="v" id="hw-power">—</span></div>
+            <div id="hw-note" style="display:none; margin-top: 8px; font-size: 10px; line-height: 1.5; color: var(--orange);"></div>
+            <div id="oc-controls">
+                <div style="margin-top: 10px;"></div>
+                <div class="field-group">
+                    <label>Target Frequency</label>
+                    <select id="cpu-freq" onchange="presetChosen()"></select>
+                </div>
+                <div class="field-group">
+                    <label id="ov-label">Extra Voltage</label>
+                    <input type="number" id="overvoltage" value="0" min="0">
+                </div>
+                <button class="danger" onclick="applyOverclock()">Apply &amp; Reboot</button>
             </div>
-            <div class="field-group">
-                <label>Overvoltage (0–8)</label>
-                <input type="number" id="overvoltage" value="4" min="0" max="8">
+            <button type="button" id="btn-bench" onclick="testUnit()" style="margin-top: 8px;">Test This Unit</button>
+            <div style="margin-top: 6px; font-size: 10px; line-height: 1.5; color: var(--text);">
+                After any change, test the unit: every core must still compute the walk's known answers while hot. One that doesn't loses shares.
             </div>
-            <button class="danger" onclick="applyOverclock()">Force Turbo</button>
         </div>
 
     </div>
@@ -115,8 +121,8 @@ function toggleTheme(){var d=document.documentElement,n=d.getAttribute('data-the
         <div class="cards-row cols-4">
             <div class="card accent">
                 <div class="card-label">Hashrate</div>
-                <div class="card-value" id="hashrate">— N/s</div>
-                <div class="card-sub" id="hashrate-sub">BLAKE3 · 1M iter/hash · <span class="hl" id="simd-label">NEON</span></div>
+                <div class="card-value" id="hashrate">— /s</div>
+                <div class="card-sub" id="hashrate-sub">attempts a second</div>
             </div>
             <div class="card green">
                 <div class="card-label">Blocks Mined</div>
@@ -131,7 +137,7 @@ function toggleTheme(){var d=document.documentElement,n=d.getAttribute('data-the
             <div class="card orange">
                 <div class="card-label">Hardware Temp</div>
                 <div class="card-value" id="temp">—</div>
-                <div class="card-sub">Freq: <span class="hl" id="current-freq">1200 MHz</span></div>
+                <div class="card-sub">Freq: <span class="hl" id="current-freq">—</span> <span id="throttle-note"></span></div>
             </div>
         </div>
 
@@ -194,13 +200,13 @@ function toggleTheme(){var d=document.documentElement,n=d.getAttribute('data-the
                     <span><div class="dot" style="background:var(--warn-accent)"></div> Temp</span>
                     <span id="chart-block-legend" style="display:none;"><div class="dot" style="background:var(--text-bright); width:2px; height:8px;"></div> Block mined</span>
                 </div>
-                <span style="font-size:10px; color:var(--text-faint);" id="chart-scale-label">— kN/s max</span>
+                <span style="font-size:10px; color:var(--text-faint);" id="chart-scale-label">— /s max</span>
             </div>
             <canvas id="telemetryChart" width="900" height="110"></canvas>
         </div>
 
         <div style="color:var(--text-faint); font-size:10px; padding-top: 6px;">
-            MidstateAxe OS v0.1.0 · BLAKE3 NEON SIMD backend · ZRAM 128 MB
+            <span id="footer-board">MidstateAxe</span>
         </div>
     </div>
 </div>
@@ -227,6 +233,9 @@ let sessionStartHeight = null;   // height when the dashboard opened
 let sessionStartMined = null;    // batches_mined when the dashboard opened
 let lastThermalWarn = 0;         // throttle: last thermal console warning (ms)
 let configuredFreq = null;       // persisted arm_freq from GET /axe/config
+let board = null;                // GET /axe/config's board: model, clock limits, AES
+let lastPowerWarn = 0;           // throttle: last under-voltage console warning (ms)
+let lastPow = null;              // proof of work last shown
 
 // ── Chart ─────────────────────────────────────────────────────────
 const CHART_TICKS = 60;
@@ -256,11 +265,25 @@ function fmtUptime(s) {
     return d > 0 ? `${d}d ${h}h` : `${h}h ${m}m`;
 }
 
+// Attempts a second: a Midstate Walk attempt takes milliseconds, a
+// BLAKE3-chain one a million hashes, so both read best as plain counts.
 function fmtHashrate(nps) {
-    if (nps >= 1e9) return (nps/1e9).toFixed(2) + ' GN/s';
-    if (nps >= 1e6) return (nps/1e6).toFixed(2) + ' MN/s';
-    if (nps >= 1e3) return (nps/1e3).toFixed(1) + ' kN/s';
-    return nps.toFixed(1) + ' N/s';
+    if (nps >= 1e6) return (nps/1e6).toFixed(2) + 'M /s';
+    if (nps >= 1e4) return (nps/1e3).toFixed(1) + 'k /s';
+    if (nps >= 100) return Math.round(nps).toLocaleString() + ' /s';
+    return nps.toFixed(1) + ' /s';
+}
+
+const POW_NAMES = { 'walk': 'Midstate Walk', 'blake3-chain': 'BLAKE3 chain' };
+
+// Extra voltage, shown in millivolts: a Pi 5 takes microvolts of
+// over_voltage_delta, older Pis over_voltage steps of 25 mV.
+function voltageMv(v) {
+    if (!board || !board.clock) return v;
+    return board.clock.voltage === 'delta_microvolts' ? v / 1000 : v * 25;
+}
+function voltageText(v) {
+    return v > 0 ? `+${voltageMv(v)} mV` : 'no extra voltage';
 }
 
 function fmtDepth(d) {
@@ -457,9 +480,13 @@ async function pollStats() {
         isSyncing = syncing;
     }
     const hrSub = document.getElementById('hashrate-sub');
-    hrSub.innerHTML = syncing
-        ? '<span class="warn">paused — node is syncing</span>'
-        : 'BLAKE3 · 1M iter/hash · <span class="hl" id="simd-label">NEON</span>';
+    if (syncing) {
+        hrSub.innerHTML = '<span class="warn">paused — node is syncing</span>';
+    } else if (axe) {
+        hrSub.textContent = `${POW_NAMES[axe.pow] || axe.pow}${board ? ' · AES ' + board.aes : ''}`;
+        if (lastPow && axe.pow !== lastPow) log(`Proof of work is now ${POW_NAMES[axe.pow] || axe.pow}.`, 'var(--accent)');
+        lastPow = axe.pow;
+    }
 
     // ── Header ───────────────────────────────────────────────
     document.getElementById('h-height').textContent = state.height.toLocaleString();
@@ -487,6 +514,30 @@ async function pollStats() {
         if (axe.freq_mhz) freqEl.textContent = axe.freq_mhz + ' MHz live';
         else if (configuredFreq) freqEl.textContent = configuredFreq + ' MHz set';
         else freqEl.textContent = '—';
+
+        // Under-voltage and throttling, from the firmware. A Pi 5 short of
+        // power caps its clock without saying so anywhere else.
+        const note = document.getElementById('throttle-note');
+        const power = document.getElementById('hw-power');
+        const words = axe.throttle || [];
+        const current = words.filter(w => w.endsWith(' now'));
+        if (axe.throttled == null) {
+            note.textContent = '';
+            power.textContent = '—';
+        } else if (words.length === 0) {
+            note.textContent = '';
+            power.textContent = 'OK';
+            power.style.color = 'var(--green)';
+        } else {
+            note.textContent = current.length ? '· ' + current.join(', ') : '';
+            note.className = 'warn';
+            power.textContent = words[0];
+            power.style.color = words.some(w => w.startsWith('under-voltage')) ? 'var(--red)' : 'var(--orange)';
+            if (words.some(w => w.startsWith('under-voltage')) && current.length && Date.now() - lastPowerWarn > 60000) {
+                log('⚠ UNDER-VOLTAGE: the power supply can\'t keep up, so the clock is held down. Use the official 27 W supply, and a short cable.', 'var(--red)');
+                lastPowerWarn = Date.now();
+            }
+        }
     }
 
     if (metrics) {
@@ -651,6 +702,7 @@ async function saveConfig() {
     const poolUrl  = document.getElementById('pool-url').value.trim();
     const poolAddr = document.getElementById('pool-mss-addr').value.trim();
     const worker   = document.getElementById('worker-name').value.trim();
+    const mwAddr   = document.getElementById('mw-addr').value.trim().toLowerCase();
 
     // Catch bad addresses here — the backend writes miner.toml verbatim, so a
     // typo would otherwise only surface as silent share rejection later.
@@ -659,6 +711,7 @@ async function saveConfig() {
         if (!/^https?:\/\//.test(poolUrl)) problems.push('Pool URL must start with http:// or https://');
         if (!HEX64.test(poolAddr)) problems.push('Pool MSS address must be exactly 64 hex characters');
         if (!HEX64.test(payout))   problems.push('Payout address must be exactly 64 hex characters');
+        if (mwAddr && !/^mw1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{100,}$/.test(mwAddr)) problems.push('Midwimble address must be an mw1… address');
         if (problems.length) {
             problems.forEach(p => log(`Config error: ${p}`, 'var(--red)'));
             return;
@@ -676,6 +729,7 @@ async function saveConfig() {
                 payout_address:  mode === 'pool' ? (payout   || null) : null,
                 pool_address:    mode === 'pool' ? (poolAddr || null) : null,
                 worker:          mode === 'pool' ? (worker   || null) : null,
+                midwimble_address: mode === 'pool' ? (mwAddr || null) : null,
             })
         });
         const data = await res.json();
@@ -702,6 +756,8 @@ async function loadConfig() {
     if (cfg.pool_address)   document.getElementById('pool-mss-addr').value = cfg.pool_address;
     if (cfg.payout_address) document.getElementById('payout-addr').value = cfg.payout_address;
     if (cfg.worker)         document.getElementById('worker-name').value = cfg.worker;
+    if (cfg.midwimble_address) document.getElementById('mw-addr').value = cfg.midwimble_address;
+    showBoard(cfg.board);
 
     if (cfg.configured_freq_mhz) {
         configuredFreq = cfg.configured_freq_mhz;
@@ -719,7 +775,7 @@ async function loadConfig() {
         sel.value = String(cfg.configured_freq_mhz);
     }
     if (cfg.configured_overvoltage != null) {
-        document.getElementById('overvoltage').value = cfg.configured_overvoltage;
+        document.getElementById('overvoltage').value = String(voltageMv(cfg.configured_overvoltage));
     }
     log(`Loaded active config: ${cfg.mode || 'solo'} mode${cfg.configured_freq_mhz ? ' \u00b7 ' + cfg.configured_freq_mhz + ' MHz' : ''}${cfg.worker ? ' \u00b7 worker \u201c' + cfg.worker + '\u201d' : ''}.`, 'var(--text-bright)');
 }
@@ -753,36 +809,115 @@ async function downloadRewards() {
     } catch (e) { log(`Network error: ${e.message}`, 'var(--red)'); }
 }
 
+// The board: what it is, whether it mines the Walk well, and the clock
+// settings it takes, all from GET /axe/config.
+function showBoard(b) {
+    board = b || null;
+    if (!board) return;
+    const set = (id, text) => { document.getElementById(id).textContent = text; };
+    // "Raspberry Pi 5 Model B Rev 1.0" → "Pi 5 Model B", the whole name on hover.
+    set('hw-board', (board.model || 'Unknown').replace(/^Raspberry Pi /, 'Pi ').replace(/ Rev [\d.]+$/, ''));
+    document.getElementById('hw-board').title = board.model || '';
+    set('hw-aes', board.aes === 'portable' ? 'none (tables)' : board.aes);
+    document.getElementById('hw-aes').style.color = board.walk_ready ? 'var(--green)' : 'var(--orange)';
+    set('footer-board', `MidstateAxe · ${board.model || 'unknown board'} · Walk AES: ${board.aes}`);
+    log(`Board: ${board.model || 'unknown'} · Walk AES: ${board.aes}`, 'var(--text-bright)');
+    if (!board.walk_ready) {
+        const note = document.getElementById('hw-note');
+        note.textContent = 'This board has no AES instructions. From block 420,000 it mines Midstate Walk at a few percent of a Raspberry Pi 5’s speed, though it still runs a full node well. The Pi 5 is the Axe board.';
+        note.style.display = 'block';
+    }
+    const c = board.clock;
+    if (!c) {
+        set('hw-stock', '—');
+        document.getElementById('oc-controls').style.display = 'none';
+        return;
+    }
+    set('hw-stock', c.stock_mhz + ' MHz');
+    const sel = document.getElementById('cpu-freq');
+    sel.innerHTML = '';
+    for (const p of c.presets) {
+        const opt = document.createElement('option');
+        opt.value = String(p.mhz);
+        opt.dataset.voltage = String(p.voltage);
+        opt.textContent = `${p.mhz} MHz · ${p.label}${p.voltage ? ' · +' + voltageMv(p.voltage) + ' mV' : ''}`;
+        sel.appendChild(opt);
+    }
+    const ov = document.getElementById('overvoltage');
+    const maxMv = voltageMv(c.voltage_max);
+    ov.min = '0';
+    ov.max = String(maxMv);
+    ov.step = String(voltageMv(c.voltage_step));
+    document.getElementById('ov-label').textContent = c.voltage === 'delta_microvolts'
+        ? `Extra Voltage (mV, 0–${maxMv})`
+        : `Extra Voltage (mV, 0–${maxMv}, in steps of 25)`;
+    sel.value = String(c.stock_mhz);
+    ov.value = '0';
+}
+
+// A preset carries the voltage it suggests.
+function presetChosen() {
+    const opt = document.getElementById('cpu-freq').selectedOptions[0];
+    if (opt && opt.dataset.voltage != null) {
+        document.getElementById('overvoltage').value = String(voltageMv(Number(opt.dataset.voltage)));
+    }
+}
+
 async function applyOverclock() {
-    const freq = document.getElementById('cpu-freq').value;
-    const ov   = document.getElementById('overvoltage').value;
-    if (!confirm(`Write arm_freq=${freq}, over_voltage=${ov} to the boot config and REBOOT the device now?`)) {
+    if (!board || !board.clock) { log('No overclock settings are known for this board.', 'var(--red)'); return; }
+    const c = board.clock;
+    const freq = parseInt(document.getElementById('cpu-freq').value);
+    const mv = Number(document.getElementById('overvoltage').value) || 0;
+    // Back into the board's own unit: microvolts on a Pi 5, 25 mV steps before it.
+    const voltage = c.voltage === 'delta_microvolts' ? Math.round(mv * 1000) : Math.round(mv / 25);
+    const stock = freq === c.stock_mhz && voltage === 0;
+    const what = stock ? 'put the stock clock back' : `set ${freq} MHz with ${voltageText(voltage)}`;
+    if (!confirm(`This will ${what} in the boot config and REBOOT the device now. Continue?`)) {
         log('Overclock cancelled.', 'var(--text-bright)');
         return;
     }
-    log(`⚠ DANGER: Applying overclock arm_freq=${freq} over_voltage=${ov}`, 'var(--red)');
+    log(stock ? 'Restoring the stock clock…' : `Applying overclock: ${freq} MHz, ${voltageText(voltage)}…`, stock ? 'var(--accent)' : 'var(--red)');
     try {
         const res = await fetch('/axe/overclock', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ freq: parseInt(freq), overvoltage: parseInt(ov) })
+            body: JSON.stringify({ freq, overvoltage: voltage })
         });
         const data = await res.json();
-        if (data.status === 'error') log(`Error: ${data.message}`, 'var(--red)');
-        else {
-            document.getElementById('current-freq').innerText = freq + ' MHz';
-            log('Overclock applied. Ensure armour heatsink is seated.', 'var(--accent)');
-            log('Rebooting in 3s to apply firmware changes...', 'var(--red)');
-            document.getElementById('main-view').style.opacity = '0.4';
-            setTimeout(() => window.location.reload(), 20000);
+        if (!res.ok || data.status === 'error' || data.error) {
+            log(`Error: ${data.message || data.error || 'HTTP ' + res.status}`, 'var(--red)');
+            return;
         }
+        document.getElementById('current-freq').innerText = freq + ' MHz';
+        if (freq > c.stock_mhz) log('Overclocked: make sure the active cooler is fitted. After the reboot, run Test This Unit.', 'var(--accent)');
+        log('Rebooting in 3s to apply firmware changes...', 'var(--red)');
+        document.getElementById('main-view').style.opacity = '0.4';
+        setTimeout(() => window.location.reload(), 20000);
     } catch (e) { log(`Network error: ${e.message}`, 'var(--red)'); }
 }
 
+// Every core checks the walk's known answers, counts attempts for five
+// seconds, then checks again while hot. Mining carries on meanwhile.
+async function testUnit() {
+    const btn = document.getElementById('btn-bench');
+    btn.disabled = true;
+    log('Testing this unit: checking every core and counting attempts for 5 seconds…', 'var(--accent)');
+    try {
+        const res = await fetch('/axe/bench', { method: 'POST' });
+        const data = await res.json();
+        if (!res.ok || data.error) log(`The test could not run: ${data.error || 'HTTP ' + res.status}`, 'var(--red)');
+        else if (data.correct) log(`✓ ${data.message}`, 'var(--green)');
+        else log(`✗ ${data.message}`, 'var(--red)');
+    } catch (e) {
+        log(`Network error: ${e.message}`, 'var(--red)');
+    } finally {
+        btn.disabled = false;
+    }
+}
+
 // ── Init ──────────────────────────────────────────────────────────
-log('MidstateAxe OS v0.1.0 booted.', 'var(--accent)');
+log('MidstateAxe dashboard ready.', 'var(--accent)');
 log('Initializing API link...');
-log('BLAKE3 NEON SIMD backend ready.');
 
 // Visibility-aware polling: 3s while the tab is visible, 15s in the
 // background, and an immediate refresh the moment the tab regains focus.

@@ -457,6 +457,24 @@ fn bench_pow(seconds: u64, threads: usize) {
             threads
         );
     }
+    // A CPU clocked past what it can do stays up but computes a wrong walk
+    // now and then, which loses shares. Every thread checks the known
+    // answers while the CPU is still hot from the runs above.
+    let wrong = (0..threads)
+        .map(|_| std::thread::spawn(walk::check_golden))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|check| check.join())
+        .filter(|answer| !matches!(answer, Ok(true)))
+        .count();
+    if wrong == 0 {
+        println!("  known answers: correct on all {} threads", threads);
+    } else {
+        println!(
+            "  known answers: WRONG on {} of {} threads. This CPU computes the walk incorrectly; lower its overclock.",
+            wrong, threads
+        );
+    }
 
     let start = std::time::Instant::now();
     let mut nonce = 0u64;

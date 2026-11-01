@@ -410,6 +410,14 @@ pub struct AxeStatsResponse {
     /// dashboard show the *actual* clock instead of a hardcoded guess.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub freq_mhz: Option<u32>,
+    /// The proof of work the node mines: "blake3-chain", or "walk" (Midstate
+    /// Walk) from height 420,000.
+    pub pow: String,
+    /// `vcgencmd get_throttled`'s flags, where it can be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub throttled: Option<u32>,
+    /// The same flags in words ("under-voltage now", …); empty when all is well.
+    pub throttle: Vec<String>,
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AxeWifiRequest {
@@ -434,7 +442,12 @@ pub struct AxeConfigRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AxeOverclockRequest {
+    /// `arm_freq`, in MHz.
     pub freq: u32,
+    /// Extra voltage, in the board's own unit (`GET /axe/config` says which):
+    /// microvolts of `over_voltage_delta` on a Raspberry Pi 5, `over_voltage`
+    /// steps of 25 mV on a Pi 4 or older. The board's stock clock with 0
+    /// removes the overclock.
     pub overvoltage: u32,
 }
 #[derive(Debug, Serialize, Deserialize)]
