@@ -66,26 +66,53 @@ Variants measured on the same core, from which the shipped one was chosen:
 | Chained steps, 2 loads | 2.5 ms | Half the VRAM traffic per step |
 | **Chained steps, 4 loads** | **3.1 ms** | Shipped |
 
-### GPU estimate (not measured)
+### GPUs
 
-This is a model with rough assumptions, not a benchmark. Take an RTX 4090
-with GPU L2 latency of about 250 cycles, a 64-bit divide at around 100
-dependent instructions, and random 32-byte-sector VRAM traffic at about
-40% of peak.
+[`docs/walk-reference/cuda/`](walk-reference/cuda/README.md) measures Walk on
+an NVIDIA GPU with one command. It checks the known answers on the GPU, finds
+how many walks in flight the GPU needs, runs them for a minute while reading
+the board's power through NVML, and checks the GPU's results on the CPU.
 
-| Strategy | Estimated rate |
-|---|---|
-| Pads resident in L2 | ~5K attempts/s (latency-bound) |
-| Pads streamed from VRAM | ~6K attempts/s (bandwidth-bound) |
+Measured so far, the CPUs with `midstate bench-pow`:
 
-That puts a 4090 around 1× a 16-core desktop per device and 2–3× worse per
-watt. For comparison, the BLAKE3 chain puts it orders of magnitude ahead.
+| Machine | Attempts/s | |
+|---|---|---|
+| Quadro M6000 GPU (Maxwell, 2015) | 854 | 129 W board power: 6.6 attempts per joule |
+| Raspberry Pi 5, 4 cores at 3.1 GHz | 1,545 | Overclocked, with the active cooler |
+| Xeon E5-1650 v3, 12 threads | 1,761 | |
+| Ryzen 7 5800X3D, 16 threads | 4,164 | |
+| Zen 4, 16 cores, 32 threads | 13,004 | |
 
-**This estimate must be confirmed with a real GPU port before activation.**
-Write a CUDA or wgpu Walk kernel, measure it, and compare it against
-`bench-pow` on a Pi 5 and a desktop.
+What the GPU run shows:
 
-The knobs, if it comes out worse than expected:
+- **Memory sets the rate.** The rate stops growing at about 1,500 walks in
+  flight. Earlier runs showed it makes no difference how many of the GPU's 24
+  multiprocessors they are spread over. Each step reads four random 32-byte
+  sectors and writes four back, so 854 attempts/s is 1.79 billion random
+  transfers a second: 57 GB/s, 18% of the card's 317 GB/s peak. The card ran
+  100% busy at 129 W, half its 250 W limit. It spends its time waiting on
+  memory.
+- **One walk takes 0.67 s** (2.6 µs a step), against 2.6 ms on a Pi 5 core.
+  Cutting the kernel from 205 registers a thread to 64, with no local memory
+  left, didn't change that.
+- **Per joule it isn't close.** A Pi 5 would have to draw 234 W at 1,545
+  attempts/s to be as inefficient. Its power supply is rated 27 W.
+
+On the BLAKE3 chain, GPUs were orders of magnitude ahead.
+
+The estimate made before any GPU was measured, recalibrated by this one:
+
+- Once a GPU runs more walks than its L2 holds, its rate is its random 32-byte
+  transfers a second divided by 2,097,152 (8 a step × 2^18 steps).
+- The model assumed an RTX 4090 gets random traffic at about 40% of peak.
+  This card gets 18%. At 18%, a 4090's 1,008 GB/s streams about 2.7K
+  attempts/s from VRAM, not the estimated 6K.
+- The model's other 4090 strategy, pads parked in its 72 MB L2 (an estimated
+  5K attempts/s, latency-bound), needs a current card to measure.
+- Cards with HBM (H100, MI300) have many more independent memory channels
+  than GDDR cards, so they are the other ones worth measuring.
+
+The knobs, if a GPU comes out better than that:
 - `WALK_LINES`: a bigger pad pushes GPUs out of L2, but must still fit a
   Pi 5's 512 KiB L2.
 - Loads per step: more loads add VRAM traffic.
@@ -178,9 +205,12 @@ outlived their template.
    - Set `WALK_TARGET_SHIFT = round(log2(chain rate ÷ walk rate))`.
    - At ~9.2M chain attempts/s (height ~354,000), 3 assumes ~1.1M Walk
      attempts/s.
-2. **Benchmark a GPU port** (see the GPU estimate above).
-3. **Run `midstate bench-pow` on a Pi 5** (`--release`, cross-compiled with
-   `.cargo/config.toml`'s `cortex-a76` target).
+2. **Benchmark a GPU port.**
+   [`docs/walk-reference/cuda/`](walk-reference/cuda/README.md) does it in
+   one command. A Quadro M6000 is measured (see [GPUs](#gpus)). Still wanted:
+   a current card, for the L2-resident case.
+3. ~~**Run `midstate bench-pow` on a Pi 5.**~~ Done: 1,545 attempts/s on four
+   cores at 3.1 GHz (1,383 at 2.8 GHz).
 4. **Confirm `WALK_ACTIVATION_HEIGHT`** leaves operators enough time.
    - 420,000 is ~46 days after height ~354,000.
    - Midwimble mirrors it as `MIDSTATE_WALK_ACTIVATION_HEIGHT` and
@@ -193,13 +223,16 @@ outlived their template.
 ## Checking an implementation
 
 `docs/walk-reference/` holds two implementations written from the
-definition rather than from the Rust:
+definition rather than from the Rust, and a GPU benchmark:
 
 - **Python.** Its AES S-box is derived from GF(2^8) inversion.
 - **C.** It uses the ARMv8 AES instructions and runs under
   `qemu-aarch64 -cpu cortex-a76`.
+- **C++ and CUDA** (`cuda/`), ported from the C. CI
+  (`.github/workflows/walk-reference.yml`) checks its known answers against
+  `walk.rs`, runs its CPU self-test and compiles its kernels.
 
-Both reproduce the golden vectors in `walk.rs`'s tests. So does the Rust code:
+All three reproduce the golden vectors in `walk.rs`'s tests. So does the Rust code:
 
 - on x86 AES-NI and on its portable path;
 - on ARMv8 AES instructions, with `walk.rs`'s tests cross-built for

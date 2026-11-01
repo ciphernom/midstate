@@ -1,0 +1,42 @@
+name: Walk reference
+
+# The CUDA benchmark keeps its own copy of the walk. This checks that the copy
+# is still midstate's: its known answers are walk.rs's, its CPU self-test
+# passes, and its kernels compile without spilling to local memory. No GPU or
+# CUDA toolkit needed.
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'docs/walk-reference/**'
+      - 'src/core/walk.rs'
+      - '.github/workflows/walk-reference.yml'
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - 'docs/walk-reference/**'
+      - 'src/core/walk.rs'
+      - '.github/workflows/walk-reference.yml'
+  workflow_dispatch:
+
+jobs:
+  cuda-bench:
+    name: CUDA bench
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: docs/walk-reference/cuda
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Known answers match src/core/walk.rs
+        run: python3 ci/check_golden.py ../../../src/core/walk.rs walk_core.h
+
+      - name: CPU self-test
+        run: |
+          g++ -std=c++17 -O2 -Wall -Wextra -Werror -pthread walk_cpu.cpp -o walk-cpu
+          ./walk-cpu --selftest
+
+      - name: Kernels compile and stay in registers
+        run: sh ci/kernels.sh

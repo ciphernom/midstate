@@ -1,13 +1,15 @@
 # Midstate Walk reference implementations
 
-Two implementations of Midstate Walk v1. Both were written from the
-definition in `src/core/walk.rs`'s module docs, not from its code, and both
-reproduce the golden vectors pinned in that file's tests.
+Implementations of Midstate Walk v1 besides midstate's own. The Python and C
+ones were written from the definition in `src/core/walk.rs`'s module docs, not
+from its code. All three reproduce the golden vectors pinned in that file's
+tests.
 
 | File | What it checks |
 |---|---|
 | `midstate_walk.py` | The whole definition, readably. The AES S-box is derived from GF(2^8) inversion and the affine map, independent of any table. |
 | `walk_arm.c` | The ARMv8 path: one AES round as `AESMC(AESE(s, 0)) ^ k`, with the 64-bit lanes packed as the Rust intrinsics pack them. |
+| [`cuda/`](cuda/README.md) | How fast a GPU runs the walk. A CUDA benchmark ported from `walk_arm.c`, whose one copy of the walk runs both in its kernels and in a CPU self-test. CI checks it against `walk.rs`. |
 
 ```sh
 pip install blake3
