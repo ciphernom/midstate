@@ -19,12 +19,16 @@ hex = "0.4"
 bincode = "1.3"
 # Mining keys are Ristretto points: decoding one catches a mistyped key.
 curve25519-dalek = "4"
-# The MWB leg of MDS <-> MWB swaps: midwimble's consensus core only, no node.
-# Its transactions are built and checked by midwimble's own rules.
-midwimble = { git = "https://github.com/ciphernom/midwimble", default-features = false }
+# The MDW leg of MDS <-> MDW swaps, and the midwimble full node walletd embeds
+# beside midstate's (`mwb_node`). Its transactions are built and checked by
+# midwimble's own rules.
+midwimble = { git = "https://github.com/ciphernom/midwimble", default-features = false, features = ["node"] }
 # The swap link's Fiat-Shamir challenge reads BLAKE3's extendable output.
 blake3 = "1.5"
 zeroize = "1"
+# Swap negotiation rides midstate's chat bus encrypted to the counterparty
+# (`mwb_wire`); midwimble already builds this AEAD for its wallet files.
+chacha20poly1305 = "0.10"
 rand = "0.8"
 tokio = { version = "1.35", features = ["full"] }
 tracing = "0.1"

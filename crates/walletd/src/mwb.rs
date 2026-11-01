@@ -559,7 +559,15 @@ impl JointSpend {
     }
 
     pub fn assemble(&self, input_sig: &SchnorrSig, plan: &KernelPlan, sig: KernelSig) -> Result<Transaction> {
-        let tx = Transaction {
+        finish_spend(self.skeleton(input_sig, plan), sig)
+    }
+
+    /// The whole spend but its kernel signature, for the journal: the
+    /// receiver learns `t` (selling MDW) long after the negotiation, and the
+    /// offsets and output this spend chose exist nowhere else. Holds no
+    /// secret that spends: the kernel still needs the pre-signature and `t`.
+    pub fn skeleton(&self, input_sig: &SchnorrSig, plan: &KernelPlan) -> Transaction {
+        Transaction {
             body: TxBody {
                 inputs: vec![Input {
                     commitment: self.view.commitment,
@@ -573,15 +581,22 @@ impl JointSpend {
                     min_height: plan.min_height,
                     excess: plan.excess,
                     owner_excess: plan.owner_excess,
-                    signature: sig,
+                    signature: KernelSig { c: [0; 32], s1: [0; 32], s2: [0; 32] },
                 }],
             },
             kernel_offset: self.kernel_offset.to_bytes(),
             owner_offset: self.owner_offset.to_bytes(),
-        };
-        tx.validate(Context::Relay)?;
-        Ok(tx)
+        }
     }
+}
+
+/// Puts the final kernel signature into a [`JointSpend::skeleton`] and
+/// checks the result by midwimble's relay rules.
+pub fn finish_spend(mut skeleton: Transaction, sig: KernelSig) -> Result<Transaction> {
+    let kernel = skeleton.body.kernels.first_mut().ok_or_else(|| anyhow!("a spend without a kernel"))?;
+    kernel.signature = sig;
+    skeleton.validate(Context::Relay)?;
+    Ok(skeleton)
 }
 
 #[cfg(test)]

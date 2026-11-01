@@ -83,6 +83,15 @@ pub enum Action {
     Unbond { id: String },
     ImportBond { text: String, label: String },
     RemoveBond { id: String },
+    LoadMwbAccount,
+    MwbEnable { phrase: String },
+    MwbSend { to: String, amount: u64 },
+    LoadMwbBook,
+    MwbPlaceOrder { side: String, mds_amount: u64, mdw_amount: u64, lifetime_blocks: u64 },
+    MwbCancelOrder { id: String },
+    LoadMwbOrders,
+    MwbTake { order_id: String },
+    LoadMwbSwaps,
 }
 
 pub enum Msg {
@@ -149,6 +158,15 @@ pub enum Msg {
     /// `what` names the action for the error banner; wallet state is unchanged
     /// unless the message says otherwise.
     Err { what: &'static str, err: String },
+    MwbAccount(MwbAccountView),
+    MwbEnabled,
+    MwbSent(String),
+    MwbBook(Vec<MwbBookEntryView>),
+    MwbOrderPlaced(String),
+    MwbOrderCancelled,
+    MwbOrders(Vec<MwbOrderView>),
+    MwbTaken(String),
+    MwbSwaps(Vec<MwbSwapView>),
 }
 
 pub fn dispatch(
@@ -343,6 +361,17 @@ pub fn dispatch(
             Action::RemoveBond { id } => {
                 run!("forget bond", h.remove_bond(id), |_| Msg::BondDone("Bond forgotten.".into()))
             }
+            Action::LoadMwbAccount => run!("mdw account", h.mwb_account(), Msg::MwbAccount),
+            Action::MwbEnable { phrase } => run!("add MDW account", h.mwb_enable(phrase), |_| Msg::MwbEnabled),
+            Action::MwbSend { to, amount } => run!("send MDW", h.mwb_send(to, amount), Msg::MwbSent),
+            Action::LoadMwbBook => run!("mdw book", h.mwb_book(), Msg::MwbBook),
+            Action::MwbPlaceOrder { side, mds_amount, mdw_amount, lifetime_blocks } => {
+                run!("place MDW order", h.mwb_place_order(side, mds_amount, mdw_amount, lifetime_blocks), Msg::MwbOrderPlaced)
+            }
+            Action::MwbCancelOrder { id } => run!("cancel MDW order", h.mwb_cancel_order(id), |_| Msg::MwbOrderCancelled),
+            Action::LoadMwbOrders => run!("mdw orders", h.mwb_orders(), Msg::MwbOrders),
+            Action::MwbTake { order_id } => run!("take MDW order", h.mwb_take(order_id), Msg::MwbTaken),
+            Action::LoadMwbSwaps => run!("mdw swaps", h.mwb_swaps(), Msg::MwbSwaps),
         }
     });
 }

@@ -22,6 +22,10 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
+#[path = "service_mwb.rs"]
+mod mwb_glue;
+use mwb_glue::MwbLive;
+
 const TICK: Duration = Duration::from_secs(2);
 /// How long a commit monitor waits for the commitment to enter chain state
 /// before declaring the send stalled (user can retry; pending is preserved).
@@ -134,6 +138,15 @@ enum Cmd {
     Unbond { id: String, resp: oneshot::Sender<Result<String>> },
     ImportBond { text: String, label: String, resp: oneshot::Sender<Result<String>> },
     RemoveBond { id: String, resp: oneshot::Sender<Result<()>> },
+    MwbAccount(oneshot::Sender<MwbAccountView>),
+    MwbEnable { phrase: String, resp: oneshot::Sender<Result<()>> },
+    MwbSend { to: String, amount: u64, resp: oneshot::Sender<Result<String>> },
+    MwbBook(oneshot::Sender<Vec<MwbBookEntryView>>),
+    MwbPlaceOrder { side: String, mds_amount: u64, mdw_amount: u64, lifetime_blocks: u64, resp: oneshot::Sender<Result<String>> },
+    MwbCancelOrder { id: String, resp: oneshot::Sender<Result<()>> },
+    MwbOrders(oneshot::Sender<Vec<MwbOrderView>>),
+    MwbTake { order_id: String, resp: oneshot::Sender<Result<String>> },
+    MwbSwaps(oneshot::Sender<Vec<MwbSwapView>>),
     Internal(Internal),
 }
 
@@ -442,12 +455,50 @@ impl WalletdHandle {
     pub async fn remove_bond(&self, id: String) -> Result<()> {
         ask!(self, RemoveBond { id: id })
     }
+
+    // ── MDS <-> MDW ─────────────────────────────────────────────────────
+
+    /// The MDW account and the embedded midwimble node.
+    pub async fn mwb_account(&self) -> Result<MwbAccountView> {
+        Ok(ask!(self, MwbAccount))
+    }
+    /// Adds the MDW account to a wallet made before it existed, from the
+    /// wallet's own recovery phrase.
+    pub async fn mwb_enable(&self, phrase: String) -> Result<()> {
+        ask!(self, MwbEnable { phrase: phrase })
+    }
+    /// Pays MDW to a midwimble address; returns the payment's kernel id.
+    pub async fn mwb_send(&self, to: String, amount: u64) -> Result<String> {
+        ask!(self, MwbSend { to: to, amount: amount })
+    }
+    /// Orders heard on the chat bus, and ours.
+    pub async fn mwb_book(&self) -> Result<Vec<MwbBookEntryView>> {
+        Ok(ask!(self, MwbBook))
+    }
+    /// Publishes an order; `side` is "sell_mds" or "sell_mdw".
+    pub async fn mwb_place_order(&self, side: String, mds_amount: u64, mdw_amount: u64, lifetime_blocks: u64) -> Result<String> {
+        ask!(self, MwbPlaceOrder { side: side, mds_amount: mds_amount, mdw_amount: mdw_amount, lifetime_blocks: lifetime_blocks })
+    }
+    pub async fn mwb_cancel_order(&self, id: String) -> Result<()> {
+        ask!(self, MwbCancelOrder { id: id })
+    }
+    pub async fn mwb_orders(&self) -> Result<Vec<MwbOrderView>> {
+        Ok(ask!(self, MwbOrders))
+    }
+    /// Takes an order heard on the bus; returns the swap id.
+    pub async fn mwb_take(&self, order_id: String) -> Result<String> {
+        ask!(self, MwbTake { order_id: order_id })
+    }
+    pub async fn mwb_swaps(&self) -> Result<Vec<MwbSwapView>> {
+        Ok(ask!(self, MwbSwaps))
+    }
 }
 
 /// Spawn the actor. `wallet_path` is the single managed wallet file
 /// (multi-wallet is a v1.x item). `data_dir`/`rpc_url` are informational.
 pub fn spawn(
     node: NodeHandle,
+    mwb_node: Option<midwimble::node::NodeHandle>,
     wallet_path: PathBuf,
     data_dir: PathBuf,
     rpc_url: Option<String>,
@@ -493,6 +544,9 @@ pub fn spawn(
         mining,
         events,
         self_tx: tx,
+        mwb_node,
+        mwb: MwbLive::default(),
+        mwb_last_mds_tip: 0,
     };
     tokio::spawn(svc.run(rx));
     handle
@@ -546,6 +600,14 @@ struct Service {
     mining: crate::mining::MiningSupervisor,
     events: broadcast::Sender<WalletEvent>,
     self_tx: mpsc::Sender<Cmd>,
+    /// The embedded midwimble node, for the MDW account and swaps; `None`
+    /// if it could not start (everything else works without it).
+    mwb_node: Option<midwimble::node::NodeHandle>,
+    /// Midwimble state: the journal (mirrored in wallet.dat while unlocked)
+    /// and what is never journalled (negotiations, the heard book).
+    mwb: MwbLive,
+    /// Midstate's tip at the last tick, for views that need no await.
+    mwb_last_mds_tip: u64,
 }
 
 impl Service {
@@ -605,6 +667,7 @@ impl Service {
                 // Reloaded from the sidecars on unlock.
                 self.restore = None;
                 self.bonds = BondBook::default();
+                self.mwb_unload();
                 let _ = resp.send(r);
             }
             Cmd::NewAddress { mss, label, resp } => {
@@ -901,6 +964,33 @@ impl Service {
             Cmd::RemoveBond { id, resp } => {
                 let _ = resp.send(self.remove_bond(&id).await);
             }
+            Cmd::MwbAccount(resp) => {
+                let _ = resp.send(self.mwb_account_view());
+            }
+            Cmd::MwbEnable { phrase, resp } => {
+                let _ = resp.send(self.mwb_enable(&phrase).await);
+            }
+            Cmd::MwbSend { to, amount, resp } => {
+                let _ = resp.send(self.mwb_send(&to, amount).await);
+            }
+            Cmd::MwbBook(resp) => {
+                let _ = resp.send(self.mwb_book_view());
+            }
+            Cmd::MwbPlaceOrder { side, mds_amount, mdw_amount, lifetime_blocks, resp } => {
+                let _ = resp.send(self.mwb_place_order(&side, mds_amount, mdw_amount, lifetime_blocks).await);
+            }
+            Cmd::MwbCancelOrder { id, resp } => {
+                let _ = resp.send(self.mwb_cancel_order(&id));
+            }
+            Cmd::MwbOrders(resp) => {
+                let _ = resp.send(self.mwb_orders_view());
+            }
+            Cmd::MwbTake { order_id, resp } => {
+                let _ = resp.send(self.mwb_take(&order_id).await);
+            }
+            Cmd::MwbSwaps(resp) => {
+                let _ = resp.send(self.mwb_swaps_view());
+            }
             Cmd::Internal(i) => self.internal(i).await,
         }
     }
@@ -930,6 +1020,8 @@ impl Service {
         // derive it, so the same words restore it there. One MSS tree of work.
         if let Ok(k) = crate::mwb::keys_from_mnemonic(phrase) {
             wallet.data.mwb_keys = Some(k.to_bytes());
+            // A fresh phrase has nothing on midwimble either.
+            wallet.data.mwb_state = self.mwb_birth_state();
         }
         wallet.save()?;
         // A fresh phrase has no history to find: no restore scan, and nothing
@@ -947,6 +1039,7 @@ impl Service {
         }
         self.bonds = BondBook::default();
         self.wallet = Some(wallet);
+        self.mwb_load();
         // Fresh wallet: nothing historical can belong to it — start scanning
         // from the current tip instead of genesis.
         self.scan_pos = self.node.get_state().await.height;
@@ -1021,6 +1114,7 @@ impl Service {
         };
         self.mss_checked = wallet.mss_keys().len() as u64;
         self.wallet = Some(wallet);
+        self.mwb_load();
         self.restore = Some(rs);
         self.sync_wots_hold();
         self.bonds = BondBook::load(&self.wallet_path).0;
@@ -1057,6 +1151,7 @@ impl Service {
         if let Some(text) = warning {
             let _ = self.events.send(WalletEvent::Warning { text });
         }
+        self.mwb_load();
         self.resume_pendings().await;
         let _ = self.events.send(WalletEvent::WalletChanged);
         Ok(())
@@ -2935,6 +3030,9 @@ impl Service {
     async fn chat_history(&self) -> Vec<ChatView> {
         let hist = self.node.chat_history.read().await;
         hist.iter()
+            // Swap adverts and negotiations ride the bus but are not
+            // conversation; the Trade view shows what they carry.
+            .filter(|m| crate::mwb_wire::parse(m).is_none())
             .map(|m| ChatView {
                 sender: m.sender.clone(),
                 text: m
@@ -6705,6 +6803,7 @@ impl Service {
         if let Err(e) = self.tick_swaps(status.height).await {
             tracing::warn!("swap tick: {e:#}");
         }
+        self.tick_mwb(status.height).await;
         let tip = status.height;
         self.check_new_mss_trees();
         self.refresh_bonds_live().await;

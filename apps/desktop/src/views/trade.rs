@@ -82,6 +82,16 @@ fn price(p: f64) -> String {
 pub fn show(app: &mut App, ui: &mut Ui) {
     let ctx = ui.ctx().clone();
     theme::heading(ui, "Trade");
+    let mut market = app.market.min(1);
+    if theme::segmented(ui, &["MDS ↔ ETH (Base)", "MDS ↔ MDW (midwimble)"], &mut market) {
+        app.market = market;
+        app.mwb_last_poll = 0.0;
+    }
+    ui.add_space(6.0);
+    if app.market == 1 {
+        crate::views::trade_mdw::show(app, ui, &ctx);
+        return;
+    }
     theme::hint(
         ui,
         "Atomic swaps between MDS and ETH on Base. One hash-lock governs both \

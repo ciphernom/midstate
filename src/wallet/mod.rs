@@ -156,6 +156,14 @@ pub struct WalletData {
     #[serde(default)]
     pub mwb_keys: Option<[[u8; 32]; 3]>,
 
+    /// walletd's midwimble state, opaque here: the MDW account's coins and
+    /// the MDS <-> MDW swap journal (walletd `mwb_store`). Kept in this file
+    /// rather than beside it because it holds what spends those coins and
+    /// locks, and so that a swap's journal entry and the send that funds its
+    /// lock reach the disk in one write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mwb_state: Option<serde_json::Value>,
+
     // ── Pruning Licenses (Phase 1) ────────────────────────────────────────
     /// Plaintext metadata for licenses this wallet owns.
     /// Stored as Vec of (coin_id, metadata) tuples.
@@ -180,6 +188,7 @@ impl WalletData {
             next_mss_index: 0,
             evm_secret: None,
             mwb_keys: None,
+            mwb_state: None,
             license_metadata: Vec::new(),
         }
     }
