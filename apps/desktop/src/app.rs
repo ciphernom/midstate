@@ -255,6 +255,27 @@ pub struct App {
     pub bond_import_label: String,
     pub bond_notice: String,
     pub bonds_last_poll: f64,
+
+    // MDS <-> MDW (Trade tab, midwimble market)
+    /// 0: MDS <-> ETH on Base; 1: MDS <-> MDW on midwimble.
+    pub market: usize,
+    pub mwb_tab: usize,
+    pub mwb_account: Option<MwbAccountView>,
+    pub mwb_book: Vec<MwbBookEntryView>,
+    pub mwb_orders: Vec<MwbOrderView>,
+    pub mwb_swaps: Vec<MwbSwapView>,
+    pub mwb_side: usize,
+    pub mwb_mds: String,
+    pub mwb_mds_unit: usize,
+    pub mwb_mdw: String,
+    pub mwb_life: String,
+    pub mwb_send_to: String,
+    pub mwb_send_amount: String,
+    pub mwb_phrase: String,
+    pub mwb_notice: String,
+    /// The order whose Take was pressed once; the next press takes it.
+    pub mwb_take_armed: Option<String>,
+    pub mwb_last_poll: f64,
 }
 
 impl App {
@@ -432,6 +453,23 @@ impl App {
             bond_import_label: String::new(),
             bond_notice: String::new(),
             bonds_last_poll: 0.0,
+            market: 0,
+            mwb_tab: 0,
+            mwb_account: None,
+            mwb_book: Vec::new(),
+            mwb_orders: Vec::new(),
+            mwb_swaps: Vec::new(),
+            mwb_side: 0,
+            mwb_mds: String::new(),
+            mwb_mds_unit: 3,
+            mwb_mdw: String::new(),
+            mwb_life: "1440".into(),
+            mwb_send_to: String::new(),
+            mwb_send_amount: String::new(),
+            mwb_phrase: String::new(),
+            mwb_notice: String::new(),
+            mwb_take_armed: None,
+            mwb_last_poll: 0.0,
         }
     }
 
@@ -892,11 +930,58 @@ impl App {
                 self.go(ctx, Action::LoadChannels);
                 self.go(ctx, Action::LoadBalance);
             }
+            Msg::MwbAccount(a) => self.mwb_account = Some(a),
+            Msg::MwbEnabled => {
+                self.busy = false;
+                self.mwb_notice = "MDW account added. It is scanning midwimble for coins this phrase \
+                                   already holds; the balance fills in as it goes."
+                    .into();
+                self.go(ctx, Action::LoadMwbAccount);
+            }
+            Msg::MwbSent(kernel) => {
+                self.busy = false;
+                self.mwb_send_amount.clear();
+                self.mwb_notice = format!(
+                    "MDW sent (kernel {}). The coins it spent stay locked until a block confirms it.",
+                    crate::theme::short_hex(&kernel, 8)
+                );
+                self.go(ctx, Action::LoadMwbAccount);
+            }
+            Msg::MwbBook(v) => self.mwb_book = v,
+            Msg::MwbOrderPlaced(id) => {
+                self.busy = false;
+                self.mwb_mds.clear();
+                self.mwb_mdw.clear();
+                self.mwb_notice = format!(
+                    "Order {} published on the chat bus. It stands while this wallet is online; \
+                     when someone takes it, the swap runs by itself.",
+                    crate::theme::short_hex(&id, 6)
+                );
+                self.go(ctx, Action::LoadMwbOrders);
+                self.go(ctx, Action::LoadMwbBook);
+            }
+            Msg::MwbOrderCancelled => {
+                self.busy = false;
+                self.go(ctx, Action::LoadMwbOrders);
+                self.go(ctx, Action::LoadMwbBook);
+            }
+            Msg::MwbOrders(v) => self.mwb_orders = v,
+            Msg::MwbTaken(id) => {
+                self.busy = false;
+                self.mwb_tab = 2;
+                self.mwb_notice = format!(
+                    "Taking the order: swap {} is negotiating with the maker's wallet. Nothing of \
+                     yours moves until their coins are locked on chain.",
+                    crate::theme::short_hex(&id, 6)
+                );
+                self.go(ctx, Action::LoadMwbSwaps);
+            }
+            Msg::MwbSwaps(v) => self.mwb_swaps = v,
             Msg::Err { what, err } => {
                 // Background loads fail benignly while locked; don't banner those.
                 let background = matches!(
                     what,
-                    "status" | "balance" | "coins" | "addresses" | "history" | "sends" | "node info" | "chat" | "channels" | "channel identity" | "invoices" | "hub" | "order book" | "base account" | "dex settings" | "swap quote" | "my orders" | "swaps" | "my bids" | "hubs" | "bonds"
+                    "status" | "balance" | "coins" | "addresses" | "history" | "sends" | "node info" | "chat" | "channels" | "channel identity" | "invoices" | "hub" | "order book" | "base account" | "dex settings" | "swap quote" | "my orders" | "swaps" | "my bids" | "hubs" | "bonds" | "mdw account" | "mdw book" | "mdw orders" | "mdw swaps"
                 );
                 if background {
                     tracing::debug!("{what}: {err}");
@@ -1015,6 +1100,12 @@ impl eframe::App for App {
                 self.dex_last_sync = t;
                 self.dex_syncing = true;
                 self.go(ctx, Action::SyncOrderBook);
+            }
+            if self.market == 1 && t - self.mwb_last_poll > 3.0 {
+                self.mwb_last_poll = t;
+                for a in [Action::LoadMwbAccount, Action::LoadMwbBook, Action::LoadMwbOrders, Action::LoadMwbSwaps] {
+                    self.go(ctx, a);
+                }
             }
             if t - self.dex_last_poll > 5.0 {
                 self.dex_last_poll = t;
@@ -1176,11 +1267,13 @@ impl eframe::App for App {
 /// MIDSTATE_DATA_DIR=/path/to/dir  # explicit, wins over PROFILE
 /// MIDSTATE_P2P_PORT=9334
 /// MIDSTATE_RPC_PORT=8546          # "none" disables the RPC listener
+/// MIDWIMBLE_P2P_PORT=9443         # the embedded midwimble node's port
 /// ```
 pub(crate) struct Profile {
     pub(crate) base: std::path::PathBuf,
     p2p_port: u16,
     rpc_port: Option<u16>,
+    mwb_port: u16,
 }
 
 pub(crate) fn profile() -> Profile {
@@ -1206,7 +1299,11 @@ pub(crate) fn profile() -> Profile {
         Ok(v) => v.parse().ok(),
         Err(_) => Some(8545),
     };
-    Profile { base, p2p_port, rpc_port }
+    let mwb_port = std::env::var("MIDWIMBLE_P2P_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(9433);
+    Profile { base, p2p_port, rpc_port, mwb_port }
 }
 
 async fn boot() -> anyhow::Result<WalletdHandle> {
@@ -1231,5 +1328,19 @@ async fn boot() -> anyhow::Result<WalletdHandle> {
     };
     let rpc_url = cfg.rpc_port.map(|p| format!("http://127.0.0.1:{p}"));
     let node = node_host::start_node(cfg).await?;
-    Ok(service::spawn(node, wallet_path, chain_dir, rpc_url))
+    // Midwimble, for the MDW account and MDS <-> MDW swaps. Everything else
+    // works without it, so a failure here is logged rather than fatal.
+    let mwb_cfg = midstate_walletd::mwb_node::MwbNodeConfig {
+        data_dir: p.base.join("midwimble"),
+        p2p_port: p.mwb_port,
+        bootstrap: Vec::new(),
+    };
+    let mwb = match midstate_walletd::mwb_node::start_mwb_node(mwb_cfg).await {
+        Ok(h) => Some(h),
+        Err(e) => {
+            tracing::error!("midwimble node did not start, so MDW trading is off: {e:#}");
+            None
+        }
+    };
+    Ok(service::spawn(node, mwb, wallet_path, chain_dir, rpc_url))
 }

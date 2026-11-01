@@ -133,6 +133,142 @@ impl LinkSecret {
     pub fn unopened(&self, challenge: &Challenge) -> Vec<[u8; 32]> {
         challenge.0.iter().enumerate().map(|(j, &b)| self.half(j, !b).to_bytes()).collect()
     }
+
+    /// The non-interactive proof, compressed for the wire
+    /// ([`LinkProof`]). Needs `k >= MIN_FIAT_SHAMIR_K`.
+    pub fn prove(&self, context: &[u8]) -> Result<LinkProof> {
+        let c = self.commit();
+        let ch = Challenge::fiat_shamir(context, &c)?;
+        let opening = self.open(&ch);
+        let closed = ch.0.iter().enumerate().map(|(j, &b)| if b { c.hash_a[j] } else { c.hash_b[j] }).collect();
+        Ok(LinkProof { t_point: c.t_point, challenge: pack_bits(&ch.0), opened: opening.scalars, closed })
+    }
+
+    /// The journal's copy: `t`, then every `a_j`.
+    pub fn to_record(&self) -> Vec<[u8; 32]> {
+        std::iter::once(self.t.to_bytes()).chain(self.a.iter().map(|a| a.to_bytes())).collect()
+    }
+
+    pub fn from_record(r: &[[u8; 32]]) -> Option<Self> {
+        let (t, a) = r.split_first()?;
+        if a.is_empty() {
+            return None;
+        }
+        Some(Self { t: scalar_from_bytes(t)?, a: a.iter().map(scalar_from_bytes).collect::<Option<_>>()? })
+    }
+}
+
+fn pack_bits(bits: &[bool]) -> Vec<u8> {
+    let mut out = vec![0u8; bits.len().div_ceil(8)];
+    for (j, &b) in bits.iter().enumerate() {
+        out[j / 8] |= (b as u8) << (j % 8);
+    }
+    out
+}
+
+fn unpack_bits(bytes: &[u8], k: usize) -> Option<Vec<bool>> {
+    if bytes.len() != k.div_ceil(8) {
+        return None;
+    }
+    let bits: Vec<bool> = (0..k).map(|j| (bytes[j / 8] >> (j % 8)) & 1 == 1).collect();
+    // Padding bits must be zero, so one challenge has one encoding.
+    (pack_bits(&bits) == bytes).then_some(bits)
+}
+
+/// A Fiat–Shamir proof as it travels: the challenge, each instance's opened
+/// half, and the hash of each unopened half. Everything else the commitment
+/// held is implied (`A_j` is `s·G` or `T − s·G`, the opened half's hash is
+/// `BLAKE3(s)`), so the verifier rebuilds the commitment, and the challenge
+/// it recomputes from that must be the one sent. 64 bytes an instance where
+/// commitment plus opening take 128: 8,240 bytes at `K_OR`, not 16,416.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkProof {
+    pub t_point: Point32,
+    /// Challenge bits, least significant first.
+    pub challenge: Vec<u8>,
+    pub opened: Vec<[u8; 32]>,
+    pub closed: Vec<[u8; 32]>,
+}
+
+/// Checks a [`LinkProof`] made for `context`.
+///
+/// # Formal Specification
+///
+/// ```text
+/// Pre:  p arrived from the prover; context is this swap's
+/// Post: Ok(v) ⇔ k = |p.opened| = |p.closed| ≥ MIN_FIAT_SHAMIR_K
+///               ∧ C = the commitment p implies
+///               ∧ Challenge::fiat_shamir(context, C) = bits(p.challenge)
+///               ∧ verify(C, that challenge, p.opened) = Ok(v)
+/// ```
+///
+/// # Reasoning
+/// Rebuilding `A_j` from the opened half makes the opened half's point check
+/// pass by construction; the check moves into the hash: a prover that sends
+/// other halves implies another commitment, whose challenge is a fresh
+/// random draw it must match bit for bit. That is the security of the
+/// uncompressed proof, which also had to match a challenge it could not
+/// choose.
+pub fn verify_proof(context: &[u8], p: &LinkProof) -> Result<VerifiedLink> {
+    let k = p.opened.len();
+    ensure!(k >= MIN_FIAT_SHAMIR_K, "a non-interactive link needs k >= {MIN_FIAT_SHAMIR_K}, got {k}");
+    ensure!(p.closed.len() == k, "proof halves disagree on k");
+    let bits = unpack_bits(&p.challenge, k).ok_or_else(|| anyhow::anyhow!("malformed challenge bits"))?;
+    let t_pt = match decompress(&p.t_point) {
+        Some(pt) if !pt.is_identity() => pt,
+        _ => bail!("adaptor point is not a valid non-identity point"),
+    };
+    let mut c = LinkCommitment { t_point: p.t_point, a_points: Vec::with_capacity(k), hash_a: Vec::with_capacity(k), hash_b: Vec::with_capacity(k) };
+    for j in 0..k {
+        let s = scalar_from_bytes(&p.opened[j])
+            .ok_or_else(|| anyhow::anyhow!("instance {j}: opening is not a canonical scalar"))?;
+        let s_pt = RistrettoPoint::mul_base(&s);
+        let (a_pt, ha, hb) =
+            if bits[j] { (t_pt - s_pt, p.closed[j], hash(&p.opened[j])) } else { (s_pt, hash(&p.opened[j]), p.closed[j]) };
+        c.a_points.push(compress(&a_pt));
+        c.hash_a.push(ha);
+        c.hash_b.push(hb);
+    }
+    let ch = Challenge::fiat_shamir(context, &c)?;
+    ensure!(ch.0 == bits, "the challenge is not the one the commitment hashes to");
+    verify(&c, &ch, &LinkOpening { scalars: p.opened.clone() })
+}
+
+/// The verifier's [`VerifiedLink`], as the journal keeps it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkRecord {
+    pub t_point: Point32,
+    pub challenge: Vec<bool>,
+    pub opened: Vec<[u8; 32]>,
+    pub unopened_hashes: Vec<[u8; 32]>,
+}
+
+impl LinkRecord {
+    pub fn of(v: &VerifiedLink) -> Self {
+        Self {
+            t_point: v.t_point,
+            challenge: v.challenge.clone(),
+            opened: v.opened.iter().map(|s| s.to_bytes()).collect(),
+            unopened_hashes: v.unopened_hashes.clone(),
+        }
+    }
+
+    pub fn link(&self) -> Result<VerifiedLink> {
+        ensure!(
+            self.challenge.len() == self.opened.len() && self.opened.len() == self.unopened_hashes.len(),
+            "link record disagrees on k"
+        );
+        Ok(VerifiedLink {
+            t_point: self.t_point,
+            challenge: self.challenge.clone(),
+            opened: self
+                .opened
+                .iter()
+                .map(|s| scalar_from_bytes(s).ok_or_else(|| anyhow::anyhow!("link record holds a non-canonical scalar")))
+                .collect::<Result<_>>()?,
+            unopened_hashes: self.unopened_hashes.clone(),
+        })
+    }
 }
 
 // ── Messages ────────────────────────────────────────────────────────────────
@@ -488,5 +624,47 @@ mod tests {
         }
         // Expect TRIALS / 2^K = 250; six standard deviations either side.
         assert!((160..=340).contains(&wins), "cheater won {wins} of {TRIALS}, expected about 250");
+    }
+
+    #[test]
+    fn the_compressed_proof_verifies_and_carries_the_same_link() {
+        let s = LinkSecret::generate(K_OR);
+        let p = s.prove(b"swap-1").unwrap();
+        assert_eq!(p.opened.len(), K_OR);
+        assert_eq!(bincode::serialized_size(&p).unwrap(), 32 + 8 + 16 + 8 + 128 * 32 + 8 + 128 * 32);
+        let v = verify_proof(b"swap-1", &p).unwrap();
+        assert_eq!(v.t_point, s.t_point());
+        // The same link the uncompressed proof gives.
+        let c = s.commit();
+        let ch = Challenge::fiat_shamir(b"swap-1", &c).unwrap();
+        let full = verify(&c, &ch, &s.open(&ch)).unwrap();
+        assert_eq!(v.merkle_root(), full.merkle_root());
+        assert_eq!(v.leaf_for_t(&s.t()).map(|(j, _)| j), full.leaf_for_t(&s.t()).map(|(j, _)| j));
+        // Its journal record round-trips.
+        let back = LinkRecord::of(&v).link().unwrap();
+        assert_eq!(back.merkle_root(), v.merkle_root());
+        let secret = LinkSecret::from_record(&s.to_record()).unwrap();
+        assert_eq!(secret.commit(), s.commit());
+    }
+
+    #[test]
+    fn a_tampered_compressed_proof_is_refused() {
+        let s = LinkSecret::generate(K_OR);
+        let p = s.prove(b"swap-1").unwrap();
+        assert!(verify_proof(b"swap-2", &p).is_err(), "bound to its swap");
+        let mut q = p.clone();
+        q.closed[5] = [9; 32];
+        assert!(verify_proof(b"swap-1", &q).is_err(), "an unopened hash swapped after the challenge");
+        let mut q = p.clone();
+        q.opened[7] = (Scalar::from_bytes_mod_order(q.opened[7]) + Scalar::ONE).to_bytes();
+        assert!(verify_proof(b"swap-1", &q).is_err(), "an opened half swapped");
+        let mut q = p.clone();
+        q.challenge[0] ^= 1;
+        assert!(verify_proof(b"swap-1", &q).is_err(), "a challenge bit flipped");
+        let mut q = p;
+        q.opened.truncate(K_AND);
+        q.closed.truncate(K_AND);
+        q.challenge.truncate(K_AND / 8);
+        assert!(verify_proof(b"swap-1", &q).is_err(), "too few instances to be non-interactive");
     }
 }

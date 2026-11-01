@@ -608,3 +608,89 @@ pub struct HubAdView {
     /// Whether we already have a channel to it — this part we know.
     pub connected: bool,
 }
+
+// ── MDS <-> MDW ─────────────────────────────────────────────────────────────
+
+/// The embedded midwimble node, as the Trade view shows it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MwbNodeView {
+    pub height: u64,
+    pub peers: usize,
+    /// Downloading a heavier chain: its tip is about to change.
+    pub syncing: bool,
+}
+
+/// The MDW account. Amounts are midwimble units (10^-8 MDW).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct MwbAccountView {
+    /// Whether this wallet has an MDW account (wallets made before it
+    /// existed get one by re-entering their recovery phrase).
+    pub enabled: bool,
+    /// Stealth address, as midwimble's wallets print it.
+    pub address: Option<String>,
+    pub spendable: u64,
+    pub immature: u64,
+    /// Set aside for a payment waiting for a block, or locked in a swap.
+    pub reserved: u64,
+    /// Next midwimble height the account will scan.
+    pub scanned: u64,
+    /// `None` when no midwimble node is running.
+    pub node: Option<MwbNodeView>,
+}
+
+/// An order heard on the chat bus (or one of ours).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MwbBookEntryView {
+    pub order_id: String,
+    /// "sell_mds": the maker sells MDS for MDW; "sell_mdw": the reverse.
+    pub side: String,
+    pub mds_amount: u64,
+    pub mdw_amount: u64,
+    /// Midstate height after which it no longer stands.
+    pub expires: u64,
+    /// Midstate height it was last heard at.
+    pub heard: u64,
+    pub mine: bool,
+}
+
+/// An order this wallet made.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MwbOrderView {
+    pub order_id: String,
+    pub side: String,
+    pub mds_amount: u64,
+    pub mdw_amount: u64,
+    pub expires: u64,
+    /// "open" | "taken" | "filled" | "cancelled" | "expired"
+    pub status: String,
+    pub swap: Option<String>,
+}
+
+/// A swap this wallet is in, or was.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MwbSwapView {
+    pub id: String,
+    /// "maker" | "taker"
+    pub role: String,
+    pub side: String,
+    pub mds_amount: u64,
+    pub mdw_amount: u64,
+    /// "negotiating" | "waiting" | "locking" | "locked" | "claiming" |
+    /// "refunding" | "done" | "refunded" | "failed"
+    pub phase: String,
+    /// Where it stands, in a sentence.
+    pub note: String,
+    pub settled: bool,
+    /// "MDS" or "MDW": what this side gives, and gets.
+    pub gives: String,
+    pub gets: String,
+    /// Refund heights: the reveal leg's and the follow leg's, each on its
+    /// own chain ("midwimble" or "midstate").
+    pub reveal_height: u64,
+    pub reveal_chain: String,
+    pub follow_height: u64,
+    pub follow_chain: String,
+    /// Unix seconds.
+    pub created: u64,
+    pub updated: u64,
+}
