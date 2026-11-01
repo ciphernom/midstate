@@ -6794,7 +6794,14 @@ impl Service {
         let status = self.sync_status().await;
         let _ = self.events.send(WalletEvent::NodeTick { status: status.clone() });
 
-        if self.wallet.is_none() || status.is_syncing {
+        if self.wallet.is_none() {
+            return;
+        }
+        // Midwimble runs on its own node, so the MDW account scans whether or
+        // not midstate has caught up; what needs midstate's tip waits for it
+        // inside (adverts, takes, swap steps).
+        self.tick_mwb(status.height).await;
+        if status.is_syncing {
             return;
         }
         if let Err(e) = self.tick_channels(status.height).await {
@@ -6803,7 +6810,6 @@ impl Service {
         if let Err(e) = self.tick_swaps(status.height).await {
             tracing::warn!("swap tick: {e:#}");
         }
-        self.tick_mwb(status.height).await;
         let tip = status.height;
         self.check_new_mss_trees();
         self.refresh_bonds_live().await;

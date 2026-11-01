@@ -546,6 +546,11 @@ impl Service {
             tracing::warn!("midwimble scan: {e:#}");
         }
         self.mwb_rebroadcast_sends(&h).await;
+        // Orders, negotiations and swaps read midstate's tip; while midstate
+        // catches up that tip is stale, so they wait for it.
+        if self.node.is_syncing() {
+            return;
+        }
         let now = now_secs();
         self.mwb_read_bus(mds_tip, &keys, now).await;
         self.mwb_negotiation_timers(now);

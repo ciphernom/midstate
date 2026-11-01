@@ -113,6 +113,8 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         wallet_health(app, &mut cols[0]);
         network_panel(app, &mut cols[1]);
     });
+    ui.add_space(4.0);
+    midwimble_panel(app, ui);
 
     // ── Recent activity ─────────────────────────────────────────────────
     ui.add_space(4.0);
@@ -199,6 +201,54 @@ fn wallet_health(app: &mut App, ui: &mut Ui) {
 }
 
 /// Node and chain condition, condensed. The full picture lives on the Node tab.
+/// The MDW account and the embedded midwimble node, one click from trading.
+fn midwimble_panel(app: &mut App, ui: &mut Ui) {
+    theme::panel_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Midwimble").font(theme::font_medium(14.0)));
+            theme::right_aligned(ui, |ui| {
+                if ui.button("Trade MDS ↔ MDW").clicked() {
+                    app.tab = Tab::Trade;
+                    app.market = 1;
+                    app.mwb_last_poll = 0.0;
+                }
+            });
+        });
+        let Some(a) = app.mwb_account.clone() else {
+            theme::hint(ui, "Reading the MDW account…");
+            return;
+        };
+        let Some(n) = a.node.clone() else {
+            theme::hint(ui, "The midwimble node did not start, so MDW is unavailable. The log says why.");
+            return;
+        };
+        ui.horizontal(|ui| {
+            theme::badge(
+                ui,
+                if n.syncing { "syncing" } else if n.peers == 0 { "no peers yet" } else { "running" },
+                if n.syncing || n.peers == 0 { theme::muted() } else { theme::ink() },
+            );
+            theme::badge(ui, &format!("{} peer(s)", n.peers), if n.peers == 0 { theme::muted() } else { theme::ink() });
+            ui.label(theme::mono(format!("height {}", units(n.height))).size(11.0).color(theme::muted()));
+        });
+        if !a.enabled {
+            theme::hint(
+                ui,
+                "This wallet has no MDW account yet. Open the MDW market to add it from your recovery phrase.",
+            );
+            return;
+        }
+        row(ui, "MDW spendable", &crate::views::trade_mdw::mdw(a.spendable));
+        if a.reserved > 0 {
+            row(ui, "locked in swaps and payments", &crate::views::trade_mdw::mdw(a.reserved));
+        }
+        if a.scanned < n.height {
+            row(ui, "scanning", &format!("block {} of {}", units(a.scanned), units(n.height)));
+        }
+    });
+}
+
 fn network_panel(app: &mut App, ui: &mut Ui) {
     theme::panel_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());

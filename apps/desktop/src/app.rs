@@ -276,6 +276,7 @@ pub struct App {
     /// The order whose Take was pressed once; the next press takes it.
     pub mwb_take_armed: Option<String>,
     pub mwb_last_poll: f64,
+    pub mwb_account_last_poll: f64,
 }
 
 impl App {
@@ -470,6 +471,7 @@ impl App {
             mwb_notice: String::new(),
             mwb_take_armed: None,
             mwb_last_poll: 0.0,
+            mwb_account_last_poll: 0.0,
         }
     }
 
@@ -1016,6 +1018,17 @@ impl App {
                     kv(ui, "coins", &theme::units(s.num_coins as u64), theme::ink());
                 }
             }
+            // The embedded midwimble node, beside midstate's.
+            if let Some(n) = self.mwb_account.as_ref().and_then(|a| a.node.as_ref()) {
+                ui.label(RichText::new("·").font(FontId::monospace(11.5)).color(theme::faint()));
+                theme::dot(ui, n.peers > 0);
+                ui.label(RichText::new("midwimble").font(FontId::monospace(11.5)).color(theme::muted()));
+                kv(ui, "peers", &n.peers.to_string(), theme::ink());
+                kv(ui, "height", &theme::units(n.height), theme::ink());
+                if n.syncing {
+                    ui.label(RichText::new("syncing…").font(FontId::monospace(11.5)).color(theme::muted()));
+                }
+            }
         });
 
         fn kv(ui: &mut egui::Ui, k: &str, v: &str, vc: Color32) {
@@ -1074,6 +1087,16 @@ impl eframe::App for App {
                 self.node_last_poll = t;
                 self.go(ctx, Action::LoadNodeInfo);
                 self.go(ctx, Action::LoadMining);
+            }
+        }
+
+        // The MDW account and midwimble's node show in the ribbon and on the
+        // Dashboard, so keep them fresh whatever tab is open.
+        if self.handle.is_some() && self.status.as_ref().is_some_and(|s| s.unlocked) {
+            let t = self.t0.elapsed().as_secs_f64();
+            if t - self.mwb_account_last_poll > 4.0 {
+                self.mwb_account_last_poll = t;
+                self.go(ctx, Action::LoadMwbAccount);
             }
         }
 
