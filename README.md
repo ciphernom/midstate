@@ -46,7 +46,7 @@ The same figures are served for listing sites (CoinGecko, CoinMarketCap, LiveCoi
 Circulating supply equals total supply: there is no premine, treasury or team allocation. It counts every block reward issued, minus the genesis reward (paid to the genesis inscription, which no key can spend) and value destroyed by data burns. After the halvings end at block 15,768,000, a tail of 1 MDS per block continues. The plain-number endpoints answer 503 until the index has caught up, rather than publish a figure that might be wrong.
 
 **Midstate Axe Dashboard:**
-For hardware nodes (or local testing), access the web dashboard at `http://127.0.0.1:8545/axe` to configure Wi-Fi, view live telemetry, and set up pool mining.
+For hardware nodes (or local testing), access the web dashboard at `http://127.0.0.1:8545/axe` to configure Wi-Fi, view live telemetry, set up pool mining, and overclock and test the board. The MidstateAxe is a Raspberry Pi 5: see MANUAL.md, section 5.
 
 ## 3. Wallet Operations
 

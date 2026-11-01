@@ -1159,13 +1159,59 @@ pub async fn axe_stats(State(node): State<AppState>) -> Json<AxeStatsResponse> {
         .and_then(|s| s.trim().parse::<u64>().ok())
         .map(|khz| (khz / 1000) as u32);
 
+    let pow = crate::core::types::pow_algo_at(node.height().await).name().to_string();
+    let throttled = throttled_flags().await;
+
     Json(AxeStatsResponse { 
         temp_c, 
         uptime_s, 
         total_nonces,
         is_axe_hardware: is_axe_device(), 
         freq_mhz,
+        pow,
+        throttled,
+        throttle: throttled
+            .map(crate::rpc::axe::throttle_words)
+            .unwrap_or_default()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
     })
+}
+
+/// The board's device-tree model ("Raspberry Pi 5 Model B Rev 1.0"), if any.
+fn board_model() -> Option<String> {
+    std::fs::read_to_string("/sys/firmware/devicetree/base/model")
+        .ok()
+        .map(|m| m.trim_end_matches('\0').trim().to_string())
+        .filter(|m| !m.is_empty())
+}
+
+/// `vcgencmd get_throttled`'s flags (under-voltage, throttling), read at most
+/// every ten seconds: the dashboard polls every three, and the command is a
+/// round trip to the firmware. `None` where there is no `vcgencmd`.
+async fn throttled_flags() -> Option<u32> {
+    static LAST: std::sync::Mutex<Option<(std::time::Instant, Option<u32>)>> = std::sync::Mutex::new(None);
+    if let Ok(last) = LAST.lock() {
+        if let Some((at, flags)) = *last {
+            if at.elapsed() < std::time::Duration::from_secs(10) {
+                return flags;
+            }
+        }
+    }
+    let flags = match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::process::Command::new("vcgencmd").arg("get_throttled").output(),
+    )
+    .await
+    {
+        Ok(Ok(out)) if out.status.success() => crate::rpc::axe::parse_throttled(&String::from_utf8_lossy(&out.stdout)),
+        _ => None,
+    };
+    if let Ok(mut last) = LAST.lock() {
+        *last = Some((std::time::Instant::now(), flags));
+    }
+    flags
 }
 
 pub fn is_axe_device() -> bool {
@@ -1205,7 +1251,33 @@ pub async fn axe_wifi_setup(
     }
 
     tracing::info!("Received WiFi setup request for SSID: {}", req.ssid);
-    
+
+    // Raspberry Pi OS (Bookworm on, so every Pi 5 image) runs its network
+    // with NetworkManager, which ignores wpa_supplicant.conf. There the
+    // credentials go to nmcli, as arguments (no shell is involved). It is
+    // started after this reply goes out: joining the new network can take
+    // the dashboard's own connection with it.
+    if networkmanager_running().await {
+        let (ssid, password) = (req.ssid.clone(), req.password.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let mut cmd = tokio::process::Command::new("nmcli");
+            cmd.args(["device", "wifi", "connect", &ssid]);
+            if !password.is_empty() {
+                cmd.args(["password", &password]);
+            }
+            match cmd.output().await {
+                Ok(out) if out.status.success() => tracing::info!("Joined Wi-Fi network {} through NetworkManager.", ssid),
+                Ok(out) => tracing::warn!("nmcli could not join {}: {}", ssid, String::from_utf8_lossy(&out.stderr).trim()),
+                Err(e) => tracing::error!("Failed to run nmcli: {}", e),
+            }
+        });
+        return Ok(Json(serde_json::json!({
+            "status": "wifi_configured",
+            "message": "Joining the network through NetworkManager. The device will drop off this one if it connects."
+        })));
+    }
+
     let conf = format!(
         "ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev\nupdate_config=1\ncountry=AU\n\nnetwork={{\n    ssid=\"{}\"\n    psk=\"{}\"\n}}\n", 
         req.ssid, req.password
@@ -1245,6 +1317,16 @@ pub async fn axe_wifi_setup(
         "status": "wifi_configured", 
         "message": "Configuration saved. Networking service is reloading..." 
     })))
+}
+
+/// Whether NetworkManager runs this device's network (Raspberry Pi OS from
+/// Bookworm on). Buildroot images use wpa_supplicant directly.
+async fn networkmanager_running() -> bool {
+    let probe = tokio::process::Command::new("nmcli").args(["-t", "-f", "RUNNING", "general"]).output();
+    match tokio::time::timeout(std::time::Duration::from_secs(3), probe).await {
+        Ok(Ok(out)) => out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "running",
+        _ => false,
+    }
 }
 
 pub async fn axe_save_config(
@@ -1300,22 +1382,17 @@ pub async fn axe_get_config() -> Json<serde_json::Value> {
         .and_then(|s| toml::from_str::<crate::node::MinerToml>(&s).ok())
         .map(|c| c.mining);
 
+    // The board, what its clock may be set to, and whether it mines
+    // Midstate Walk well (AES instructions).
+    let model = board_model();
+    let profile = model.as_deref().and_then(crate::rpc::axe::profile);
+    let aes = crate::core::walk::backend_name();
+
     // Parse the persisted overclock back out of the boot config.
-    let mut configured_freq_mhz: Option<u32> = None;
-    let mut configured_overvoltage: Option<u32> = None;
-    for path in ["/boot/firmware/config.txt", "/boot/config.txt"] {
-        if let Ok(cfg) = std::fs::read_to_string(path) {
-            for line in cfg.lines() {
-                if let Some(v) = line.strip_prefix("arm_freq=") {
-                    configured_freq_mhz = v.trim().parse().ok();
-                }
-                if let Some(v) = line.strip_prefix("over_voltage=") {
-                    configured_overvoltage = v.trim().parse().ok();
-                }
-            }
-            break;
-        }
-    }
+    let (configured_freq_mhz, configured_overvoltage) = boot_config_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|cfg| crate::rpc::axe::configured(&cfg, profile.as_ref()))
+        .unwrap_or((None, None));
 
     Json(serde_json::json!({
         "mode": mining.as_ref().map(|m| m.mode.clone()).unwrap_or_else(|| "solo".to_string()),
@@ -1323,9 +1400,26 @@ pub async fn axe_get_config() -> Json<serde_json::Value> {
         "payout_address": mining.as_ref().and_then(|m| m.payout_address.clone()),
         "pool_address": mining.as_ref().and_then(|m| m.pool_address.clone()),
         "worker": mining.as_ref().and_then(|m| m.worker.clone()),
+        "midwimble_address": mining.as_ref().and_then(|m| m.midwimble_address.clone()),
         "configured_freq_mhz": configured_freq_mhz,
         "configured_overvoltage": configured_overvoltage,
+        "board": {
+            "model": model,
+            "clock": profile,
+            "aes": aes,
+            // Without AES instructions the walk runs on tables, at a few
+            // percent of a Raspberry Pi 5's speed.
+            "walk_ready": aes != "portable",
+        },
     }))
+}
+
+/// The Pi's boot config: `/boot/firmware/config.txt` on Raspberry Pi OS
+/// from Bookworm on, `/boot/config.txt` on Buildroot and older images.
+fn boot_config_path() -> Option<&'static str> {
+    ["/boot/firmware/config.txt", "/boot/config.txt"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
 }
 
 pub async fn axe_apply_overclock(
@@ -1340,52 +1434,31 @@ pub async fn axe_apply_overclock(
         })));
     }
 
-    // --- STRICT BOUNDS CHECKING ---
-    // Prevent the user from entering values that will prevent the Pi from booting
-    if req.freq < 800 || req.freq > 1400 {
-        return Err(ErrorResponse { error: "Frequency out of safe bounds (800-1400 MHz)".into() });
-    }
-    if req.overvoltage > 8 {
-        return Err(ErrorResponse { error: "Overvoltage out of safe bounds (0-8)".into() });
-    }
+    // --- BOUNDS, PER BOARD ---
+    // Each Raspberry Pi family has its own range (`rpc::axe`): one board's
+    // limits on another either won't boot or throw away most of its speed.
+    let model = board_model().unwrap_or_default();
+    let Some(profile) = crate::rpc::axe::profile(&model) else {
+        return Err(ErrorResponse {
+            error: format!("No overclock settings are known for this board ({}).", if model.is_empty() { "unidentified" } else { model.as_str() }),
+        });
+    };
+    crate::rpc::axe::check(&profile, req.freq, req.overvoltage).map_err(|error| ErrorResponse { error })?;
 
-    tracing::info!("Applying hardware overclock: {} MHz, OV: {}", req.freq, req.overvoltage);
+    tracing::info!("Applying hardware overclock on {}: {} MHz, extra voltage {}", model, req.freq, req.overvoltage);
 
-    // Buildroot uses /boot/config.txt, newer RaspiOS uses /boot/firmware/config.txt
-    let config_paths = ["/boot/firmware/config.txt", "/boot/config.txt"];
-    let mut target_path = "";
-    
-    for path in &config_paths {
-        if std::path::Path::new(path).exists() {
-            target_path = path;
-            break;
-        }
-    }
-
-    if target_path.is_empty() {
+    let Some(target_path) = boot_config_path() else {
         return Err(ErrorResponse { error: "Could not locate Raspberry Pi boot config".into() });
-    }
+    };
 
     // Read current config
     let current_config = std::fs::read_to_string(target_path)
         .map_err(|e| ErrorResponse { error: format!("Failed to read config: {}", e) })?;
 
-    // Filter out old overclock settings
-    let mut new_config: Vec<String> = current_config.lines()
-        .filter(|line| {
-            !line.starts_with("arm_freq=") &&
-            !line.starts_with("over_voltage=") &&
-            !line.starts_with("force_turbo=")
-        })
-        .map(|s| s.to_string())
-        .collect();
-
-    // Append new requested settings
-    new_config.push(format!("arm_freq={}", req.freq));
-    new_config.push(format!("over_voltage={}", req.overvoltage));
-    new_config.push("force_turbo=1".to_string());
-
-    let config_content = new_config.join("\n") + "\n";
+    // The old overclock out, the new one in as one marked block for every
+    // model. No force_turbo: a miner keeps the cores busy anyway, and with
+    // over_voltage it sets an older Pi's warranty bit for good.
+    let config_content = crate::rpc::axe::rewrite_config(&current_config, &profile, req.freq, req.overvoltage);
 
     // Write back to disk
     if let Err(e) = std::fs::write(target_path, config_content) {
@@ -1403,6 +1476,44 @@ pub async fn axe_apply_overclock(
     Ok(Json(serde_json::json!({ 
         "status": "success", 
         "message": "Overclock applied to boot config. System rebooting..." 
+    })))
+}
+
+/// POST /axe/bench — "Test this unit". Every core first checks it computes
+/// Midstate Walk's known answers, then all of them count attempts for five
+/// seconds, and check the answers again while hot: after an overclock, the
+/// way to find out whether it holds. A core that gets one wrong would lose
+/// shares (the pool re-checks each) and waste its power. Mining goes on
+/// meanwhile, more slowly. One test at a time.
+pub async fn axe_bench() -> Result<Json<serde_json::Value>, ErrorResponse> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static RUNNING: AtomicBool = AtomicBool::new(false);
+
+    if !is_axe_device() {
+        return Err(ErrorResponse { error: "The unit test is only available on MidstateAxe hardware.".into() });
+    }
+    if RUNNING.swap(true, Ordering::SeqCst) {
+        return Err(ErrorResponse { error: "A test is already running.".into() });
+    }
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let result = tokio::task::spawn_blocking(move || {
+        crate::core::walk::bench(threads, std::time::Duration::from_secs(5))
+    })
+    .await;
+    RUNNING.store(false, Ordering::SeqCst);
+    let (rate, correct) = result.map_err(|e| ErrorResponse { error: format!("The test could not run: {}", e) })?;
+
+    let message = if correct {
+        format!("{:.0} Walk attempts a second on {} threads, and every core computed the known answers.", rate, threads)
+    } else {
+        "A core computed a wrong answer: this overclock is unstable. Lower the clock or add voltage, then test again.".to_string()
+    };
+    Ok(Json(serde_json::json!({
+        "threads": threads,
+        "attempts_per_second": rate,
+        "aes": crate::core::walk::backend_name(),
+        "correct": correct,
+        "message": message,
     })))
 }
 

@@ -367,6 +367,11 @@ impl NodeHandle {
         self.state.read().await.clone()
     }
 
+    /// The chain height, without copying the whole state.
+    pub async fn height(&self) -> u64 {
+        self.state.read().await.height
+    }
+
     /// True while the node is actively downloading/verifying historical blocks.
     /// Mirrors the event loop's own definition:
     /// `sync.is_in_progress() || sync.has_active_session()`.

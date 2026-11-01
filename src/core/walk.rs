@@ -182,6 +182,103 @@ pub fn backend_name() -> &'static str {
     }
 }
 
+// ── Known answers ───────────────────────────────────────────────────────────
+
+/// Pinned outputs, as (mining hash, nonce, proof-of-work hash) in hex.
+/// Cross-checked against two independent implementations written from the
+/// definition in this module (midstate's `docs/walk-reference`): a Python one
+/// (S-box derived from GF(2^8) inversion) and a C one run on an emulated
+/// Cortex-A76 through the ARMv8 AES instructions. Changing any of these is a
+/// hard fork.
+///
+/// The tests check them, and so does [`check_golden`], which an overclocked
+/// miner runs to find out whether its CPU still computes the walk correctly.
+#[cfg(not(feature = "fast-mining"))]
+pub const GOLDEN: [(&str, u64, &str); 3] = [
+    (
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        0,
+        "a934fced2d9a53fb09d6abe089f3d2f5bba9a421b41ee5726233a525cc7438e7",
+    ),
+    (
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        u64::MAX,
+        "65d237f595f07bee156c635ad45f721987ce38d79ea14c89e40c5555613d0768",
+    ),
+    (
+        "374bf98b3b8f7f41a9e291154fc582a65bb3e14180cb9a07fef08e55f3006c50",
+        42,
+        "5f2da9d320de391aef28bcaab63e3d1a25402b4541cdff8680059a87c7d515b7",
+    ),
+];
+
+#[cfg(feature = "fast-mining")]
+pub const GOLDEN: [(&str, u64, &str); 3] = [
+    (
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        0,
+        "592cd5f394f7dc705343585a7cb48c58ce8da5f646dadb81af440e0d7a470e40",
+    ),
+    (
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        u64::MAX,
+        "f1488d17741b4eaaa909374c90ea70adfe89ceaa16d7ca8605c0da25f031e9f3",
+    ),
+    (
+        "374bf98b3b8f7f41a9e291154fc582a65bb3e14180cb9a07fef08e55f3006c50",
+        42,
+        "8f9d7f1d42826a15f81dbee9fd7e25ca3edee11776dfb48e078feebfeab2ab13",
+    ),
+];
+
+/// Whether this thread's CPU computes [`GOLDEN`] exactly, through
+/// [`walk_hash`] (the fast path this CPU mines with).
+///
+/// A CPU pushed past what it can do stays up but computes wrong results now
+/// and then. A miner like that loses shares (the pool re-checks each one)
+/// rather than producing bad blocks, but it is wasting its power: an
+/// overclock is only good if this holds on every core, while hot.
+pub fn check_golden() -> bool {
+    GOLDEN.iter().all(|(mining_hash, nonce, want)| {
+        let (mut m, mut w) = ([0u8; 32], [0u8; 32]);
+        hex::decode_to_slice(mining_hash, &mut m).is_ok()
+            && hex::decode_to_slice(want, &mut w).is_ok()
+            && walk_hash(&m, *nonce) == w
+    })
+}
+
+/// Walk attempts a second over `threads` threads for `duration`, and whether
+/// every thread computed [`GOLDEN`] correctly both before and after (so the
+/// second check runs on a hot CPU). For the miner's "test this unit".
+pub fn bench(threads: usize, duration: std::time::Duration) -> (f64, bool) {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    let mining_hash = crate::core::types::hash(b"midstate walk bench");
+    let stop = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicU64::new(0));
+    let start = std::time::Instant::now();
+    let workers: Vec<_> = (0..threads.max(1) as u64)
+        .map(|t| {
+            let (stop, done) = (stop.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut good = check_golden();
+                let mut nonce = t << 40;
+                while !stop.load(Ordering::Relaxed) {
+                    std::hint::black_box(walk_hash(&mining_hash, nonce));
+                    nonce += 1;
+                    done.fetch_add(1, Ordering::Relaxed);
+                }
+                good &= check_golden();
+                good
+            })
+        })
+        .collect();
+    std::thread::sleep(duration);
+    stop.store(true, Ordering::Relaxed);
+    let good = workers.into_iter().all(|w| w.join().unwrap_or(false));
+    (done.load(Ordering::Relaxed) as f64 / start.elapsed().as_secs_f64(), good)
+}
+
 // ── The walk ────────────────────────────────────────────────────────────────
 
 #[inline(always)]
@@ -625,49 +722,6 @@ mod tests {
         assert_ne!(a, walk_hash(&m2, 1));
     }
 
-    /// Pinned outputs. Cross-checked against two independent implementations
-    /// written from the definition above (midstate's `docs/walk-reference`):
-    /// a Python one (S-box derived from GF(2^8) inversion) and a C one run on
-    /// an emulated Cortex-A76 through the ARMv8 AES instructions. Changing
-    /// any of these is a hard fork.
-    #[cfg(not(feature = "fast-mining"))]
-    const GOLDEN: [(&str, u64, &str); 3] = [
-        (
-            "0000000000000000000000000000000000000000000000000000000000000000",
-            0,
-            "a934fced2d9a53fb09d6abe089f3d2f5bba9a421b41ee5726233a525cc7438e7",
-        ),
-        (
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-            u64::MAX,
-            "65d237f595f07bee156c635ad45f721987ce38d79ea14c89e40c5555613d0768",
-        ),
-        (
-            "374bf98b3b8f7f41a9e291154fc582a65bb3e14180cb9a07fef08e55f3006c50",
-            42,
-            "5f2da9d320de391aef28bcaab63e3d1a25402b4541cdff8680059a87c7d515b7",
-        ),
-    ];
-
-    #[cfg(feature = "fast-mining")]
-    const GOLDEN: [(&str, u64, &str); 3] = [
-        (
-            "0000000000000000000000000000000000000000000000000000000000000000",
-            0,
-            "592cd5f394f7dc705343585a7cb48c58ce8da5f646dadb81af440e0d7a470e40",
-        ),
-        (
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-            u64::MAX,
-            "f1488d17741b4eaaa909374c90ea70adfe89ceaa16d7ca8605c0da25f031e9f3",
-        ),
-        (
-            "374bf98b3b8f7f41a9e291154fc582a65bb3e14180cb9a07fef08e55f3006c50",
-            42,
-            "8f9d7f1d42826a15f81dbee9fd7e25ca3edee11776dfb48e078feebfeab2ab13",
-        ),
-    ];
-
     fn hex32(s: &str) -> [u8; 32] {
         let mut out = [0u8; 32];
         for (i, b) in out.iter_mut().enumerate() {
@@ -683,6 +737,14 @@ mod tests {
             assert_eq!(walk_hash(&m, nonce), hex32(want), "fast path, nonce {nonce}");
             assert_eq!(walk_hash_portable(&m, nonce), hex32(want), "portable, nonce {nonce}");
         }
+        assert!(check_golden());
+    }
+
+    #[test]
+    fn a_bench_counts_attempts_and_checks_every_thread() {
+        let (rate, good) = bench(2, std::time::Duration::from_millis(300));
+        assert!(rate > 0.0);
+        assert!(good, "this CPU computes the known answers");
     }
 
     #[test]
