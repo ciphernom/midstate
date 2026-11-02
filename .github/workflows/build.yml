@@ -131,6 +131,24 @@ jobs:
         RUSTFLAGS: ${{ matrix.rustflags || '' }}
       run: cargo build --release --target ${{ matrix.target }} -p midstate-desktop
 
+    # The desktop exe carries the Midstate logo, which Explorer, shortcuts and
+    # pinned taskbar entries show (apps/desktop/build.rs embeds it with the
+    # SDK's rc.exe). A build that cannot find rc.exe still succeeds, with
+    # Windows' generic icon, so the release fails here instead.
+    - name: Check the desktop exe has its icon (Windows)
+      if: matrix.os == 'windows-latest' && matrix.desktop
+      shell: pwsh
+      run: |
+        Add-Type -Namespace Win32 -Name Shell -MemberDefinition '[DllImport("shell32.dll", CharSet = CharSet.Unicode)] public static extern uint ExtractIconEx(string file, int index, IntPtr[] large, IntPtr[] small, uint count);'
+        $exe = (Resolve-Path "target\${{ matrix.target }}\release\midstate-desktop.exe").Path
+        # Index -1 with no buffers asks how many icons the file holds.
+        $n = [Win32.Shell]::ExtractIconEx($exe, -1, $null, $null, 0)
+        Write-Host "midstate-desktop.exe holds $n icon(s)"
+        if ($n -lt 1) {
+          Write-Host "::error::midstate-desktop.exe has no icon: build.rs could not embed it (no rc.exe from the Windows SDK?)"
+          exit 1
+        }
+
     # A binary built against a newer glibc than a machine has stops at once
     # there. This fails the build instead, if a runner image ever brings a
     # newer one again. readelf reads the ARM builds' symbols too.

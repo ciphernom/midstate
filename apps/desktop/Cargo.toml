@@ -26,3 +26,7 @@ anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs = "5.0"
+
+[build-dependencies]
+# The Windows executable's icon (build.rs). Does nothing for other targets.
+embed-resource = "3.0"
