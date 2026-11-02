@@ -55,9 +55,9 @@ jobs:
           #
           # crt-static links the MSVC runtime into the binary instead of
           # importing VCRUNTIME140.dll from the Visual C++ Redistributable.
-          # We ship a bare .exe with no installer, so there is nothing to
-          # carry that redist along; a user without it gets a loader error
-          # before main() ever runs. Costs a few hundred KB.
+          # Neither the zip nor the installer carries that redist along, and
+          # a user without it would get a loader error before main() ever
+          # runs. Costs a few hundred KB.
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             pkg_name: midstate-windows-amd64
@@ -259,6 +259,83 @@ jobs:
         Compress-Archive -Path "$stage\*" `
           -DestinationPath "$env:RUNNER_TEMP\${{ matrix.pkg_name }}.zip" -Force
 
+    # ── Windows installer ─────────────────────────────────────────────────
+    # midstate-windows-amd64-setup.exe, from apps/desktop/assets/windows/
+    # midstate-setup.iss: both executables in one folder (mining needs
+    # midstate.exe beside the app), Start menu and desktop shortcuts with the
+    # app's icon, and an uninstaller. See WINDOWS INSTALLER in the NOTES.
+    - name: Build installer (Windows)
+      if: matrix.os == 'windows-latest' && matrix.desktop
+      shell: pwsh
+      run: |
+        function Find-Iscc {
+          Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup*\ISCC.exe", "$env:ProgramFiles\Inno Setup*\ISCC.exe" `
+            -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+        }
+        # The runner image ships Inno Setup; Chocolatey is the fallback.
+        $iscc = Find-Iscc
+        if (-not $iscc) {
+          choco install innosetup --no-progress -y | Out-Null
+          $iscc = Find-Iscc
+        }
+        if (-not $iscc) { throw "Inno Setup's ISCC.exe is not installed" }
+        Write-Host "using $iscc"
+
+        $version = '0.0.0'
+        if ($env:GITHUB_REF_TYPE -eq 'tag') { $version = $env:GITHUB_REF_NAME.TrimStart('v') }
+        $bin = (Resolve-Path "target\${{ matrix.target }}\release").Path
+        & $iscc "/DAppVersion=$version" "/DBinDir=$bin" "/O$env:RUNNER_TEMP" `
+          apps\desktop\assets\windows\midstate-setup.iss
+        if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+
+    # Installs it silently for this user into a scratch folder, checks the
+    # files, both shortcuts and the Apps entry, then uninstalls it and checks
+    # that it cleaned up after itself.
+    - name: Test installer (Windows)
+      if: matrix.os == 'windows-latest' && matrix.desktop
+      shell: pwsh
+      run: |
+        $setup = "$env:RUNNER_TEMP\midstate-windows-amd64-setup.exe"
+        $dir   = "$env:RUNNER_TEMP\midstate-installed"
+        $log   = "$env:RUNNER_TEMP\midstate-setup.log"
+        $p = Start-Process $setup -Wait -PassThru -ArgumentList `
+               "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CURRENTUSER /TASKS=desktopicon /DIR=`"$dir`" /LOG=`"$log`""
+        if ($p.ExitCode -ne 0) {
+          Get-Content $log -ErrorAction SilentlyContinue
+          throw "setup exited with code $($p.ExitCode)"
+        }
+
+        foreach ($f in 'midstate-desktop.exe', 'midstate.exe', 'unins000.exe') {
+          if (-not (Test-Path "$dir\$f")) { throw "setup did not install $f" }
+        }
+        $startLnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'Midstate Desktop.lnk'
+        $deskLnk  = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Midstate Desktop.lnk'
+        foreach ($l in $startLnk, $deskLnk) {
+          if (-not (Test-Path $l)) { throw "no shortcut at $l" }
+        }
+        $target = (New-Object -ComObject WScript.Shell).CreateShortcut($startLnk).TargetPath
+        if ($target -ne "$dir\midstate-desktop.exe") { throw "the Start menu shortcut opens $target" }
+        function Get-AppsEntry {
+          Get-ChildItem 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall' -ErrorAction SilentlyContinue |
+            Get-ItemProperty -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -eq 'Midstate Desktop' }
+        }
+        $entry = Get-AppsEntry
+        if (-not $entry) { throw 'no uninstaller registered under Apps' }
+        Write-Host "installed $($entry.DisplayName) $($entry.DisplayVersion) in $dir (icon $($entry.DisplayIcon))"
+
+        Start-Process "$dir\unins000.exe" -Wait -ArgumentList '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART'
+        # The uninstaller hands over to a copy of itself and returns at once.
+        $deadline = (Get-Date).AddSeconds(120)
+        while (((Test-Path "$dir\midstate-desktop.exe") -or (Get-AppsEntry)) -and (Get-Date) -lt $deadline) {
+          Start-Sleep -Seconds 1
+        }
+        foreach ($l in "$dir\midstate-desktop.exe", "$dir\midstate.exe", $startLnk, $deskLnk) {
+          if (Test-Path $l) { throw "uninstalling left $l behind" }
+        }
+        if (Get-AppsEntry) { throw 'uninstalling left the Apps entry behind' }
+        Write-Host 'the installer installs, and the uninstaller removes, all of it'
+
 
     - name: Package software OpenGL (Windows)
       if: matrix.os == 'windows-latest'
@@ -402,6 +479,14 @@ jobs:
         path: ${{ runner.temp }}/${{ matrix.pkg_name }}.zip
         if-no-files-found: error
 
+    - name: Upload Artifact (installer, Windows)
+      if: matrix.os == 'windows-latest' && matrix.desktop
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.pkg_name }}-setup
+        path: ${{ runner.temp }}/${{ matrix.pkg_name }}-setup.exe
+        if-no-files-found: error
+
     - name: Upload Artifact (macOS .app bundle)
       if: matrix.bundle_name != ''
       uses: actions/upload-artifact@v4
@@ -490,10 +575,11 @@ jobs:
 # start, and the error dialog points there.
 #
 # CRT-STATIC. The Windows target links the MSVC runtime statically so the
-# shipped .exe needs no Visual C++ Redistributable — there is no installer to
-# carry one along. This links cleanly as of 2026-08-12; if it ever stops,
-# suspect a C dependency built against the dynamic runtime (mimalloc is the
-# likely candidate; cc-rs normally follows the crt-static flag on its own).
+# shipped .exe needs no Visual C++ Redistributable — neither the zip nor the
+# installer carries one along. This links cleanly as of 2026-08-12; if it
+# ever stops, suspect a C dependency built against the dynamic runtime
+# (mimalloc is the likely candidate; cc-rs normally follows the crt-static
+# flag on its own).
 # To confirm the dependency is actually gone, check a downloaded artifact's
 # import table for VCRUNTIME140.dll:
 #     x86_64-w64-mingw32-objdump -p midstate-desktop.exe | grep 'DLL Name'
@@ -501,6 +587,18 @@ jobs:
 # ASSET NAMES CHANGED. Releases now carry archives (midstate-windows-amd64.zip,
 # midstate-linux-amd64.tar.gz, …) rather than bare renamed binaries, so any
 # install docs or download links pointing at the old names need updating.
+#
+# WINDOWS INSTALLER. midstate-windows-amd64-setup.exe is built with Inno
+# Setup 6.5.2 or later (the windows-2025 image ships 6.7; Chocolatey is the
+# fallback). It installs for the current user, into
+# %LOCALAPPDATA%\Programs\Midstate, with no administrator prompt; `/ALLUSERS`
+# installs for everyone. Upgrades go over the top: the AppId in
+# midstate-setup.iss is how Windows recognises the app, so never change it.
+# The wallet stays out of it: wallets and chain data live in
+# %APPDATA%\midstate-desktop, which uninstalling leaves alone. Like the exe,
+# the installer is UNSIGNED, so SmartScreen warns on first run ("Windows
+# protected your PC" → More info → Run anyway). Signing needs a code-signing
+# certificate held as a repository secret, and a SignTool line in the .iss.
 #
 # The macOS bundle is UNSIGNED. Gatekeeper will refuse it on first launch
 # ("unidentified developer", or "damaged" once the download carries a
