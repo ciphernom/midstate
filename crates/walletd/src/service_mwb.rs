@@ -9,7 +9,7 @@
 use super::{now_secs, SendMeta, Service};
 use crate::api::*;
 use crate::mwb::min_fee;
-use crate::mwb_account::{BlockView, MwbAccount, REORG};
+use crate::mwb_account::{BlockView, MwbAccount, SwapOutputs, LOCK_LABEL, REORG};
 use crate::mwb_negotiate::{abort_messages, Ctx, Linger, Negotiation, Step, MAX_RESENDS, NEGOTIATION_SECS, RESEND_SECS};
 use crate::mwb_trade::{
     build_mds_spend, check_terms, decide, observe, sign_mds_spend, Act, BookEntry, Chains, Leg,
@@ -35,11 +35,17 @@ const MWB_SCAN_CHUNK: u64 = 500;
 const MWB_SAVE_EVERY: u64 = 1_000;
 /// Seconds between rebroadcasts of a payment still waiting for a block.
 const MWB_REBROADCAST_SECS: u64 = 120;
-/// Label of a swap's lock funding among the account's payments.
-const LOCK_LABEL: &str = "swap lock";
 /// Midstate blocks before an external commit that has not appeared is made
 /// again.
 const RECOMMIT_BLOCKS: u64 = 20;
+
+/// Where the embedded node keeps its chain, listens, and serves its
+/// explorer: fixed at boot.
+pub(super) struct MwbPlace {
+    pub(super) explorer: Option<String>,
+    pub(super) data_dir: String,
+    pub(super) p2p_port: u16,
+}
 
 /// The actor's midwimble state that is not journalled.
 #[derive(Default)]
@@ -265,14 +271,16 @@ impl Service {
             bail!("wallet is locked");
         }
         self.mwb.keys.clone().ok_or_else(|| {
-            anyhow!("this wallet has no MDW account yet: enter your recovery phrase in the Trade view to add it")
+            anyhow!("this wallet has no MDW account yet: enter your recovery phrase on the Receive tab to add it")
         })
     }
 
-    fn mwb_ready_to_trade(&self) -> Result<WalletKeys> {
+    /// Spending MDW needs midwimble alone: its node in step with the
+    /// network, and the account scanned to its tip (else the coins it picks
+    /// may be spent already, or a payment may be missed).
+    fn mwb_ready_to_spend(&self) -> Result<WalletKeys> {
         let keys = self.mwb_keys()?;
         ensure!(self.mwb_node.is_some(), "the midwimble node is not running");
-        ensure!(!self.node.is_syncing(), "midstate is still syncing");
         ensure!(self.mwb_synced(), "midwimble is still syncing, or has no peers yet");
         let tip = self.mwb_tip().unwrap_or(0);
         ensure!(
@@ -283,24 +291,148 @@ impl Service {
         Ok(keys)
     }
 
+    /// A swap reads both chains, so midstate must be in step too.
+    fn mwb_ready_to_trade(&self) -> Result<WalletKeys> {
+        let keys = self.mwb_ready_to_spend()?;
+        ensure!(!self.node.is_syncing(), "midstate is still syncing");
+        Ok(keys)
+    }
+
     // ── Commands ────────────────────────────────────────────────────────
 
     pub(super) fn mwb_account_view(&self) -> MwbAccountView {
         let node = self.mwb_node.as_ref().map(|h| {
             let i = h.info();
-            MwbNodeView { height: i.state.height, peers: i.peers.len(), syncing: i.syncing }
+            MwbNodeView {
+                height: i.state.height,
+                peers: i.peers.len(),
+                syncing: i.syncing,
+                explorer: self.mwb_place.as_ref().and_then(|p| p.explorer.clone()),
+            }
         });
         let tip = node.as_ref().map_or(0, |n| n.height);
-        let b = self.mwb.store.account.balance(tip);
+        let account = &self.mwb.store.account;
+        let b = account.balance(tip);
         MwbAccountView {
             enabled: self.mwb.keys.is_some(),
             address: self.mwb.keys.as_ref().map(|k| k.address().encode()),
             spendable: b.spendable,
             immature: b.immature,
             reserved: b.reserved,
-            scanned: self.mwb.store.account.scanned,
+            scanned: account.scanned,
             node,
+            coins: account.coins.iter().filter(|c| c.spent_height.is_none()).count(),
+            spendable_coins: account.spendable_values(tip),
         }
+    }
+
+    pub(super) fn mwb_node_info(&self) -> Option<MwbNodeInfo> {
+        let h = self.mwb_node.as_ref()?;
+        let place = self.mwb_place.as_ref();
+        let i = h.info();
+        let s = &i.state;
+        let difficulty_bits = {
+            let mut bits = 0u32;
+            for b in s.target {
+                if b == 0 {
+                    bits += 8;
+                } else {
+                    bits += b.leading_zeros();
+                    break;
+                }
+            }
+            bits
+        };
+        Some(MwbNodeInfo {
+            height: s.height,
+            tip_timestamp: s.timestamp,
+            header_hash: hex::encode(s.header_hash),
+            midstate: hex::encode(s.mw_midstate),
+            depth: s.depth.to_string(),
+            difficulty_bits,
+            // `height` counts the blocks applied, so it is the next block's.
+            block_reward: midwimble::core::types::block_reward(s.height),
+            supply: s.supply,
+            utxo_count: s.utxos.len(),
+            bonds: s.bonds.len(),
+            mempool: i.mempool_count,
+            syncing: i.syncing,
+            peer_id: i.peer_id.clone(),
+            peers: i
+                .peer_details
+                .iter()
+                .map(|p| MwbPeerView { id: p.id.clone(), addr: p.addr.clone(), outbound: p.outbound })
+                .collect(),
+            data_dir: place.map(|p| p.data_dir.clone()).unwrap_or_default(),
+            p2p_port: place.map_or(0, |p| p.p2p_port),
+            explorer: place.and_then(|p| p.explorer.clone()),
+        })
+    }
+
+    /// Coins swaps paid into the account: bought ones (we claimed the MDW
+    /// lock) and refunds (our own lock came back).
+    fn mwb_swap_outputs(&self) -> SwapOutputs {
+        let mut out = SwapOutputs::new();
+        for sw in &self.mwb.store.swaps {
+            let id = hex::encode(sw.id);
+            let (claim, kind) = if sw.funder() { (false, "refund") } else { (true, "swap") };
+            if let Ok(c) = sw.mwb_spend_output(claim) {
+                out.insert(c, (kind, id));
+            }
+        }
+        out
+    }
+
+    pub(super) fn mwb_history_view(&self) -> Vec<MwbHistoryView> {
+        if self.mwb.keys.is_none() {
+            return Vec::new();
+        }
+        let tip = self.mwb_tip().unwrap_or(0);
+        let mut rows = self.mwb.store.account.history(tip, &self.mwb_swap_outputs());
+        // Coins found before the account kept block times: ask the chain.
+        if let Some(h) = self.mwb_node.as_ref() {
+            for r in rows.iter_mut().filter(|r| r.time == 0 && r.incoming) {
+                if let Some(height) = r.height {
+                    if let Ok(Some(header)) = h.storage().load_header(height) {
+                        r.time = header.timestamp;
+                    }
+                }
+            }
+        }
+        rows
+    }
+
+    pub(super) fn mwb_coins_view(&self) -> Vec<MwbCoinView> {
+        if self.mwb.keys.is_none() {
+            return Vec::new();
+        }
+        let mut v = self.mwb.store.account.coin_views(self.mwb_tip().unwrap_or(0));
+        if let Some(h) = self.mwb_node.as_ref() {
+            for c in v.iter_mut().filter(|c| c.time == 0) {
+                if let Ok(Some(header)) = h.storage().load_header(c.height) {
+                    c.time = header.timestamp;
+                }
+            }
+        }
+        v
+    }
+
+    /// Scans midwimble for the account again from `from`. Refused while a
+    /// payment waits for a block or a swap runs: a rescan forgets coins and
+    /// finds them again, and what holds them is not part of the chain.
+    pub(super) fn mwb_rescan(&mut self, from: u64) -> Result<()> {
+        self.mwb_keys()?;
+        let account = &self.mwb.store.account;
+        ensure!(
+            !account.payments.iter().any(|p| p.pending()),
+            "an MDW payment is still waiting for a block: rescan once it has one"
+        );
+        ensure!(
+            self.mwb.negs.is_empty() && self.mwb.store.swaps.iter().all(|s| s.phase.settled()),
+            "a swap is under way: rescan once it has finished"
+        );
+        self.mwb.store.account.rescan_from(from);
+        self.mwb_save()
     }
 
     /// Adds the MDW account to a wallet made before it existed. The phrase
@@ -324,7 +456,7 @@ impl Service {
     }
 
     pub(super) async fn mwb_send(&mut self, to: &str, amount: u64) -> Result<String> {
-        let keys = self.mwb_ready_to_trade()?;
+        let keys = self.mwb_ready_to_spend()?;
         let to = StealthAddress::decode(to.trim()).context("not a midwimble address")?;
         let h = self.mwb_node.clone().unwrap();
         let tip = h.state().height;
@@ -545,6 +677,7 @@ impl Service {
         if let Err(e) = self.mwb_scan(&h, &keys).await {
             tracing::warn!("midwimble scan: {e:#}");
         }
+        self.mwb_backfill_times(&h);
         self.mwb_rebroadcast_sends(&h).await;
         // Orders, negotiations and swaps read midstate's tip; while midstate
         // catches up that tip is stale, so they wait for it.
@@ -612,6 +745,23 @@ impl Service {
             self.ch_notice(format!("{} MDW arrived in your midwimble account.", midwimble::core::types::format_amount(received)));
         }
         Ok(())
+    }
+
+    /// Coins found before the account kept block times get theirs from the
+    /// chain, a few hundred a tick, so the history needs no lookups.
+    fn mwb_backfill_times(&mut self, h: &midwimble::node::NodeHandle) {
+        let mut filled = 0;
+        for c in self.mwb.store.account.coins.iter_mut().filter(|c| c.time == 0).take(300) {
+            if let Ok(Some(header)) = h.storage().load_header(c.height) {
+                c.time = header.timestamp;
+                filled += 1;
+            }
+        }
+        if filled > 0 {
+            if let Err(e) = self.mwb_save() {
+                tracing::warn!("MDW account not saved: {e:#}");
+            }
+        }
     }
 
     async fn mwb_rebroadcast_sends(&mut self, h: &midwimble::node::NodeHandle) {

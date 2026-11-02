@@ -1,6 +1,7 @@
 use crate::app::App;
 use crate::bridge::Action;
-use crate::theme::{self, units};
+use crate::theme::{self, ago, units};
+use crate::views::mdw::{self as m, mdw};
 use midstate_walletd::api::AddressInfo;
 use eframe::egui::{self, Color32, ColorImage, RichText, TextEdit, TextureOptions, Ui};
 use qrcode::QrCode;
@@ -8,6 +9,15 @@ use qrcode::QrCode;
 pub fn show(app: &mut App, ui: &mut Ui) {
     let ctx = ui.ctx().clone();
     theme::heading(ui, "Receive");
+    if theme::segmented(ui, &crate::views::send::ASSETS, &mut app.recv_asset) {
+        app.copied_at = None;
+        app.error.clear();
+    }
+    ui.add_space(6.0);
+    if app.recv_asset == 1 {
+        receive_mdw(app, ui, &ctx);
+        return;
+    }
 
     ui.columns(2, |cols| {
         // Left: generator
@@ -224,4 +234,94 @@ fn ensure_qr(app: &mut App, ctx: &egui::Context, addr: &str) {
     let img = ColorImage { size: [n, n], pixels };
     let tex = ctx.load_texture(format!("qr:{addr}"), img, TextureOptions::NEAREST);
     app.qr = Some((addr.to_string(), tex));
+}
+
+// ── MDW ─────────────────────────────────────────────────────────────────
+
+/// The MDW account's address, and what has arrived at it.
+fn receive_mdw(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
+    if !m::account_gate(app, ui, ctx) {
+        return;
+    }
+    let Some(a) = app.mwb_account.clone() else { return };
+    let Some(addr) = a.address.clone() else { return };
+
+    ui.columns(2, |cols| {
+        theme::panel_frame().show(&mut cols[0], |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new("Your MDW address").font(theme::font_medium(14.0)).color(theme::ink()));
+            ui.add_space(4.0);
+            theme::hint(
+                ui,
+                "One address, for good. It is a stealth address: every payment to it lands on a \
+                 fresh one-time output that only this wallet can find, so it can be shared \
+                 publicly, posted or reused without linking the payments to each other or to you.",
+            );
+            ui.add_space(4.0);
+            theme::hint(
+                ui,
+                "It is also the address midwimble's own wallets open from your recovery phrase: \
+                 coins sent there show up here, and the other way round.",
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label(theme::mono(mdw(a.spendable)).size(13.0).color(theme::ink()));
+                if a.reserved > 0 {
+                    ui.label(theme::mono(format!("+ {} set aside", mdw(a.reserved))).size(11.0).color(theme::muted()));
+                }
+                if a.immature > 0 {
+                    ui.label(theme::mono(format!("+ {} maturing", mdw(a.immature))).size(11.0).color(theme::muted()));
+                }
+            });
+            ui.add_space(4.0);
+            m::node_line(app, ui);
+            theme::hint(ui, "Payments show here once a block takes them, about a minute after they are sent.");
+        });
+
+        theme::panel_frame().show(&mut cols[1], |ui| {
+            ui.set_width(ui.available_width());
+            ensure_qr(app, ctx, &addr);
+            ui.vertical_centered(|ui| {
+                if let Some((_, tex)) = &app.qr {
+                    ui.image(egui::load::SizedTexture::new(tex.id(), egui::vec2(168.0, 168.0)));
+                }
+                ui.add_space(6.0);
+                ui.add(egui::Label::new(RichText::new(&addr).monospace().size(10.5)).wrap());
+                ui.add_space(4.0);
+                let now = ui.input(|i| i.time);
+                let copied = app.copied_at.map(|t| now - t < 1.5).unwrap_or(false);
+                if ui.button(if copied { "Copied" } else { "Copy address" }).clicked() {
+                    ui.ctx().copy_text(addr.clone());
+                    app.copied_at = Some(now);
+                }
+            });
+        });
+    });
+
+    theme::heading(ui, "Received");
+    let rows: Vec<_> = app.mwb_history.iter().filter(|h| h.incoming).take(10).cloned().collect();
+    theme::panel_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        if rows.is_empty() {
+            theme::hint(ui, "Nothing yet. Share the address above to get paid in MDW.");
+            return;
+        }
+        let explorer = m::mwb_explorer(app);
+        egui::Grid::new("mdw_received").num_columns(5).spacing([20.0, 8.0]).striped(true).show(ui, |ui| {
+            header(ui, &["Amount", "What", "Where", "When", ""]);
+            for h in &rows {
+                ui.label(theme::mono(format!("+{}", mdw(h.amount))).size(12.0).color(theme::ink()));
+                theme::badge(ui, m::kind_label(&h.kind), theme::muted());
+                ui.label(theme::mono(m::status_text(h)).size(11.0).color(theme::muted()));
+                ui.label(RichText::new(if h.time > 0 { ago(h.time) } else { "—".into() }).size(11.0).color(theme::muted()));
+                m::explorer_button(
+                    ui,
+                    "explorer",
+                    explorer.as_deref().and_then(|e| m::history_page(e, h)),
+                    "Open the coin in midwimble's explorer, served by your own node",
+                );
+                ui.end_row();
+            }
+        });
+    });
 }

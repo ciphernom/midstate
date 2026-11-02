@@ -611,13 +611,54 @@ pub struct HubAdView {
 
 // ── MDS <-> MDW ─────────────────────────────────────────────────────────────
 
-/// The embedded midwimble node, as the Trade view shows it.
+/// The embedded midwimble node, in brief (the ribbon, the Dashboard).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MwbNodeView {
     pub height: u64,
     pub peers: usize,
     /// Downloading a heavier chain: its tip is about to change.
     pub syncing: bool,
+    /// The node's block explorer on this machine (`http://127.0.0.1:…/`),
+    /// when it is being served.
+    #[serde(default)]
+    pub explorer: Option<String>,
+}
+
+/// The embedded midwimble node in full, for the Node tab.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MwbNodeInfo {
+    pub height: u64,
+    /// Unix time of the tip block.
+    pub tip_timestamp: u64,
+    pub header_hash: String,
+    /// Running hash over every applied block.
+    pub midstate: String,
+    /// Cumulative work (u128, as a decimal string).
+    pub depth: String,
+    /// Leading zero bits of the next block's target.
+    pub difficulty_bits: u32,
+    /// The next block's reward, in midwimble units.
+    pub block_reward: u64,
+    /// MDW minted so far, in midwimble units.
+    pub supply: u64,
+    pub utxo_count: usize,
+    /// Mining bonds registered and still able to sign.
+    pub bonds: usize,
+    pub mempool: usize,
+    pub syncing: bool,
+    pub peer_id: String,
+    pub peers: Vec<MwbPeerView>,
+    pub data_dir: String,
+    pub p2p_port: u16,
+    pub explorer: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MwbPeerView {
+    pub id: String,
+    pub addr: String,
+    /// This node dialled it (rather than it dialling us).
+    pub outbound: bool,
 }
 
 /// The MDW account. Amounts are midwimble units (10^-8 MDW).
@@ -636,6 +677,57 @@ pub struct MwbAccountView {
     pub scanned: u64,
     /// `None` when no midwimble node is running.
     pub node: Option<MwbNodeView>,
+    /// Unspent coins, whatever holds them.
+    #[serde(default)]
+    pub coins: usize,
+    /// Values of the coins a payment may spend now, largest first: what
+    /// `mwb_account::send_fee` and `max_send` price a send from.
+    #[serde(default)]
+    pub spendable_coins: Vec<u64>,
+}
+
+/// One entry of the MDW account's history.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MwbHistoryView {
+    /// Incoming: "received" | "mined" | "swap" (bought in a swap) |
+    /// "refund" (a swap lock of ours, back). Outgoing: "sent" |
+    /// "swap lock" (put into a swap).
+    pub kind: String,
+    /// What arrived, or what was paid (the fee apart).
+    pub amount: u64,
+    pub fee: u64,
+    pub incoming: bool,
+    /// Its block, once it has one (for a failed payment, the block that
+    /// spent its coins some other way).
+    pub height: Option<u64>,
+    /// Unix seconds: the block's time for a coin, when it was made for a
+    /// payment (0 when not known).
+    pub time: u64,
+    /// "pending" | "confirmed" | "failed" | "maturing"
+    pub status: String,
+    /// Who a send paid.
+    pub to: Option<String>,
+    /// An incoming coin's commitment: its page in the explorer.
+    pub output: Option<String>,
+    /// A payment's kernel excess: its page in the explorer.
+    pub kernel: Option<String>,
+    pub swap: Option<String>,
+}
+
+/// An unspent coin of the MDW account.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MwbCoinView {
+    pub commitment: String,
+    pub value: u64,
+    pub height: u64,
+    /// Unix seconds (0 when not known).
+    pub time: u64,
+    pub coinbase: bool,
+    /// "spendable" | "maturing" | "payment" (a payment waiting for a block
+    /// spends it) | "swap" (set aside for a swap's lock)
+    pub status: String,
+    /// Where a mined coin becomes spendable.
+    pub matures_at: Option<u64>,
 }
 
 /// An order heard on the chat bus (or one of ours).

@@ -1,12 +1,25 @@
 use crate::app::App;
 use crate::bridge::Action;
-use crate::theme::{self, send_timeline, short_hex, units};
+use crate::theme::{self, ago, send_timeline, short_hex, units};
+use crate::views::mdw::{self as m, mdw};
 use eframe::egui::{self, RichText, TextEdit, Ui};
 use midstate_walletd::api::SendStage;
+use midstate_walletd::mwb_account::{max_send, send_fee};
+
+/// The coins this tab sends, in the order of its switch.
+pub const ASSETS: [&str; 2] = ["MDS · midstate", "MDW · midwimble"];
 
 pub fn show(app: &mut App, ui: &mut Ui) {
     let ctx = ui.ctx().clone();
     theme::heading(ui, "Send");
+    if theme::segmented(ui, &ASSETS, &mut app.send_asset) {
+        app.error.clear();
+    }
+    ui.add_space(6.0);
+    if app.send_asset == 1 {
+        send_mdw(app, ui, &ctx);
+        return;
+    }
 
     let syncing = app.sync.as_ref().map(|s| s.is_syncing).unwrap_or(true);
     // A restored wallet signs nothing until its restore scan has found every
@@ -32,7 +45,17 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                 app.addr_ok = if t.is_empty() { None } else { Some(false) };
             }
         }
-        if app.addr_ok == Some(false) && !app.send_to.trim().is_empty() {
+        if app.send_to.trim().starts_with("mw1") {
+            // A midwimble address pasted here: the right form is one click away.
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("That is a midwimble address: MDW goes there, not MDS.").size(12.0).color(theme::bright()));
+                if ui.button(RichText::new("Send MDW to it").size(11.0)).clicked() {
+                    app.mwb_send_to = std::mem::take(&mut app.send_to);
+                    app.addr_ok = None;
+                    app.send_asset = 1;
+                }
+            });
+        } else if app.addr_ok == Some(false) && !app.send_to.trim().is_empty() {
             // Could be a typo, or a one-time key that has already signed —
             // walletd says which, and they call for different responses.
             ui.label(
@@ -247,4 +270,174 @@ fn estimated_fee(app: &App) -> u64 {
     // at 10 units per KiB, with headroom.
     let bytes = 100 + 1636 * inputs.max(1) as u64 + 100 * 8;
     bytes * 10 / 1024 + 40
+}
+
+// ── MDW ─────────────────────────────────────────────────────────────────
+
+/// Pay MDW to a midwimble address. One transaction, priced before it is
+/// built, then followed until a block takes it.
+fn send_mdw(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
+    if !m::account_gate(app, ui, ctx) {
+        return;
+    }
+    let a = app.mwb_account.clone().unwrap_or_default();
+    let values = a.spendable_coins.clone();
+    let most = max_send(&values);
+
+    theme::panel_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+
+        theme::hint(ui, "Recipient address");
+        ui.add(
+            TextEdit::singleline(&mut app.mwb_send_to)
+                .hint_text("mw1…")
+                .font(egui::TextStyle::Monospace)
+                .desired_width(f32::INFINITY),
+        );
+        let to = app.mwb_send_to.trim().to_string();
+        let to_ok = !to.is_empty() && midstate_walletd::mwb::check_address(&to).is_ok();
+        if !to.is_empty() && !to_ok {
+            if to.len() == 72 && to.chars().all(|c| c.is_ascii_hexdigit()) {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("That is a midstate address: MDS goes there, not MDW.").size(12.0).color(theme::bright()));
+                    if ui.button(RichText::new("Send MDS to it").size(11.0)).clicked() {
+                        app.send_to = std::mem::take(&mut app.mwb_send_to);
+                        app.addr_ok = None;
+                        app.go(ctx, Action::ValidateAddress { addr: app.send_to.clone() });
+                        app.send_asset = 0;
+                    }
+                });
+            } else {
+                ui.label(
+                    RichText::new("Not a midwimble address: they start mw1 and carry a checksum, so check for a typo.")
+                        .size(12.0)
+                        .color(theme::red()),
+                );
+            }
+        }
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            theme::hint(ui, "Amount");
+            theme::right_aligned(ui, |ui| {
+                if ui
+                    .add_enabled(most > 0, egui::Button::new(RichText::new("send all").size(11.0)))
+                    .on_hover_text("Your whole spendable MDW, less the fee.")
+                    .clicked()
+                {
+                    app.mwb_send_amount = m::plain(most);
+                }
+                ui.label(RichText::new(format!("{} available", mdw(a.spendable))).size(11.5).color(theme::muted()));
+            });
+        });
+        ui.horizontal(|ui| {
+            let r = ui.add(
+                TextEdit::singleline(&mut app.mwb_send_amount)
+                    .hint_text("0.0")
+                    .font(egui::TextStyle::Monospace)
+                    .desired_width(180.0),
+            );
+            if r.changed() {
+                app.mwb_send_amount.retain(|c| c.is_ascii_digit() || c == '.' || c == ',');
+            }
+            ui.label(theme::mono("MDW").color(theme::muted()));
+        });
+        let amount = m::parse_mdw(&app.mwb_send_amount);
+        let fee = amount.as_ref().ok().map(|v| send_fee(&values, *v));
+        match (&amount, &fee) {
+            (Ok(v), Some(Ok(f))) => {
+                ui.label(
+                    RichText::new(format!("= {} · fee {} · {} leaves the account", mdw(*v), mdw(*f), mdw(v + f)))
+                        .size(12.0)
+                        .color(theme::bright()),
+                );
+            }
+            (Ok(_), Some(Err(_))) => {
+                ui.label(
+                    RichText::new(format!("More than this account can pay: {} at most, fee included.", mdw(most)))
+                        .size(12.0)
+                        .color(theme::amber()),
+                );
+            }
+            (Err(e), _) if !e.is_empty() => {
+                ui.label(RichText::new(e).size(12.0).color(theme::amber()));
+            }
+            _ => {}
+        }
+        theme::hint(
+            ui,
+            "One transaction: it is final once a block takes it, about a minute. The fee is \
+             midwimble's relay minimum for the coins it spends. The address is a stealth address, \
+             so the payment lands on a one-time output only its owner can find.",
+        );
+
+        ui.add_space(10.0);
+        let waiting = m::not_ready(app);
+        let can = to_ok && matches!(fee, Some(Ok(_))) && !app.busy && waiting.is_none();
+        theme::right_aligned(ui, |ui| {
+            let label = if app.busy { "Sending…" } else { waiting.unwrap_or("Send MDW") };
+            if ui.add_enabled(can, egui::Button::new(RichText::new(label).strong())).clicked() {
+                app.busy = true;
+                app.error.clear();
+                app.mwb_notice.clear();
+                app.go(ctx, Action::MwbSend { to: to.clone(), amount: amount.clone().unwrap_or(0) });
+            }
+        });
+        if !app.error.is_empty() {
+            ui.label(RichText::new(&app.error).color(theme::red()));
+        }
+        if !app.mwb_notice.is_empty() {
+            ui.label(RichText::new(&app.mwb_notice).size(12.0).color(theme::bright()));
+        }
+    });
+
+    let payments: Vec<_> = app.mwb_history.iter().filter(|h| !h.incoming).take(12).cloned().collect();
+    if payments.is_empty() {
+        return;
+    }
+    theme::heading(ui, "MDW payments");
+    let explorer = m::mwb_explorer(app);
+    for p in &payments {
+        theme::panel_frame().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(theme::mono(mdw(p.amount)));
+                if p.fee > 0 {
+                    ui.label(theme::mono(format!("· fee {}", mdw(p.fee))).color(theme::muted()));
+                }
+                match &p.to {
+                    Some(to) => {
+                        ui.label(theme::mono(format!("· to {}", m::short_addr(to))).color(theme::muted()));
+                    }
+                    None => {
+                        ui.label(theme::mono("· into a swap").color(theme::muted()));
+                    }
+                }
+                theme::right_aligned(ui, |ui| {
+                    m::explorer_button(
+                        ui,
+                        "explorer",
+                        explorer.as_deref().and_then(|e| m::history_page(e, p)),
+                        "Open it in midwimble's explorer, served by your own node",
+                    );
+                    if p.time > 0 {
+                        ui.label(RichText::new(ago(p.time)).size(11.0).color(theme::faint()));
+                    }
+                });
+            });
+            ui.horizontal(|ui| {
+                let at = p.height.map(|b| format!("block {}", units(b))).unwrap_or_default();
+                let (badge, colour, note) = match p.status.as_str() {
+                    "pending" => ("waiting for a block", theme::bright(), String::new()),
+                    "failed" => ("failed", theme::red(), format!("its coins went to another transaction, {at}")),
+                    _ => ("in a block", theme::ink(), at),
+                };
+                theme::badge(ui, badge, colour);
+                if !note.is_empty() {
+                    ui.label(RichText::new(note).size(11.0).color(theme::muted()));
+                }
+            });
+        });
+        ui.add_space(4.0);
+    }
 }

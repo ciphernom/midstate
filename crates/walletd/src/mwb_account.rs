@@ -15,6 +15,7 @@
 //! them (the payment confirmed, or something else won); a swap releases its
 //! funding coins only if it never broadcast the funding.
 
+use crate::api::{MwbCoinView, MwbHistoryView};
 use anyhow::{anyhow, bail, Result};
 use curve25519_dalek::scalar::Scalar;
 use midwimble::core::mw::builder::{build_transaction, Payment, Spendable};
@@ -23,7 +24,7 @@ use midwimble::core::mw::stealth::{scan_output, StealthAddress, WalletKeys};
 use midwimble::core::mw::transaction::{Output, Transaction};
 use midwimble::core::types::{Batch, COINBASE_MATURITY};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Recent block ids kept for reorganisation detection, as midwimble's wallet.
 pub const REORG_WINDOW: usize = 200;
@@ -32,6 +33,8 @@ const ROLLBACK_STEP: u64 = 10;
 /// What [`MwbAccount::scan`] fails with when a block does not build on the
 /// one scanned before it.
 pub const REORG: &str = "midwimble reorg detected";
+/// Label of a swap's lock funding among the account's payments.
+pub const LOCK_LABEL: &str = "swap lock";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MwbCoin {
@@ -45,6 +48,10 @@ pub struct MwbCoin {
     /// Who may still spend it: `pay:<kernel id>` for a payment waiting for a
     /// block, `swap:<swap id>` for a swap's lock funding.
     pub reserved: Option<String>,
+    /// Unix time of the block that created it (0 for coins found before the
+    /// account kept it).
+    #[serde(default)]
+    pub time: u64,
 }
 
 impl MwbCoin {
@@ -85,6 +92,13 @@ pub struct MwbPayment {
     /// A block spent one of its inputs some other way.
     pub failed_at: Option<u64>,
     pub label: String,
+    /// Its kernel's excess: what midwimble's explorer looks a kernel up by.
+    #[serde(default)]
+    pub excess: Option<Point32>,
+    /// Every output it creates. Those that come back to the account are its
+    /// change, not money received.
+    #[serde(default)]
+    pub outputs: Vec<Point32>,
 }
 
 impl MwbPayment {
@@ -126,6 +140,8 @@ pub struct BlockView<'a> {
     pub height: u64,
     pub id: [u8; 32],
     pub prev: [u8; 32],
+    /// Unix seconds.
+    pub timestamp: u64,
     pub outputs: Vec<(&'a Output, bool)>,
     pub spent: HashSet<Point32>,
     pub kernels: HashSet<[u8; 32]>,
@@ -139,11 +155,55 @@ impl<'a> BlockView<'a> {
             height,
             id: b.extension.final_hash,
             prev: b.prev_header_hash,
+            timestamp: b.timestamp,
             outputs: body.chain(reward).collect(),
             spent: b.body.input_commitments().copied().collect(),
             kernels: b.body.kernel_ids().into_iter().collect(),
         }
     }
+}
+
+/// How many of `values` (largest first) a payment of `amount` spends, and
+/// its fee `fee_for(n)`: the largest coins, until they cover both.
+pub fn plan(values: &[u64], amount: u64, fee_for: impl Fn(u64) -> u64) -> Result<(usize, u64)> {
+    if amount == 0 {
+        bail!("amount must be positive");
+    }
+    let mut n = 0usize;
+    let mut total = 0u64;
+    for v in values {
+        let need = amount.checked_add(fee_for(n.max(1) as u64)).ok_or_else(|| anyhow!("amount overflow"))?;
+        if total >= need {
+            break;
+        }
+        n += 1;
+        total = total.saturating_add(*v);
+    }
+    let fee = fee_for(n.max(1) as u64);
+    let need = amount.checked_add(fee).ok_or_else(|| anyhow!("amount overflow"))?;
+    if total < need {
+        bail!("not enough spendable MDW: have {total}, need {need} (fee included)");
+    }
+    Ok((n, fee))
+}
+
+/// A send's fee: midwimble's relay minimum for the coins [`plan`] picks,
+/// one payment and its change. `values` are the spendable coins, largest
+/// first, as [`crate::api::MwbAccountView::spendable_coins`] lists them.
+pub fn send_fee(values: &[u64], amount: u64) -> Result<u64> {
+    plan(values, amount, |n| crate::mwb::min_fee(n, 2, 1)).map(|(_, fee)| fee)
+}
+
+/// The most a single send can pay out of `values` (largest first): every
+/// coin worth its fee, less that fee.
+pub fn max_send(values: &[u64]) -> u64 {
+    let mut best = 0u64;
+    let mut total = 0u64;
+    for (i, v) in values.iter().enumerate() {
+        total = total.saturating_add(*v);
+        best = best.max(total.saturating_sub(crate::mwb::min_fee(i as u64 + 1, 2, 1)));
+    }
+    best
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -243,6 +303,7 @@ impl MwbAccount {
                     coinbase: *coinbase,
                     spent_height: None,
                     reserved: None,
+                    time: b.timestamp,
                 });
                 d.received.push((owned.value, *coinbase));
             }
@@ -306,30 +367,35 @@ impl MwbAccount {
         b
     }
 
+    /// Coins a payment may spend now, largest first.
+    fn candidates(&self, tip: u64) -> Vec<&MwbCoin> {
+        let mut v: Vec<&MwbCoin> = self.coins.iter().filter(|c| c.spendable_at(tip)).collect();
+        v.sort_by(|a, b| b.value.cmp(&a.value));
+        v
+    }
+
+    /// Values of the coins a payment may spend now, largest first: what
+    /// [`send_fee`] and [`max_send`] price a payment from.
+    pub fn spendable_values(&self, tip: u64) -> Vec<u64> {
+        self.candidates(tip).iter().map(|c| c.value).collect()
+    }
+
     /// Picks coins, largest first, covering `amount` plus the fee
-    /// `fee_for(n)` for however many end up chosen.
+    /// `fee_for(n)` for however many end up chosen ([`plan`]).
     pub fn select(&self, amount: u64, tip: u64, fee_for: impl Fn(u64) -> u64) -> Result<(Vec<Spendable>, u64)> {
-        if amount == 0 {
-            bail!("amount must be positive");
-        }
-        let mut candidates: Vec<&MwbCoin> = self.coins.iter().filter(|c| c.spendable_at(tip)).collect();
-        candidates.sort_by(|a, b| b.value.cmp(&a.value));
-        let mut chosen = Vec::new();
-        let mut total = 0u64;
-        for c in candidates {
-            let need = amount.checked_add(fee_for(chosen.len().max(1) as u64)).ok_or_else(|| anyhow!("amount overflow"))?;
-            if total >= need {
-                break;
-            }
-            chosen.push(c.to_spendable()?);
-            total += c.value;
-        }
-        let fee = fee_for(chosen.len().max(1) as u64);
-        let need = amount.checked_add(fee).ok_or_else(|| anyhow!("amount overflow"))?;
-        if total < need {
-            bail!("not enough spendable MDW: have {total}, need {need} (fee included)");
-        }
+        let candidates = self.candidates(tip);
+        let values: Vec<u64> = candidates.iter().map(|c| c.value).collect();
+        let (n, fee) = plan(&values, amount, fee_for)?;
+        let chosen = candidates[..n].iter().map(|c| c.to_spendable()).collect::<Result<Vec<_>>>()?;
         Ok((chosen, fee))
+    }
+
+    /// Scans again from `height`: what blocks from there taught the account
+    /// is forgotten and learned again. A scan from below where the account
+    /// began reaches coins it was never looking for.
+    pub fn rescan_from(&mut self, height: u64) {
+        self.rollback_to(height);
+        self.birth = self.birth.min(height);
     }
 
     /// Sets coins aside for `why`. Fails, changing nothing, if any is
@@ -363,7 +429,8 @@ impl MwbAccount {
     /// Records a transaction about to be broadcast and moves its inputs'
     /// reservation to it (from `was`, a swap's, if given).
     pub fn record_payment(&mut self, tx: &Transaction, to: &str, amount: u64, label: &str, was: Option<&str>) -> Result<[u8; 32]> {
-        let kernel = tx.body.kernels.first().ok_or_else(|| anyhow!("a payment without a kernel"))?.id();
+        let k = tx.body.kernels.first().ok_or_else(|| anyhow!("a payment without a kernel"))?;
+        let kernel = k.id();
         let inputs: Vec<Point32> = tx.input_commitments().copied().collect();
         let p = MwbPayment {
             kernel,
@@ -377,6 +444,8 @@ impl MwbAccount {
             height: None,
             failed_at: None,
             label: label.to_string(),
+            excess: Some(k.excess),
+            outputs: tx.outputs().map(|o| o.commitment).collect(),
         };
         let tag = p.reservation();
         for c in self.coins.iter_mut().filter(|c| inputs.contains(&c.commitment)) {
@@ -426,7 +495,116 @@ impl MwbAccount {
         }
         self.payments.retain(|p| !(&p.kernel == kernel && p.height.is_none()));
     }
+
+    /// The change of the account's own payments: every output a payment
+    /// recorded, and for a payment recorded before outputs were kept, the
+    /// coin worth what it left over in the block that confirmed it.
+    fn change(&self) -> HashSet<Point32> {
+        let mut out: HashSet<Point32> = self.payments.iter().flat_map(|p| p.outputs.iter().copied()).collect();
+        let value: HashMap<Point32, u64> = self.coins.iter().map(|c| (c.commitment, c.value)).collect();
+        for p in self.payments.iter().filter(|p| p.outputs.is_empty()) {
+            let Some(h) = p.height else { continue };
+            let Some(spent) = p.inputs.iter().map(|c| value.get(c).copied()).sum::<Option<u64>>() else { continue };
+            let Some(left) = spent.checked_sub(p.amount.saturating_add(p.fee)).filter(|v| *v > 0) else { continue };
+            if let Some(c) = self.coins.iter().find(|c| c.height == h && c.value == left && !out.contains(&c.commitment)) {
+                out.insert(c.commitment);
+            }
+        }
+        out
+    }
+
+    /// The account's history, newest first: coins that arrived (the change
+    /// of its own payments left out) and payments that left. `swaps` names
+    /// the coins swaps paid in.
+    pub fn history(&self, tip: u64, swaps: &SwapOutputs) -> Vec<MwbHistoryView> {
+        let change = self.change();
+        let mut rows: Vec<MwbHistoryView> = Vec::new();
+        for c in self.coins.iter().filter(|c| !change.contains(&c.commitment)) {
+            let (kind, swap) = match swaps.get(&c.commitment) {
+                Some((kind, id)) => (kind.to_string(), Some(id.clone())),
+                None if c.coinbase => ("mined".to_string(), None),
+                None => ("received".to_string(), None),
+            };
+            let maturing = c.coinbase && tip < c.height + COINBASE_MATURITY;
+            rows.push(MwbHistoryView {
+                kind,
+                amount: c.value,
+                fee: 0,
+                incoming: true,
+                height: Some(c.height),
+                time: c.time,
+                status: if maturing { "maturing" } else { "confirmed" }.into(),
+                to: None,
+                output: Some(hex::encode(c.commitment)),
+                kernel: None,
+                swap,
+            });
+        }
+        for p in &self.payments {
+            let lock = p.label == LOCK_LABEL;
+            let status = if p.height.is_some() {
+                "confirmed"
+            } else if p.failed_at.is_some() {
+                "failed"
+            } else {
+                "pending"
+            };
+            rows.push(MwbHistoryView {
+                kind: if lock { "swap lock" } else { "sent" }.into(),
+                amount: p.amount,
+                fee: p.fee,
+                incoming: false,
+                height: p.height.or(p.failed_at),
+                time: p.created,
+                status: status.into(),
+                to: (!lock).then(|| p.to.clone()),
+                output: None,
+                kernel: p.excess.map(hex::encode),
+                swap: None,
+            });
+        }
+        // Payments still waiting first, then newest block first.
+        rows.sort_by(|a, b| {
+            let key = |r: &MwbHistoryView| (r.status == "pending", r.height.unwrap_or(0), r.time);
+            key(b).cmp(&key(a))
+        });
+        rows
+    }
+
+    /// Unspent coins, largest first.
+    pub fn coin_views(&self, tip: u64) -> Vec<MwbCoinView> {
+        let mut v: Vec<MwbCoinView> = self
+            .coins
+            .iter()
+            .filter(|c| c.spent_height.is_none())
+            .map(|c| {
+                let matures_at = c.coinbase.then_some(c.height + COINBASE_MATURITY);
+                let status = match c.reserved.as_deref() {
+                    Some(r) if r.starts_with("pay:") => "payment",
+                    Some(_) => "swap",
+                    None if matures_at.is_some_and(|m| tip < m) => "maturing",
+                    None => "spendable",
+                };
+                MwbCoinView {
+                    commitment: hex::encode(c.commitment),
+                    value: c.value,
+                    height: c.height,
+                    time: c.time,
+                    coinbase: c.coinbase,
+                    status: status.into(),
+                    matures_at,
+                }
+            })
+            .collect();
+        v.sort_by(|a, b| b.value.cmp(&a.value));
+        v
+    }
 }
+
+/// Coins a swap paid into the account, by commitment: what each was
+/// ("swap" for one bought, "refund" for a lock of ours come back) and the
+/// swap's id.
+pub type SwapOutputs = HashMap<Point32, (&'static str, String)>;
 
 pub fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -449,10 +627,100 @@ mod tests {
             height,
             id: [id; 32],
             prev: [prev; 32],
+            timestamp: 1_800_000_000 + 60 * height,
             outputs: outs.iter().map(|o| (o, false)).collect(),
             spent: spent.iter().copied().collect(),
             kernels: kernels.iter().copied().collect(),
         }
+    }
+
+    #[test]
+    fn sends_are_priced_as_they_will_be_built() {
+        let f = |n| crate::mwb::min_fee(n, 2, 1);
+        let values = [9_000_000, 4_000_000, 3_000_000];
+        assert_eq!(send_fee(&values, 1_000_000).unwrap(), f(1));
+        assert_eq!(send_fee(&values, 10_000_000).unwrap(), f(2), "two coins cover it");
+        let max = max_send(&values);
+        assert_eq!(max, 16_000_000 - f(3));
+        assert_eq!(plan(&values, max, f).unwrap(), (3, f(3)));
+        assert!(plan(&values, max + 1, f).is_err());
+        // A coin worth less than the fee it adds is left out of the most.
+        let dusty = [5_000_000, 1];
+        assert_eq!(max_send(&dusty), 5_000_000 - f(1));
+        assert!(send_fee(&dusty, max_send(&dusty)).is_ok());
+        assert_eq!(max_send(&[]), 0);
+        assert!(send_fee(&values, 0).is_err());
+    }
+
+    #[test]
+    fn history_leaves_change_out_and_names_what_swaps_paid() {
+        let keys = WalletKeys::random();
+        let a = new_output(&keys.address(), 5_000_000).unwrap().output;
+        let mut acct = MwbAccount::starting_at(0);
+        acct.scan(&keys, &block(0, 1, 0, &[a], &[], &[])).unwrap();
+        let tx = acct.build_send(&keys, &WalletKeys::random().address(), 2_000_000, 1).unwrap();
+        let pending = acct.history(1, &SwapOutputs::new());
+        assert_eq!(pending[0].kind, "sent");
+        assert_eq!(pending[0].status, "pending", "waiting payments come first");
+        assert!(pending[0].kernel.is_some(), "the explorer finds it by its excess");
+
+        let spent: Vec<Point32> = tx.input_commitments().copied().collect();
+        let outs: Vec<Output> = tx.outputs().cloned().collect();
+        acct.scan(&keys, &block(1, 2, 1, &outs, &spent, &[tx.body.kernels[0].id()])).unwrap();
+        assert_eq!(acct.coins.len(), 2, "the change came back");
+        let bought = new_output(&keys.address(), 7_000_000).unwrap().output;
+        acct.scan(&keys, &block(2, 3, 2, &[bought.clone()], &[], &[])).unwrap();
+        let swaps = SwapOutputs::from([(bought.commitment, ("swap", "ab".to_string()))]);
+
+        let rows = acct.history(3, &swaps);
+        let kinds: Vec<(&str, u64, &str)> = rows.iter().map(|r| (r.kind.as_str(), r.amount, r.status.as_str())).collect();
+        assert_eq!(
+            kinds,
+            vec![("swap", 7_000_000, "confirmed"), ("sent", 2_000_000, "confirmed"), ("received", 5_000_000, "confirmed")],
+            "no row for the change"
+        );
+        assert_eq!(rows[0].swap.as_deref(), Some("ab"));
+        assert_eq!(rows[2].time, 1_800_000_000, "the block's time");
+
+        // A payment recorded before outputs were kept: its change is the
+        // coin worth what it left over, in the block that confirmed it.
+        acct.payments[0].outputs.clear();
+        assert_eq!(acct.history(3, &swaps).len(), 3);
+    }
+
+    #[test]
+    fn coins_say_what_holds_them() {
+        let keys = WalletKeys::random();
+        let a = new_output(&keys.address(), 3_000_000).unwrap().output;
+        let b = new_output(&keys.address(), 4_000_000).unwrap().output;
+        let reward = new_output(&keys.address(), 6_000_000).unwrap().output;
+        let mut acct = MwbAccount::starting_at(0);
+        let mut view = block(0, 1, 0, &[], &[], &[]);
+        view.outputs = vec![(&a, false), (&b, false), (&reward, true)];
+        acct.scan(&keys, &view).unwrap();
+        acct.reserve(&[b.commitment], "swap:9").unwrap();
+        let v = acct.coin_views(1);
+        let status: Vec<(u64, &str)> = v.iter().map(|c| (c.value, c.status.as_str())).collect();
+        assert_eq!(status, vec![(6_000_000, "maturing"), (4_000_000, "swap"), (3_000_000, "spendable")]);
+        assert_eq!(v[0].matures_at, Some(COINBASE_MATURITY));
+        assert_eq!(acct.coin_views(COINBASE_MATURITY)[0].status, "spendable");
+        let rows = acct.history(1, &SwapOutputs::new());
+        let mined = rows.iter().find(|r| r.kind == "mined").unwrap();
+        assert_eq!((mined.amount, mined.status.as_str()), (6_000_000, "maturing"));
+    }
+
+    #[test]
+    fn a_rescan_forgets_and_relearns_from_its_height() {
+        let keys = WalletKeys::random();
+        let mut acct = MwbAccount::starting_at(5);
+        let a = new_output(&keys.address(), 3_000_000).unwrap().output;
+        acct.scan(&keys, &block(5, 1, 0, &[a], &[], &[])).unwrap();
+        acct.scan(&keys, &block(6, 2, 1, &[], &[], &[])).unwrap();
+        acct.rescan_from(2);
+        assert_eq!((acct.scanned, acct.birth), (2, 2));
+        assert!(acct.coins.is_empty(), "block 5 is scanned again");
+        acct.rescan_from(9);
+        assert_eq!(acct.scanned, 2, "a rescan never skips ahead");
     }
 
     #[test]

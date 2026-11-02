@@ -28,11 +28,19 @@ pub fn show(app: &mut App, ui: &mut Ui, status: &WalletStatus) {
                 .size(11.5)
                 .color(theme::muted()),
         );
+        ui.add_space(8.0);
+        theme::hint(ui, "MIDWIMBLE CHAIN DATA");
+        ui.label(
+            theme::mono(app.mwb_node.as_ref().map(|n| n.data_dir.as_str()).unwrap_or("—"))
+                .size(11.5)
+                .color(theme::muted()),
+        );
         ui.add_space(6.0);
         theme::hint(
             ui,
             "Back up your recovery phrase, not these files. The wallet file is encrypted \
-             with your password; the chain data can always be re-synced.",
+             with your password, and holds the MDW account too; either chain's data can always \
+             be re-synced.",
         );
     });
 
@@ -69,6 +77,36 @@ pub fn show(app: &mut App, ui: &mut Ui, status: &WalletStatus) {
                 }
             }
         });
+
+        // MDW: the same, on midwimble.
+        if app.mwb_account.as_ref().is_some_and(|a| a.enabled) {
+            ui.add_space(10.0);
+            theme::hint(
+                ui,
+                "MDW: scans midwimble for this wallet's MDW account again, from a block. Use it if \
+                 an MDW payment seems missing; midwimble's own wallets find the same coins from \
+                 your phrase. It waits while a payment or swap is under way.",
+            );
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let r = ui.add(
+                    TextEdit::singleline(&mut app.mwb_rescan_h)
+                        .hint_text("from midwimble block")
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(200.0),
+                );
+                if r.changed() {
+                    app.mwb_rescan_h.retain(|c| c.is_ascii_digit());
+                }
+                let from = app.mwb_rescan_h.parse::<u64>();
+                if ui.add_enabled(from.is_ok() && !app.busy, egui::Button::new("Rescan MDW")).clicked() {
+                    app.busy = true;
+                    app.settings_msg.clear();
+                    app.error.clear();
+                    app.go(&ctx, Action::MwbRescan { from: from.unwrap_or(0) });
+                }
+            });
+        }
         if !app.settings_msg.is_empty() {
             ui.label(RichText::new(&app.settings_msg).color(theme::green()).size(12.0));
         }

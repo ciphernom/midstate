@@ -61,6 +61,8 @@ pub enum CoinsTab {
     Holdings,
     Housekeeping,
     Advanced,
+    /// The MDW account's coins.
+    Mdw,
 }
 
 /// Sub-navigation within the Channels tab.
@@ -256,8 +258,25 @@ pub struct App {
     pub bond_notice: String,
     pub bonds_last_poll: f64,
 
+    // MDW: midwimble, beside midstate in every tab
+    /// Which coin the Send, Receive and History tabs show: 0 MDS, 1 MDW.
+    pub send_asset: usize,
+    pub recv_asset: usize,
+    pub hist_asset: usize,
+    /// Which node the Node tab details: 0 midstate, 1 midwimble.
+    pub node_chain: usize,
+    pub mwb_node: Option<MwbNodeInfo>,
+    pub mwb_history: Vec<MwbHistoryView>,
+    pub mwb_coins: Vec<MwbCoinView>,
+    pub mwb_hist_filter: usize,
+    pub mwb_hist_open: Option<usize>,
+    pub mwb_rescan_h: String,
+    pub mwb_history_last_poll: f64,
+    pub mwb_node_last_poll: f64,
+
     // MDS <-> MDW (Trade tab, midwimble market)
-    /// 0: MDS <-> ETH on Base; 1: MDS <-> MDW on midwimble.
+    /// 0: MDS <-> ETH on Base (shown only with MIDSTATE_ETH_MARKET=1);
+    /// 1: MDS <-> MDW on midwimble.
     pub market: usize,
     pub mwb_tab: usize,
     pub mwb_account: Option<MwbAccountView>,
@@ -454,7 +473,19 @@ impl App {
             bond_import_label: String::new(),
             bond_notice: String::new(),
             bonds_last_poll: 0.0,
-            market: 0,
+            send_asset: 0,
+            recv_asset: 0,
+            hist_asset: 0,
+            node_chain: 0,
+            mwb_node: None,
+            mwb_history: Vec::new(),
+            mwb_coins: Vec::new(),
+            mwb_hist_filter: 0,
+            mwb_hist_open: None,
+            mwb_rescan_h: String::new(),
+            mwb_history_last_poll: 0.0,
+            mwb_node_last_poll: 0.0,
+            market: 1,
             mwb_tab: 0,
             mwb_account: None,
             mwb_book: Vec::new(),
@@ -489,6 +520,8 @@ impl App {
             Action::LoadAddresses,
             Action::LoadHistory,
             Action::LoadSends,
+            Action::LoadMwbAccount,
+            Action::LoadMwbHistory,
         ] {
             self.go(ctx, a);
         }
@@ -707,6 +740,11 @@ impl App {
                 self.book = None;
                 self.bonds.clear();
                 self.bond_confirm = false;
+                self.mwb_history.clear();
+                self.mwb_coins.clear();
+                self.mwb_send_to.clear();
+                self.mwb_send_amount.clear();
+                self.mwb_notice.clear();
                 self.tab = Tab::Dashboard;
                 self.onboard = Onboard::Unlock;
                 self.go(ctx, Action::LoadStatus);
@@ -939,15 +977,19 @@ impl App {
                                    already holds; the balance fills in as it goes."
                     .into();
                 self.go(ctx, Action::LoadMwbAccount);
+                self.go(ctx, Action::LoadMwbHistory);
             }
             Msg::MwbSent(kernel) => {
                 self.busy = false;
+                self.mwb_send_to.clear();
                 self.mwb_send_amount.clear();
                 self.mwb_notice = format!(
-                    "MDW sent (kernel {}). The coins it spent stay locked until a block confirms it.",
+                    "Sent (kernel {}). It is final once a block takes it, about a minute; until then \
+                     the coins it spends stay set aside for it.",
                     crate::theme::short_hex(&kernel, 8)
                 );
                 self.go(ctx, Action::LoadMwbAccount);
+                self.go(ctx, Action::LoadMwbHistory);
             }
             Msg::MwbBook(v) => self.mwb_book = v,
             Msg::MwbOrderPlaced(id) => {
@@ -979,11 +1021,20 @@ impl App {
                 self.go(ctx, Action::LoadMwbSwaps);
             }
             Msg::MwbSwaps(v) => self.mwb_swaps = v,
+            Msg::MwbNode(n) => self.mwb_node = n,
+            Msg::MwbHistory(v) => self.mwb_history = v,
+            Msg::MwbCoins(v) => self.mwb_coins = v,
+            Msg::MwbRescanOk => {
+                self.busy = false;
+                self.mwb_rescan_h.clear();
+                self.settings_msg = "Rescanning midwimble: the MDW balance updates as the scan runs.".into();
+                self.go(ctx, Action::LoadMwbAccount);
+            }
             Msg::Err { what, err } => {
                 // Background loads fail benignly while locked; don't banner those.
                 let background = matches!(
                     what,
-                    "status" | "balance" | "coins" | "addresses" | "history" | "sends" | "node info" | "chat" | "channels" | "channel identity" | "invoices" | "hub" | "order book" | "base account" | "dex settings" | "swap quote" | "my orders" | "swaps" | "my bids" | "hubs" | "bonds" | "mdw account" | "mdw book" | "mdw orders" | "mdw swaps"
+                    "status" | "balance" | "coins" | "addresses" | "history" | "sends" | "node info" | "chat" | "channels" | "channel identity" | "invoices" | "hub" | "order book" | "base account" | "dex settings" | "swap quote" | "my orders" | "swaps" | "my bids" | "hubs" | "bonds" | "mdw account" | "mdw book" | "mdw orders" | "mdw swaps" | "mdw node" | "mdw history" | "mdw coins"
                 );
                 if background {
                     tracing::debug!("{what}: {err}");
@@ -1091,12 +1142,35 @@ impl eframe::App for App {
         }
 
         // The MDW account and midwimble's node show in the ribbon and on the
-        // Dashboard, so keep them fresh whatever tab is open.
-        if self.handle.is_some() && self.status.as_ref().is_some_and(|s| s.unlocked) {
+        // Dashboard, so keep them fresh whatever tab is open (the node's line
+        // shows while the wallet is locked too).
+        if self.handle.is_some() {
             let t = self.t0.elapsed().as_secs_f64();
             if t - self.mwb_account_last_poll > 4.0 {
                 self.mwb_account_last_poll = t;
                 self.go(ctx, Action::LoadMwbAccount);
+            }
+        }
+        // MDW history feeds the Dashboard, Send, Receive and History tabs;
+        // the coin list only its own sub-tab.
+        let unlocked = self.status.as_ref().is_some_and(|s| s.unlocked);
+        if self.handle.is_some() && unlocked {
+            let t = self.t0.elapsed().as_secs_f64();
+            let wants_history = matches!(self.tab, Tab::Dashboard | Tab::Send | Tab::Receive | Tab::History);
+            let wants_coins = self.tab == Tab::Coins && self.coins_tab == CoinsTab::Mdw;
+            if (wants_history || wants_coins) && t - self.mwb_history_last_poll > 4.0 {
+                self.mwb_history_last_poll = t;
+                self.go(ctx, if wants_coins { Action::LoadMwbCoins } else { Action::LoadMwbHistory });
+            }
+        }
+        // Midwimble's node in full: the Node tab, and its paths in Settings.
+        if self.handle.is_some()
+            && (self.tab == Tab::Node || (self.tab == Tab::Settings && self.mwb_node.is_none()))
+        {
+            let t = self.t0.elapsed().as_secs_f64();
+            if t - self.mwb_node_last_poll > 3.0 {
+                self.mwb_node_last_poll = t;
+                self.go(ctx, Action::LoadMwbNode);
             }
         }
 
@@ -1119,7 +1193,10 @@ impl eframe::App for App {
             // Rescan on open and then keep up: incremental scans are cheap
             // (about 30 new Base blocks a minute, and midstate is local), and
             // without this your own newly published order never shows up.
-            if !self.dex_syncing && (self.dex_last_sync < 0.0 || t - self.dex_last_sync > 60.0) {
+            // Base is read only while its market is on screen; with it hidden
+            // the wallet makes no calls to Base at all.
+            let eth = views::trade::eth_market() && self.market == 0;
+            if eth && !self.dex_syncing && (self.dex_last_sync < 0.0 || t - self.dex_last_sync > 60.0) {
                 self.dex_last_sync = t;
                 self.dex_syncing = true;
                 self.go(ctx, Action::SyncOrderBook);
@@ -1130,7 +1207,7 @@ impl eframe::App for App {
                     self.go(ctx, a);
                 }
             }
-            if t - self.dex_last_poll > 5.0 {
+            if eth && t - self.dex_last_poll > 5.0 {
                 self.dex_last_poll = t;
                 self.go(ctx, Action::LoadOrderBook);
                 self.go(ctx, Action::LoadMyOrders);
@@ -1291,12 +1368,17 @@ impl eframe::App for App {
 /// MIDSTATE_P2P_PORT=9334
 /// MIDSTATE_RPC_PORT=8546          # "none" disables the RPC listener
 /// MIDWIMBLE_P2P_PORT=9443         # the embedded midwimble node's port
+/// MIDWIMBLE_EXPLORER_PORT=9445     # its explorer on loopback; "none" for none
 /// ```
+///
+/// A taken explorer port falls back to a free one, so a second profile
+/// needs no explorer port of its own.
 pub(crate) struct Profile {
     pub(crate) base: std::path::PathBuf,
     p2p_port: u16,
     rpc_port: Option<u16>,
     mwb_port: u16,
+    mwb_explorer_port: Option<u16>,
 }
 
 pub(crate) fn profile() -> Profile {
@@ -1326,7 +1408,12 @@ pub(crate) fn profile() -> Profile {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(9433);
-    Profile { base, p2p_port, rpc_port, mwb_port }
+    let mwb_explorer_port = match std::env::var("MIDWIMBLE_EXPLORER_PORT") {
+        Ok(v) if v.eq_ignore_ascii_case("none") => None,
+        Ok(v) => Some(v.parse().unwrap_or(midstate_walletd::mwb_node::DEFAULT_EXPLORER_PORT)),
+        Err(_) => Some(midstate_walletd::mwb_node::DEFAULT_EXPLORER_PORT),
+    };
+    Profile { base, p2p_port, rpc_port, mwb_port, mwb_explorer_port }
 }
 
 async fn boot() -> anyhow::Result<WalletdHandle> {
@@ -1357,9 +1444,10 @@ async fn boot() -> anyhow::Result<WalletdHandle> {
         data_dir: p.base.join("midwimble"),
         p2p_port: p.mwb_port,
         bootstrap: Vec::new(),
+        explorer_port: p.mwb_explorer_port,
     };
     let mwb = match midstate_walletd::mwb_node::start_mwb_node(mwb_cfg).await {
-        Ok(h) => Some(h),
+        Ok(n) => Some(n),
         Err(e) => {
             tracing::error!("midwimble node did not start, so MDW trading is off: {e:#}");
             None

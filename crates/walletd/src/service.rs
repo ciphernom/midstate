@@ -147,6 +147,10 @@ enum Cmd {
     MwbOrders(oneshot::Sender<Vec<MwbOrderView>>),
     MwbTake { order_id: String, resp: oneshot::Sender<Result<String>> },
     MwbSwaps(oneshot::Sender<Vec<MwbSwapView>>),
+    MwbNodeInfo(oneshot::Sender<Option<MwbNodeInfo>>),
+    MwbHistory(oneshot::Sender<Vec<MwbHistoryView>>),
+    MwbCoins(oneshot::Sender<Vec<MwbCoinView>>),
+    MwbRescan { from: u64, resp: oneshot::Sender<Result<()>> },
     Internal(Internal),
 }
 
@@ -492,13 +496,29 @@ impl WalletdHandle {
     pub async fn mwb_swaps(&self) -> Result<Vec<MwbSwapView>> {
         Ok(ask!(self, MwbSwaps))
     }
+    /// The embedded midwimble node in full (`None` if it did not start).
+    pub async fn mwb_node_info(&self) -> Result<Option<MwbNodeInfo>> {
+        Ok(ask!(self, MwbNodeInfo))
+    }
+    /// The MDW account's history, newest first.
+    pub async fn mwb_history(&self) -> Result<Vec<MwbHistoryView>> {
+        Ok(ask!(self, MwbHistory))
+    }
+    /// The MDW account's unspent coins, largest first.
+    pub async fn mwb_coins(&self) -> Result<Vec<MwbCoinView>> {
+        Ok(ask!(self, MwbCoins))
+    }
+    /// Scans midwimble for the account again, from `from`.
+    pub async fn mwb_rescan(&self, from: u64) -> Result<()> {
+        ask!(self, MwbRescan { from: from })
+    }
 }
 
 /// Spawn the actor. `wallet_path` is the single managed wallet file
 /// (multi-wallet is a v1.x item). `data_dir`/`rpc_url` are informational.
 pub fn spawn(
     node: NodeHandle,
-    mwb_node: Option<midwimble::node::NodeHandle>,
+    mwb_node: Option<crate::mwb_node::MwbNode>,
     wallet_path: PathBuf,
     data_dir: PathBuf,
     rpc_url: Option<String>,
@@ -544,7 +564,12 @@ pub fn spawn(
         mining,
         events,
         self_tx: tx,
-        mwb_node,
+        mwb_place: mwb_node.as_ref().map(|n| mwb_glue::MwbPlace {
+            explorer: n.explorer.clone(),
+            data_dir: n.data_dir.display().to_string(),
+            p2p_port: n.p2p_port,
+        }),
+        mwb_node: mwb_node.map(|n| n.handle),
         mwb: MwbLive::default(),
         mwb_last_mds_tip: 0,
     };
@@ -603,6 +628,8 @@ struct Service {
     /// The embedded midwimble node, for the MDW account and swaps; `None`
     /// if it could not start (everything else works without it).
     mwb_node: Option<midwimble::node::NodeHandle>,
+    /// Where that node keeps its chain, listens, and serves its explorer.
+    mwb_place: Option<mwb_glue::MwbPlace>,
     /// Midwimble state: the journal (mirrored in wallet.dat while unlocked)
     /// and what is never journalled (negotiations, the heard book).
     mwb: MwbLive,
@@ -990,6 +1017,18 @@ impl Service {
             }
             Cmd::MwbSwaps(resp) => {
                 let _ = resp.send(self.mwb_swaps_view());
+            }
+            Cmd::MwbNodeInfo(resp) => {
+                let _ = resp.send(self.mwb_node_info());
+            }
+            Cmd::MwbHistory(resp) => {
+                let _ = resp.send(self.mwb_history_view());
+            }
+            Cmd::MwbCoins(resp) => {
+                let _ = resp.send(self.mwb_coins_view());
+            }
+            Cmd::MwbRescan { from, resp } => {
+                let _ = resp.send(self.mwb_rescan(from));
             }
             Cmd::Internal(i) => self.internal(i).await,
         }

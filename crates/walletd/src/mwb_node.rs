@@ -6,9 +6,12 @@
 //! created and driven on a dedicated OS thread with its own runtime, and only
 //! the `NodeHandle` (`Clone + Send + Sync`) leaves it.
 //!
-//! The embedded node never mines, relays no midstate headers (only block
-//! producers need `midstate_rpc`) and serves no RPC: walletd reads its state,
-//! storage and mempool through the handle, and submits through it.
+//! The embedded node never mines and relays no midstate headers (only block
+//! producers need `midstate_rpc`). It serves no RPC either: walletd reads its
+//! state, storage and mempool through the handle, and submits through it.
+//! What it does serve is midwimble's block explorer, read-only and on
+//! loopback, so every MDW payment the wallet shows is one click from the
+//! chain this machine verified.
 
 use anyhow::{anyhow, Context, Result};
 use midwimble::node::{Node, NodeConfig, NodeHandle};
@@ -20,6 +23,10 @@ use std::path::PathBuf;
 pub const DEFAULT_MWB_BOOTSTRAP: &[&str] =
     &["/ip4/134.199.148.215/tcp/9433/p2p/12D3KooWCvjd2SBokjWMH712NXNFWHKr7kJAeBsUQ447LHk7wrzu"];
 
+/// The explorer's port: midwimble's own suggestion for `--explorer`, one
+/// above its RPC (9434).
+pub const DEFAULT_EXPLORER_PORT: u16 = 9435;
+
 #[derive(Clone, Debug)]
 pub struct MwbNodeConfig {
     /// Chain database directory, separate from midstate's.
@@ -28,19 +35,37 @@ pub struct MwbNodeConfig {
     pub p2p_port: u16,
     /// Bootstrap peer multiaddrs. Empty ⇒ [`DEFAULT_MWB_BOOTSTRAP`].
     pub bootstrap: Vec<String>,
+    /// Loopback port for the block explorer. `None` serves none, `Some(0)`
+    /// any free port; a port already taken falls back to a free one.
+    pub explorer_port: Option<u16>,
 }
 
 impl Default for MwbNodeConfig {
     fn default() -> Self {
-        Self { data_dir: PathBuf::from("./midwimble"), p2p_port: 9433, bootstrap: Vec::new() }
+        Self {
+            data_dir: PathBuf::from("./midwimble"),
+            p2p_port: 9433,
+            bootstrap: Vec::new(),
+            explorer_port: Some(DEFAULT_EXPLORER_PORT),
+        }
     }
+}
+
+/// The running node, and where to find it.
+#[derive(Clone)]
+pub struct MwbNode {
+    pub handle: NodeHandle,
+    /// `http://127.0.0.1:<port>/`, while the explorer is served.
+    pub explorer: Option<String>,
+    pub data_dir: PathBuf,
+    pub p2p_port: u16,
 }
 
 /// Starts the embedded midwimble node on its own thread. Resolves once the
 /// node has opened its database and identity; sync then runs in the
 /// background, observable through the handle (`info().syncing`,
 /// `state().height`).
-pub async fn start_mwb_node(cfg: MwbNodeConfig) -> Result<NodeHandle> {
+pub async fn start_mwb_node(cfg: MwbNodeConfig) -> Result<MwbNode> {
     let listen: libp2p::Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", cfg.p2p_port)
         .parse()
         .context("invalid midwimble listen multiaddr")?;
@@ -59,8 +84,9 @@ pub async fn start_mwb_node(cfg: MwbNodeConfig) -> Result<NodeHandle> {
 
     let mut config = NodeConfig::new(cfg.data_dir.clone(), listen);
     config.bootstrap = bootstrap;
+    let explorer_port = cfg.explorer_port;
 
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<NodeHandle>>();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(NodeHandle, Option<String>)>>();
     std::thread::Builder::new()
         .name("midwimble-node".into())
         .spawn(move || {
@@ -85,7 +111,11 @@ pub async fn start_mwb_node(cfg: MwbNodeConfig) -> Result<NodeHandle> {
                         return;
                     }
                 };
-                let _ = ready_tx.send(Ok(handle));
+                let explorer = match explorer_port {
+                    Some(port) => serve_explorer(&handle, port).await,
+                    None => None,
+                };
+                let _ = ready_tx.send(Ok((handle, explorer)));
                 if let Err(e) = node.run().await {
                     tracing::error!("midwimble node event loop exited: {e:#}");
                 }
@@ -93,7 +123,42 @@ pub async fn start_mwb_node(cfg: MwbNodeConfig) -> Result<NodeHandle> {
         })
         .context("failed to spawn the midwimble node thread")?;
 
-    ready_rx
+    let (handle, explorer) = ready_rx
         .await
-        .map_err(|_| anyhow!("midwimble node thread exited before startup finished"))?
+        .map_err(|_| anyhow!("midwimble node thread exited before startup finished"))??;
+    Ok(MwbNode { handle, explorer, data_dir: cfg.data_dir, p2p_port: cfg.p2p_port })
+}
+
+/// Binds the explorer on loopback (`port`, or any free one if that is
+/// taken) and serves it on the node's runtime. The explorer only reads, and
+/// builds its index the first time a page asks, so an unopened explorer
+/// costs nothing. A failure leaves the wallet as it is, without the link.
+async fn serve_explorer(handle: &NodeHandle, port: u16) -> Option<String> {
+    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+        Ok(l) => l,
+        Err(e) if port != 0 => {
+            tracing::info!("midwimble explorer: port {port} is taken ({e}); using a free one");
+            match tokio::net::TcpListener::bind(("127.0.0.1", 0)).await {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::warn!("midwimble explorer not served: {e}");
+                    return None;
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("midwimble explorer not served: {e}");
+            return None;
+        }
+    };
+    let url = format!("http://{}/", listener.local_addr().ok()?);
+    let node = handle.clone();
+    tokio::spawn(async move {
+        let index = midwimble::explorer::SharedIndex::default();
+        if let Err(e) = midwimble::rpc::serve_explorer_on(node, listener, index).await {
+            tracing::warn!("midwimble explorer stopped: {e:#}");
+        }
+    });
+    tracing::info!("midwimble explorer at {url}");
+    Some(url)
 }

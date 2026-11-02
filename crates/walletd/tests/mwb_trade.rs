@@ -78,6 +78,7 @@ impl Sim {
             height: h,
             id: [1; 32],
             prev: [0; 32],
+            timestamp: 0,
             outputs: cb.outputs.outputs.iter().map(|o| (o, true)).collect(),
             spent: Default::default(),
             kernels: Default::default(),

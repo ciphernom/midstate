@@ -1,5 +1,6 @@
 use crate::app::{App, Tab};
 use crate::theme::{self, ago, fmt_duration, send_timeline, short_hex, units};
+use crate::views::mdw::{self as m, mdw};
 use eframe::egui::{self, FontId, RichText, Ui};
 use midstate_walletd::api::SendStage;
 
@@ -50,6 +51,8 @@ pub fn show(app: &mut App, ui: &mut Ui) {
             "",
         );
     });
+
+    mdw_money(app, ui);
 
     if let Some(b) = &b {
         if b.unconfirmed > 0 {
@@ -109,47 +112,34 @@ pub fn show(app: &mut App, ui: &mut Ui) {
     }
 
     ui.add_space(4.0);
-    ui.columns(2, |cols| {
+    ui.columns(3, |cols| {
         wallet_health(app, &mut cols[0]);
         network_panel(app, &mut cols[1]);
+        midwimble_panel(app, &mut cols[2]);
     });
-    ui.add_space(4.0);
-    midwimble_panel(app, ui);
 
     // ── Recent activity ─────────────────────────────────────────────────
     ui.add_space(4.0);
     theme::heading(ui, "Recent activity");
+    let recent = recent_rows(app);
     theme::panel_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
-        if app.history.is_empty() {
+        if recent.is_empty() {
             theme::hint(ui, "No activity yet. Share an address from the Receive tab to get paid.");
             return;
         }
         egui::Grid::new("recent").num_columns(5).spacing([22.0, 7.0]).striped(true).show(ui, |ui| {
-            for h in app.history.iter().take(8) {
-                let incoming = h.kind == "received" || h.kind == "coinbase";
-                theme::badge(ui, &h.kind, if incoming { theme::ink() } else { theme::muted() });
-                ui.label(theme::mono(if h.amount > 0 {
-                    format!("{}{}", if incoming { "+" } else { "" }, units(h.amount))
-                } else {
-                    "—".into()
-                }));
-                ui.label(
-                    theme::mono(if h.fee > 0 { format!("fee {}", units(h.fee)) } else { "—".into() })
-                        .color(theme::muted())
-                        .size(11.5),
-                );
-                ui.label(
-                    theme::mono(format!("{}→{}", h.n_in, h.n_out))
-                        .color(theme::faint())
-                        .size(11.0),
-                );
-                ui.label(RichText::new(ago(h.timestamp)).color(theme::muted()).size(11.5));
+            for r in &recent {
+                ui.label(theme::mono(r.coin).size(10.5).color(theme::faint()));
+                theme::badge(ui, &r.kind, if r.incoming { theme::ink() } else { theme::muted() });
+                ui.label(theme::mono(&r.amount));
+                ui.label(theme::mono(&r.fee).color(theme::muted()).size(11.5));
+                ui.label(RichText::new(if r.time > 0 { ago(r.time) } else { "—".into() }).color(theme::muted()).size(11.5));
                 ui.end_row();
             }
         });
     });
-    if !app.history.is_empty() {
+    if !recent.is_empty() {
         ui.horizontal(|ui| {
             theme::hint(ui, "Full record on the");
             if ui.link(RichText::new("History").size(12.0)).clicked() {
@@ -158,6 +148,77 @@ pub fn show(app: &mut App, ui: &mut Ui) {
             theme::hint(ui, "tab.");
         });
     }
+}
+
+/// One line of recent activity, from either chain.
+struct Recent {
+    coin: &'static str,
+    kind: String,
+    amount: String,
+    fee: String,
+    incoming: bool,
+    time: u64,
+}
+
+/// The latest of both histories, newest first.
+fn recent_rows(app: &App) -> Vec<Recent> {
+    let mut v: Vec<Recent> = app
+        .history
+        .iter()
+        .take(8)
+        .map(|h| {
+            let incoming = h.kind == "received" || h.kind == "coinbase";
+            Recent {
+                coin: "MDS",
+                kind: h.kind.clone(),
+                amount: if h.amount > 0 {
+                    format!("{}{}", if incoming { "+" } else { "" }, units(h.amount))
+                } else {
+                    "—".into()
+                },
+                fee: if h.fee > 0 { format!("fee {}", units(h.fee)) } else { "—".into() },
+                incoming,
+                time: h.timestamp,
+            }
+        })
+        .collect();
+    v.extend(app.mwb_history.iter().filter(|h| h.status != "failed").take(8).map(|h| Recent {
+        coin: "MDW",
+        kind: m::kind_label(&h.kind).to_string(),
+        amount: format!("{}{}", if h.incoming { "+" } else { "-" }, mdw(h.amount)),
+        fee: if h.fee > 0 { format!("fee {}", m::plain(h.fee)) } else { "—".into() },
+        incoming: h.incoming,
+        // A payment still waiting sorts as now.
+        time: if h.status == "pending" { theme::now_secs() } else { h.time },
+    }));
+    v.sort_by(|a, b| b.time.cmp(&a.time));
+    v.truncate(8);
+    v
+}
+
+/// MDW beside MDS: the account's balance, or how to add it.
+fn mdw_money(app: &mut App, ui: &mut Ui) {
+    let Some(a) = app.mwb_account.clone() else { return };
+    if a.node.is_none() {
+        return;
+    }
+    ui.add_space(4.0);
+    if !a.enabled {
+        ui.horizontal(|ui| {
+            theme::hint(ui, "MDW: this wallet has no midwimble account yet.");
+            if ui.link(RichText::new("Add it").size(12.0)).clicked() {
+                app.tab = Tab::Receive;
+                app.recv_asset = 1;
+            }
+        });
+        return;
+    }
+    ui.columns(4, |c| {
+        theme::stat(&mut c[0], "MDW spendable", &m::plain(a.spendable), "MDW");
+        theme::stat(&mut c[1], "Set aside", &m::plain(a.reserved), "payments, swaps");
+        theme::stat(&mut c[2], "Maturing", &m::plain(a.immature), "mined");
+        theme::stat(&mut c[3], "MDW coins", &units(a.coins as u64), "");
+    });
 }
 
 /// Things that quietly stop a wallet working: exhausted signing keys and
@@ -200,23 +261,18 @@ fn wallet_health(app: &mut App, ui: &mut Ui) {
     });
 }
 
-/// Node and chain condition, condensed. The full picture lives on the Node tab.
-/// The MDW account and the embedded midwimble node, one click from trading.
+/// Midwimble's node, condensed, as midstate's beside it.
 fn midwimble_panel(app: &mut App, ui: &mut Ui) {
     theme::panel_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
             ui.label(RichText::new("Midwimble").font(theme::font_medium(14.0)));
             theme::right_aligned(ui, |ui| {
-                if ui.button("Trade MDS ↔ MDW").clicked() {
-                    app.tab = Tab::Trade;
-                    app.market = 1;
-                    app.mwb_last_poll = 0.0;
-                }
+                m::explorer_button(ui, "explorer", m::mwb_explorer(app), "midwimble's block explorer, served beside its node");
             });
         });
         let Some(a) = app.mwb_account.clone() else {
-            theme::hint(ui, "Reading the MDW account…");
+            theme::hint(ui, "Starting the node…");
             return;
         };
         let Some(n) = a.node.clone() else {
@@ -226,33 +282,37 @@ fn midwimble_panel(app: &mut App, ui: &mut Ui) {
         ui.horizontal(|ui| {
             theme::badge(
                 ui,
-                if n.syncing { "syncing" } else if n.peers == 0 { "no peers yet" } else { "running" },
+                if n.syncing { "syncing" } else if n.peers == 0 { "no peers yet" } else { "in sync" },
                 if n.syncing || n.peers == 0 { theme::muted() } else { theme::ink() },
             );
             theme::badge(ui, &format!("{} peer(s)", n.peers), if n.peers == 0 { theme::muted() } else { theme::ink() });
-            ui.label(theme::mono(format!("height {}", units(n.height))).size(11.0).color(theme::muted()));
         });
-        if !a.enabled {
-            theme::hint(
-                ui,
-                "This wallet has no MDW account yet. Open the MDW market to add it from your recovery phrase.",
-            );
-            return;
+        row(ui, "height", &units(n.height));
+        if a.enabled && a.scanned < n.height {
+            row(ui, "finding coins", &format!("{} of {}", units(a.scanned), units(n.height)));
         }
-        row(ui, "MDW spendable", &crate::views::trade_mdw::mdw(a.spendable));
-        if a.reserved > 0 {
-            row(ui, "locked in swaps and payments", &crate::views::trade_mdw::mdw(a.reserved));
+        if ui.button(RichText::new("Trade MDS ↔ MDW").size(11.0)).clicked() {
+            app.tab = Tab::Trade;
+            app.market = 1;
+            app.mwb_last_poll = 0.0;
         }
-        if a.scanned < n.height {
-            row(ui, "scanning", &format!("block {} of {}", units(a.scanned), units(n.height)));
+        if n.peers == 0 {
+            theme::hint(ui, "No peers yet: the node is still dialing midwimble's seed.");
         }
     });
 }
 
+/// Midstate's node and chain condition, condensed. The full picture lives
+/// on the Node tab.
 fn network_panel(app: &mut App, ui: &mut Ui) {
     theme::panel_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.label(RichText::new("Network").font(theme::font_medium(14.0)));
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Midstate").font(theme::font_medium(14.0)));
+            theme::right_aligned(ui, |ui| {
+                m::explorer_button(ui, "explorer", m::mds_explorer(app), "midstate's block explorer, served by this node");
+            });
+        });
         let Some(s) = app.sync.clone() else {
             theme::hint(ui, "Starting the node…");
             return;
