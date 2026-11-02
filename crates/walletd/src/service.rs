@@ -25,6 +25,8 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 #[path = "service_mwb.rs"]
 mod mwb_glue;
 use mwb_glue::MwbLive;
+#[path = "service_mining.rs"]
+mod mining_glue;
 
 const TICK: Duration = Duration::from_secs(2);
 /// How long a commit monitor waits for the commitment to enter chain state
@@ -151,6 +153,9 @@ enum Cmd {
     MwbHistory(oneshot::Sender<Vec<MwbHistoryView>>),
     MwbCoins(oneshot::Sender<Vec<MwbCoinView>>),
     MwbRescan { from: u64, resp: oneshot::Sender<Result<()>> },
+    RegisterBond { id: String, resp: oneshot::Sender<Result<String>> },
+    BondRules(oneshot::Sender<BondRulesView>),
+    CoBondFile { id: String, resp: oneshot::Sender<Result<String>> },
     Internal(Internal),
 }
 
@@ -512,6 +517,19 @@ impl WalletdHandle {
     pub async fn mwb_rescan(&self, from: u64) -> Result<()> {
         ask!(self, MwbRescan { from: from })
     }
+    /// Registers bond `id` with midwimble: the wallet keeps at it until the
+    /// bond is ready, and says where it stands.
+    pub async fn register_bond(&self, id: String) -> Result<String> {
+        ask!(self, RegisterBond { id: id })
+    }
+    /// Midwimble's bond rules now, and this wallet's mining key.
+    pub async fn bond_rules(&self) -> Result<BondRulesView> {
+        Ok(ask!(self, BondRules))
+    }
+    /// A registered bond as a co-bond file (no secret), for a pool operator.
+    pub async fn co_bond_file(&self, id: String) -> Result<String> {
+        ask!(self, CoBondFile { id: id })
+    }
 }
 
 /// Spawn the actor. `wallet_path` is the single managed wallet file
@@ -570,6 +588,7 @@ pub fn spawn(
             p2p_port: n.p2p_port,
         }),
         mwb_node: mwb_node.map(|n| n.handle),
+        merge: None,
         mwb: MwbLive::default(),
         mwb_last_mds_tip: 0,
     };
@@ -630,6 +649,9 @@ struct Service {
     mwb_node: Option<midwimble::node::NodeHandle>,
     /// Where that node keeps its chain, listens, and serves its explorer.
     mwb_place: Option<mwb_glue::MwbPlace>,
+    /// The merged-mining endpoint the local pool signs MDW blocks through
+    /// (`mwb_mining::MergeServer`), while mining runs on it.
+    merge: Option<crate::mwb_mining::MergeServer>,
     /// Midwimble state: the journal (mirrored in wallet.dat while unlocked)
     /// and what is never journalled (negotiations, the heard book).
     mwb: MwbLive,
@@ -695,6 +717,9 @@ impl Service {
                 self.restore = None;
                 self.bonds = BondBook::default();
                 self.mwb_unload();
+                // The bond's secret leaves with the wallet: the local pool
+                // mines midstate alone until it is unlocked again.
+                self.refresh_merge_bond();
                 let _ = resp.send(r);
             }
             Cmd::NewAddress { mss, label, resp } => {
@@ -735,6 +760,7 @@ impl Service {
             }
             Cmd::StopMining { resp } => {
                 self.mining.stop().await;
+                self.merge = None;
                 let _ = resp.send(Ok(()));
             }
             Cmd::NodeInfo(resp) => {
@@ -1030,6 +1056,19 @@ impl Service {
             Cmd::MwbRescan { from, resp } => {
                 let _ = resp.send(self.mwb_rescan(from));
             }
+            Cmd::RegisterBond { id, resp } => {
+                let _ = resp.send(self.register_bond(&id).await);
+            }
+            Cmd::BondRules(resp) => {
+                let _ = resp.send(self.bond_rules());
+            }
+            Cmd::CoBondFile { id, resp } => {
+                let r = crate::mwb_mining::parse_bond_id(&id).and_then(|raw| {
+                    let b = self.bonds.find(&raw).ok_or_else(|| anyhow!("no such bond"))?;
+                    crate::mwb_mining::co_bond_file(b)
+                });
+                let _ = resp.send(r);
+            }
             Cmd::Internal(i) => self.internal(i).await,
         }
     }
@@ -1191,6 +1230,8 @@ impl Service {
             let _ = self.events.send(WalletEvent::Warning { text });
         }
         self.mwb_load();
+        // Mining that ran through the lock signs MDW blocks again.
+        self.refresh_merge_bond();
         self.resume_pendings().await;
         let _ = self.events.send(WalletEvent::WalletChanged);
         Ok(())
@@ -1717,6 +1758,7 @@ impl Service {
         let state = self.node.get_state().await;
         let now = now_secs();
         let rpc = self.midstate_rpc_addr();
+        let wallet_key = self.mining_key().ok();
         let w = self.wallet.as_ref().unwrap();
         let pending = |c: &Option<[u8; 32]>| c.is_some_and(|c| w.find_pending(&c).is_some());
         Ok(self
@@ -1741,23 +1783,28 @@ impl Service {
                 } else {
                     "not_funded"
                 };
-                let below_min = b.value < bond::midwimble::MIN_MINING_BOND;
-                let counts_until = if below_min { None } else { bond::midwimble::counts_until(b.bonded_until) };
+                let min = bond::midwimble::min_bond(now);
+                let below_min = b.value < min;
+                let counts_until = if below_min { None } else { bond::midwimble::counts_until(b.bonded_until, now) };
                 let midwimble = match counts_until {
-                    _ if below_min => " Below midwimble's minimum bond, so it never counts for mining \
-                                       (fine for a rehearsal)."
-                        .to_string(),
-                    Some(t) if t > now => format!(
-                        " Midwimble counts it for mining for about {} more, once registered.",
-                        bond::secs_human(t - now)
+                    _ if below_min => format!(
+                        " Below the {} midwimble counts now, so it never mines (fine for a rehearsal).",
+                        bond::gmds(min)
                     ),
-                    _ => " Midwimble no longer counts it: less than two days of its lock remain by \
-                          midwimble's clock."
-                        .to_string(),
+                    Some(t) => format!(
+                        " Midwimble counts it for mining for about {} more{}.",
+                        bond::secs_human(t.saturating_sub(now)),
+                        if b.reg.phase == "on_chain" { "" } else { ", once registered" }
+                    ),
+                    None => format!(
+                        " Midwimble no longer counts it: a bond needs more than {} days of its lock left, \
+                         by a clock that runs a week ahead.",
+                        bond::midwimble::min_remaining_lock(now) / 1440
+                    ),
                 };
                 let status_text = match status {
-                    "locking" => "Locking: the send is on its way (see the Send tab). Register it with \
-                                  midwimble once it confirms."
+                    "locking" => "Locking: the send is on its way (see the Send tab). Midwimble can register \
+                                  it once it confirms."
                         .to_string(),
                     "locked" => format!(
                         "Locked until block {} (about {}).{}",
@@ -1791,6 +1838,13 @@ impl Service {
                     export_line: b.export_line(),
                     can_unbond: status == "unlocked",
                     can_remove: matches!(status, "unbonded" | "not_funded"),
+                    wallet_key: wallet_key == Some(b.mining_key),
+                    reg_phase: b.reg.phase.clone(),
+                    reg_progress: b.reg.progress,
+                    reg_note: b.reg.note.clone(),
+                    can_register: matches!(status, "locked" | "locking")
+                        && counts_until.is_some()
+                        && b.reg.phase != "on_chain",
                 }
             })
             .collect())
@@ -1875,6 +1929,8 @@ impl Service {
             unbond_sig: None,
             owner_next_leaf: 0,
             seen_live: false,
+            bond_file: None,
+            reg: Default::default(),
         };
         let id = rec.coin_id();
         self.bonds.bonds.push(rec);
@@ -2127,6 +2183,8 @@ impl Service {
             unbond_sig: None,
             owner_next_leaf: 0,
             seen_live: false,
+            bond_file: None,
+            reg: Default::default(),
         };
         let id = rec.coin_id();
         if self.bonds.find(&id).is_some() {
@@ -2957,7 +3015,11 @@ impl Service {
             bail!("unlock the wallet before mining — rewards need somewhere to go");
         }
         let payout = self.mining_payout_address()?;
-        self.mining.start(payout, threads, pool_url).await;
+        let mdw = self.mdw_mining_args(&pool_url).await;
+        if mdw.merge_rpc.is_none() {
+            self.merge = None;
+        }
+        self.mining.start(payout, threads, pool_url, mdw).await;
         Ok(())
     }
 
@@ -3005,6 +3067,7 @@ impl Service {
             view.block_reward = ps.block_reward;
             view.workers = ps.workers;
         }
+        self.fill_mdw_view(&mut view, &st.mdw);
         view
     }
 
@@ -6852,6 +6915,7 @@ impl Service {
         let tip = status.height;
         self.check_new_mss_trees();
         self.refresh_bonds_live().await;
+        self.advance_registrations().await;
 
         // A restore pass records the window it starts with at height 0; one
         // whose start was never recorded (interrupted between passes) restarts.

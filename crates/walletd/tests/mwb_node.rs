@@ -27,6 +27,7 @@ async fn the_midwimble_node_starts_serves_its_explorer_and_its_blocks_scan() {
         p2p_port: 0,
         bootstrap: Vec::new(),
         explorer_port: Some(0),
+        midstate_rpc: None,
     };
     let node = start_mwb_node(cfg.clone()).await.expect("the node starts");
     let h = node.handle.clone();

@@ -25,6 +25,7 @@ pub mod mining;
 pub mod mwb;
 pub mod mwb_account;
 pub mod mwb_link;
+pub mod mwb_mining;
 pub mod mwb_negotiate;
 pub mod mwb_node;
 pub mod mwb_trade;

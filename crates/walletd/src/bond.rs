@@ -57,45 +57,84 @@ const MIN_FEE_PER_KB: u64 = 10;
 /// Slack above that floor, as for swap sweeps.
 const FEE_MARGIN: u64 = 20;
 
-/// Midwimble's launch parameters (midwimble `core/types.rs` and
-/// `core/bond.rs`). Midstate consensus knows nothing of them, so the wallet
-/// uses them for guidance, never to refuse a bond.
+/// Midwimble's bond rules, read from midwimble's own library, so they move
+/// when its network does (the early phase's 16 mMDS bonds gave way to 128
+/// gMDS at mainnet, and a new bond's price follows midwimble's difficulty
+/// from 30 November 2026). Midstate consensus knows nothing of them: the
+/// wallet uses them for guidance and to register, never to refuse a lock.
 pub mod midwimble {
-    /// Smallest bond midwimble counts: 2^24 units (16 mMDS).
-    pub const MIN_MINING_BOND: u64 = 1 << 24;
-    /// A bond counts only while at least this many blocks of its lock remain
-    /// by midwimble's clock: two days.
-    pub const MIN_REMAINING_BOND_LOCK: u64 = 2 * 24 * 60;
-    /// Midwimble's clock deliberately runs a week ahead of midstate's height.
-    pub const CLOCK_MARGIN: u64 = 7 * 24 * 60;
-    /// Midwimble refuses to register a bond locked further ahead than a year.
-    pub const MAX_BOND_HORIZON: u64 = 365 * 24 * 60;
-    /// A registration needs a day of midstate work buried above its proof.
-    pub const REGISTRATION_DELAY_BLOCKS: u64 = 24 * 60;
+    use ::midwimble::core::bond as mb;
 
-    /// Midwimble's estimate of midstate's height at `timestamp`
-    /// (`bond::est_midstate_height`): midstate's schedule from its genesis,
-    /// plus the clock margin.
-    pub fn est_midstate_height(timestamp: u64) -> u64 {
-        timestamp.saturating_sub(midstate::core::types::BITCOIN_BLOCK_TIME) / 60 + CLOCK_MARGIN
+    /// The smallest bond midwimble counts at `now` (unix seconds).
+    pub fn min_bond(now: u64) -> u64 {
+        mb::min_mining_bond(now)
     }
 
-    /// The last unix time at which midwimble still counts a bond locked until
-    /// `until`, or `None` if it never would.
-    pub fn counts_until(until: u64) -> Option<u64> {
-        let h = until.checked_sub(MIN_REMAINING_BOND_LOCK + CLOCK_MARGIN)?;
-        Some(midstate::core::types::BITCOIN_BLOCK_TIME + h * 60 + 59)
+    /// What a new bond must hold at midwimble's difficulty `target`: the
+    /// minimum, doubling with the chain's work, up to [`MAX_BOND`].
+    pub fn registration_min(target: &[u8; 32], now: u64) -> u64 {
+        mb::registration_min_bond(target, now)
+    }
+
+    /// The most a new bond can be asked to hold.
+    pub const MAX_BOND: u64 = mb::MAX_MINING_BOND;
+
+    /// Midstate blocks of its lock a bond must keep to count at `now`.
+    pub fn min_remaining_lock(now: u64) -> u64 {
+        mb::min_remaining_bond_lock(now)
+    }
+
+    /// A registration waits for a day of midwimble's work above its proof.
+    pub const REGISTRATION_DELAY_BLOCKS: u64 = 24 * 60;
+
+    /// Midwimble's estimate of midstate's height at `timestamp`: its
+    /// schedule from genesis plus a week's margin, high on purpose.
+    pub fn est_midstate_height(timestamp: u64) -> u64 {
+        mb::est_midstate_height(timestamp)
+    }
+
+    /// The last unix time, from `now` on, at which midwimble still counts a
+    /// bond locked until `until`; `None` if it does not count now.
+    pub fn counts_until(until: u64, now: u64) -> Option<u64> {
+        let counts = |t: u64| until >= mb::est_midstate_height(t).saturating_add(mb::min_remaining_bond_lock(t));
+        if !counts(now) {
+            return None;
+        }
+        // Eligibility only runs down with time (midwimble asserts as much),
+        // so the edge is a binary search away.
+        let (mut lo, mut hi) = (now, now.saturating_add(20 * 365 * 86_400));
+        if counts(hi) {
+            return Some(hi);
+        }
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if counts(mid) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        Some(lo)
     }
 
     /// The highest lock height midwimble would register at `now`.
     pub fn horizon(now: u64) -> u64 {
-        est_midstate_height(now) + MAX_BOND_HORIZON
+        est_midstate_height(now) + mb::MAX_BOND_HORIZON
     }
 
     /// The lock height that keeps a bond counted for `days` after it
-    /// registers (a day from now), by midwimble's clock.
+    /// registers (about a day from now), by midwimble's clock.
     pub fn until_for_days(now: u64, days: u64) -> u64 {
-        est_midstate_height(now) + MIN_REMAINING_BOND_LOCK + REGISTRATION_DELAY_BLOCKS + days * 24 * 60
+        est_midstate_height(now) + min_remaining_lock(now) + REGISTRATION_DELAY_BLOCKS + days * 24 * 60
+    }
+}
+
+/// A bond size for people: whole gMDS (2^30 units) where it is that.
+pub fn gmds(units: u64) -> String {
+    if units >= 1 << 30 && units % (1 << 30) == 0 {
+        format!("{} gMDS", units >> 30)
+    } else {
+        format!("{units} units")
     }
 }
 
@@ -278,6 +317,39 @@ pub struct BondRecord {
     /// The coin has been seen unspent on chain at least once.
     #[serde(default)]
     pub seen_live: bool,
+    /// Its registration with midwimble, as `midwimble bond register` keeps
+    /// it in a bond file (no secret: the mining secret is the phrase's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bond_file: Option<::midwimble::core::bond::BondFile>,
+    /// Where that registration stands (`mwb_mining`).
+    #[serde(default)]
+    pub reg: RegStatus,
+}
+
+/// Where a bond's registration with midwimble stands, as the wallet last
+/// found it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegStatus {
+    /// "" (not asked) | "waiting" (asked; the coin is not confirmed yet, or
+    /// the first attempt is due) | "burying" | "ready" | "on_chain" |
+    /// "failed" (the last attempt failed; retried)
+    #[serde(default)]
+    pub phase: String,
+    /// Burial progress: percent of the work a registration needs.
+    #[serde(default)]
+    pub progress: u32,
+    #[serde(default)]
+    pub note: String,
+    /// Unix time of the last attempt.
+    #[serde(default)]
+    pub checked: u64,
+}
+
+impl RegStatus {
+    /// Asked to register, and not there yet.
+    pub fn active(&self) -> bool {
+        matches!(self.phase.as_str(), "waiting" | "burying" | "ready" | "failed")
+    }
 }
 
 impl BondRecord {
@@ -639,6 +711,8 @@ mod tests {
             unbond_sig: None,
             owner_next_leaf: 0,
             seen_live: true,
+            bond_file: None,
+            reg: Default::default(),
         };
         let (mut state, _) = midstate::core::types::State::genesis();
         state.coins.insert(rec.coin_id(), false);
@@ -748,20 +822,27 @@ mod tests {
     }
 
     #[test]
-    fn midwimble_counts_a_bond_until_two_days_plus_its_margin_before_unlock() {
+    fn midwimbles_rules_come_from_midwimble() {
         use super::midwimble::*;
-        let g = midstate::core::types::BITCOIN_BLOCK_TIME;
-        assert_eq!(est_midstate_height(g), CLOCK_MARGIN);
-        assert_eq!(est_midstate_height(g + 600), CLOCK_MARGIN + 10);
-        let until = 400_000;
-        let last = counts_until(until).unwrap();
-        assert!(est_midstate_height(last) + MIN_REMAINING_BOND_LOCK <= until);
-        assert!(est_midstate_height(last + 1) + MIN_REMAINING_BOND_LOCK > until);
-        assert_eq!(counts_until(MIN_REMAINING_BOND_LOCK + CLOCK_MARGIN - 1), None);
-        let now = g + 340_000 * 60;
+        // Mainnet, 2 November 2026: the early phase is over.
+        let now = 1_793_584_000;
+        assert_eq!(min_bond(now), 1 << 37, "128 gMDS");
+        assert_eq!(min_remaining_lock(now), 30 * 1440, "thirty days");
+        assert_eq!(MAX_BOND, 1 << 39, "512 gMDS at most");
+        // A bond counts while its lock outlasts midwimble's clock by the
+        // minimum: up to the last second that holds, and not after.
+        let until = est_midstate_height(now) + min_remaining_lock(now) + 7 * 1440;
+        let last = counts_until(until, now).unwrap();
+        assert!(est_midstate_height(last) + min_remaining_lock(last) <= until);
+        assert!(est_midstate_height(last + 1) + min_remaining_lock(last + 1) > until);
+        assert!((last - now) / 86_400 >= 6, "about a week");
+        assert_eq!(counts_until(est_midstate_height(now) + min_remaining_lock(now) - 1, now), None);
+        // A lock picked for 30 days counts that long after a day's registration.
         let u = until_for_days(now, 30);
-        let counted_days = (counts_until(u).unwrap() - now) / 86_400;
-        assert_eq!(counted_days, 31, "30 days after a day's registration");
+        assert_eq!((counts_until(u, now).unwrap() - now) / 86_400, 31);
+        assert!(u <= horizon(now));
+        assert_eq!(gmds(1 << 37), "128 gMDS");
+        assert_eq!(gmds(1000), "1000 units");
     }
 
     #[test]
@@ -783,6 +864,8 @@ mod tests {
             unbond_sig: None,
             owner_next_leaf: 0,
             seen_live: false,
+            bond_file: None,
+            reg: Default::default(),
         });
         book.save(&wp).unwrap();
         let (back, warn) = BondBook::load(&wp);
