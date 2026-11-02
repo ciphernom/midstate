@@ -6,9 +6,11 @@
 //! created and driven on a dedicated OS thread with its own runtime, and only
 //! the `NodeHandle` (`Clone + Send + Sync`) leaves it.
 //!
-//! The embedded node never mines and relays no midstate headers (only block
-//! producers need `midstate_rpc`). It serves no RPC either: walletd reads its
-//! state, storage and mempool through the handle, and submits through it.
+//! The embedded node never mines by itself. It follows midstate's headers
+//! through midstate's node RPC when it has one, so the blocks this wallet's
+//! bond merge-mines can relay what a registration needs (`mwb_mining`). It
+//! serves no RPC: walletd reads its state, storage and mempool through the
+//! handle, and submits through it.
 //! What it does serve is midwimble's block explorer, read-only and on
 //! loopback, so every MDW payment the wallet shows is one click from the
 //! chain this machine verified.
@@ -38,6 +40,10 @@ pub struct MwbNodeConfig {
     /// Loopback port for the block explorer. `None` serves none, `Some(0)`
     /// any free port; a port already taken falls back to a free one.
     pub explorer_port: Option<u16>,
+    /// Midstate's node RPC (`host:port`), polled for the headers midwimble's
+    /// blocks relay. A bond registers only while the relay holds its proof's
+    /// header, so a node that may mine one in should follow midstate.
+    pub midstate_rpc: Option<String>,
 }
 
 impl Default for MwbNodeConfig {
@@ -47,6 +53,7 @@ impl Default for MwbNodeConfig {
             p2p_port: 9433,
             bootstrap: Vec::new(),
             explorer_port: Some(DEFAULT_EXPLORER_PORT),
+            midstate_rpc: None,
         }
     }
 }
@@ -84,6 +91,7 @@ pub async fn start_mwb_node(cfg: MwbNodeConfig) -> Result<MwbNode> {
 
     let mut config = NodeConfig::new(cfg.data_dir.clone(), listen);
     config.bootstrap = bootstrap;
+    config.midstate_rpc = cfg.midstate_rpc.clone();
     let explorer_port = cfg.explorer_port;
 
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(NodeHandle, Option<String>)>>();

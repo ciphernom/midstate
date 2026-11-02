@@ -258,7 +258,7 @@ impl Service {
         self.mwb_node.as_ref().map(|h| h.state().height)
     }
 
-    fn mwb_synced(&self) -> bool {
+    pub(super) fn mwb_synced(&self) -> bool {
         self.mwb_node.as_ref().is_some_and(|h| {
             let i = h.info();
             !i.syncing && !i.peers.is_empty()

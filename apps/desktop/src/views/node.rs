@@ -494,6 +494,27 @@ fn mining_panel(app: &mut App, ui: &mut Ui, syncing: bool) {
             );
         }
 
+        // ── MDW: the same hashing, on midwimble ───────────────────────────
+        // The hasher names this wallet's MDW address to whichever pool it
+        // mines on; the local pool merge-mines too while a bond is ready.
+        if !m.mdw_address.is_empty() {
+            row_copy(ui, "mdw to", &m.mdw_address);
+        }
+        if m.mdw_merge && !m.mdw_bond.is_empty() {
+            row(
+                ui,
+                "signed by",
+                &format!("bond {}", short_hex(&m.mdw_bond, 16)),
+                Some(
+                    "The bond whose key signs the midwimble blocks this pool finds. \
+                     Its card on the Bonds tab says where it stands.",
+                ),
+            );
+        }
+        if !m.mdw_note.is_empty() {
+            theme::hint(ui, &m.mdw_note);
+        }
+
         ui.add_space(6.0);
 
         // ── Controls ──────────────────────────────────────────────────────
@@ -570,12 +591,26 @@ fn mining_panel(app: &mut App, ui: &mut Ui, syncing: bool) {
                 app.mining_pool = m.default_pool_url.clone();
                 app.mining_pool_touched = true;
             }
-            theme::hint(
-                ui,
-                "Leave as the local address to run your own pool, or enter any \
-                 stratum+tcp:// URL to mine on someone else's.",
-            );
+            if !m.merge_pool.is_empty()
+                && ui
+                    .small_button("pool that pays MDW")
+                    .on_hover_text(format!(
+                        "{}: a public pool that merge-mines midwimble. It pays your MDW address its \
+                         share of the midwimble blocks it finds, with no bond of your own; its page \
+                         at rpc.cypherpunk.gold/pool lists them.",
+                        m.merge_pool
+                    ))
+                    .clicked()
+            {
+                app.mining_pool = m.merge_pool.clone();
+                app.mining_pool_touched = true;
+            }
         });
+        theme::hint(
+            ui,
+            "Leave as the local address to run your own pool, or enter any \
+             stratum+tcp:// URL to mine on someone else's.",
+        );
 
         ui.add_space(6.0);
         let ready = !syncing;

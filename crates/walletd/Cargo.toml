@@ -23,6 +23,9 @@ curve25519-dalek = "4"
 # beside midstate's (`mwb_node`). Its transactions are built and checked by
 # midwimble's own rules.
 midwimble = { git = "https://github.com/ciphernom/midwimble", default-features = false, features = ["node"] }
+# The merged-mining endpoint the local pool asks for MDW jobs
+# (`mwb_mining::MergeServer`): the same axum midwimble's own RPC is built on.
+axum = { version = "0.8", default-features = false, features = ["json", "tokio", "http1"] }
 # The swap link's Fiat-Shamir challenge reads BLAKE3's extendable output.
 blake3 = "1.5"
 zeroize = "1"
@@ -34,6 +37,11 @@ tokio = { version = "1.35", features = ["full"] }
 tracing = "0.1"
 dirs = "5.0"
 libp2p = { version = "0.56", default-features = false }
+
+[features]
+# Test builds only: midwimble's devnet (easy targets, a stand-in midstate),
+# for the merged-mining test (`cargo test --features devnet --test mwb_mining`).
+devnet = ["midwimble/fast-mining"]
 
 [dev-dependencies]
 tempfile = "3.8"

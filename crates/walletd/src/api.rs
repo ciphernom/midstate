@@ -194,6 +194,22 @@ pub struct MiningView {
     pub uptime_secs: u64,
     /// Set when a child process exited unexpectedly or startup failed.
     pub last_error: Option<String>,
+    /// The MDW address the hasher names to its pool (empty without an MDW
+    /// account): a pool that merge-mines midwimble pays it.
+    #[serde(default)]
+    pub mdw_address: String,
+    /// The local pool is merge-mining MDW, signed with this wallet's bond.
+    #[serde(default)]
+    pub mdw_merge: bool,
+    /// That bond's id (hex), while it is.
+    #[serde(default)]
+    pub mdw_bond: String,
+    /// What the running (or next) mining does for MDW, in a sentence.
+    #[serde(default)]
+    pub mdw_note: String,
+    /// A pool known to merge-mine midwimble, to offer.
+    #[serde(default)]
+    pub merge_pool: String,
 }
 
 /// Stages of the two-phase send. Persisted implicitly via the wallet's
@@ -312,6 +328,43 @@ pub struct BondView {
     pub export_line: String,
     pub can_unbond: bool,
     pub can_remove: bool,
+    /// Locked on this wallet's own mining key, so it mines from here.
+    #[serde(default)]
+    pub wallet_key: bool,
+    /// Its registration with midwimble: "" (not asked) | "waiting" |
+    /// "burying" | "ready" | "on_chain" | "failed".
+    #[serde(default)]
+    pub reg_phase: String,
+    /// Burial progress, percent.
+    #[serde(default)]
+    pub reg_progress: u32,
+    /// Where the registration stands, in a sentence.
+    #[serde(default)]
+    pub reg_note: String,
+    /// The wallet can register it (locked, large enough, lock long enough).
+    #[serde(default)]
+    pub can_register: bool,
+}
+
+/// Midwimble's bond rules as they stand, and this wallet's mining key.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct BondRulesView {
+    /// This wallet's mining key (hex): bonds on it mine from this wallet.
+    pub mining_key: String,
+    /// The smallest bond midwimble counts now.
+    pub min_bond: u64,
+    /// What a new bond must hold at midwimble's difficulty now (the minimum
+    /// until the price starts following the chain's work).
+    pub registration_min: u64,
+    pub max_bond: u64,
+    /// Midstate blocks of its lock a bond must keep to count.
+    pub min_lock_blocks: u64,
+    /// The highest lock height midwimble registers now.
+    pub horizon: u64,
+    /// Midwimble's estimate of midstate's height now.
+    pub est_midstate_height: u64,
+    /// Registration reads midstate through this app's node RPC.
+    pub rpc_on: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

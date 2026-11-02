@@ -117,6 +117,70 @@ pub struct MiningState {
     pub stratum_port: u16,
     pub audit_port: u16,
     pub started_at: Option<Instant>,
+    /// What this mining does for MDW.
+    pub mdw: MdwMining,
+}
+
+/// MDW for a mining run (`mwb_mining`): the address the hasher names to its
+/// pool, so a pool that merge-mines midwimble pays it, and the merged-mining
+/// endpoint the local pool commits its jobs through, when this wallet has a
+/// bond ready to sign them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MdwMining {
+    /// `mw1…`, or `None` without an MDW account.
+    pub address: Option<String>,
+    /// `host:port` of walletd's merge endpoint, for the local pool only.
+    pub merge_rpc: Option<String>,
+    /// The `midstate` binary predates MDW mining, so this run left MDW out.
+    pub outdated: bool,
+}
+
+impl MdwMining {
+    /// As far as `binary` takes it. A `midstate` older than MDW mining
+    /// refuses these flags outright, which would stop mining altogether, so
+    /// a run on one mines midstate alone and says why.
+    async fn supported_by(mut self, binary: &Path) -> Self {
+        async fn takes(binary: &Path, sub: &str, flag: &str) -> bool {
+            Command::new(binary)
+                .args([sub, "--help"])
+                .kill_on_drop(true)
+                .output()
+                .await
+                .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(flag))
+        }
+        if self.address.is_some() && !takes(binary, "miner", "--midwimble-address").await {
+            tracing::warn!("{} predates MDW mining; mining midstate alone", binary.display());
+            return Self { outdated: true, ..Self::default() };
+        }
+        if self.merge_rpc.is_some() && !takes(binary, "pool", "--midwimble-rpc").await {
+            self.merge_rpc = None;
+            self.outdated = true;
+        }
+        self
+    }
+
+    /// `midstate pool` arguments: merge-mine against the endpoint, paying
+    /// the pool's own MDW share to this wallet (a solo pool takes no fee).
+    pub fn pool_args(&self) -> Vec<String> {
+        match (&self.merge_rpc, &self.address) {
+            (Some(rpc), Some(addr)) => vec![
+                "--midwimble-rpc".into(),
+                rpc.clone(),
+                "--midwimble-address".into(),
+                addr.clone(),
+            ],
+            _ => Vec::new(),
+        }
+    }
+
+    /// `midstate miner` arguments: this wallet's MDW address, for any pool
+    /// that merge-mines.
+    pub fn miner_args(&self) -> Vec<String> {
+        match &self.address {
+            Some(addr) => vec!["--midwimble-address".into(), addr.clone()],
+            None => Vec::new(),
+        }
+    }
 }
 
 impl Default for MiningState {
@@ -131,6 +195,7 @@ impl Default for MiningState {
             stratum_port: 0,
             audit_port: 0,
             started_at: None,
+            mdw: MdwMining::default(),
         }
     }
 }
@@ -266,7 +331,7 @@ impl MiningSupervisor {
     /// # Safety / Invariants
     /// - **No partial state.** If the hasher fails to launch, any pool this call
     ///   started is killed before `Error` is published.
-    pub async fn start(&self, payout_address: String, threads: usize, pool_url: String) {
+    pub async fn start(&self, payout_address: String, threads: usize, pool_url: String, mdw: MdwMining) {
         {
             let st = self.state.read().await;
             if st.phase == MiningPhase::Running || st.phase.is_busy() {
@@ -295,13 +360,14 @@ impl MiningSupervisor {
                 local_pool: local,
                 threads,
                 started_at: Some(Instant::now()),
+                mdw: mdw.clone(),
                 ..Default::default()
             };
         }
 
         let this = self.clone();
         tokio::spawn(async move {
-            if let Err(e) = this.start_inner(payout_address, threads, effective, local).await {
+            if let Err(e) = this.start_inner(payout_address, threads, effective, local, mdw).await {
                 tracing::warn!("mining failed to start: {e:#}");
                 this.kill_children().await;
                 let mut st = this.state.write().await;
@@ -318,6 +384,7 @@ impl MiningSupervisor {
         threads: usize,
         pool_url: String,
         local: bool,
+        mdw: MdwMining,
     ) -> Result<()> {
         if payout_address.trim().is_empty() {
             bail!("a payout address is required before mining can start");
@@ -325,6 +392,8 @@ impl MiningSupervisor {
         let binary = Self::find_binary()?;
         std::fs::create_dir_all(&self.work_dir)
             .with_context(|| format!("could not create {}", self.work_dir.display()))?;
+        let mdw = mdw.supported_by(&binary).await;
+        self.state.write().await.mdw = mdw.clone();
 
         let mut stratum_port = BASE_STRATUM_PORT;
         let mut audit_port = BASE_AUDIT_PORT;
@@ -347,6 +416,7 @@ impl MiningSupervisor {
                 .arg("--rpc-host").arg("127.0.0.1")
                 .arg("--rpc-port").arg(self.node_rpc_port.to_string())
                 .arg("--fee").arg("0")
+                .args(mdw.pool_args())
                 .kill_on_drop(true)
                 .spawn()
                 .with_context(|| format!("could not launch {} pool", binary.display()))?;
@@ -373,6 +443,7 @@ impl MiningSupervisor {
             .arg("--payout-address").arg(&payout_address)
             .arg("--worker").arg("desktop")
             .arg("--threads").arg(threads.to_string())
+            .args(mdw.miner_args())
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| anyhow!("could not launch hasher: {e}"))?;
@@ -640,6 +711,52 @@ mod tests {
             "stratum+tcp://rpc.cypherpunk.gold:3333"
         ));
         assert!(!MiningSupervisor::is_local("stratum+tcp://10.0.0.5:3333"));
+    }
+
+    #[test]
+    fn mdw_rides_the_hasher_always_and_the_pool_only_with_a_bond() {
+        let none = MdwMining::default();
+        assert!(none.pool_args().is_empty() && none.miner_args().is_empty());
+        let pooled = MdwMining { address: Some("mw1abc".into()), ..MdwMining::default() };
+        assert_eq!(pooled.miner_args(), ["--midwimble-address", "mw1abc"]);
+        assert!(pooled.pool_args().is_empty(), "no bond, so the local pool mines midstate alone");
+        let solo = MdwMining {
+            address: Some("mw1abc".into()),
+            merge_rpc: Some("127.0.0.1:40001".into()),
+            ..MdwMining::default()
+        };
+        assert_eq!(
+            solo.pool_args(),
+            ["--midwimble-rpc", "127.0.0.1:40001", "--midwimble-address", "mw1abc"]
+        );
+    }
+
+    /// A `midstate` that predates MDW mining would refuse the flags and stop
+    /// mining altogether, so a run on one leaves MDW out instead.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_older_midstate_mines_midstate_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = |name: &str, help: &str| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, format!("#!/bin/sh\necho '{help}'\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+        let current = fake("current", "--pool-url --payout-address --midwimble-address --midwimble-rpc");
+        let old = fake("old", "--pool-url --payout-address --worker --threads");
+        let solo = MdwMining {
+            address: Some("mw1abc".into()),
+            merge_rpc: Some("127.0.0.1:40001".into()),
+            ..MdwMining::default()
+        };
+        assert_eq!(solo.clone().supported_by(&current).await, solo);
+        let left_out = solo.supported_by(&old).await;
+        assert!(left_out.outdated);
+        assert!(left_out.miner_args().is_empty() && left_out.pool_args().is_empty());
+        // Nothing asked of it, nothing to check.
+        assert_eq!(MdwMining::default().supported_by(&old).await, MdwMining::default());
     }
 
     #[test]

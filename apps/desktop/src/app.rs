@@ -257,6 +257,11 @@ pub struct App {
     pub bond_import_label: String,
     pub bond_notice: String,
     pub bonds_last_poll: f64,
+    /// Midwimble's bond rules and this wallet's mining key.
+    pub bond_rules: Option<BondRulesView>,
+    /// 0: lock on this wallet's own mining key (it mines from here);
+    /// 1: on another key (a pool's, for a co-bond, or one of midwimble's).
+    pub bond_key_mode: usize,
 
     // MDW: midwimble, beside midstate in every tab
     /// Which coin the Send, Receive and History tabs show: 0 MDS, 1 MDW.
@@ -465,7 +470,7 @@ impl App {
             abandon_addr: String::new(),
             bonds: Vec::new(),
             bond_key: String::new(),
-            bond_exp: midstate_walletd::bond::midwimble::MIN_MINING_BOND.trailing_zeros(),
+            bond_exp: midstate_walletd::bond::midwimble::min_bond(theme::now_secs()).trailing_zeros(),
             bond_until: String::new(),
             bond_label: String::new(),
             bond_confirm: false,
@@ -473,6 +478,8 @@ impl App {
             bond_import_label: String::new(),
             bond_notice: String::new(),
             bonds_last_poll: 0.0,
+            bond_rules: None,
+            bond_key_mode: 0,
             send_asset: 0,
             recv_asset: 0,
             hist_asset: 0,
@@ -1024,6 +1031,20 @@ impl App {
             Msg::MwbNode(n) => self.mwb_node = n,
             Msg::MwbHistory(v) => self.mwb_history = v,
             Msg::MwbCoins(v) => self.mwb_coins = v,
+            Msg::BondRules(r) => {
+                // Start the amount at what a new bond needs, once.
+                if self.bond_rules.is_none() && r.registration_min.is_power_of_two() {
+                    self.bond_exp = self.bond_exp.max(r.registration_min.trailing_zeros());
+                }
+                self.bond_rules = Some(r);
+            }
+            Msg::CoBondFile(text) => {
+                self.busy = false;
+                ctx.copy_text(text);
+                self.bond_notice = "Co-bond file copied. Save it as a .json file and give it to the pool \
+                                    operator: it holds no secret, and only your phrase can unbond the coin."
+                    .into();
+            }
             Msg::MwbRescanOk => {
                 self.busy = false;
                 self.mwb_rescan_h.clear();
@@ -1034,7 +1055,7 @@ impl App {
                 // Background loads fail benignly while locked; don't banner those.
                 let background = matches!(
                     what,
-                    "status" | "balance" | "coins" | "addresses" | "history" | "sends" | "node info" | "chat" | "channels" | "channel identity" | "invoices" | "hub" | "order book" | "base account" | "dex settings" | "swap quote" | "my orders" | "swaps" | "my bids" | "hubs" | "bonds" | "mdw account" | "mdw book" | "mdw orders" | "mdw swaps" | "mdw node" | "mdw history" | "mdw coins"
+                    "status" | "balance" | "coins" | "addresses" | "history" | "sends" | "node info" | "chat" | "channels" | "channel identity" | "invoices" | "hub" | "order book" | "base account" | "dex settings" | "swap quote" | "my orders" | "swaps" | "my bids" | "hubs" | "bonds" | "mdw account" | "mdw book" | "mdw orders" | "mdw swaps" | "mdw node" | "mdw history" | "mdw coins" | "bond rules"
                 );
                 if background {
                     tracing::debug!("{what}: {err}");
@@ -1226,6 +1247,7 @@ impl eframe::App for App {
             if t - self.bonds_last_poll > 3.0 {
                 self.bonds_last_poll = t;
                 self.go(ctx, Action::LoadBonds);
+                self.go(ctx, Action::LoadBondRules);
                 if self.balance.is_none() {
                     self.go(ctx, Action::LoadBalance);
                 }
@@ -1437,6 +1459,7 @@ async fn boot() -> anyhow::Result<WalletdHandle> {
         ..Default::default()
     };
     let rpc_url = cfg.rpc_port.map(|p| format!("http://127.0.0.1:{p}"));
+    let cfg_rpc_port = cfg.rpc_port;
     let node = node_host::start_node(cfg).await?;
     // Midwimble, for the MDW account and MDS <-> MDW swaps. Everything else
     // works without it, so a failure here is logged rather than fatal.
@@ -1445,6 +1468,8 @@ async fn boot() -> anyhow::Result<WalletdHandle> {
         p2p_port: p.mwb_port,
         bootstrap: Vec::new(),
         explorer_port: p.mwb_explorer_port,
+        // Midwimble's relay follows midstate through this app's own node.
+        midstate_rpc: cfg_rpc_port.map(|port| format!("127.0.0.1:{port}")),
     };
     let mwb = match midstate_walletd::mwb_node::start_mwb_node(mwb_cfg).await {
         Ok(n) => Some(n),

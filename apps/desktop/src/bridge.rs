@@ -96,6 +96,9 @@ pub enum Action {
     LoadMwbHistory,
     LoadMwbCoins,
     MwbRescan { from: u64 },
+    RegisterBond { id: String },
+    LoadBondRules,
+    CopyCoBondFile { id: String },
 }
 
 pub enum Msg {
@@ -175,6 +178,9 @@ pub enum Msg {
     MwbHistory(Vec<MwbHistoryView>),
     MwbCoins(Vec<MwbCoinView>),
     MwbRescanOk,
+    BondRules(BondRulesView),
+    /// A bond file for a pool operator, to put on the clipboard.
+    CoBondFile(String),
 }
 
 pub fn dispatch(
@@ -354,8 +360,8 @@ pub fn dispatch(
             Action::CreateBond { mining_key, value, until, label } => {
                 run!("lock bond", h.create_bond(mining_key, value, until, label), |_| {
                     Msg::BondDone(
-                        "Locking the bond: follow the send on the Send tab, then register it with \
-                         midwimble using the command on its card."
+                        "Locking the bond: follow the send on the Send tab. Once it confirms, Register on \
+                         its card has midwimble count it."
                             .into(),
                     )
                 })
@@ -384,6 +390,9 @@ pub fn dispatch(
             Action::LoadMwbHistory => run!("mdw history", h.mwb_history(), Msg::MwbHistory),
             Action::LoadMwbCoins => run!("mdw coins", h.mwb_coins(), Msg::MwbCoins),
             Action::MwbRescan { from } => run!("rescan MDW", h.mwb_rescan(from), |_| Msg::MwbRescanOk),
+            Action::RegisterBond { id } => run!("register bond", h.register_bond(id), Msg::BondDone),
+            Action::LoadBondRules => run!("bond rules", h.bond_rules(), Msg::BondRules),
+            Action::CopyCoBondFile { id } => run!("co-bond file", h.co_bond_file(id), Msg::CoBondFile),
         }
     });
 }
