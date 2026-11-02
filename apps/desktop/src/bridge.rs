@@ -92,6 +92,10 @@ pub enum Action {
     LoadMwbOrders,
     MwbTake { order_id: String },
     LoadMwbSwaps,
+    LoadMwbNode,
+    LoadMwbHistory,
+    LoadMwbCoins,
+    MwbRescan { from: u64 },
 }
 
 pub enum Msg {
@@ -167,6 +171,10 @@ pub enum Msg {
     MwbOrders(Vec<MwbOrderView>),
     MwbTaken(String),
     MwbSwaps(Vec<MwbSwapView>),
+    MwbNode(Option<MwbNodeInfo>),
+    MwbHistory(Vec<MwbHistoryView>),
+    MwbCoins(Vec<MwbCoinView>),
+    MwbRescanOk,
 }
 
 pub fn dispatch(
@@ -372,6 +380,10 @@ pub fn dispatch(
             Action::LoadMwbOrders => run!("mdw orders", h.mwb_orders(), Msg::MwbOrders),
             Action::MwbTake { order_id } => run!("take MDW order", h.mwb_take(order_id), Msg::MwbTaken),
             Action::LoadMwbSwaps => run!("mdw swaps", h.mwb_swaps(), Msg::MwbSwaps),
+            Action::LoadMwbNode => run!("mdw node", h.mwb_node_info(), Msg::MwbNode),
+            Action::LoadMwbHistory => run!("mdw history", h.mwb_history(), Msg::MwbHistory),
+            Action::LoadMwbCoins => run!("mdw coins", h.mwb_coins(), Msg::MwbCoins),
+            Action::MwbRescan { from } => run!("rescan MDW", h.mwb_rescan(from), |_| Msg::MwbRescanOk),
         }
     });
 }

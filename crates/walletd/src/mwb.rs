@@ -106,6 +106,12 @@ pub fn min_fee(inputs: u64, outputs: u64, kernels: u64) -> u64 {
     (inputs * INPUT_WEIGHT + outputs * OUTPUT_WEIGHT + kernels * KERNEL_WEIGHT) * MIN_FEE_PER_WEIGHT
 }
 
+/// Whether `s` is a midwimble address (`mw1…`), and why not if it is not:
+/// for a send form to say before anything is built.
+pub fn check_address(s: &str) -> Result<()> {
+    StealthAddress::decode(s.trim()).map(|_| ())
+}
+
 fn point(p: &Point32, what: &str) -> Result<RistrettoPoint> {
     match decompress(p) {
         Some(pt) if !pt.is_identity() => Ok(pt),

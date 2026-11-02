@@ -6,6 +6,7 @@
 use crate::app::{App, CoinsTab};
 use crate::bridge::Action;
 use crate::theme::{self, short_hex, units};
+use crate::views::mdw::{self as m, mdw};
 use eframe::egui::{self, FontId, RichText, TextEdit, Ui};
 
 pub fn show(app: &mut App, ui: &mut Ui) {
@@ -14,16 +15,18 @@ pub fn show(app: &mut App, ui: &mut Ui) {
 
     let frag = app.coins.iter().filter(|c| c.live && c.kind != "mss").count();
     let l1 = if frag > 8 { format!("Housekeeping ({frag})") } else { "Housekeeping".to_string() };
-    let labels = ["Holdings", l1.as_str(), "Advanced"];
+    let labels = ["Holdings", l1.as_str(), "Advanced", "MDW"];
     let mut ix = match app.coins_tab {
         CoinsTab::Holdings => 0,
         CoinsTab::Housekeeping => 1,
         CoinsTab::Advanced => 2,
+        CoinsTab::Mdw => 3,
     };
     if theme::segmented(ui, &labels, &mut ix) {
-        app.coins_tab = [CoinsTab::Holdings, CoinsTab::Housekeeping, CoinsTab::Advanced][ix];
+        app.coins_tab = [CoinsTab::Holdings, CoinsTab::Housekeeping, CoinsTab::Advanced, CoinsTab::Mdw][ix];
         app.error.clear();
         app.coins_notice.clear();
+        app.mwb_history_last_poll = 0.0;
     }
     ui.add_space(10.0);
 
@@ -31,6 +34,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         CoinsTab::Holdings => holdings(app, ui, &ctx),
         CoinsTab::Housekeeping => housekeeping(app, ui, &ctx),
         CoinsTab::Advanced => advanced(app, ui, &ctx),
+        CoinsTab::Mdw => mdw_coins(app, ui, &ctx),
     }
 
     if app.busy {
@@ -378,4 +382,69 @@ fn advanced(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
             }
         });
     });
+}
+
+// ── MDW ─────────────────────────────────────────────────────────────────
+
+/// The MDW account's unspent coins. Midwimble coins carry any amount, so
+/// there is nothing to defragment; what matters is what holds each one.
+fn mdw_coins(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
+    if !m::account_gate(app, ui, ctx) {
+        return;
+    }
+    let coins = app.mwb_coins.clone();
+    let total: u64 = coins.iter().map(|c| c.value).sum();
+    let free = coins.iter().filter(|c| c.status == "spendable").count();
+    let maturing = coins.iter().filter(|c| c.status == "maturing").count();
+    ui.columns(4, |c| {
+        theme::stat(&mut c[0], "Value", &m::plain(total), "MDW");
+        theme::stat(&mut c[1], "Coins", &units(coins.len() as u64), "unspent");
+        theme::stat(&mut c[2], "Spendable now", &units(free as u64), "");
+        theme::stat(&mut c[3], "Maturing", &units(maturing as u64), "mined");
+    });
+    ui.add_space(6.0);
+    theme::panel_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        if coins.is_empty() {
+            theme::hint(ui, "No MDW coins yet.");
+            return;
+        }
+        let explorer = m::mwb_explorer(app);
+        egui::Grid::new("mdw_coins").num_columns(5).spacing([20.0, 7.0]).striped(true).show(ui, |ui| {
+            for h in ["Value", "Block", "Status", "Commitment", ""] {
+                ui.label(RichText::new(h.to_uppercase()).font(FontId::monospace(9.5)).color(theme::muted()));
+            }
+            ui.end_row();
+            for c in &coins {
+                ui.label(theme::mono(mdw(c.value)).size(11.5).color(theme::ink()));
+                ui.label(theme::mono(units(c.height)).size(11.0).color(theme::muted()));
+                let status = match (c.status.as_str(), c.matures_at) {
+                    ("maturing", Some(h)) => format!("maturing · block {}", units(h)),
+                    ("payment", _) => "a payment spends it".into(),
+                    ("swap", _) => "set aside for a swap".into(),
+                    (s, _) => s.to_string(),
+                };
+                theme::badge(ui, &status, if c.status == "spendable" { theme::ink() } else { theme::muted() });
+                if ui
+                    .add(egui::Button::new(RichText::new(short_hex(&c.commitment, 8)).font(FontId::monospace(10.0))))
+                    .on_hover_text("click to copy the commitment")
+                    .clicked()
+                {
+                    ui.ctx().copy_text(c.commitment.clone());
+                }
+                m::explorer_button(
+                    ui,
+                    "explorer",
+                    explorer.as_deref().map(|e| m::mwb_page(e, "output", &c.commitment)),
+                    "Open the coin in midwimble's explorer, served by your own node",
+                );
+                ui.end_row();
+            }
+        });
+    });
+    theme::hint(
+        ui,
+        "Each coin is a Pedersen commitment: the chain shows that it exists, never what it holds. \
+         A mined coin matures before it can be spent; its status says at which block.",
+    );
 }

@@ -79,15 +79,27 @@ fn price(p: f64) -> String {
     format!("{s} gwei")
 }
 
+/// Whether the MDS <-> ETH market is offered. It is hidden while it is not
+/// dependable: `MIDSTATE_ETH_MARKET=1` brings it back, for whoever is
+/// working on it. Hidden, the wallet makes no calls to Base at all.
+pub fn eth_market() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MIDSTATE_ETH_MARKET").is_ok_and(|v| v == "1"))
+}
+
 pub fn show(app: &mut App, ui: &mut Ui) {
     let ctx = ui.ctx().clone();
     theme::heading(ui, "Trade");
-    let mut market = app.market.min(1);
-    if theme::segmented(ui, &["MDS ↔ ETH (Base)", "MDS ↔ MDW (midwimble)"], &mut market) {
-        app.market = market;
-        app.mwb_last_poll = 0.0;
+    if eth_market() {
+        let mut market = app.market.min(1);
+        if theme::segmented(ui, &["MDS ↔ ETH (Base)", "MDS ↔ MDW (midwimble)"], &mut market) {
+            app.market = market;
+            app.mwb_last_poll = 0.0;
+        }
+        ui.add_space(6.0);
+    } else {
+        app.market = 1;
     }
-    ui.add_space(6.0);
     if app.market == 1 {
         crate::views::trade_mdw::show(app, ui, &ctx);
         return;

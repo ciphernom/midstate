@@ -4,6 +4,7 @@ pub mod chat;
 pub mod coins;
 pub mod dashboard;
 pub mod history;
+pub mod mdw;
 pub mod node;
 pub mod onboarding;
 pub mod receive;

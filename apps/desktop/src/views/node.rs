@@ -1,15 +1,202 @@
-//! The node panel. This app runs a full node in-process, so everything here
-//! is read from local consensus state rather than asked of a third party —
-//! which is the point, and worth showing rather than just asserting.
+//! The node panel. This app runs two full nodes in-process, midstate's and
+//! midwimble's, so everything here is read from local consensus state rather
+//! than asked of a third party — which is the point, and worth showing
+//! rather than just asserting.
 
 use crate::app::App;
 use crate::bridge::Action;
 use crate::theme::{self, ago, fmt_dt, short_hex, units};
+use crate::views::mdw::{self as m, mdw};
 use eframe::egui::{self, FontId, RichText, Ui};
 
 pub fn show(app: &mut App, ui: &mut Ui) {
     theme::heading(ui, "Node");
+    overview(app, ui);
+    ui.add_space(8.0);
+    theme::segmented(ui, &["midstate", "midwimble"], &mut app.node_chain);
+    ui.add_space(6.0);
+    if app.node_chain == 1 {
+        midwimble(app, ui);
+    } else {
+        midstate(app, ui);
+    }
+}
 
+/// Both nodes side by side: how each is doing, and its explorer.
+fn overview(app: &mut App, ui: &mut Ui) {
+    let mds = app.sync.clone();
+    let mds_node = app.node.clone();
+    let mwb = app.mwb_account.as_ref().and_then(|a| a.node.clone());
+    let mwb_info = app.mwb_node.clone();
+    let (mds_explorer, mwb_explorer) = (m::mds_explorer(app), m::mwb_explorer(app));
+    ui.columns(2, |c| {
+        theme::panel_frame().show(&mut c[0], |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                theme::dot(ui, mds.as_ref().is_some_and(|s| s.peer_count > 0));
+                ui.label(RichText::new("midstate").font(theme::font_medium(14.0)));
+                theme::right_aligned(ui, |ui| {
+                    m::explorer_button(ui, "explorer", mds_explorer.clone(), "midstate's block explorer, served by this node");
+                });
+            });
+            let Some(s) = mds else {
+                theme::hint(ui, "starting…");
+                return;
+            };
+            row(ui, "height", &units(s.height), None);
+            row(ui, "peers", &s.peer_count.to_string(), None);
+            row(ui, "state", if s.is_syncing { "syncing" } else { "in sync" }, None);
+            if let Some(n) = &mds_node {
+                row(ui, "last block", &ago(n.tip_timestamp), None);
+            }
+            row(ui, "mempool", &s.mempool.to_string(), None);
+        });
+        theme::panel_frame().show(&mut c[1], |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                theme::dot(ui, mwb.as_ref().is_some_and(|n| n.peers > 0));
+                ui.label(RichText::new("midwimble").font(theme::font_medium(14.0)));
+                theme::right_aligned(ui, |ui| {
+                    m::explorer_button(ui, "explorer", mwb_explorer.clone(), "midwimble's block explorer, served beside its node");
+                });
+            });
+            let Some(n) = mwb else {
+                theme::hint(ui, if app.mwb_account.is_some() { "not running this session" } else { "starting…" });
+                return;
+            };
+            row(ui, "height", &units(n.height), None);
+            row(ui, "peers", &n.peers.to_string(), None);
+            row(ui, "state", if n.syncing { "syncing" } else if n.peers == 0 { "looking for peers" } else { "in sync" }, None);
+            if let Some(i) = &mwb_info {
+                row(ui, "last block", &ago(i.tip_timestamp), None);
+                row(ui, "mempool", &i.mempool.to_string(), None);
+            }
+        });
+    });
+}
+
+/// Midwimble's node: the same picture as midstate's, from its own chain.
+fn midwimble(app: &mut App, ui: &mut Ui) {
+    let Some(n) = app.mwb_node.clone() else {
+        let off = app.mwb_account.as_ref().is_some_and(|a| a.node.is_none());
+        theme::hint(
+            ui,
+            if off {
+                "The midwimble node did not start this session, so MDW is unavailable; the log says why."
+            } else {
+                "Reading node state…"
+            },
+        );
+        return;
+    };
+    ui.label(
+        RichText::new(theme::grouped_hash(&n.midstate, 8))
+            .font(FontId::monospace(26.0))
+            .color(theme::ambient()),
+    );
+    ui.add_space(2.0);
+    ui.columns(3, |c| {
+        theme::stat(&mut c[0], "Height", &units(n.height), "blocks");
+        theme::stat(&mut c[1], "Unspent outputs", &units(n.utxo_count as u64), "");
+        theme::stat(&mut c[2], "Block reward", &m::plain(n.block_reward), "MDW");
+    });
+    ui.columns(3, |c| {
+        theme::stat(&mut c[0], "Difficulty", &n.difficulty_bits.to_string(), "leading zeros");
+        theme::stat(&mut c[1], "Supply", &m::plain(n.supply), "MDW mined");
+        theme::stat(&mut c[2], "Mining bonds", &units(n.bonds as u64), "registered");
+    });
+    ui.add_space(6.0);
+
+    theme::panel_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(RichText::new("Chain tip").font(theme::font_medium(14.0)));
+        row(ui, "last block", &format!("{}  ·  {}", fmt_dt(n.tip_timestamp), ago(n.tip_timestamp)), None);
+        row_copy(ui, "header hash", &n.header_hash);
+        row_copy(ui, "midstate", &n.midstate);
+        row(ui, "cumulative work", &n.depth, None);
+        row(ui, "mempool", &format!("{} transaction(s) waiting", n.mempool), None);
+        if n.syncing {
+            theme::hint(
+                ui,
+                "Downloading a heavier chain: these figures describe the chain as far as this node \
+                 has verified it, and its tip is about to move.",
+            );
+        }
+    });
+
+    ui.add_space(6.0);
+    theme::panel_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Peers").font(theme::font_medium(14.0)));
+            theme::badge(ui, &n.peers.len().to_string(), if n.peers.is_empty() { theme::muted() } else { theme::ink() });
+        });
+        if n.peers.is_empty() {
+            theme::hint(
+                ui,
+                &format!(
+                    "No peers connected. The node keeps dialing midwimble's seed; if this persists, check \
+                     whether outbound connections on port {} are blocked.",
+                    if n.p2p_port == 0 { 9433 } else { n.p2p_port }
+                ),
+            );
+            return;
+        }
+        theme::hint(ui, "Midwimble nodes this one is connected to, and who dialled whom.");
+        egui::ScrollArea::vertical()
+            .max_height(180.0)
+            .auto_shrink([false, false])
+            .id_salt("mwb_peers")
+            .show(ui, |ui| {
+                for p in &n.peers {
+                    ui.horizontal(|ui| {
+                        theme::badge(ui, if p.outbound { "out" } else { "in" }, theme::muted());
+                        ui.label(theme::mono(short_hex(&p.id, 12)).size(11.0).color(theme::muted()));
+                        ui.label(theme::mono(&p.addr).size(10.5).color(theme::faint()));
+                        if ui.button(RichText::new("copy").size(10.0)).clicked() {
+                            ui.ctx().copy_text(p.id.clone());
+                        }
+                    });
+                }
+            });
+    });
+
+    ui.add_space(6.0);
+    theme::panel_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(RichText::new("This machine").font(theme::font_medium(14.0)));
+        row_copy(ui, "data directory", &n.data_dir);
+        row(ui, "p2p port", &n.p2p_port.to_string(), None);
+        row_copy(ui, "node id", &n.peer_id);
+        match &n.explorer {
+            Some(url) => {
+                row_copy(ui, "explorer", url);
+                theme::hint(
+                    ui,
+                    "Midwimble's block explorer, served by this app from the chain this node verified, \
+                     on this machine only. Every MDW payment in History opens there.",
+                );
+                if ui.button("Open explorer in browser").clicked() {
+                    m::open_url(url);
+                }
+            }
+            None => theme::hint(ui, "The explorer is not served this session (MIDWIMBLE_EXPLORER_PORT=none, or no port was free)."),
+        }
+    });
+    if let Some(a) = app.mwb_account.as_ref().filter(|a| a.enabled) {
+        ui.add_space(6.0);
+        theme::panel_frame().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new("Your MDW account").font(theme::font_medium(14.0)));
+            row(ui, "spendable", &mdw(a.spendable), None);
+            row(ui, "scanned to", &format!("block {}", units(a.scanned.saturating_sub(1))), None);
+            theme::hint(ui, "Settings can scan midwimble again from any height, if a payment seems missing.");
+        });
+    }
+}
+
+/// Midstate's node.
+fn midstate(app: &mut App, ui: &mut Ui) {
     let Some(n) = app.node.clone() else {
         theme::hint(ui, "Reading node state…");
         return;
@@ -122,7 +309,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                  party. Other wallets on this machine can point at the same address.",
             );
             if ui.button("Open explorer in browser").clicked() {
-                let _ = open_url(url);
+                m::open_url(url);
             }
         } else {
             theme::hint(ui, "The RPC listener is not enabled for this session.");
@@ -476,12 +663,3 @@ fn row_copy(ui: &mut Ui, label: &str, value: &str) {
     });
 }
 
-fn open_url(url: &str) -> std::io::Result<()> {
-    #[cfg(target_os = "linux")]
-    let cmd = "xdg-open";
-    #[cfg(target_os = "macos")]
-    let cmd = "open";
-    #[cfg(target_os = "windows")]
-    let cmd = "explorer";
-    std::process::Command::new(cmd).arg(url).spawn().map(|_| ())
-}
