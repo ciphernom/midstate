@@ -1,0 +1,9 @@
+// Resources linked into midstate-desktop.exe on Windows (see build.rs).
+//
+// The icon is what Windows shows for the program itself: in Explorer, on
+// shortcuts and in the Start menu, and on a pinned taskbar entry before the
+// app opens its window. The shell takes the first icon in the file.
+// midstate-desktop.ico holds the logo at 16 to 256 px, drawn from
+// ../logo-1024.png, the same source as the macOS app's icon.
+
+1 ICON "midstate-desktop.ico"
