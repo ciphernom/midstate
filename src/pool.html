@@ -138,6 +138,22 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-sp
 .btn-more { display: block; background: transparent; border: 0; padding: 2px 0 0; color: var(--text-muted); font-family: 'Inter', sans-serif; font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
 .btn-more:hover { color: var(--text-bright); }
 .pay.hit .addr { color: var(--text-max); font-weight: 700; }
+th[data-sort] { cursor: pointer; user-select: none; }
+th[data-sort]:hover { color: var(--text-bright); }
+th.sorted-desc::after { content: ' \25BE'; }
+th.sorted-asc::after { content: ' \25B4'; }
+.tbl-mine { margin-top: 0; }
+.tbl-mine[hidden] { display: none; }
+
+/* the viewer's own address (pinned with "pin as mine") */
+tr.mine > td { background: var(--accent-bg); }
+.pay.mine .addr { color: var(--text-max); font-weight: 700; }
+.you-tag { font-family: 'Inter', sans-serif; font-size: 9px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--on-accent); background: var(--accent); padding: 0 4px; margin-left: 6px; }
+.hdr-right a.mine-link { color: var(--text-bright); text-decoration: none; letter-spacing: 0.5px; }
+.hdr-right a.mine-link:hover { color: var(--accent); text-decoration: underline; }
+.ctx-actions { display: flex; align-items: center; gap: 14px; }
+.ctx-actions .btn-verify { margin-top: 0; }
+.idle-tag { font-family: 'Inter', sans-serif; font-size: 9px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-max); border: 1px solid var(--text-max); padding: 0 4px; margin-right: 6px; }
 
 /* connect box */
 .code { background: var(--code-bg); color: var(--text-bright); padding: 10px 12px; border-left: 3px solid var(--stark-accent); overflow-x: auto; font-family: 'JetBrains Mono', monospace; font-size: 12px; user-select: all; }
@@ -234,6 +250,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-sp
     <span><span class="label">FEE</span> <span class="val" id="h-fee">--</span></span>
     <span><span class="label">MINERS</span> <span class="val" id="h-miners">--</span></span>
     <span><span class="label">HEIGHT</span> <span class="val" id="h-height">--</span></span>
+    <span id="h-mine" hidden></span>
     <span><div class="live-dot" id="live-dot" style="background: var(--red);"></div> <span class="label">STATUS</span> <span class="val" id="status-text">OFFLINE</span></span>
     <button id="theme-toggle" class="btn theme-toggle" onclick="toggleTheme()" aria-label="Toggle theme"><svg class="icon-sun" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg><svg class="icon-moon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg></button>
   </div>
@@ -307,7 +324,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-sp
       <h2>Miner Leaderboard (Active Shares)</h2>
       <div class="table-scroll">
         <table>
-          <thead><tr><th class="num">#</th><th>Miner Address</th><th class="num">Live Hashrate</th><th class="num">Active Shares</th><th class="num">Weight</th><th class="num">Efficiency</th></tr></thead>
+          <thead><tr><th class="num" data-sort="rank" title="Rank by active shares (click a column to sort by it)">#</th><th>Miner Address</th><th class="num" data-sort="hashrate">Live Hashrate</th><th class="num" data-sort="shares">Active Shares</th><th class="num">Weight</th><th class="num" data-sort="efficiency">Efficiency</th></tr></thead>
           <tbody id="miners-table"><tr class="empty-row"><td colspan="6">Loading...</td></tr></tbody>
         </table>
       </div>
@@ -346,12 +363,17 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-sp
           <div class="card-v" id="mw-miners">--</div>
           <div class="card-sub" id="mw-shares">-- shares toward the next block</div>
         </div>
+        <div class="card">
+          <div class="card-k">Next Block Pays</div>
+          <div class="card-v" id="mw-reward">--</div>
+          <div class="card-sub" id="mw-eta">after the pool's fee</div>
+        </div>
       </div>
       <h3>Next midwimble block pays</h3>
       <div class="table-scroll">
         <table>
-          <thead><tr><th>Midwimble Address</th><th class="num">Shares</th><th class="num">Weight</th></tr></thead>
-          <tbody id="mw-scores"><tr class="empty-row"><td colspan="3">Loading...</td></tr></tbody>
+          <thead><tr><th class="num" data-sort="rank" title="Rank by shares (click a column to sort by it)">#</th><th>Midwimble Address</th><th class="num" data-sort="hashrate">Live Hashrate</th><th class="num" data-sort="shares">Shares</th><th class="num">Weight</th><th class="num" title="Addresses with 1/31 of the shares or more are paid exactly; the rest are drawn, each with a chance in proportion to its shares">Next Block</th></tr></thead>
+          <tbody id="mw-scores"><tr class="empty-row"><td colspan="6">Loading...</td></tr></tbody>
         </table>
       </div>
       <h3>Midwimble blocks found</h3>
@@ -381,7 +403,10 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-sp
           <div class="k">Miner Address</div>
           <div class="ctx-addr" id="miner-addr">--</div>
         </div>
-        <a class="back" href="#/">&larr; Back to Pool</a>
+        <div class="ctx-actions">
+          <button type="button" class="btn-verify" id="mn-pin" title="Remember this address in this browser: it gets a link at the top and is marked in the tables">&#9734; pin as mine</button>
+          <a class="back" href="#/">&larr; Back to Pool</a>
+        </div>
       </div>
     </div>
 
@@ -457,11 +482,79 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-sp
       <h2>Worker Breakdown</h2>
       <div class="table-scroll">
         <table>
-          <thead><tr><th>Worker</th><th class="num">Accepted Shares</th><th class="num">Share of Rigs</th></tr></thead>
-          <tbody id="mn-workers"><tr class="empty-row"><td colspan="3">No worker data yet for this address.</td></tr></tbody>
+          <thead><tr><th data-sort="name">Worker</th><th class="num" data-sort="hashrate">Live Hashrate</th><th class="num" data-sort="shares">Accepted Shares</th><th class="num">Share of Rigs</th><th class="num" data-sort="last" title="When this page last saw the rig's share count grow">Last Share</th></tr></thead>
+          <tbody id="mn-workers"><tr class="empty-row"><td colspan="5">No worker data yet for this address.</td></tr></tbody>
         </table>
       </div>
       <div class="card-sub" id="mn-workers-note" style="margin-top:8px;"></div>
+    </div>
+
+  </section>
+
+  <!-- ============ VIEW C: A MIDWIMBLE ADDRESS ============ -->
+  <section id="view-mw" hidden>
+
+    <div class="pool-box">
+      <div class="ctx">
+        <div>
+          <div class="k">Midwimble Address <span class="fee-tag" id="mwa-pool" hidden>pool</span></div>
+          <div class="ctx-addr" id="mwa-addr">--</div>
+        </div>
+        <div class="ctx-actions">
+          <button type="button" class="btn-verify" id="mwa-pin" title="Remember this address in this browser: it gets a link at the top and is marked in the tables">&#9734; pin as mine</button>
+          <a class="back" href="#/">&larr; Back to Pool</a>
+        </div>
+      </div>
+    </div>
+
+    <div class="cards">
+      <div class="card">
+        <div class="card-k">Live Hashrate</div>
+        <div class="card-v" id="mwa-hr">--</div>
+        <div class="card-sub">60-second rolling average</div>
+      </div>
+      <div class="card">
+        <div class="card-k">Shares</div>
+        <div class="card-v" id="mwa-score">--</div>
+        <div class="card-sub" id="mwa-rank">toward the next midwimble block</div>
+      </div>
+      <div class="card">
+        <div class="card-k">Next Block</div>
+        <div class="card-v" id="mwa-next">--</div>
+        <div class="card-sub" id="mwa-next-sub">--</div>
+      </div>
+      <div class="card">
+        <div class="card-k">Est. MDW / Day</div>
+        <div class="card-v" id="mwa-day">--</div>
+        <div class="card-sub">at current hashrate</div>
+      </div>
+      <div class="card">
+        <div class="card-k">Blocks Paid</div>
+        <div class="card-v" id="mwa-paid">--</div>
+        <div class="card-sub" id="mwa-paid-sub">of the recent midwimble blocks</div>
+      </div>
+    </div>
+
+    <div class="charts">
+      <div class="pool-box chart-box">
+        <h2>Hashrate (10 min)</h2>
+        <div class="chart-wrap"><canvas id="chart-mwa-hr"></canvas></div>
+      </div>
+      <div class="pool-box chart-box">
+        <h2>Share of Recent Midwimble Blocks</h2>
+        <div class="chart-wrap"><canvas id="chart-mwa-paid"></canvas></div>
+      </div>
+    </div>
+
+    <div class="pool-box">
+      <h2>Midwimble Blocks That Paid It</h2>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th class="num">Age</th><th class="num">Height</th><th class="num">Share of Block</th></tr></thead>
+          <tbody id="mwa-blocks"><tr class="empty-row"><td colspan="3">None of the recent midwimble blocks paid this address.</td></tr></tbody>
+        </table>
+      </div>
+      <div class="ref-note">Midwimble amounts are confidential, so the pool shows each address's share of a block; the wallet holding the address sees the coins. Every share a miner submits with this <span class="mono">--midwimble-address</span> adds a point here, whichever midstate address it mines for. A block marked orphaned paid nobody: its shares went back to the table, for the next block to pay.</div>
     </div>
 
   </section>
@@ -487,10 +580,50 @@ const EXPLORER_BLOCK_URL = (hash) => '/?q=' + hash;
 // ---------------------------------------------------------------------------
 let latest = null;                      // last /pool/stats payload
 
-let snapshots = [];                     // [{ t, total: BigInt, miners: {addrKey: BigInt} }] within 60s
+// Rolling rates from counts that only grow, a key at a time: a count that
+// falls (a block took the score it paid, the pool restarted) starts its own
+// key over and leaves every other key's window alone.
+class Rates {
+  constructor(windowMs) {
+    this.windowMs = windowMs;
+    this.hist = new Map();                // key -> [{ t, v }] inside the window
+    this.lastUp = new Map();              // key -> when the count last grew
+    this.since = new Map();               // key -> when this page first saw it
+  }
+  observe(key, v, t) {
+    let h = this.hist.get(key);
+    if (h && h.length && v < h[h.length - 1].v) h = null;
+    if (!h) { h = []; this.hist.set(key, h); }
+    if (h.length && v > h[h.length - 1].v) this.lastUp.set(key, t);
+    if (!this.since.has(key)) this.since.set(key, t);
+    h.push({ t, v });
+  }
+  prune(now) {
+    for (const [key, h] of this.hist) {
+      while (h.length && h[0].t < now - this.windowMs) h.shift();
+      if (!h.length) this.hist.delete(key);
+    }
+  }
+  // key -> growth per second times `scale`, for keys seen twice in the window.
+  perSecond(scale) {
+    const out = {};
+    for (const [key, h] of this.hist) {
+      const dt = h.length > 1 ? (h[h.length - 1].t - h[0].t) / 1000 : 0;
+      if (dt > 0) out[key] = (h[h.length - 1].v - h[0].v) / dt * scale;
+    }
+    return out;
+  }
+}
+
+const minerRates  = new Rates(HASHRATE_WINDOW_MS);  // addrKey -> lifetime accepted shares
+const workerRates = new Rates(HASHRATE_WINDOW_MS);  // addrKey + worker -> its accepted shares
+const mwRates     = new Rates(HASHRATE_WINDOW_MS);  // midwimble address -> its score
+let lastTotalScore = null;              // total active shares at the last poll
 
 let displayPoolHashrate   = 0;          // Number (N/s), 60s rolling average
 let displayMinerHashrates = {};         // addrKey -> Number, 60s rolling average
+let displayWorkerHashrates = {};        // workerKey -> Number
+let displayMwHashrates    = {};         // midwimble address -> Number
 
 let shareTargetBig    = 0n;
 let expectedSharesBig = 0n;             // expected pool shares to find one block
@@ -500,6 +633,7 @@ let networkHashrate   = 0;              // Number (N/s)
 const poolHist  = [];                   // [{t, v}]
 const netHist   = [];                   // [{t, v}]
 const minerHist = {};                   // addrKey -> [{t, v}]
+const mwHist    = {};                   // midwimble address -> [{t, v}]
 
 const charts = {};                      // id -> Chart instance
 const haveChart = (typeof Chart !== 'undefined');
@@ -623,7 +757,7 @@ function pagerFor(id, opts) {
   const body = $(id);
   let p = pagers[id];
   if (p && p.body === body) return p;
-  p = pagers[id] = { body, page: 0, query: '', size: opts.size, scope: null, items: [], hits: [], opts };
+  p = pagers[id] = { body, page: 0, query: '', size: opts.size, sort: null, scope: null, items: [], hits: [], opts };
   try {
     const saved = Number(localStorage.getItem('midstate-pool-rows:' + id));
     if (PAGE_SIZES.includes(saved)) p.size = saved;
@@ -631,11 +765,14 @@ function pagerFor(id, opts) {
 
   p.bar = document.createElement('div');
   p.bar.className = 'tbl-bar';
-  p.bar.innerHTML = '<input type="search" class="tbl-search" spellcheck="false" autocomplete="off"><span class="tbl-count"></span>';
+  p.bar.innerHTML = '<input type="search" class="tbl-search" spellcheck="false" autocomplete="off">' +
+    '<button type="button" class="btn-verify tbl-mine" hidden>&#9733; my row</button>' +
+    '<span class="tbl-count"></span>';
   p.input = p.bar.querySelector('input');
   p.input.placeholder = opts.placeholder;
   p.input.setAttribute('aria-label', opts.placeholder);
   p.count = p.bar.querySelector('.tbl-count');
+  p.mineBtn = p.bar.querySelector('.tbl-mine');
 
   p.nav = document.createElement('div');
   p.nav.className = 'tbl-nav';
@@ -675,7 +812,39 @@ function pagerFor(id, opts) {
     const top = p.bar.hidden ? scroll : p.bar;
     if (top.getBoundingClientRect().top < 0) top.scrollIntoView({ block: 'start' });
   });
+  // Sorting: a column with data-sort sorts by opts.sorts[that key], most
+  // first (least first for a column in opts.ascFirst, such as names), and
+  // the other way on the next click; "#" goes back to rank order.
+  const head = body.closest('table').tHead;
+  if (head) head.addEventListener('click', (ev) => {
+    const th = ev.target.closest('th[data-sort]');
+    if (!th || !p.opts.sorts) return;
+    const key = th.dataset.sort;
+    const firstDesc = !(p.opts.ascFirst || []).includes(key);
+    p.sort = (key === 'rank' || !p.opts.sorts[key]) ? null
+      : (p.sort && p.sort.key === key) ? { key, desc: !p.sort.desc } : { key, desc: firstDesc };
+    p.page = 0;
+    drawPage(p);
+  });
+  // "My row": the page with the pinned address on it, search cleared.
+  p.mineBtn.addEventListener('click', () => {
+    p.query = p.input.value = '';
+    const all = sorted(p, p.items);
+    const at = p.opts.mine ? all.findIndex(p.opts.mine) : -1;
+    if (at < 0) return;
+    p.page = Math.floor(at / p.size);
+    drawPage(p);
+    const row = p.body.querySelector('tr.mine');
+    if (row) row.scrollIntoView({ block: 'center' });
+  });
   return p;
+}
+
+// `list` in the pager's chosen order (or as given, for rank order).
+function sorted(p, list) {
+  const cmp = p.sort && p.opts.sorts && p.opts.sorts[p.sort.key];
+  if (!cmp) return list;
+  return list.slice().sort((a, b) => (p.sort.desc ? cmp(b, a) : cmp(a, b)));
 }
 
 // Draws `items` into the table body `id`, a page at a time. `opts`:
@@ -686,6 +855,8 @@ function pagerFor(id, opts) {
 //   size, noun     the page size first shown, and what a row is
 //   placeholder    the search box's hint
 //   enter(hits, q) what Enter in the search box does, if anything
+//   sorts          column key -> comparator, for th[data-sort] (optional)
+//   mine(item)     whether the row is the pinned address, for "my row"
 //   scope          what the rows belong to (the miner a miner page shows):
 //                  another scope starts over, search and page
 function renderPaged(id, items, opts) {
@@ -707,9 +878,9 @@ function drawPage(p) {
   const raw = p.query.trim().toLowerCase();
   const byHeight = raw.startsWith('#') && !!opts.height;
   const q = byHeight ? raw.slice(1) : raw.replace(/^#/, '');
-  const hits = p.hits = !q ? items : items.filter((it) => byHeight
+  const hits = p.hits = sorted(p, !q ? items : items.filter((it) => byHeight
     ? String(opts.height(it) == null ? '' : opts.height(it)).startsWith(q)
-    : opts.text(it).includes(q));
+    : opts.text(it).includes(q)));
   const pages = Math.max(1, Math.ceil(hits.length / p.size));
   p.page = Math.min(Math.max(0, p.page), pages - 1);
   const from = p.page * p.size;
@@ -728,17 +899,29 @@ function drawPage(p) {
   const [first, prev, next, last] = p.nav.querySelectorAll('button');
   first.disabled = prev.disabled = p.page === 0;
   next.disabled = last.disabled = p.page >= pages - 1;
+  // The pinned address's row, when it's in the table but not on screen.
+  const mineAt = opts.mine ? hits.findIndex(opts.mine) : -1;
+  const mineHere = mineAt >= from && mineAt < from + p.size;
+  p.mineBtn.hidden = !opts.mine || mineHere || !items.some(opts.mine);
+  if (p.mineBtn.hidden === false) p.bar.hidden = false;
+  const head = p.body.closest('table').tHead;
+  if (head) head.querySelectorAll('th[data-sort]').forEach((th) => {
+    const on = p.sort && p.sort.key === th.dataset.sort;
+    th.classList.toggle('sorted-desc', !!on && p.sort.desc);
+    th.classList.toggle('sorted-asc', !!on && !p.sort.desc);
+  });
 }
 
-// A block's payees, cut to the first few (and any the search names), with a
-// button for the rest. Which lists are open survives the refresh.
+// A block's payees, cut to the first few (and any the search names, or
+// `keep` keeps: the pinned address), with a button for the rest. Which
+// lists are open survives the refresh.
 const PAY_PREVIEW = 5;
 const openPayLists = new Set();
-function payList(key, list, q, one) {
+function payList(key, list, q, one, keep) {
   const named = (p) => !!q && String(p.address).toLowerCase().includes(q);
   if (list.length <= PAY_PREVIEW + 1) return list.map((p) => one(p, named(p))).join('');
   const open = openPayLists.has(key);
-  const shown = open ? list : list.filter((p, i) => i < PAY_PREVIEW || named(p));
+  const shown = open ? list : list.filter((p, i) => i < PAY_PREVIEW || named(p) || (!!keep && keep(p)));
   const rest = list.length - shown.length;
   const more = open ? 'show fewer' : (rest > 0 ? ('+' + fmtInt(rest) + ' more') : '');
   return shown.map((p) => one(p, named(p))).join('') +
@@ -760,6 +943,118 @@ function openMinerSearch(hits, typed) {
   const address = hits.length === 1 ? hits[0].m.address : (addrKey(typed).length === 64 ? typed : null);
   if (address) location.hash = '#/miner/' + encodeURIComponent(address);
 }
+
+// The same for the midwimble score table, and midwimble address pages.
+function openMwSearch(hits, typed) {
+  const address = hits.length === 1 ? hits[0].s.address : (/^mw1[0-9a-z]{20,}$/i.test(typed) ? typed : null);
+  if (address) location.hash = '#/mw/' + encodeURIComponent(address);
+}
+const mwHref = (address) => '#/mw/' + encodeURIComponent(address);
+
+// ---------------------------------------------------------------------------
+// "Pin as mine": the viewer's own addresses, kept in this browser only. They
+// get a link at the top, a marked row in each table, and stay in view in a
+// block's cut list of payees.
+// ---------------------------------------------------------------------------
+const PIN_STORE = { miner: 'midstate-pool-mine', mw: 'midstate-pool-mine-mw' };
+const pins = { miner: '', mw: '' };
+Object.keys(PIN_STORE).forEach((k) => { try { pins[k] = localStorage.getItem(PIN_STORE[k]) || ''; } catch (e) {} });
+
+function setPin(kind, address) {
+  pins[kind] = address || '';
+  try {
+    if (address) localStorage.setItem(PIN_STORE[kind], address);
+    else localStorage.removeItem(PIN_STORE[kind]);
+  } catch (e) {}
+  renderRoute();
+}
+const isMyMiner = (address) => !!pins.miner && addrKey(address) === addrKey(pins.miner);
+const isMyMw = (address) => !!pins.mw && address === pins.mw;
+const youTag = '<span class="you-tag">you</span>';
+
+function renderPins() {
+  const links = [];
+  if (pins.miner) links.push('<a class="mine-link" href="#/miner/' + encodeURIComponent(pins.miner) + '" title="' + esc(pins.miner) + '">&#9733; MY MINER</a>');
+  if (pins.mw) links.push('<a class="mine-link" href="' + mwHref(pins.mw) + '" title="' + esc(pins.mw) + '">&#9733; MY MDW</a>');
+  $('h-mine').innerHTML = links.join(' &nbsp;');
+  $('h-mine').hidden = !links.length;
+}
+
+// A page's pin button, for `address` of `kind`.
+function pinButton(id, kind, address) {
+  const btn = $(id);
+  const on = kind === 'miner' ? isMyMiner(address) : isMyMw(address);
+  btn.innerHTML = on ? '&#9733; pinned as mine' : '&#9734; pin as mine';
+  btn.onclick = () => setPin(kind, on ? '' : address);
+}
+
+// ---------------------------------------------------------------------------
+// Durations, MDW, and what the next midwimble block pays (client-side, from
+// the score table the pool already sends)
+// ---------------------------------------------------------------------------
+function fmtDuration(secs) {
+  if (secs == null || !isFinite(secs) || secs <= 0) return '--';
+  if (secs < 90) return Math.round(secs) + 's';
+  const m = Math.round(secs / 60);
+  if (m < 90) return m + 'm';
+  const h = Math.floor(m / 60);
+  if (h < 48) return h + 'h ' + String(m % 60).padStart(2, '0') + 'm';
+  return Math.floor(h / 24) + 'd ' + (h % 24) + 'h';
+}
+
+// Seconds to a hash under `target` at `hashrate`, on average.
+function expectedSecs(target, hashrate) {
+  if (!(hashrate > 0) || !(target > 0n)) return null;
+  return Number(TWO256 / target) / hashrate;
+}
+
+const MDW_COIN = 1e8;                   // midwimble's base units per MDW
+function fmtMdw(units) {
+  if (!(units > 0) || !isFinite(units)) return '--';
+  const v = units / MDW_COIN;
+  return (v >= 1000 ? v.toLocaleString('en-US', { maximumFractionDigits: 0 })
+    : v.toLocaleString('en-US', { maximumSignificantDigits: 4 })) + ' MDW';
+}
+
+// What the next midwimble block pays each address, the pool's way (allocate
+// in pool.rs): of the reward after the fee, an address with 1/31 of the
+// score or more is paid its share exactly. The others share the outputs
+// left, each worth an equal cut, by systematic sampling: an address is paid
+// one (or more) with a chance in proportion to its score. Amounts need the
+// block's reward, which an older pool doesn't send; chances don't.
+const MW_SLOTS = 31;
+function mwNextBlock(mw, feePercent) {
+  const scores = (mw && mw.scores) || [];
+  const total = scores.reduce((a, s) => a + (Number(s.score) || 0), 0);
+  const pot = (Number(mw && mw.reward) || 0) * (1 - (Number(feePercent) || 0) / 100);
+  const by = new Map();
+  let exactPaid = 0, exactCount = 0, smallWeight = 0;
+  scores.forEach((s) => {
+    const w = Number(s.score) || 0;
+    if (w > 0 && w * MW_SLOTS >= total) { exactCount++; exactPaid += pot * w / total; }
+    else if (w > 0) smallWeight += w;
+  });
+  const slots = MW_SLOTS - exactCount;
+  const slot = slots > 0 ? (pot - exactPaid) / slots : 0;
+  scores.forEach((s) => {
+    const w = Number(s.score) || 0;
+    if (!(w > 0)) return;
+    if (w * MW_SLOTS >= total) by.set(s.address, { exact: true, amount: pot * w / total });
+    else by.set(s.address, { exact: false, chance: Math.min(1, slots * w / smallWeight), slot });
+  });
+  return { by, pot };
+}
+
+function nextBlockCell(nb) {
+  if (!nb) return '--';
+  if (nb.exact) return nb.amount > 0 ? fmtMdw(nb.amount) : 'paid exactly';
+  const pct = nb.chance * 100;
+  return (pct >= 10 ? pct.toFixed(0) : pct.toFixed(pct >= 1 ? 1 : 2)) + '% chance' +
+    (nb.slot > 0 ? '<div class="card-sub">' + fmtMdw(nb.slot) + ' if drawn</div>' : '');
+}
+
+const workerKey = (w) => addrKey(w.address) + '/' + String(w.worker || 'default');
+const IDLE_MS = 10 * 60 * 1000;         // a rig with no share this long is idle
 
 // ---------------------------------------------------------------------------
 // Derived metrics (all client-side from data the backend already sends)
@@ -1109,40 +1404,28 @@ async function fetchStats() {
     hashesPerShareBig = shareTargetBig > 0n ? (TWO256 / shareTargetBig) : 0n;
     networkHashrate = netBig > 0n ? (Number(TWO256 / netBig) / blockTime) : 0;
 
-    // ---- 60-second rolling-average hashrate ----
-    // Share submissions are Poisson, so a raw 5s delta spikes and craters between polls.
-    // Instead, diff the newest snapshot against the oldest one still inside a 60s window.
+    // ---- 60-second rolling-average hashrates ----
+    // Share submissions are Poisson, so a raw 5s delta spikes and craters
+    // between polls: each rate is the growth over the last 60s instead. Every
+    // accepted share is one point, so a miner's lifetime accepted count gives
+    // its rate, and those never fall when a block lands (active shares do,
+    // for everyone, which used to blank every rate for a minute after each
+    // block). A rig's accepted count and a midwimble address's score work the
+    // same way; a count that does fall starts only its own key over.
     const now = Date.now();
-    const snap = { t: now, total: BigInt(data.total_score), miners: {} };
-    (data.miners || []).forEach((m) => { snap.miners[addrKey(m.address)] = BigInt(m.score); });
-
-    // Block-find reset: scores are deducted when a block lands, so total_score drops.
-    // Flush the buffer so the rate cleanly falls to 0 and rebuilds over the next 60s
-    // (which doubles as a visual "block just hit" indicator).
-    const prevSnap = snapshots.length ? snapshots[snapshots.length - 1] : null;
-    if (prevSnap && snap.total < prevSnap.total) snapshots = [];
-
-    snapshots.push(snap);
-    while (snapshots.length && snapshots[0].t < now - HASHRATE_WINDOW_MS) snapshots.shift();
-
-    const oldest = snapshots[0];
-    const newest = snapshots[snapshots.length - 1];
-    const dt = (newest.t - oldest.t) / 1000;
-    if (snapshots.length >= 2 && dt > 0 && hashesPerShareBig > 0n) {
-      const dPool = newest.total - oldest.total;
-      displayPoolHashrate = dPool > 0n ? Number(dPool * hashesPerShareBig) / dt : 0;
-      const hr = {};
-      Object.keys(newest.miners).forEach((k) => {
-        const o = oldest.miners[k] || 0n;
-        const d = newest.miners[k] - o;
-        hr[k] = d > 0n ? Number(d * hashesPerShareBig) / dt : 0;
-      });
-      displayMinerHashrates = hr;
-    } else {
-      // One snapshot only (fresh start or just after a block) -> rate is still rebuilding.
-      displayPoolHashrate = 0;
-      displayMinerHashrates = {};
-    }
+    const hps = Number(hashesPerShareBig);
+    (data.miners || []).forEach((m) => {
+      minerRates.observe(addrKey(m.address), Number(m.accepted != null ? m.accepted : m.score) || 0, now);
+    });
+    (data.workers || []).forEach((w) => workerRates.observe(workerKey(w), Number(w.score) || 0, now));
+    ((data.midwimble && data.midwimble.scores) || []).forEach((s) => mwRates.observe(s.address, Number(s.score) || 0, now));
+    [minerRates, workerRates, mwRates].forEach((r) => r.prune(now));
+    displayMinerHashrates = minerRates.perSecond(hps);
+    displayWorkerHashrates = workerRates.perSecond(hps);
+    displayMwHashrates = mwRates.perSecond(hps);
+    // The pool's rate: every miner's, including one whose active shares went
+    // to a block a moment ago and isn't listed until its next share.
+    displayPoolHashrate = Object.values(displayMinerHashrates).reduce((a, v) => a + Math.max(0, v), 0);
 
     // ---- 10-minute rolling chart history (consumes the smoothed values) ----
     poolHist.push({ t: now, v: displayPoolHashrate });
@@ -1151,15 +1434,18 @@ async function fetchStats() {
       const k = addrKey(m.address);
       (minerHist[k] = minerHist[k] || []).push({ t: now, v: displayMinerHashrates[k] || 0 });
     });
+    ((data.midwimble && data.midwimble.scores) || []).forEach((s) => {
+      (mwHist[s.address] = mwHist[s.address] || []).push({ t: now, v: displayMwHashrates[s.address] || 0 });
+    });
 
     const cutoff = now - WINDOW_MS;
     while (poolHist.length && poolHist[0].t < cutoff) poolHist.shift();
     while (netHist.length && netHist[0].t < cutoff) netHist.shift();
-    Object.keys(minerHist).forEach((k) => {
-      const a = minerHist[k];
+    [minerHist, mwHist].forEach((hist) => Object.keys(hist).forEach((k) => {
+      const a = hist[k];
       while (a.length && a[0].t < cutoff) a.shift();
-      if (!a.length) delete minerHist[k];
-    });
+      if (!a.length) delete hist[k];
+    }));
 
     // ---- block-found detection (banner + activity log) ----
     const recent = data.recent_blocks || [];
@@ -1190,10 +1476,11 @@ async function fetchStats() {
     lastMwFound = mwFound;
 
     // ---- share-gain activity ----
-    if (prevSnap && snap.total > prevSnap.total) {
-      const gained = Number(snap.total - prevSnap.total);
-      pushActivity('share', '+' + fmtInt(gained) + ' shares \u00b7 pool score ' + fmtInt(Number(snap.total)));
+    const totalScore = Number(data.total_score) || 0;
+    if (lastTotalScore != null && totalScore > lastTotalScore) {
+      pushActivity('share', '+' + fmtInt(totalScore - lastTotalScore) + ' shares \u00b7 pool score ' + fmtInt(totalScore));
     }
+    lastTotalScore = totalScore;
 
     // ---- continuous global fairness audit (top miner vs published root) ----
     auditTopMiner(data);
@@ -1213,6 +1500,8 @@ function currentRoute() {
   const h = location.hash.replace(/^#/, '');
   const m = h.match(/^\/miner\/(.+)$/);
   if (m) return { view: 'miner', address: decodeURIComponent(m[1]) };
+  const w = h.match(/^\/mw\/(.+)$/);
+  if (w) return { view: 'mw', address: decodeURIComponent(w[1]) };
   return { view: 'pool' };
 }
 
@@ -1220,9 +1509,12 @@ function renderRoute() {
   const r = currentRoute();
   $('view-pool').hidden  = (r.view !== 'pool');
   $('view-miner').hidden = (r.view !== 'miner');
+  $('view-mw').hidden    = (r.view !== 'mw');
+  renderPins();
   if (!latest) return;
   if (r.view === 'pool') renderPool(latest);
-  else renderMiner(latest, r.address);
+  else if (r.view === 'miner') renderMiner(latest, r.address);
+  else renderMwAddress(latest, r.address);
 }
 
 // ---------------------------------------------------------------------------
@@ -1243,7 +1535,6 @@ function renderPool(data) {
   $('m-net-hr').textContent = formatHashrate(networkHashrate);
   $('m-pool-hr').textContent = formatHashrate(displayPoolHashrate);
   const sharePct = networkHashrate > 0 ? (displayPoolHashrate / networkHashrate * 100) : 0;
-  $('m-pool-share').textContent = 'share of network ' + sharePct.toFixed(2) + '%';
 
   const eff = effortPct(data.total_score, expectedSharesBig);
   const st = effortStyle(eff);
@@ -1282,16 +1573,34 @@ function renderPool(data) {
     : 0;
   $('s-cpd').textContent = cpd > 0 ? fmtInt(cpd) : '--';
 
+  // How often the pool finds a block, on average, at its live hashrate (or,
+  // while that is still building, its last hour's).
+  const etaRate = displayPoolHashrate > 0 ? displayPoolHashrate : (hr1h || 0);
+  const every = expectedSecs(targetBig(data.network_target), etaRate);
+  $('m-pool-share').textContent = 'share of network ' + sharePct.toFixed(2) + '%' +
+    (every != null ? ' · a block every ~' + fmtDuration(every) : '');
+
   renderTicker();
 
-  // Leaderboard: ranked by active shares, a page at a time.
+  // Leaderboard: ranked by active shares, a page at a time, sortable.
   const miners = (data.miners || []).map((m, i) => ({ m, rank: i + 1 }));
+  const minerHr = (r) => displayMinerHashrates[addrKey(r.m.address)] || 0;
+  const minerEff = (r) => {
+    const acc = Number(r.m.accepted) || 0, sub = acc + (Number(r.m.rejected) || 0);
+    return sub > 0 ? acc / sub : -1;
+  };
   renderPaged('miners-table', miners, {
     cols: 6, size: 25, noun: 'miners',
     placeholder: 'Search miner address — Enter opens its page',
     empty: '<tr class="empty-row"><td colspan="6">No active shares yet. Waiting for hashes...</td></tr>',
     text: (r) => String(r.m.address).toLowerCase(),
     enter: openMinerSearch,
+    mine: (r) => isMyMiner(r.m.address),
+    sorts: {
+      hashrate: (a, b) => minerHr(a) - minerHr(b),
+      shares: (a, b) => (Number(a.m.score) || 0) - (Number(b.m.score) || 0),
+      efficiency: (a, b) => minerEff(a) - minerEff(b),
+    },
     row: ({ m, rank }) => {
       const k = addrKey(m.address);
       const hr = displayMinerHashrates[k] || 0;
@@ -1301,9 +1610,10 @@ function renderPool(data) {
       const effCell = sub > 0
         ? (((acc / sub) * 100).toFixed(1) + '%' + (rej > 0 ? '<div class="card-sub">' + fmtInt(rej) + ' rejected</div>' : ''))
         : '--';
-      return '<tr>' +
+      const mine = isMyMiner(m.address);
+      return '<tr' + (mine ? ' class="mine"' : '') + '>' +
         '<td class="num rank">' + fmtInt(rank) + '</td>' +
-        '<td><a class="addr" href="' + href + '" title="' + esc(m.address) + '">' + esc(shortAddr(m.address)) + '</a></td>' +
+        '<td><a class="addr" href="' + href + '" title="' + esc(m.address) + '">' + esc(shortAddr(m.address)) + '</a>' + (mine ? youTag : '') + '</td>' +
         '<td class="num">' + formatHashrate(hr) + '</td>' +
         '<td class="num">' + fmtInt(m.score) + '</td>' +
         '<td class="num">' + pct.toFixed(2) + '%</td>' +
@@ -1339,12 +1649,13 @@ function renderPool(data) {
       const listKey = 'block:' + (b.block_ts != null ? b.block_ts : (b.hash || b.timestamp));
       const paidRows = payList(listKey, agg, q, (p, hit) => {
         const isFee = addrKey(p.address) === poolKey;
+        const mine = isMyMiner(p.address);
         const href = '#/miner/' + encodeURIComponent(p.address);
         const label = isFee
           ? ('<span class="addr">' + esc(shortAddr(p.address)) + '</span><span class="fee-tag">pool fee</span>')
-          : ('<a class="addr" href="' + href + '" title="' + esc(p.address) + '">' + esc(shortAddr(p.address)) + '</a>');
-        return '<div class="pay' + (hit ? ' hit' : '') + '">' + label + '<span class="amt">' + fmtInt(p.value) + '</span></div>';
-      }) || '--';
+          : ('<span><a class="addr" href="' + href + '" title="' + esc(p.address) + '">' + esc(shortAddr(p.address)) + '</a>' + (mine ? youTag : '') + '</span>');
+        return '<div class="pay' + (hit ? ' hit' : '') + (mine ? ' mine' : '') + '">' + label + '<span class="amt">' + fmtInt(p.value) + '</span></div>';
+      }, (p) => isMyMiner(p.address)) || '--';
       const verifyBtn = (b.block_ts != null)
         ? '<button class="btn-verify" onclick="verifyBlockSplit(' + Number(b.block_ts) + ', this)">verify split</button>'
         : '';
@@ -1395,19 +1706,42 @@ function renderMidwimble(data) {
   $('mw-miners').textContent = fmtInt(scores.length);
   $('mw-shares').textContent = fmtInt(total) + ' shares toward the next block';
 
-  const label = (addr) => '<span class="addr" title="' + esc(addr) + '">' + esc(shortAddr(addr)) + '</span>' +
-    (addr === mw.pool_address ? '<span class="fee-tag">pool</span>' : '');
+  // What the next block pays, after the fee, and how often the pool finds
+  // one: a share under midwimble's target is a midwimble block too.
+  const next = mwNextBlock(mw, data.midwimble_fee_percent);
+  $('mw-reward').textContent = next.pot > 0 ? fmtMdw(next.pot) : '--';
+  const every = mw.active ? expectedSecs(targetBig(mw.target), displayPoolHashrate) : null;
+  $('mw-eta').textContent = every != null
+    ? ('after the pool’s fee · one every ~' + fmtDuration(every))
+    : 'after the pool’s fee';
 
-  renderPaged('mw-scores', scores, {
-    cols: 3, size: 25, noun: 'addresses',
-    placeholder: 'Search midwimble address',
-    empty: '<tr class="empty-row"><td colspan="3">No midwimble shares yet.</td></tr>',
-    text: (s) => String(s.address).toLowerCase(),
-    row: (s) => {
+  // Each address links to its own page.
+  const label = (addr) => '<a class="addr" href="' + mwHref(addr) + '" title="' + esc(addr) + '">' + esc(shortAddr(addr)) + '</a>' +
+    (addr === mw.pool_address ? '<span class="fee-tag">pool</span>' : '') +
+    (isMyMw(addr) ? youTag : '');
+
+  const ranked = scores.map((s, i) => ({ s, rank: i + 1 }));
+  const mwHr = (r) => displayMwHashrates[r.s.address] || 0;
+  renderPaged('mw-scores', ranked, {
+    cols: 6, size: 25, noun: 'addresses',
+    placeholder: 'Search midwimble address — Enter opens its page',
+    empty: '<tr class="empty-row"><td colspan="6">No midwimble shares yet.</td></tr>',
+    text: (r) => String(r.s.address).toLowerCase(),
+    enter: openMwSearch,
+    mine: (r) => isMyMw(r.s.address),
+    sorts: {
+      hashrate: (a, b) => mwHr(a) - mwHr(b),
+      shares: (a, b) => (Number(a.s.score) || 0) - (Number(b.s.score) || 0),
+    },
+    row: ({ s, rank }) => {
       const pct = total > 0 ? (Number(s.score) / total * 100) : 0;
-      return '<tr><td>' + label(s.address) + '</td>' +
+      return '<tr' + (isMyMw(s.address) ? ' class="mine"' : '') + '>' +
+        '<td class="num rank">' + fmtInt(rank) + '</td>' +
+        '<td>' + label(s.address) + '</td>' +
+        '<td class="num">' + formatHashrate(displayMwHashrates[s.address] || 0) + '</td>' +
         '<td class="num">' + fmtInt(s.score) + '</td>' +
-        '<td class="num">' + pct.toFixed(2) + '%</td></tr>';
+        '<td class="num">' + pct.toFixed(2) + '%</td>' +
+        '<td class="num">' + nextBlockCell(next.by.get(s.address)) + '</td></tr>';
     },
   });
 
@@ -1422,8 +1756,8 @@ function renderMidwimble(data) {
       const sum = pays.reduce((a, p) => a + (Number(p.weight) || 0), 0);
       const paid = payList('mw:' + (b.midstate_block || b.timestamp), pays, q, (p, hit) => {
         const pct = sum > 0 ? (Number(p.weight) / sum * 100) : 0;
-        return '<div class="pay' + (hit ? ' hit' : '') + '"><span>' + label(p.address) + '</span><span class="amt">' + pct.toFixed(2) + '%</span></div>';
-      }) || '--';
+        return '<div class="pay' + (hit ? ' hit' : '') + (isMyMw(p.address) ? ' mine' : '') + '"><span>' + label(p.address) + '</span><span class="amt">' + pct.toFixed(2) + '%</span></div>';
+      }, (p) => isMyMw(p.address)) || '--';
       // Settling, or replaced on midwimble (its scores went back to the
       // table, for the next block to pay).
       const state = b.status === 'orphaned'
@@ -1511,18 +1845,38 @@ function renderMiner(data, address) {
   const myWorkers = (data.workers || []).filter((w) => addrKey(w.address) === key);
   myWorkers.sort((a, b) => (Number(b.score) || 0) - (Number(a.score) || 0));
   const wtot = myWorkers.reduce((a, w) => a + (Number(w.score) || 0), 0);
+  // A rig's live rate is its accepted count's growth; its last share is
+  // when this page last saw that count grow. A rig this page has watched
+  // for IDLE_MS without a share is idle.
+  const nowMs = Date.now();
+  const rigHr = (w) => displayWorkerHashrates[workerKey(w)] || 0;
+  const lastUp = (w) => workerRates.lastUp.get(workerKey(w)) || 0;
+  const quiet = (w) => nowMs - (lastUp(w) || workerRates.since.get(workerKey(w)) || nowMs);
+  const idle = (w) => quiet(w) >= IDLE_MS;
   renderPaged('mn-workers', myWorkers, {
-    scope: key, cols: 3, size: 25, noun: 'workers',
+    scope: key, cols: 5, size: 25, noun: 'workers',
     placeholder: 'Search worker name',
-    empty: '<tr class="empty-row"><td colspan="3">No worker data yet for this address.</td></tr>',
+    empty: '<tr class="empty-row"><td colspan="5">No worker data yet for this address.</td></tr>',
     text: (w) => String(w.worker || 'default').toLowerCase(),
+    ascFirst: ['name'],
+    sorts: {
+      name: (a, b) => String(a.worker || 'default').localeCompare(String(b.worker || 'default'), 'en', { numeric: true }),
+      hashrate: (a, b) => rigHr(a) - rigHr(b),
+      shares: (a, b) => (Number(a.score) || 0) - (Number(b.score) || 0),
+      last: (a, b) => lastUp(a) - lastUp(b),
+    },
     row: (w) => {
       const c = Number(w.score) || 0;
       const p = wtot > 0 ? (c / wtot * 100) : 0;
+      const up = lastUp(w);
+      const last = up ? relAge(up / 1000)
+        : (idle(w) ? 'none in ' + fmtDuration(quiet(w) / 1000) : '\u2014');
       return '<tr>' +
         '<td class="mono">' + esc(w.worker || 'default') + '</td>' +
+        '<td class="num">' + formatHashrate(rigHr(w)) + '</td>' +
         '<td class="num">' + fmtInt(c) + '</td>' +
         '<td class="num">' + p.toFixed(1) + '%</td>' +
+        '<td class="num">' + (idle(w) ? '<span class="idle-tag">idle</span>' : '') + last + '</td>' +
       '</tr>';
     },
   });
@@ -1530,13 +1884,139 @@ function renderMiner(data, address) {
     $('mn-workers-note').textContent = '';
   } else {
     const distinct = new Set(myWorkers.map((w) => w.worker)).size;
-    $('mn-workers-note').textContent = distinct <= 1
+    const idleCount = myWorkers.filter(idle).length;
+    $('mn-workers-note').textContent = (distinct <= 1
       ? 'Lifetime accepted shares per rig. Every miner currently reports under one name \u2014 pass --worker <name> on each rig to tell them apart here.'
-      : 'Lifetime accepted shares per rig, since the pool last started.';
+      : 'Lifetime accepted shares per rig, since the pool last started.') +
+      (idleCount ? (' ' + fmtInt(idleCount) + ' of ' + fmtInt(myWorkers.length) + ' rigs idle: no share in the ' + fmtDuration(IDLE_MS / 1000) + ' this page has watched.') : '');
   }
+  pinButton('mn-pin', 'miner', address);
 
   renderMinerHrChart(key);
   renderMinerEarnChart(events);
+}
+
+// ---------------------------------------------------------------------------
+// View C: a midwimble address. Every share mined with it as the
+// --midwimble-address earns it a point, whichever midstate address mined it.
+// ---------------------------------------------------------------------------
+function renderMwAddress(data, address) {
+  $('mwa-addr').textContent = address;
+  pinButton('mwa-pin', 'mw', address);
+  const mw = data.midwimble;
+  $('mwa-pool').hidden = !(mw && address === mw.pool_address);
+  if (!mw) {
+    ['mwa-hr', 'mwa-score', 'mwa-next', 'mwa-day', 'mwa-paid'].forEach((id) => { $(id).textContent = '--'; });
+    $('mwa-next-sub').textContent = 'this pool does not merge-mine midwimble';
+    return;
+  }
+  const scores = mw.scores || [];
+  const at = scores.findIndex((s) => s.address === address);
+  const score = at >= 0 ? (Number(scores[at].score) || 0) : 0;
+  const total = Number(mw.total_score) || 0;
+  const hr = displayMwHashrates[address] || 0;
+  const next = mwNextBlock(mw, data.midwimble_fee_percent);
+  const nb = next.by.get(address);
+
+  $('mwa-hr').textContent = formatHashrate(hr);
+  $('mwa-score').textContent = fmtInt(score);
+  $('mwa-rank').textContent = at >= 0
+    ? ((total > 0 ? (score / total * 100).toFixed(2) + '% of the next block · ' : '') +
+       '#' + fmtInt(at + 1) + ' of ' + fmtInt(scores.length))
+    : 'none toward the next block yet';
+
+  // Paid exactly, or drawn: see mwNextBlock.
+  if (!nb) {
+    $('mwa-next').textContent = '--';
+    $('mwa-next-sub').textContent = 'no shares toward it yet';
+  } else if (nb.exact) {
+    $('mwa-next').textContent = nb.amount > 0 ? fmtMdw(nb.amount) : 'paid exactly';
+    $('mwa-next-sub').textContent = 'its share, exactly: it holds 1/' + MW_SLOTS + ' of the shares or more';
+  } else {
+    const pct = nb.chance * 100;
+    $('mwa-next').textContent = (pct >= 10 ? pct.toFixed(0) : pct.toFixed(pct >= 1 ? 1 : 2)) + '% chance';
+    $('mwa-next-sub').textContent = (nb.slot > 0 ? 'of an output of ' + fmtMdw(nb.slot) + '. ' : '') +
+      'Under 1/' + MW_SLOTS + ' of the shares, outputs are drawn by shares.';
+  }
+
+  // A day's worth: each of its hashes has a chance of being a midwimble block
+  // (target over 2^256), and on average it is paid its share of each block.
+  const mwTarget = targetBig(mw.target);
+  const perDay = (next.pot > 0 && mwTarget > 0n && hr > 0) ? hr * 86400 / Number(TWO256 / mwTarget) * next.pot : 0;
+  $('mwa-day').textContent = perDay > 0 ? fmtMdw(perDay) : '--';
+
+  // The recent blocks that paid it, with its share of each.
+  const blocks = mw.recent_blocks || [];
+  const paid = blocks.map((b) => {
+    const pays = b.payouts || [];
+    const sum = pays.reduce((a, p) => a + (Number(p.weight) || 0), 0);
+    const own = pays.filter((p) => p.address === address).reduce((a, p) => a + (Number(p.weight) || 0), 0);
+    return { b, share: sum > 0 ? own / sum : 0 };
+  }).filter((e) => e.share > 0);
+  $('mwa-paid').textContent = fmtInt(paid.length);
+  $('mwa-paid-sub').textContent = 'of the last ' + fmtInt(blocks.length) + ' midwimble blocks';
+  renderPaged('mwa-blocks', paid, {
+    scope: address, cols: 3, size: 10, noun: 'blocks',
+    placeholder: 'Search #height',
+    empty: '<tr class="empty-row"><td colspan="3">None of the recent midwimble blocks paid this address.</td></tr>',
+    text: (e) => String(e.b.height),
+    height: (e) => e.b.height,
+    row: (e) => {
+      const state = e.b.status === 'orphaned'
+        ? '<span class="fee-tag" title="Midwimble replaced this block: it paid nobody, and its shares went back to the table.">orphaned</span>'
+        : e.b.status === 'pending' ? '<span class="fee-tag" title="Not settled yet.">settling</span>' : '';
+      return '<tr><td class="num">' + relAge(e.b.timestamp) + '</td>' +
+        '<td class="num">' + ((e.b.height != null) ? '#' + fmtInt(e.b.height) : '--') + state + '</td>' +
+        '<td class="num">' + (e.share * 100).toFixed(2) + '%</td></tr>';
+    },
+  });
+
+  renderMwHrChart(address);
+  renderMwPaidChart(paid);
+}
+
+function renderMwHrChart(address) {
+  if (!haveChart) return;
+  const ctx = $('chart-mwa-hr'); if (!ctx) return;
+  const hist = mwHist[address] || [];
+  const labels = hist.map((p) => timeLabel(p.t));
+  const data = hist.map((p) => p.v);
+  const pal = palette();
+  if (!charts.mwahr) {
+    charts.mwahr = new Chart(ctx, {
+      type: 'line',
+      data: { labels, datasets: [{ label: 'Hashrate', data, borderColor: pal.accent, backgroundColor: 'transparent', borderWidth: 1.5, tension: 0, pointRadius: 0, fill: false }] },
+      options: lineOpts(formatHashrate)
+    });
+  } else {
+    charts.mwahr.data.labels = labels;
+    charts.mwahr.data.datasets[0].data = data;
+    charts.mwahr.data.datasets[0].borderColor = pal.accent;
+    charts.mwahr.update('none');
+    charts.mwahr.resize();
+  }
+}
+
+function renderMwPaidChart(paid) {
+  if (!haveChart) return;
+  const ctx = $('chart-mwa-paid'); if (!ctx) return;
+  const arr = paid.slice().reverse();                   // oldest -> newest
+  const labels = arr.map((e) => (e.b.height != null ? '#' + e.b.height : relAge(e.b.timestamp)));
+  const data = arr.map((e) => Number((e.share * 100).toFixed(2)));
+  const pal = palette();
+  if (!charts.mwapaid) {
+    charts.mwapaid = new Chart(ctx, {
+      type: 'bar',
+      data: { labels, datasets: [{ label: 'Share', data, backgroundColor: pal.accent, borderWidth: 0 }] },
+      options: barOpts((v) => v + '%')
+    });
+  } else {
+    charts.mwapaid.data.labels = labels;
+    charts.mwapaid.data.datasets[0].data = data;
+    charts.mwapaid.data.datasets[0].backgroundColor = pal.accent;
+    charts.mwapaid.update('none');
+    charts.mwapaid.resize();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1651,7 +2131,12 @@ function renderVerify(panel, block, snap, poolAddr) {
     row,
   });
 }
-window.addEventListener('hashchange', renderRoute);
+window.addEventListener('hashchange', () => {
+  // A miner's or an address's page opens at its top, not wherever in the
+  // pool's tables its link was.
+  if (currentRoute().view !== 'pool') window.scrollTo(0, 0);
+  renderRoute();
+});
 
 // Rebuild charts with a fresh palette whenever the theme flips.
 new MutationObserver((muts) => {

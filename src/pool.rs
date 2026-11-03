@@ -1030,6 +1030,17 @@ async fn midwimble_stats(state: &PoolState) -> serde_json::Value {
         return serde_json::Value::Null;
     };
     let status = state.merge_status.read().await.clone();
+    // The current job's midwimble block: what it mints and its target, for
+    // the dashboard's estimates (what the next block pays each address, and
+    // how often the pool finds one). Nothing new to compute or store.
+    let (reward, target) = {
+        let job = state.current_job.read().await;
+        let merge = job.as_ref().and_then(|j| j.midwimble.as_ref());
+        (
+            merge.and_then(|m| m.reward),
+            merge.map(|m| hex::encode(m.target)),
+        )
+    };
     let mut scores = midwimble_scores(&state.db);
     scores.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     let total_score: u64 = scores.iter().map(|(_, s)| *s).sum();
@@ -1059,6 +1070,9 @@ async fn midwimble_stats(state: &PoolState) -> serde_json::Value {
         // replace: it builds on the block before them.
         "orphans": status.orphans,
         "updated": status.updated,
+        "reward": reward,
+        "target": target,
+        "fee_percent": state.midwimble_fee_percent,
         "scores": scores
             .iter()
             .map(|(address, score)| serde_json::json!({ "address": address, "score": score }))
@@ -4464,8 +4478,18 @@ mod tests {
         assert_eq!(before["blocks_found"], 0);
         assert_eq!(before["total_score"], 4);
         assert_eq!(before["scores"][0]["address"], ALICE, "highest score first");
+        assert!(
+            before["reward"].is_null() && before["target"].is_null(),
+            "no job, no block to describe"
+        );
 
         serve_winning_job(&state, 1, midwimble_scores(&db)).await;
+        // What the job's block mints, and its target: the page estimates
+        // payouts and how often the pool finds a block from them.
+        let serving = midwimble_stats(&state).await;
+        assert_eq!(serving["reward"], 23_932_616);
+        assert_eq!(serving["target"], "ff".repeat(32));
+        assert_eq!(serving["fee_percent"], state.midwimble_fee_percent);
         process_share(&state, [1; 32], "rig", Some(ALICE), 1, 11).await.unwrap();
         settled(&mock, 1).await;
 
