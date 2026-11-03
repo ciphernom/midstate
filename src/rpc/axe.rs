@@ -6,7 +6,7 @@
 //!
 //! # The board
 //!
-//! From block 420,000 midstate mines Midstate Walk, which wants AES
+//! From block 371,500 midstate mines Midstate Walk, which wants AES
 //! instructions, and the Raspberry Pi 5 is the first Pi that has them: it is
 //! the Axe's board. Older Pis still run a full node and can still be set
 //! here, within limits right for them, but they mine the Walk at a few

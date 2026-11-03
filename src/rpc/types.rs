@@ -411,7 +411,7 @@ pub struct AxeStatsResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub freq_mhz: Option<u32>,
     /// The proof of work the node mines: "blake3-chain", or "walk" (Midstate
-    /// Walk) from height 420,000.
+    /// Walk) from height 371,500.
     pub pow: String,
     /// `vcgencmd get_throttled`'s flags, where it can be read.
     #[serde(skip_serializing_if = "Option::is_none")]

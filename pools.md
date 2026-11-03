@@ -50,9 +50,9 @@ You must open/port-forward the Stratum TCP port (e.g., `3333`) on your firewall 
 
 **Browser miners.** The web wallet mines over the HTTP API: `/api/template`, `/api/submit` and `/api/proof`. The pool also serves them under `/pool/api/…`, so a reverse proxy that already forwards `/pool` (the dashboard) to the API port carries browser miners with no extra rule. A browser miner enters the pool's base URL, for example `https://your.host/pool`, and the web wallet's built-in default is `https://rpc.cypherpunk.gold/pool`. It must be HTTPS, because a wallet served over HTTPS cannot call an `http://` pool.
 
-### Midstate Walk (from block 420,000)
+### Midstate Walk (from block 371,500)
 
-From block 420,000 the proof of work is Midstate Walk (`docs/MIDSTATE_WALK.md`). Pools and miners must run the release that knows it before then:
+From block 371,500 the proof of work is Midstate Walk (`docs/MIDSTATE_WALK.md`). Pools and miners must run a release that switches at 371,500 before then (v6.0.0 to v6.1.1 switch at 420,000):
 
 - Jobs say which proof of work they take. `mining.notify` carries the block height as a fifth parameter, and the HTTP and WebRTC templates carry `height` and `pow`. A miner that predates Walk keeps mining the BLAKE3 chain, and its shares are rejected after the switch.
 - A core makes about 20 times more Walk attempts per second than BLAKE3-chain attempts, so at the same `--share-bits` it finds shares about 20 times as often. Each share is about 20 times cheaper to verify, but there are 20 times as many messages, so consider adding 4 to `--share-bits` at the switch.

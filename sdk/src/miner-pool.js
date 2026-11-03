@@ -3,7 +3,7 @@
 // # Reasoning
 //
 // Each nonce is a fixed amount of sequential work — a 1,000,000-iteration BLAKE3
-// chain (~130 ms) below height 420,000, one Midstate Walk (a few ms) from then
+// chain (~130 ms) below height 371,500, one Midstate Walk (a few ms) from then
 // on — and no amount of batching or scheduling improves a single thread. The
 // work is embarrassingly parallel though — nonces are independent — so cores
 // are the only lever. Workers are told which proof of work to run with each

@@ -1,7 +1,7 @@
 # Midstate Walk
 
 Midstate Walk is the proof of work from block `WALK_ACTIVATION_HEIGHT`
-(420,000) on. It replaces the 1,000,000-step BLAKE3 chain, which GPUs
+(371,500) on. It replaces the 1,000,000-step BLAKE3 chain, which GPUs
 dominate. The code is `src/core/walk.rs`, and its module docs hold the exact
 definition.
 
@@ -43,7 +43,7 @@ It is still hashing, so it is as post-quantum as before.
 | Scratchpad | 4,096 lines × 64 B = 256 KiB | 256 lines (16 KiB) |
 | Steps per attempt | 2^18 | 2^10 |
 | BLAKE3 re-mix | every 2^12 steps | every 2^8 |
-| Activation | height 420,000 | height 20 |
+| Activation | height 371,500 | height 20 |
 | Difficulty reset (`WALK_TARGET_SHIFT`) | 3 (target × 8 at activation) | 0 |
 
 ### Measured costs
@@ -138,9 +138,9 @@ The knobs, if that margin needs widening:
   - `pow_algo_at(height)` picks the algorithm.
   - `create_extension_at` and `verify_extension_at` route by it.
   - `apply_batch` verifies each block at its real height, so history below
-    420,000 still validates with the BLAKE3 chain.
+    371,500 still validates with the BLAKE3 chain.
 - **Difficulty.**
-  - From 420,000, ASERT's integer shift gets `WALK_TARGET_SHIFT` added. This
+  - From 371,500, ASERT's integer shift gets `WALK_TARGET_SHIFT` added. This
     is the same as moving the schedule by that many half-lives.
   - The rule stays a pure function of (height, timestamp), and ASERT corrects
     whatever error the estimate has.
@@ -226,7 +226,8 @@ outlived their template.
 3. ~~**Run `midstate bench-pow` on a Pi 5.**~~ Done: 1,545 attempts/s on four
    cores at 3.1 GHz (1,383 at 2.8 GHz).
 4. **Confirm `WALK_ACTIVATION_HEIGHT`** leaves operators enough time.
-   - 420,000 is ~46 days after height ~354,000.
+   - 371,500 is ~6.6 days after height ~362,060 (moved forward from
+     420,000; releases v6.0.0 to v6.1.1 still switch there).
    - Midwimble mirrors it as `MIDSTATE_WALK_ACTIVATION_HEIGHT` and
      `MIDSTATE_WALK_TARGET_SHIFT`. Both must change together.
 5. ~~Rebuild `wasm-wallet/pkg`, update the SDK miner, rebuild `sdk/pkg` and

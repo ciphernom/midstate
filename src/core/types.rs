@@ -921,10 +921,13 @@ pub const EXTENSION_ITERATIONS: u64 = 100;
 /// # Safety / Invariants
 /// - **Consensus-critical (hard fork):** every node must switch at exactly
 ///   this height; nodes that have not upgraded reject the first Walk block.
-/// - Scheduled about 66,000 blocks (~46 days) past the tip at the time of
-///   writing (~354,000), after `V6_ACTIVATION_HEIGHT`.
+/// - Moved forward from 420,000: scheduled about 9,400 blocks (~6.6 days)
+///   past the tip at the time of writing (~362,060), so it now activates
+///   before `V6_ACTIVATION_HEIGHT`, which it does not depend on. Releases
+///   v6.0.0 to v6.1.1 still switch at 420,000.
+/// - Midwimble mirrors it as `MIDSTATE_WALK_ACTIVATION_HEIGHT`.
 #[cfg(not(feature = "fast-mining"))]
-pub const WALK_ACTIVATION_HEIGHT: u64 = 420_000;
+pub const WALK_ACTIVATION_HEIGHT: u64 = 371_500;
 /// Test builds switch after a handful of blocks, so tests cross the boundary.
 #[cfg(feature = "fast-mining")]
 pub const WALK_ACTIVATION_HEIGHT: u64 = 20;

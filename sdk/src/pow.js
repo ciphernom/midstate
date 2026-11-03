@@ -3,7 +3,7 @@
 // # Reasoning
 //
 // Midstate changes proof of work at a height. Blocks below the node's
-// `WALK_ACTIVATION_HEIGHT` (420,000) carry the BLAKE3 chain: `create_extension`,
+// `WALK_ACTIVATION_HEIGHT` (371,500) carry the BLAKE3 chain: `create_extension`,
 // 1,000,000 sequential BLAKE3 hashes per nonce. Blocks from that height carry
 // Midstate Walk: a 256 KiB scratchpad walked 2^18 steps by a chain of
 // multiply, divide and AES-round operations (`docs/MIDSTATE_WALK.md` in the

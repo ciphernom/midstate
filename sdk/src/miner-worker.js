@@ -7,7 +7,7 @@
 // # Reasoning
 //
 // The proof of work is the whole cost: one nonce is a 1,000,000-iteration
-// sequential BLAKE3 chain (~130 ms) below height 420,000, or one Midstate Walk
+// sequential BLAKE3 chain (~130 ms) below height 371,500, or one Midstate Walk
 // (a few ms) from then on, and nothing about batching or scheduling changes
 // that. Parallelism is therefore the only lever, and it is embarrassingly
 // parallel — each nonce is independent — so the design is simply "partition the

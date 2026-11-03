@@ -1,6 +1,6 @@
 # Midstate Walk GPU bench
 
-Measures Midstate Walk, midstate's proof of work from block 420,000, on an
+Measures Midstate Walk, midstate's proof of work from block 371,500, on an
 NVIDIA GPU, so that GPUs can be compared with CPUs. It is a benchmark, not a
 miner. The specification is [`docs/MIDSTATE_WALK.md`](../../MIDSTATE_WALK.md),
 whose [GPUs](../../MIDSTATE_WALK.md#gpus) section has the results so far.

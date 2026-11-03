@@ -137,7 +137,7 @@ CoinJoin (`wallet mix`) operates in phases: `Collecting`, `Signing`, and `Commit
 
 ## 5. Midstate Axe & Hardware Operations
 
-Midstate runs on bare-metal ARM hardware. The MidstateAxe is a **Raspberry Pi 5** (or a Pi 500 or Compute Module 5): from block 420,000 the proof of work is Midstate Walk, which wants AES instructions, and the Pi 5 is the first Pi that has them. In testing, a Pi 5 at 3.1 GHz with an active cooler made 1,545 Walk attempts a second; at the stock 2.4 GHz expect about 1,200. A Pi 4, Pi 3 or Zero 2 W has no AES instructions: it still runs a full node well, but it mines the Walk at a few percent of a Pi 5.
+Midstate runs on bare-metal ARM hardware. The MidstateAxe is a **Raspberry Pi 5** (or a Pi 500 or Compute Module 5): from block 371,500 the proof of work is Midstate Walk, which wants AES instructions, and the Pi 5 is the first Pi that has them. In testing, a Pi 5 at 3.1 GHz with an active cooler made 1,545 Walk attempts a second; at the stock 2.4 GHz expect about 1,200. A Pi 4, Pi 3 or Zero 2 W has no AES instructions: it still runs a full node well, but it mines the Walk at a few percent of a Pi 5.
 
 When the node is running, you can access the local hardware dashboard by navigating a browser to:
 `http://127.0.0.1:8545/axe` (or the IP of the device on your local network).

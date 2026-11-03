@@ -2112,7 +2112,7 @@ if ('serviceWorker' in navigator) {
         // Midstate Walk replaces the BLAKE3 chain at this height (the node's
         // WALK_ACTIVATION_HEIGHT). The miner follows each template's `pow` on
         // its own; this is only for the countdown shown before the switch.
-        const WALK_ACTIVATION_HEIGHT = 420000;
+        const WALK_ACTIVATION_HEIGHT = 371500;
         // The public pool new miners use until they pick another. The pool
         // serves its browser API under /pool/api as well as /api.
         const DEFAULT_POOL_URL = 'https://rpc.cypherpunk.gold/pool';
@@ -2472,7 +2472,7 @@ if ('serviceWorker' in navigator) {
             }
             const blocks = WALK_ACTIVATION_HEIGHT - tip;
             const days = Math.max(1, Math.round(blocks * 60 / 86400));
-            el.innerHTML = `<b>Midstate Walk starts at block 420,000</b>, ${blocks.toLocaleString('en')} blocks from now `
+            el.innerHTML = `<b>Midstate Walk starts at block 371,500</b>, ${blocks.toLocaleString('en')} blocks from now `
                 + `(about ${days} day${days === 1 ? '' : 's'}). It is the new proof of work, and a browser mines it almost `
                 + `as fast as a native miner, so a browser's share of the network grows sharply then. Until it starts you can `
                 + `mine, but a browser earns very little against today's GPU miners.`;
