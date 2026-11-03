@@ -32,7 +32,7 @@ use crate::mwb::{
 };
 use crate::mwb_account::{scalar, MwbAccount};
 use crate::mwb_link::{verify, verify_proof, Challenge, LinkCommitment, LinkRecord, LinkSecret, K_AND, K_OR};
-use crate::mwb_trade::{check_terms, encode_mwb, mds_pk, taker_lock_deadline, MwbOrder, MwbSwap, Phase, Role};
+use crate::mwb_trade::{check_side_open, check_terms, encode_mwb, mds_pk, taker_lock_deadline, MwbOrder, MwbSwap, Phase, Role};
 use crate::mwb_wire::{
     point, session_messages, take_messages, taker_session, Advert, FunderCommit, FunderNonces, KeyPair, Msg, Offer,
     OfferLink, Outgoing, ReceiverNonces, ReceiverSigs, Session, Side, Take, To,
@@ -254,6 +254,7 @@ impl Negotiation {
     /// Taker: opens a negotiation on a heard order.
     pub fn take(advert: &Advert, key: &KeyPair, ctx: &mut Ctx) -> Result<(Self, Vec<Outgoing>)> {
         check_terms(advert.mds_amount, advert.mdw_amount)?;
+        check_side_open(advert.side, ctx.mds_tip)?;
         ensure!(ctx.mds_tip < advert.expires, "that order has expired");
         let session = taker_session(key, advert)?;
         if advert.side == Side::SellMds {
@@ -285,6 +286,7 @@ impl Negotiation {
     /// Maker: answers a take of one of its orders.
     pub fn answer(order: &MwbOrder, take: Take, session: Session, ctx: &mut Ctx) -> Result<(Self, Vec<Outgoing>)> {
         ensure!(order.takeable(ctx.mds_tip), "that order is no longer open");
+        check_side_open(order.side, ctx.mds_tip)?;
         ensure!(
             take.side == order.side && take.mds_amount == order.mds_amount && take.mdw_amount == order.mdw_amount,
             "the take does not match the order's terms"

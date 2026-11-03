@@ -12,7 +12,7 @@ use crate::mwb::min_fee;
 use crate::mwb_account::{BlockView, MwbAccount, SwapOutputs, LOCK_LABEL, REORG};
 use crate::mwb_negotiate::{abort_messages, Ctx, Linger, Negotiation, Step, MAX_RESENDS, NEGOTIATION_SECS, RESEND_SECS};
 use crate::mwb_trade::{
-    build_mds_spend, check_terms, decide, observe, sign_mds_spend, Act, BookEntry, Chains, Leg,
+    build_mds_spend, check_side_open, check_terms, decide, observe, sign_mds_spend, Act, BookEntry, Chains, Leg,
     MdsSpendKind, MwbOrder, MwbStore, MwbSwap, OrderStatus, Phase, Role, ADVERT_EVERY, ADVERT_STALE, MAX_ORDER_LIFE,
     MIN_ORDER_LIFE, REBROADCAST_BLOCKS,
 };
@@ -566,6 +566,7 @@ impl Service {
             _ => bail!("side must be sell_mds or sell_mdw"),
         };
         let tip = self.node.get_state().await.height;
+        check_side_open(side, tip)?;
         let mwb_tip = self.mwb_tip().unwrap_or(0);
         match side {
             Side::SellMds => {
@@ -840,7 +841,9 @@ impl Service {
         }
         let mut out = Vec::new();
         for o in &mut self.mwb.store.orders {
-            if o.takeable(mds_tip) && (o.last_advert == 0 || mds_tip >= o.last_advert + ADVERT_EVERY) {
+            let due = o.last_advert == 0 || mds_tip >= o.last_advert + ADVERT_EVERY;
+            // An order that cannot start yet (`check_side_open`) waits unannounced.
+            if o.takeable(mds_tip) && due && check_side_open(o.side, mds_tip).is_ok() {
                 if let Ok(a) = o.advert() {
                     out.push(a.chat());
                     o.last_advert = mds_tip;
