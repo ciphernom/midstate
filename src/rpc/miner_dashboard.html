@@ -824,7 +824,7 @@ function showBoard(b) {
     log(`Board: ${board.model || 'unknown'} · Walk AES: ${board.aes}`, 'var(--text-bright)');
     if (!board.walk_ready) {
         const note = document.getElementById('hw-note');
-        note.textContent = 'This board has no AES instructions. From block 420,000 it mines Midstate Walk at a few percent of a Raspberry Pi 5’s speed, though it still runs a full node well. The Pi 5 is the Axe board.';
+        note.textContent = 'This board has no AES instructions. From block 371,500 it mines Midstate Walk at a few percent of a Raspberry Pi 5’s speed, though it still runs a full node well. The Pi 5 is the Axe board.';
         note.style.display = 'block';
     }
     const c = board.clock;
