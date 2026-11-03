@@ -118,6 +118,27 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-sp
 .eff-good { color: var(--green); }
 .eff-bad { color: var(--red); }
 
+/* long tables: a search box above, pages below (built by pagerFor) */
+.tbl-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
+.tbl-search { flex: 1 1 240px; max-width: 460px; background: var(--bg); border: 1px solid var(--border); border-radius: 0; color: var(--text-main); font-family: 'JetBrains Mono', monospace; font-size: 11px; padding: 6px 9px; outline: none; }
+.tbl-search::placeholder { color: var(--text-faint); }
+.tbl-search:focus { border-color: var(--accent); }
+.tbl-search::-webkit-search-cancel-button { filter: grayscale(1); opacity: 0.7; cursor: pointer; }
+.tbl-count { font-size: 10px; color: var(--text-faint); font-variant-numeric: tabular-nums; }
+.tbl-nav { display: flex; align-items: center; justify-content: flex-end; gap: 6px 16px; flex-wrap: wrap; margin-top: 8px; font-size: 10px; color: var(--text-muted); }
+.tbl-pages { display: inline-flex; align-items: center; gap: 6px; }
+.tbl-nav button { background: transparent; border: 1px solid var(--border); border-radius: 0; color: var(--text-main); font-family: 'JetBrains Mono', monospace; font-size: 11px; line-height: 1.4; min-width: 26px; padding: 2px 6px; cursor: pointer; }
+.tbl-nav button:hover:not(:disabled) { border-color: var(--accent); }
+.tbl-nav button:disabled { color: var(--text-faint); cursor: default; }
+.tbl-nav select { background: var(--bg); border: 1px solid var(--border); border-radius: 0; color: var(--text-main); font-family: 'JetBrains Mono', monospace; font-size: 10px; padding: 2px 4px; }
+.tbl-page { min-width: 96px; text-align: center; font-variant-numeric: tabular-nums; white-space: nowrap; }
+@media (max-width: 600px) { .tbl-search { flex-basis: 100%; max-width: none; } }
+.tbl-bar[hidden], .tbl-nav[hidden] { display: none; }
+.rank { color: var(--text-faint); width: 1%; }
+.btn-more { display: block; background: transparent; border: 0; padding: 2px 0 0; color: var(--text-muted); font-family: 'Inter', sans-serif; font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
+.btn-more:hover { color: var(--text-bright); }
+.pay.hit .addr { color: var(--text-max); font-weight: 700; }
+
 /* connect box */
 .code { background: var(--code-bg); color: var(--text-bright); padding: 10px 12px; border-left: 3px solid var(--stark-accent); overflow-x: auto; font-family: 'JetBrains Mono', monospace; font-size: 12px; user-select: all; }
 .hint { color: var(--text-muted); font-size: 12px; margin-bottom: 10px; }
@@ -286,8 +307,8 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-sp
       <h2>Miner Leaderboard (Active Shares)</h2>
       <div class="table-scroll">
         <table>
-          <thead><tr><th>Miner Address</th><th class="num">Live Hashrate</th><th class="num">Active Shares</th><th class="num">Weight</th><th class="num">Efficiency</th></tr></thead>
-          <tbody id="miners-table"><tr class="empty-row"><td colspan="5">Loading...</td></tr></tbody>
+          <thead><tr><th class="num">#</th><th>Miner Address</th><th class="num">Live Hashrate</th><th class="num">Active Shares</th><th class="num">Weight</th><th class="num">Efficiency</th></tr></thead>
+          <tbody id="miners-table"><tr class="empty-row"><td colspan="6">Loading...</td></tr></tbody>
         </table>
       </div>
     </div>
@@ -426,8 +447,8 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-sp
       <h2>Recent Payouts</h2>
       <div class="table-scroll">
         <table>
-          <thead><tr><th class="num">Age</th><th>Block Hash</th><th class="num">Amount Paid</th></tr></thead>
-          <tbody id="mn-payouts"><tr class="empty-row"><td colspan="3">No payouts to this address in the last 100 blocks.</td></tr></tbody>
+          <thead><tr><th class="num">Age</th><th class="num">Height</th><th>Block Hash</th><th class="num">Amount Paid</th></tr></thead>
+          <tbody id="mn-payouts"><tr class="empty-row"><td colspan="4">No payouts to this address in the last 100 blocks.</td></tr></tbody>
         </table>
       </div>
     </div>
@@ -584,6 +605,160 @@ function palette() {
     max:      cssVar('--text-max'),
     panel:    cssVar('--bg-panel')
   };
+}
+
+// ---------------------------------------------------------------------------
+// Long tables: a search box above, pages below. A busy pool has thousands of
+// miners, and blocks that pay hundreds of them, so each table shows a page of
+// what matches. The controls are built once, beside the table: the 5s refresh
+// redraws only the rows, never the search box (its text, its focus).
+// ---------------------------------------------------------------------------
+const PAGE_SIZES = [10, 25, 50, 100];
+const SEARCH_FROM = 10;                 // fewer rows than this: no search box
+const pagers = {};                      // tbody id -> its search and page
+
+// The pager of the table whose body is `id`: built on first use, and again
+// when the table itself was rebuilt (as the split verification's is).
+function pagerFor(id, opts) {
+  const body = $(id);
+  let p = pagers[id];
+  if (p && p.body === body) return p;
+  p = pagers[id] = { body, page: 0, query: '', size: opts.size, scope: null, items: [], hits: [], opts };
+  try {
+    const saved = Number(localStorage.getItem('midstate-pool-rows:' + id));
+    if (PAGE_SIZES.includes(saved)) p.size = saved;
+  } catch (e) {}
+
+  p.bar = document.createElement('div');
+  p.bar.className = 'tbl-bar';
+  p.bar.innerHTML = '<input type="search" class="tbl-search" spellcheck="false" autocomplete="off"><span class="tbl-count"></span>';
+  p.input = p.bar.querySelector('input');
+  p.input.placeholder = opts.placeholder;
+  p.input.setAttribute('aria-label', opts.placeholder);
+  p.count = p.bar.querySelector('.tbl-count');
+
+  p.nav = document.createElement('div');
+  p.nav.className = 'tbl-nav';
+  p.nav.innerHTML =
+    '<label>rows <select aria-label="Rows per page">' + PAGE_SIZES.map((n) => '<option>' + n + '</option>').join('') + '</select></label>' +
+    '<span class="tbl-pages">' +
+      '<button type="button" data-go="first" aria-label="First page">&laquo;</button>' +
+      '<button type="button" data-go="prev" aria-label="Previous page">&lsaquo;</button>' +
+      '<span class="tbl-page"></span>' +
+      '<button type="button" data-go="next" aria-label="Next page">&rsaquo;</button>' +
+      '<button type="button" data-go="last" aria-label="Last page">&raquo;</button>' +
+    '</span>';
+  p.select = p.nav.querySelector('select');
+  p.select.value = String(p.size);
+  p.label = p.nav.querySelector('.tbl-page');
+
+  const scroll = body.closest('.table-scroll');
+  scroll.before(p.bar);
+  scroll.after(p.nav);
+
+  p.input.addEventListener('input', () => { p.query = p.input.value; p.page = 0; drawPage(p); });
+  p.input.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter' && p.opts.enter) p.opts.enter(p.hits, p.query.trim());
+  });
+  p.select.addEventListener('change', () => {
+    p.size = Number(p.select.value) || opts.size;
+    p.page = 0;
+    try { localStorage.setItem('midstate-pool-rows:' + id, String(p.size)); } catch (e) {}
+    drawPage(p);
+  });
+  p.nav.addEventListener('click', (ev) => {
+    const b = ev.target.closest('button[data-go]');
+    if (!b) return;
+    p.page = { first: 0, prev: p.page - 1, next: p.page + 1, last: Infinity }[b.dataset.go];
+    drawPage(p);
+    // A page of tall rows can leave the table's top above the screen.
+    const top = p.bar.hidden ? scroll : p.bar;
+    if (top.getBoundingClientRect().top < 0) top.scrollIntoView({ block: 'start' });
+  });
+  return p;
+}
+
+// Draws `items` into the table body `id`, a page at a time. `opts`:
+//   row(item, q)   the row's HTML (q: the search, lower case, or '')
+//   text(item)     what the search looks in, lower case
+//   height(item)   the row's height, if rows have one (for "#height")
+//   cols, empty    the column count, and the row for no items at all
+//   size, noun     the page size first shown, and what a row is
+//   placeholder    the search box's hint
+//   enter(hits, q) what Enter in the search box does, if anything
+//   scope          what the rows belong to (the miner a miner page shows):
+//                  another scope starts over, search and page
+function renderPaged(id, items, opts) {
+  const p = pagerFor(id, opts);
+  if (opts.scope !== p.scope) {
+    p.scope = opts.scope;
+    p.page = 0;
+    p.query = p.input.value = '';
+  }
+  p.items = items;
+  p.opts = opts;
+  drawPage(p);
+}
+
+function drawPage(p) {
+  const { items, opts } = p;
+  // "#412" looks for heights starting 412 (where rows have heights), not
+  // for "412" anywhere in a hash or an address.
+  const raw = p.query.trim().toLowerCase();
+  const byHeight = raw.startsWith('#') && !!opts.height;
+  const q = byHeight ? raw.slice(1) : raw.replace(/^#/, '');
+  const hits = p.hits = !q ? items : items.filter((it) => byHeight
+    ? String(opts.height(it) == null ? '' : opts.height(it)).startsWith(q)
+    : opts.text(it).includes(q));
+  const pages = Math.max(1, Math.ceil(hits.length / p.size));
+  p.page = Math.min(Math.max(0, p.page), pages - 1);
+  const from = p.page * p.size;
+  const shown = hits.slice(from, from + p.size);
+
+  if (!items.length) p.body.innerHTML = opts.empty;
+  else if (!hits.length) p.body.innerHTML = '<tr class="empty-row"><td colspan="' + opts.cols + '">Nothing here matches “' + esc(p.query.trim()) + '”.</td></tr>';
+  else p.body.innerHTML = shown.map((it) => opts.row(it, byHeight ? '' : q)).join('');
+
+  p.bar.hidden = items.length < SEARCH_FROM && !q;
+  p.count.textContent = q
+    ? (fmtInt(hits.length) + ' of ' + fmtInt(items.length) + ' ' + opts.noun + ' match')
+    : (fmtInt(items.length) + ' ' + opts.noun);
+  p.nav.hidden = hits.length <= PAGE_SIZES[0];
+  p.label.textContent = fmtInt(from + 1) + '–' + fmtInt(from + shown.length) + ' of ' + fmtInt(hits.length);
+  const [first, prev, next, last] = p.nav.querySelectorAll('button');
+  first.disabled = prev.disabled = p.page === 0;
+  next.disabled = last.disabled = p.page >= pages - 1;
+}
+
+// A block's payees, cut to the first few (and any the search names), with a
+// button for the rest. Which lists are open survives the refresh.
+const PAY_PREVIEW = 5;
+const openPayLists = new Set();
+function payList(key, list, q, one) {
+  const named = (p) => !!q && String(p.address).toLowerCase().includes(q);
+  if (list.length <= PAY_PREVIEW + 1) return list.map((p) => one(p, named(p))).join('');
+  const open = openPayLists.has(key);
+  const shown = open ? list : list.filter((p, i) => i < PAY_PREVIEW || named(p));
+  const rest = list.length - shown.length;
+  const more = open ? 'show fewer' : (rest > 0 ? ('+' + fmtInt(rest) + ' more') : '');
+  return shown.map((p) => one(p, named(p))).join('') +
+    (more ? '<button type="button" class="btn-more" data-list="' + esc(key) + '">' + more + '</button>' : '');
+}
+
+document.addEventListener('click', (ev) => {
+  const b = ev.target.closest('.btn-more');
+  if (!b) return;
+  const key = b.dataset.list;
+  if (openPayLists.has(key)) openPayLists.delete(key); else openPayLists.add(key);
+  const p = pagers[b.closest('tbody').id];
+  if (p) drawPage(p);
+});
+
+// Enter in the leaderboard's search: the one miner it found, or an address
+// typed in full (a miner with no shares right now has no row, but a page).
+function openMinerSearch(hits, typed) {
+  const address = hits.length === 1 ? hits[0].m.address : (addrKey(typed).length === 64 ? typed : null);
+  if (address) location.hash = '#/miner/' + encodeURIComponent(address);
 }
 
 // ---------------------------------------------------------------------------
@@ -1109,13 +1284,15 @@ function renderPool(data) {
 
   renderTicker();
 
-  // Leaderboard
-  const tb = $('miners-table');
-  const miners = data.miners || [];
-  if (!miners.length) {
-    tb.innerHTML = '<tr class="empty-row"><td colspan="5">No active shares yet. Waiting for hashes...</td></tr>';
-  } else {
-    tb.innerHTML = miners.map((m) => {
+  // Leaderboard: ranked by active shares, a page at a time.
+  const miners = (data.miners || []).map((m, i) => ({ m, rank: i + 1 }));
+  renderPaged('miners-table', miners, {
+    cols: 6, size: 25, noun: 'miners',
+    placeholder: 'Search miner address — Enter opens its page',
+    empty: '<tr class="empty-row"><td colspan="6">No active shares yet. Waiting for hashes...</td></tr>',
+    text: (r) => String(r.m.address).toLowerCase(),
+    enter: openMinerSearch,
+    row: ({ m, rank }) => {
       const k = addrKey(m.address);
       const hr = displayMinerHashrates[k] || 0;
       const pct = total > 0 ? (Number(m.score) / total * 100) : 0;
@@ -1125,22 +1302,26 @@ function renderPool(data) {
         ? (((acc / sub) * 100).toFixed(1) + '%' + (rej > 0 ? '<div class="card-sub">' + fmtInt(rej) + ' rejected</div>' : ''))
         : '--';
       return '<tr>' +
+        '<td class="num rank">' + fmtInt(rank) + '</td>' +
         '<td><a class="addr" href="' + href + '" title="' + esc(m.address) + '">' + esc(shortAddr(m.address)) + '</a></td>' +
         '<td class="num">' + formatHashrate(hr) + '</td>' +
         '<td class="num">' + fmtInt(m.score) + '</td>' +
         '<td class="num">' + pct.toFixed(2) + '%</td>' +
         '<td class="num">' + effCell + '</td>' +
       '</tr>';
-    }).join('');
-  }
+    },
+  });
 
-  // Recent blocks
-  const bt = $('blocks-table');
-  if (!blocks.length) {
-    bt.innerHTML = '<tr class="empty-row"><td colspan="6">No blocks found yet. Keep hashing!</td></tr>';
-  } else {
-    const poolKey = addrKey(data.pool_address || '');
-    bt.innerHTML = blocks.map((b) => {
+  // Recent blocks: each shows its first few payees; search finds a block by
+  // height, hash, or an address it paid.
+  const poolKey = addrKey(data.pool_address || '');
+  renderPaged('blocks-table', blocks, {
+    cols: 6, size: 10, noun: 'blocks',
+    placeholder: 'Search #height, block hash or an address it paid',
+    empty: '<tr class="empty-row"><td colspan="6">No blocks found yet. Keep hashing!</td></tr>',
+    text: (b) => ((b.height || '') + ' ' + (b.hash || '') + ' ' + (b.payouts || []).map((p) => p.address).join(' ')).toLowerCase(),
+    height: (b) => b.height || null,
+    row: (b, q) => {
       const e = effortPct(b.total_score, blockExpected(b.net_target));
       const effCls = (e != null && e < 100) ? 'eff-good' : 'eff-bad';
       const effTxt = (e == null) ? '--' : e.toFixed(1) + '%';
@@ -1155,14 +1336,15 @@ function renderPool(data) {
       const rewardCell = reward > 0
         ? (fmtInt(reward) + '<div class="card-sub">fee ' + feePct.toFixed(1) + '%</div>')
         : '--';
-      const paidRows = agg.map((p) => {
+      const listKey = 'block:' + (b.block_ts != null ? b.block_ts : (b.hash || b.timestamp));
+      const paidRows = payList(listKey, agg, q, (p, hit) => {
         const isFee = addrKey(p.address) === poolKey;
         const href = '#/miner/' + encodeURIComponent(p.address);
         const label = isFee
           ? ('<span class="addr">' + esc(shortAddr(p.address)) + '</span><span class="fee-tag">pool fee</span>')
           : ('<a class="addr" href="' + href + '" title="' + esc(p.address) + '">' + esc(shortAddr(p.address)) + '</a>');
-        return '<div class="pay">' + label + '<span class="amt">' + fmtInt(p.value) + '</span></div>';
-      }).join('') || '--';
+        return '<div class="pay' + (hit ? ' hit' : '') + '">' + label + '<span class="amt">' + fmtInt(p.value) + '</span></div>';
+      }) || '--';
       const verifyBtn = (b.block_ts != null)
         ? '<button class="btn-verify" onclick="verifyBlockSplit(' + Number(b.block_ts) + ', this)">verify split</button>'
         : '';
@@ -1174,8 +1356,8 @@ function renderPool(data) {
         '<td class="num">' + rewardCell + '</td>' +
         '<td>' + paidRows + verifyBtn + '</td>' +
       '</tr>';
-    }).join('');
-  }
+    },
+  });
 
   renderMidwimble(data);
   renderHashrateChart();
@@ -1216,35 +1398,44 @@ function renderMidwimble(data) {
   const label = (addr) => '<span class="addr" title="' + esc(addr) + '">' + esc(shortAddr(addr)) + '</span>' +
     (addr === mw.pool_address ? '<span class="fee-tag">pool</span>' : '');
 
-  $('mw-scores').innerHTML = scores.length
-    ? scores.map((s) => {
-        const pct = total > 0 ? (Number(s.score) / total * 100) : 0;
-        return '<tr><td>' + label(s.address) + '</td>' +
-          '<td class="num">' + fmtInt(s.score) + '</td>' +
-          '<td class="num">' + pct.toFixed(2) + '%</td></tr>';
-      }).join('')
-    : '<tr class="empty-row"><td colspan="3">No midwimble shares yet.</td></tr>';
+  renderPaged('mw-scores', scores, {
+    cols: 3, size: 25, noun: 'addresses',
+    placeholder: 'Search midwimble address',
+    empty: '<tr class="empty-row"><td colspan="3">No midwimble shares yet.</td></tr>',
+    text: (s) => String(s.address).toLowerCase(),
+    row: (s) => {
+      const pct = total > 0 ? (Number(s.score) / total * 100) : 0;
+      return '<tr><td>' + label(s.address) + '</td>' +
+        '<td class="num">' + fmtInt(s.score) + '</td>' +
+        '<td class="num">' + pct.toFixed(2) + '%</td></tr>';
+    },
+  });
 
-  $('mw-blocks').innerHTML = blocks.length
-    ? blocks.map((b) => {
-        const pays = b.payouts || [];
-        const sum = pays.reduce((a, p) => a + (Number(p.weight) || 0), 0);
-        const paid = pays.map((p) => {
-          const pct = sum > 0 ? (Number(p.weight) / sum * 100) : 0;
-          return '<div class="pay"><span>' + label(p.address) + '</span><span class="amt">' + pct.toFixed(2) + '%</span></div>';
-        }).join('') || '--';
-        // Settling, or replaced on midwimble (its scores went back to the
-        // table, for the next block to pay).
-        const state = b.status === 'orphaned'
-          ? '<span class="fee-tag" title="Midwimble replaced this block. The scores it paid went back to the table, for the next block to pay.">orphaned</span>'
-          : b.status === 'pending'
-            ? '<span class="fee-tag" title="Not settled yet: if midwimble replaces it, the scores it paid go back to the table.">settling</span>'
-            : '';
-        return '<tr><td class="num">' + relAge(b.timestamp) + '</td>' +
-          '<td class="num">' + ((b.height != null) ? ('#' + fmtInt(b.height)) : '--') + state + '</td>' +
-          '<td>' + paid + '</td></tr>';
-      }).join('')
-    : '<tr class="empty-row"><td colspan="3">No midwimble blocks found yet.</td></tr>';
+  renderPaged('mw-blocks', blocks, {
+    cols: 3, size: 10, noun: 'blocks',
+    placeholder: 'Search #height or an address it paid',
+    empty: '<tr class="empty-row"><td colspan="3">No midwimble blocks found yet.</td></tr>',
+    text: (b) => ((b.height != null ? b.height : '') + ' ' + (b.payouts || []).map((p) => p.address).join(' ')).toLowerCase(),
+    height: (b) => b.height,
+    row: (b, q) => {
+      const pays = b.payouts || [];
+      const sum = pays.reduce((a, p) => a + (Number(p.weight) || 0), 0);
+      const paid = payList('mw:' + (b.midstate_block || b.timestamp), pays, q, (p, hit) => {
+        const pct = sum > 0 ? (Number(p.weight) / sum * 100) : 0;
+        return '<div class="pay' + (hit ? ' hit' : '') + '"><span>' + label(p.address) + '</span><span class="amt">' + pct.toFixed(2) + '%</span></div>';
+      }) || '--';
+      // Settling, or replaced on midwimble (its scores went back to the
+      // table, for the next block to pay).
+      const state = b.status === 'orphaned'
+        ? '<span class="fee-tag" title="Midwimble replaced this block. The scores it paid went back to the table, for the next block to pay.">orphaned</span>'
+        : b.status === 'pending'
+          ? '<span class="fee-tag" title="Not settled yet: if midwimble replaces it, the scores it paid go back to the table.">settling</span>'
+          : '';
+      return '<tr><td class="num">' + relAge(b.timestamp) + '</td>' +
+        '<td class="num">' + ((b.height != null) ? ('#' + fmtInt(b.height)) : '--') + state + '</td>' +
+        '<td>' + paid + '</td></tr>';
+    },
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1296,32 +1487,36 @@ function renderMiner(data, address) {
     ? (fmtInt(acc) + ' accepted / ' + fmtInt(rej) + ' rejected')
     : 'accepted / submitted (lifetime)';
 
-  const pt = $('mn-payouts');
-  if (!events.length) {
-    pt.innerHTML = '<tr class="empty-row"><td colspan="3">No payouts to this address in the last 100 blocks.</td></tr>';
-  } else {
-    pt.innerHTML = events.map((e) => {
+  // The rows below belong to this address: another miner's page starts over.
+  renderPaged('mn-payouts', events, {
+    scope: key, cols: 4, size: 25, noun: 'payouts',
+    placeholder: 'Search #height or block hash',
+    empty: '<tr class="empty-row"><td colspan="4">No payouts to this address in the last 100 blocks.</td></tr>',
+    text: (e) => ((e.b.height || '') + ' ' + (e.b.hash || '')).toLowerCase(),
+    height: (e) => e.b.height || null,
+    row: (e) => {
       const hashCell = e.b.hash
         ? ('<a href="' + EXPLORER_BLOCK_URL(e.b.hash) + '" target="_blank" rel="noopener" title="' + esc(e.b.hash) + '">' + esc(shortHash(e.b.hash)) + '</a>')
         : '<span class="addr">--</span>';
       return '<tr>' +
         '<td class="num">' + relAge(e.b.timestamp) + '</td>' +
+        '<td class="num">' + (e.b.height ? '#' + fmtInt(e.b.height) : '--') + '</td>' +
         '<td class="mono">' + hashCell + '</td>' +
         '<td class="num">' + fmtInt(e.sum) + '</td>' +
       '</tr>';
-    }).join('');
-  }
+    },
+  });
 
   // Per-worker breakdown for this address (stats only; payouts stay per-address).
   const myWorkers = (data.workers || []).filter((w) => addrKey(w.address) === key);
-  const wt = $('mn-workers');
-  if (!myWorkers.length) {
-    wt.innerHTML = '<tr class="empty-row"><td colspan="3">No worker data yet for this address.</td></tr>';
-    $('mn-workers-note').textContent = '';
-  } else {
-    myWorkers.sort((a, b) => (Number(b.score) || 0) - (Number(a.score) || 0));
-    const wtot = myWorkers.reduce((a, w) => a + (Number(w.score) || 0), 0);
-    wt.innerHTML = myWorkers.map((w) => {
+  myWorkers.sort((a, b) => (Number(b.score) || 0) - (Number(a.score) || 0));
+  const wtot = myWorkers.reduce((a, w) => a + (Number(w.score) || 0), 0);
+  renderPaged('mn-workers', myWorkers, {
+    scope: key, cols: 3, size: 25, noun: 'workers',
+    placeholder: 'Search worker name',
+    empty: '<tr class="empty-row"><td colspan="3">No worker data yet for this address.</td></tr>',
+    text: (w) => String(w.worker || 'default').toLowerCase(),
+    row: (w) => {
       const c = Number(w.score) || 0;
       const p = wtot > 0 ? (c / wtot * 100) : 0;
       return '<tr>' +
@@ -1329,7 +1524,11 @@ function renderMiner(data, address) {
         '<td class="num">' + fmtInt(c) + '</td>' +
         '<td class="num">' + p.toFixed(1) + '%</td>' +
       '</tr>';
-    }).join('');
+    },
+  });
+  if (!myWorkers.length) {
+    $('mn-workers-note').textContent = '';
+  } else {
     const distinct = new Set(myWorkers.map((w) => w.worker)).size;
     $('mn-workers-note').textContent = distinct <= 1
       ? 'Lifetime accepted shares per rig. Every miner currently reports under one name \u2014 pass --worker <name> on each rig to tell them apart here.'
@@ -1404,23 +1603,26 @@ function renderVerify(panel, block, snap, poolAddr) {
 
   scores.sort((a, b) => b.score - a.score);
   let maxDev = 0;
-  const rows = scores.map((s) => {
+  const entries = scores.map((s) => {
     const paid = payByKey[s.key] || 0;
     const scorePct = totalScore > 0 ? (s.score / totalScore * 100) : 0;
     const payPct = distributable > 0 ? (paid / distributable * 100) : 0;
     const expected = totalScore > 0 ? (s.score / totalScore * distributable) : 0;
     const dev = payPct - scorePct;
     if (paid > 0 || s.score > 0) maxDev = Math.max(maxDev, Math.abs(dev));
-    const devCls = Math.abs(dev) <= 1 ? '' : (Math.abs(dev) <= 5 ? 'dev-mid' : 'dev-hi');
-    const tag = (paid === 0 && s.score > 0) ? '<span class="fee-tag">below min coin</span>' : '';
+    return { address: s.address, score: s.score, paid, scorePct, expected, dev };
+  });
+  const row = (s) => {
+    const devCls = Math.abs(s.dev) <= 1 ? '' : (Math.abs(s.dev) <= 5 ? 'dev-mid' : 'dev-hi');
+    const tag = (s.paid === 0 && s.score > 0) ? '<span class="fee-tag">below min coin</span>' : '';
     return '<tr>' +
-      '<td><span class="addr">' + esc(shortAddr(s.address)) + '</span>' + tag + '</td>' +
-      '<td class="num">' + scorePct.toFixed(2) + '%</td>' +
-      '<td class="num">' + fmtInt(expected) + '</td>' +
-      '<td class="num">' + fmtInt(paid) + '</td>' +
-      '<td class="num ' + devCls + '">' + (dev >= 0 ? '+' : '') + dev.toFixed(2) + '</td>' +
+      '<td><span class="addr" title="' + esc(s.address) + '">' + esc(shortAddr(s.address)) + '</span>' + tag + '</td>' +
+      '<td class="num">' + s.scorePct.toFixed(2) + '%</td>' +
+      '<td class="num">' + fmtInt(s.expected) + '</td>' +
+      '<td class="num">' + fmtInt(s.paid) + '</td>' +
+      '<td class="num ' + devCls + '">' + (s.dev >= 0 ? '+' : '') + s.dev.toFixed(2) + '</td>' +
     '</tr>';
-  }).join('');
+  };
 
   const pass = (unearned.length === 0) && totalOk;
   const badgeCls = pass ? 'ok' : 'bad';
@@ -1438,9 +1640,16 @@ function renderVerify(panel, block, snap, poolAddr) {
     (unearned.length ? '<div class="verify-meta bad">Paid without committed shares: ' + unearned.map((k) => esc(k.slice(0, 12) + '\u2026')).join(', ') + '</div>' : '') +
     '<div class="table-scroll"><table>' +
       '<thead><tr><th>Miner</th><th class="num">Committed %</th><th class="num">Expected</th><th class="num">Paid</th><th class="num">\u0394 pp</th></tr></thead>' +
-      '<tbody>' + rows + '</tbody>' +
+      '<tbody id="verify-rows"></tbody>' +
     '</table></div>' +
     '<div class="card-sub" style="margin-top:8px;">Payouts are power-of-2 coins, so a small &Delta; is coin rounding, not unfairness. The exact guarantees: no address was paid without committed shares, and every payout is a real coin in this block\'s coinbase.</div>';
+  renderPaged('verify-rows', entries, {
+    scope: block.block_ts, cols: 5, size: 25, noun: 'miners',
+    placeholder: 'Search miner address',
+    empty: '<tr class="empty-row"><td colspan="5">No committed scores in this snapshot.</td></tr>',
+    text: (s) => String(s.address).toLowerCase(),
+    row,
+  });
 }
 window.addEventListener('hashchange', renderRoute);
 
