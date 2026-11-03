@@ -58,9 +58,13 @@ curve25519-dalek = "4"
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_env = "msvc")))'.dependencies]
 tikv-jemallocator = "0.5.4"
 
-# Use mimalloc on Windows (Not Wasm, Windows MSVC)
+# Windows MSVC dependencies (Not Wasm)
 [target.'cfg(all(not(target_arch = "wasm32"), target_env = "msvc"))'.dependencies]
 mimalloc = "0.1.43"
+
+# Windows DirectX 12 bindings
+windows = "0.62"
+windows-core = { version = "0.62", features = ["std"] }
 
 
 [features]
