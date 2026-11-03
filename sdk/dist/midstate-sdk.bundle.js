@@ -36949,7 +36949,7 @@ const MidstateUtils = {
 // # Reasoning
 //
 // Midstate changes proof of work at a height. Blocks below the node's
-// `WALK_ACTIVATION_HEIGHT` (420,000) carry the BLAKE3 chain: `create_extension`,
+// `WALK_ACTIVATION_HEIGHT` (371,500) carry the BLAKE3 chain: `create_extension`,
 // 1,000,000 sequential BLAKE3 hashes per nonce. Blocks from that height carry
 // Midstate Walk: a 256 KiB scratchpad walked 2^18 steps by a chain of
 // multiply, divide and AES-round operations (`docs/MIDSTATE_WALK.md` in the
@@ -37025,10 +37025,10 @@ function buildExtension(inner, pow, midstate, nonce) {
 // ═══════════════════════════════════════════════════════════════════════════
 //
 // Every nonce costs a fixed amount of sequential work, so mining here is not a
-// throughput race. Below height 420,000 that work is `create_extension`: a
+// throughput race. Below height 371,500 that work is `create_extension`: a
 // (midstate ⌢ nonce) seed iterated through BLAKE3 EXTENSION_ITERATIONS
 // (1,000,000) times. One nonce costs ~130 ms, SIMD runs four lanes at once, and
-// a worker lands around 15–30 nonces/second. From 420,000 it is Midstate Walk,
+// a worker lands around 15–30 nonces/second. From 371,500 it is Midstate Walk,
 // a 256 KiB memory walk of 2^18 dependent steps that costs a few milliseconds
 // per nonce. The template says which one it wants (§4).
 //
@@ -37073,7 +37073,7 @@ function buildExtension(inner, pow, midstate, nonce) {
 //
 // ── 4. The template names its proof of work ──
 //
-// From WALK_ACTIVATION_HEIGHT (420,000) the node verifies Midstate Walk instead
+// From WALK_ACTIVATION_HEIGHT (371,500) the node verifies Midstate Walk instead
 // of the BLAKE3 chain. Templates and pool jobs carry `pow` ("blake3-chain" or
 // "walk"), and the search and the extension rebuilt for submission must both
 // use it: a Walk nonce submitted with a BLAKE3-chain extension is a block the

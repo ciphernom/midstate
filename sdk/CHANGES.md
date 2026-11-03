@@ -2,6 +2,10 @@
 
 Version 2.9.1 → 2.10.0.
 
+> Node v6.2.0 moves the switch forward from 420,000 to height 371,500. The
+> SDK mines whatever each template's `pow` field names, so 2.10.0 needs no
+> update. The heights below are as 2.10.0 shipped.
+
 From height 420,000 the node verifies Midstate Walk instead of the BLAKE3 chain
 (`docs/MIDSTATE_WALK.md` in the node repository). Templates and pool jobs from
 v6.0.0 nodes and pools name the algorithm in a `pow` field, `"blake3-chain"` or

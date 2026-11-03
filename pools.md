@@ -52,11 +52,11 @@ You must open/port-forward the Stratum TCP port (e.g., `3333`) on your firewall 
 
 ### Midstate Walk (from block 371,500)
 
-From block 371,500 the proof of work is Midstate Walk (`docs/MIDSTATE_WALK.md`). Pools and miners must run a release that switches at 371,500 before then (v6.0.0 to v6.1.1 switch at 420,000):
+From block 371,500 the proof of work is Midstate Walk (`docs/MIDSTATE_WALK.md`). Pools and miners must run v6.2.0 or later before then (v6.0.0 to v6.1.1 still switch at 420,000 and split off):
 
 - Jobs say which proof of work they take. `mining.notify` carries the block height as a fifth parameter, and the HTTP and WebRTC templates carry `height` and `pow`. A miner that predates Walk keeps mining the BLAKE3 chain, and its shares are rejected after the switch.
 - A core makes about 20 times more Walk attempts per second than BLAKE3-chain attempts, so at the same `--share-bits` it finds shares about 20 times as often. Each share is about 20 times cheaper to verify, but there are 20 times as many messages, so consider adding 4 to `--share-bits` at the switch.
-- Merged mining pauses while one chain has switched and the other has not. Midwimble's `/merge/job` says which proof of work its block takes, and the pool merges only matching jobs (the dashboard says why when it does not).
+- Merged mining pauses while one chain has switched and the other has not. Midwimble's `/merge/job` says which proof of work its block takes, and the pool merges only matching jobs (the dashboard says why when it does not). The midwimble node must run v1.3-DIMEBAG or later, which switches at its block 37,300 and mirrors midstate's 371,500.
 
 ### 4. Merge-Mine Midwimble (Optional)
 The pool can mine midwimble with the same work and pay its miners in both coins. Run a midwimble node that holds the pool's mining bonds (see `docs/BONDED_POW.md` in midwimble), then point the pool at it:
