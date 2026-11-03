@@ -227,7 +227,7 @@ outlived their template.
    cores at 3.1 GHz (1,383 at 2.8 GHz).
 4. **Confirm `WALK_ACTIVATION_HEIGHT`** leaves operators enough time.
    - 371,500 is ~6.6 days after height ~362,060 (moved forward from
-     420,000; releases v6.0.0 to v6.1.1 still switch there).
+     420,000 in v6.2.0; v6.0.0 to v6.1.1 still switch there).
    - Midwimble mirrors it as `MIDSTATE_WALK_ACTIVATION_HEIGHT` and
      `MIDSTATE_WALK_TARGET_SHIFT`. Both must change together.
 5. ~~Rebuild `wasm-wallet/pkg`, update the SDK miner, rebuild `sdk/pkg` and

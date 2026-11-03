@@ -778,7 +778,7 @@ td.hl { color: var(--text-max); font-weight: 600; background: var(--highlight); 
 
             <div class="callout stark">
                 <h4>New proof of work: Midstate Walk, from block 371,500</h4>
-                <p>Midstate is moving mining back to the CPU. Each attempt becomes one long, dependent walk over a 256 KiB scratchpad of 64-bit multiplies, divides and AES rounds: work a CPU core does well and a GPU does badly. Every node needs a release that switches at block 371,500 before then, expected around 10 November 2026. Releases v6.0.0 to v6.1.1 switch at 420,000.</p>
+                <p>Midstate is moving mining back to the CPU. Each attempt becomes one long, dependent walk over a 256 KiB scratchpad of 64-bit multiplies, divides and AES rounds: work a CPU core does well and a GPU does badly. Every node needs v6.2.0 or later before block 371,500, expected around 10 November 2026. Releases v6.0.0 to v6.1.1 still switch at 420,000 and would split off.</p>
                 <p style="margin-top: 18px;"><a href="#walk" class="btn">How the Walk works →</a></p>
             </div>
 
@@ -1074,10 +1074,10 @@ for step in 0..max_iters {
             <h3>The switch</h3>
             <ul>
                 <li><strong>When:</strong> block 371,500, expected around 10 November 2026 at 60-second blocks.</li>
-                <li><strong>Nodes:</strong> every node needs a release that switches at 371,500 before then. A node on v6.0.0 to v6.1.1 still expects the BLAKE3 chain until 420,000, and one on v5 never switches: both reject the first Walk block and stay on a chain the rest of the network has left.</li>
+                <li><strong>Nodes:</strong> every node needs v6.2.0 or later before then. A node on v6.0.0 to v6.1.1 still expects the BLAKE3 chain until 420,000, and one on v5 never switches: both reject the first Walk block and stay on a chain the rest of the network has left.</li>
                 <li><strong>Difficulty:</strong> the target eases 8× at the switch, and ASERT takes over from there.</li>
                 <li><strong>Miners and pools:</strong> <code>midstate miner</code>, pools, the web wallet and the SDK change over by themselves, because templates name the proof of work in a <code>pow</code> field. Third-party miners, including MidstateAxe firmware, must switch at 371,500.</li>
-                <li><strong>Midwimble</strong> switches at its block 37,300, a few hours earlier. Merged mining pauses between the two switches.</li>
+                <li><strong>Midwimble</strong> switches at its block 37,300, a few hours earlier, from v1.3-DIMEBAG. Merged mining pauses between the two switches.</li>
             </ul>
             <p><a href="https://github.com/ciphernom/midstate/releases" target="_blank" class="btn">Releases on GitHub ↗</a></p>
         </div>
@@ -2542,7 +2542,7 @@ Script:
                     <div class="rm-status">[ BUILDING ]</div>
                     <div class="rm-body">
                         <span class="rm-title"><a href="#walk">Midstate Walk</a> proof of work</span>
-                        <div class="rm-note">A dependent walk over a 256 KiB scratchpad, built so a Raspberry Pi 5 can mine and a GPU has no special advantage. Released in v6.0.0 "Anselmo"; it activates at block 371,500, expected around 10 November 2026.</div>
+                        <div class="rm-note">A dependent walk over a 256 KiB scratchpad, built so a Raspberry Pi 5 can mine and a GPU has no special advantage. Released in v6.0.0 "Anselmo" and brought forward in v6.2.0; it activates at block 371,500, expected around 10 November 2026.</div>
                     </div>
                 </div>
 
