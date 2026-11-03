@@ -92,6 +92,12 @@ pub async fn start_mwb_node(cfg: MwbNodeConfig) -> Result<MwbNode> {
     let mut config = NodeConfig::new(cfg.data_dir.clone(), listen);
     config.bootstrap = bootstrap;
     config.midstate_rpc = cfg.midstate_rpc.clone();
+    // While the tip is a run of other producers' over-cap blocks, the blocks
+    // this wallet's bond merge-mines build on the block before it, so one of
+    // them replaces the run (`midwimble::core::orphan`), as on midwimble's
+    // own node. MIDSTATE_MDW_NO_ORPHAN=1 keeps them on the tip, as
+    // `midwimble node --no-orphan-over-cap` does.
+    config.orphan_over_cap = std::env::var("MIDSTATE_MDW_NO_ORPHAN").map_or(true, |v| v != "1");
     let explorer_port = cfg.explorer_port;
 
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(NodeHandle, Option<String>)>>();

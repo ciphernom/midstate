@@ -210,6 +210,30 @@ pub fn status_text(h: &midstate_walletd::api::MwbHistoryView) -> String {
     }
 }
 
+/// How settled an MDW entry in a block is: of its confirmations, those that
+/// counted in full in fork choice ("3 at full weight"). Only they take bonds
+/// to undo.
+pub fn settled_text(h: &midstate_walletd::api::MwbHistoryView) -> Option<String> {
+    Some(match h.full_weight_confirmations? {
+        0 => "none at full weight yet".into(),
+        n => format!("{} at full weight", theme::units(n)),
+    })
+}
+
+/// [`status_text`] and [`settled_text`] on one line.
+pub fn status_line(h: &midstate_walletd::api::MwbHistoryView) -> String {
+    match settled_text(h) {
+        Some(s) => format!("{} · {s}", status_text(h)),
+        None => status_text(h),
+    }
+}
+
+/// What [`settled_text`] means, for its hover.
+pub const FULL_WEIGHT_HINT: &str = "Confirmations at full weight: blocks from this one to the tip that \
+    counted in full in midwimble's fork choice. Only they take bonds to undo. A block over its \
+    signer's cap adds next to nothing, and one full-weight block replaces a run of them, so an \
+    entry with none at full weight can still be reorganised away.";
+
 /// The explorer page for an MDW history entry: its kernel, else its coin,
 /// else its block; a payment still waiting, the mempool it waits in.
 pub fn history_page(base: &str, h: &midstate_walletd::api::MwbHistoryView) -> Option<String> {

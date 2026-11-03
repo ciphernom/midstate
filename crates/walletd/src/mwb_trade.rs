@@ -39,7 +39,11 @@ use midwimble::core::mw::transaction::{Kernel, Transaction as MwbTx};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Blocks on top of a lock before the other side builds on it.
+/// Blocks on top of a lock before the other side builds on it. On
+/// midwimble, only blocks that counted in full in fork choice
+/// ([`Chains::mwb_full_weight`]): an over-cap block adds next to nothing to
+/// the chain's weight, so one full-weight block on the block below replaces
+/// a lock buried under nothing else, however many of them there are.
 pub const CONFIRMATIONS: u64 = 2;
 /// Reveal-leg blocks the taker keeps in hand when it locks: its lock must
 /// confirm, and the maker see it, before the reveal cutoff.
@@ -533,6 +537,11 @@ pub trait Chains {
     fn mds_spend(&self, coin: &[u8; 32], from: u64) -> (Option<Vec<Vec<u8>>>, u64);
     /// An unspent output: the height of its block, and its owner key.
     fn mwb_output(&self, commitment: &Point32) -> Option<(u64, Point32)>;
+    /// How many of midwimble's blocks from `height` to the tip counted in
+    /// full in fork choice, the block at `height` included: the
+    /// confirmations that would take bonds to undo
+    /// (`midwimble::core::orphan::full_weight_blocks`).
+    fn mwb_full_weight(&self, height: u64) -> u64;
     /// A kernel with this excess pair, in the mempool or in blocks from
     /// `from` up; and where the block search got to.
     fn mwb_kernel(&self, excess: &Point32, owner_excess: &Point32, from: u64) -> (Option<Kernel>, u64);
@@ -574,7 +583,7 @@ pub fn observe(sw: &mut MwbSwap, c: &impl Chains, mine_pending: bool) -> Obs {
             if sw.mwb_scan_from == 0 {
                 sw.mwb_scan_from = h;
             }
-            if depth_ok(mwb_tip, h) {
+            if c.mwb_full_weight(h) >= CONFIRMATIONS {
                 Lock::Confirmed
             } else {
                 Lock::Unconfirmed
