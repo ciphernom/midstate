@@ -70,6 +70,8 @@ A merge-mining pool also takes miners who give only a midwimble address, as the 
 
 Every accepted share earns a point of midwimble score for its miner's midwimble address. Each midwimble block the pool finds pays those scores, then clears them. A midwimble coinbase has room for 31 miners: a miner with at least 1/31 of the score is paid exactly, and the rest share the remaining outputs by a draw seeded with both chains' tips, so each one's expected payout is exactly its share.
 
+Midwimble's nodes replace a run of blocks that went over their bond's cap with a block that counts in full (`docs/BONDED_POW.md` in midwimble), so a pool with too few bonds for its share of the work loses some of its midwimble blocks. A replaced block paid nobody, so the pool gives back the scores it took, once, for its next midwimble block to pay. It watches each block it finds until 10 blocks that counted in full bury it, or more than 100 blocks do: the dashboard marks a block settling until then, and orphaned once another block has settled in its place. The node replaces other bonds' over-cap blocks the same way (unless started with `--no-orphan-over-cap`), so a job can build past them, and the dashboard says when one does.
+
 ---
 
 ## Part 2: Mining on a Pool
