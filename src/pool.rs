@@ -90,6 +90,11 @@ struct MergeCommit {
     claimed: Arc<std::sync::atomic::AtomicBool>,
     /// The midwimble height of the block this job makes, as the node said.
     height: Option<u64>,
+    /// How many over-cap blocks at midwimble's tip that block would replace:
+    /// while the tip is a run of them, the node builds on the block before
+    /// the run (midwimble `core/orphan.rs`). 0 on the tip, and from a node
+    /// that does not say.
+    orphans: u64,
     /// What that block mints, subsidy plus fees, as the node said (a node
     /// from before it said doesn't). Browser wallets estimate earnings with it.
     reward: Option<u64>,
@@ -110,6 +115,8 @@ struct MergeStatus {
     note: Option<String>,
     /// The midwimble height of the block the current job makes.
     height: Option<u64>,
+    /// How many over-cap blocks at midwimble's tip that block would replace.
+    orphans: u64,
     /// When this was set (unix seconds); 0 before the first job.
     updated: u64,
 }
@@ -119,11 +126,18 @@ impl MergeStatus {
     /// if it has one) after planning failed with `error`, if it did.
     fn of_job(merge: Option<&MergeCommit>, error: Option<&str>, now: u64) -> Self {
         match merge {
-            Some(m) => MergeStatus { active: true, note: m.note.clone(), height: m.height, updated: now },
+            Some(m) => MergeStatus {
+                active: true,
+                note: m.note.clone(),
+                height: m.height,
+                orphans: m.orphans,
+                updated: now,
+            },
             None => MergeStatus {
                 active: false,
                 note: Some(error.unwrap_or("this job's coinbase had no room for the commitment").to_string()),
                 height: None,
+                orphans: 0,
                 updated: now,
             },
         }
@@ -251,6 +265,12 @@ impl ShareMerkleTree {
 // when one of the job's shares becomes that block, the scores it paid come
 // out of the table: proportional payment, one midwimble block at a time.
 //
+// They come out when the block is found, and go back in if midwimble later
+// replaces it (`reconcile_midwimble_blocks`). Midwimble's nodes replace runs
+// of over-cap blocks on sight (midwimble `core/orphan.rs`), so a pool short
+// of bonds loses blocks routinely, and its miners must not lose the score
+// those blocks were to pay.
+//
 // Score is kept per midwimble address and credited by the connection that did
 // the work. Naming somebody else's midstate address therefore gains nothing of
 // theirs: the shares you submit pay your midwimble address, theirs pay theirs.
@@ -259,8 +279,30 @@ impl ShareMerkleTree {
 const MW_SHARES_TABLE: TableDefinition<&str, u64> = TableDefinition::new("midwimble_shares");
 
 /// Midwimble blocks this pool found, for the dashboard, keyed by when (unix
-/// milliseconds): JSON `{ height, timestamp, payouts: [{ address, weight }] }`.
+/// milliseconds): JSON `{ height, timestamp, payouts: [{ address, weight }],
+/// midstate_block, status }`. `status` is `pending` until the block settles
+/// (`confirmed`) or is replaced (`orphaned`), or `unverified` if the node
+/// could not tell it from another; a block recorded before tracking began
+/// has none.
 const MW_BLOCKS_TABLE: TableDefinition<u64, &str> = TableDefinition::new("midwimble_blocks");
+
+/// Midwimble blocks this pool found that have not settled yet, keyed by the
+/// midstate block whose proof of work they carry (hex), which midwimble's
+/// explorer reports for every merge-mined block: JSON `{ height, row, paid:
+/// [[address, score]] }`, `row` being the block's `MW_BLOCKS_TABLE` key and
+/// `paid` the scores it took out of the table.
+const MW_PENDING_TABLE: TableDefinition<&str, &str> = TableDefinition::new("midwimble_pending");
+
+/// A midwimble block is settled once this many of the blocks from it to the
+/// tip counted in full in fork choice: replacing it would take a heavier
+/// branch than all of them.
+const MW_SETTLED_FULL_WEIGHT: u64 = 10;
+
+/// A midwimble block is settled, too, once more blocks than this bury it:
+/// deeper than any midwimble node builds past (`core::orphan::
+/// MAX_ORPHAN_DEPTH`), what settles it on a node that does not count
+/// full-weight confirmations.
+const MW_SETTLED_DEPTH: u64 = 100;
 
 /// How many found midwimble blocks `/pool/stats` lists.
 const MW_RECENT_BLOCKS: usize = 10;
@@ -604,6 +646,8 @@ struct MergeJobReply {
     mining_hash: String,
     target: [u8; 32],
     height: Option<u64>,
+    /// Over-cap blocks that block would replace, if the node says.
+    orphans: u64,
     /// What that block mints, if the node says.
     reward: Option<u64>,
     /// The proof of work midwimble requires of that block. A node that
@@ -650,7 +694,15 @@ async fn request_merge_job(
         return Err(format!("unusable job: {job}"));
     }
     let pow = parse_merge_pow(&job)?;
-    Ok(MergeJobReply { commitment, mining_hash, target, height: job["height"].as_u64(), reward: job["reward"].as_u64(), pow })
+    Ok(MergeJobReply {
+        commitment,
+        mining_hash,
+        target,
+        height: job["height"].as_u64(),
+        orphans: job["orphans"].as_u64().unwrap_or(0),
+        reward: job["reward"].as_u64(),
+        pow,
+    })
 }
 
 /// Gets this job's midwimble block from the midwimble node, paying the score
@@ -717,6 +769,7 @@ async fn plan_merge(
             paid: Arc::new(paid),
             claimed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             height: reply.height,
+            orphans: reply.orphans,
             reward: reply.reward,
             payouts: Arc::new(payouts),
             note,
@@ -724,8 +777,18 @@ async fn plan_merge(
     ))
 }
 
-/// Records a midwimble block this pool found, at `height`, for the dashboard.
-fn record_midwimble_block(db: &Database, height: Option<u64>, merge: &MergeCommit) -> anyhow::Result<()> {
+/// Records a midwimble block this pool found, at `height`, carrying the proof
+/// of work of the midstate block `midstate_block` (hex): a row for the
+/// dashboard and, while its height is known, an entry that watches it until
+/// it settles or is replaced (`reconcile_midwimble_blocks`), with `paid`, the
+/// scores it took out of the table.
+fn record_midwimble_block(
+    db: &Database,
+    height: Option<u64>,
+    merge: &MergeCommit,
+    midstate_block: &str,
+    paid: &[(String, u64)],
+) -> anyhow::Result<()> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
@@ -734,7 +797,14 @@ fn record_midwimble_block(db: &Database, height: Option<u64>, merge: &MergeCommi
         .iter()
         .map(|(address, weight)| serde_json::json!({ "address": address, "weight": weight }))
         .collect();
-    let row = serde_json::json!({ "height": height, "timestamp": now.as_secs(), "payouts": payouts }).to_string();
+    let row = serde_json::json!({
+        "height": height,
+        "timestamp": now.as_secs(),
+        "payouts": payouts,
+        "midstate_block": midstate_block,
+        "status": height.map(|_| "pending"),
+    })
+    .to_string();
     let txn = db.begin_write()?;
     {
         let mut table = txn.open_table(MW_BLOCKS_TABLE)?;
@@ -743,8 +813,214 @@ fn record_midwimble_block(db: &Database, height: Option<u64>, merge: &MergeCommi
             key += 1;
         }
         table.insert(key, row.as_str())?;
+        if let Some(height) = height {
+            let entry =
+                serde_json::json!({ "height": height, "row": key, "paid": paid }).to_string();
+            txn.open_table(MW_PENDING_TABLE)?
+                .insert(midstate_block, entry.as_str())?;
+        }
     }
     txn.commit()?;
+    Ok(())
+}
+
+/// Whether a midwimble block, as midwimble's explorer describes it, has
+/// settled: buried under [`MW_SETTLED_FULL_WEIGHT`] blocks that counted in
+/// full, deeper than [`MW_SETTLED_DEPTH`], or below a finalized checkpoint.
+fn midwimble_block_settled(block: &serde_json::Value) -> bool {
+    block["finalized"].as_bool() == Some(true)
+        || block["full_weight_confirmations"]
+            .as_u64()
+            .is_some_and(|n| n >= MW_SETTLED_FULL_WEIGHT)
+        || block["confirmations"]
+            .as_u64()
+            .is_some_and(|n| n > MW_SETTLED_DEPTH)
+}
+
+/// What becomes of a pending midwimble block of this pool's, at `height` and
+/// carrying the proof of work of the midstate block `ours` (hex), from what
+/// the node's explorer shows at that height (`None`: no block to show) and
+/// the node's `/state` height (its tip's height plus one, so `node_height -
+/// height` blocks bury the one at `height`, itself included): `"confirmed"`,
+/// `"orphaned"` (its scores go back), `"unverified"`, or `None` to keep
+/// watching it.
+///
+/// Another block at its height counts as having replaced it only once that
+/// block has settled in turn, so a fork still being decided never gives the
+/// scores back while the pool's block may yet win.
+fn midwimble_block_fate(
+    ours: &str,
+    height: u64,
+    shown: Option<&serde_json::Value>,
+    node_height: Option<u64>,
+) -> Option<&'static str> {
+    // More than MW_SETTLED_DEPTH blocks deep: whatever holds the height keeps it.
+    let deep = node_height.is_some_and(|n| n > height.saturating_add(MW_SETTLED_DEPTH));
+    // No block to show (an endpoint with no explorer, such as the desktop
+    // wallet's, or a chain not back up to this height), or an explorer that
+    // does not say which blocks are merge-mined: nothing tells the pool's
+    // block from another, so it is let go unrefunded once nothing could
+    // replace it any more.
+    let Some((block, merged)) = shown.and_then(|b| Some((b, b.get("merged")?))) else {
+        return deep.then_some("unverified");
+    };
+    let settled = deep || midwimble_block_settled(block);
+    if merged["midstate_block"].as_str() == Some(ours) {
+        settled.then_some("confirmed")
+    } else if block["hash"].is_string() {
+        settled.then_some("orphaned")
+    } else {
+        None
+    }
+}
+
+/// One reconciliation at a time: they are spawned beside the job loop.
+static MW_RECONCILING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Settles the midwimble blocks this pool found (`MW_PENDING_TABLE`) against
+/// the midwimble node's chain ([`midwimble_block_fate`]). A block still there
+/// that has settled ([`midwimble_block_settled`]) is confirmed, and no longer
+/// watched. One whose height now holds another block, settled in turn, was
+/// replaced: the scores it took go back into the table, for the pool's next
+/// block to pay. Anything unclear (the node unreachable, the chain not back
+/// up to the block's height, a fork not yet decided) leaves the block pending
+/// for the next try, so a block is never refunded on a guess. A block the
+/// node cannot tell from others (an endpoint without midwimble's explorer,
+/// such as the desktop wallet's) is given up on, unrefunded, once the chain
+/// is past any node's orphaning depth above it.
+///
+/// The pool knows its block by the midstate block that carries its proof of
+/// work, which midwimble's explorer reports for a merge-mined block
+/// (`merged.midstate_block`).
+async fn reconcile_midwimble_blocks(
+    state: &Arc<PoolState>,
+    client: &reqwest::Client,
+) -> Result<(), String> {
+    let Some(rpc) = state.midwimble_rpc.as_deref() else {
+        return Ok(());
+    };
+    let node_height = match client
+        .get(format!("{rpc}/state"))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+    {
+        Ok(r) => r
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|s| s["height"].as_u64()),
+        Err(_) => None,
+    };
+    let pending: Vec<(String, serde_json::Value)> = {
+        let txn = state.db.begin_read().map_err(|e| e.to_string())?;
+        let table = txn
+            .open_table(MW_PENDING_TABLE)
+            .map_err(|e| e.to_string())?;
+        let rows = table.iter().map_err(|e| e.to_string())?;
+        rows.flatten()
+            .map(|(k, v)| {
+                (
+                    k.value().to_string(),
+                    serde_json::from_str(v.value()).unwrap_or_default(),
+                )
+            })
+            .collect()
+    };
+    let mut resolved: Vec<(String, serde_json::Value, &str)> = Vec::new();
+    for (midstate_block, entry) in pending {
+        let Some(height) = entry["height"].as_u64() else {
+            continue;
+        };
+        let Ok(resp) = client
+            .get(format!("{rpc}/explorer/block/{height}"))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+        else {
+            continue;
+        };
+        // Not found: no block at that height, or no explorer at all. Any
+        // other failure says nothing, so the block waits for the next try.
+        let shown = match resp.status() {
+            s if s.is_success() => match resp.json::<serde_json::Value>().await {
+                Ok(block) => Some(block),
+                Err(_) => continue,
+            },
+            reqwest::StatusCode::NOT_FOUND => None,
+            _ => continue,
+        };
+        if let Some(status) =
+            midwimble_block_fate(&midstate_block, height, shown.as_ref(), node_height)
+        {
+            resolved.push((midstate_block, entry, status));
+        }
+    }
+    if resolved.is_empty() {
+        return Ok(());
+    }
+    let txn = state.db.begin_write().map_err(|e| e.to_string())?;
+    {
+        let mut pending = txn
+            .open_table(MW_PENDING_TABLE)
+            .map_err(|e| e.to_string())?;
+        let mut rows = txn.open_table(MW_BLOCKS_TABLE).map_err(|e| e.to_string())?;
+        let mut scores = txn.open_table(MW_SHARES_TABLE).map_err(|e| e.to_string())?;
+        for (key, entry, status) in &resolved {
+            // Once only, whichever reconciliation gets there first.
+            if pending
+                .remove(key.as_str())
+                .map_err(|e| e.to_string())?
+                .is_none()
+            {
+                continue;
+            }
+            if let Some(row_key) = entry["row"].as_u64() {
+                let row = rows
+                    .get(row_key)
+                    .map_err(|e| e.to_string())?
+                    .and_then(|v| serde_json::from_str::<serde_json::Value>(v.value()).ok());
+                if let Some(mut row) = row {
+                    row["status"] = serde_json::json!(status);
+                    rows.insert(row_key, row.to_string().as_str())
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+            let height = entry["height"].as_u64().unwrap_or(0);
+            match *status {
+                "confirmed" => {
+                    tracing::info!("midwimble block {height} has settled");
+                    continue;
+                }
+                "unverified" => {
+                    tracing::info!(
+                        "midwimble block {height} is past the orphaning depth, but the node cannot tell it from another; no longer watched"
+                    );
+                    continue;
+                }
+                _ => {}
+            }
+            let paid = entry["paid"].as_array().cloned().unwrap_or_default();
+            for p in &paid {
+                let (Some(address), Some(score)) = (p[0].as_str(), p[1].as_u64()) else {
+                    continue;
+                };
+                let current = scores
+                    .get(address)
+                    .map_err(|e| e.to_string())?
+                    .map(|v| v.value())
+                    .unwrap_or(0);
+                scores
+                    .insert(address, current.saturating_add(score))
+                    .map_err(|e| e.to_string())?;
+            }
+            tracing::warn!(
+                "midwimble block {height} was replaced; the scores it took from {} address(es) are back, for the next block to pay",
+                paid.len()
+            );
+        }
+    }
+    txn.commit().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -757,16 +1033,18 @@ async fn midwimble_stats(state: &PoolState) -> serde_json::Value {
     let mut scores = midwimble_scores(&state.db);
     scores.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     let total_score: u64 = scores.iter().map(|(_, s)| *s).sum();
-    let (mut blocks_found, mut recent) = (0usize, Vec::new());
+    let (mut blocks_found, mut blocks_orphaned, mut recent) = (0usize, 0usize, Vec::new());
     if let Ok(txn) = state.db.begin_read() {
         if let Ok(table) = txn.open_table(MW_BLOCKS_TABLE) {
             if let Ok(rows) = table.iter() {
                 for row in rows.rev().flatten() {
                     blocks_found += 1;
+                    let block = serde_json::from_str::<serde_json::Value>(row.1.value()).ok();
+                    if block.as_ref().is_some_and(|b| b["status"] == "orphaned") {
+                        blocks_orphaned += 1;
+                    }
                     if recent.len() < MW_RECENT_BLOCKS {
-                        if let Ok(block) = serde_json::from_str::<serde_json::Value>(row.1.value()) {
-                            recent.push(block);
-                        }
+                        recent.extend(block);
                     }
                 }
             }
@@ -777,6 +1055,9 @@ async fn midwimble_stats(state: &PoolState) -> serde_json::Value {
         "active": status.active,
         "note": status.note,
         "height": status.height,
+        // Over-cap blocks at midwimble's tip the current job's block would
+        // replace: it builds on the block before them.
+        "orphans": status.orphans,
         "updated": status.updated,
         "scores": scores
             .iter()
@@ -784,6 +1065,8 @@ async fn midwimble_stats(state: &PoolState) -> serde_json::Value {
             .collect::<Vec<_>>(),
         "total_score": total_score,
         "blocks_found": blocks_found,
+        // Of those, the ones midwimble replaced: their scores went back.
+        "blocks_orphaned": blocks_orphaned,
         "recent_blocks": recent,
     })
 }
@@ -1217,6 +1500,7 @@ pub async fn run_stratum_pool(
         let _ = write_txn.open_table(PENDING_BLOCKS_TABLE).unwrap();
         let _ = write_txn.open_table(MW_SHARES_TABLE).unwrap();
         let _ = write_txn.open_table(MW_BLOCKS_TABLE).unwrap();
+        let _ = write_txn.open_table(MW_PENDING_TABLE).unwrap();
         // ── One-off migration: purge stale zero-score rows ──
         // Databases written by affected versions accumulated permanent `score == 0`
         // rows (the deduction path used to write them back instead of removing them).
@@ -1408,6 +1692,10 @@ pub async fn run_stratum_pool(
         // one midwimble block, so once that tip moves no share can win
         // midwimble until the job is rebuilt.
         let mut last_mw_tip = String::new();
+        // The block midwimble's node builds on in place of that tip, when it
+        // builds past a run of over-cap blocks at it (`orphaning` in its
+        // `/state`): a node may work it out only after the tip arrives.
+        let mut last_mw_base = String::new();
         // Seed job IDs with the Unix timestamp so IDs issued before a pool restart
         // can never collide with IDs issued after it. (A zero-seeded counter resets
         // on restart; a still-connected miner's stale share can then carry a job_id
@@ -1525,9 +1813,13 @@ pub async fn run_stratum_pool(
             let force_new_job = !current_tip.is_empty()
                 && state_clone.force_new_job.swap(false, std::sync::atomic::Ordering::SeqCst);
 
-            // When merge-mining, a new midwimble tip needs a new job too. The
+            // When merge-mining, a new midwimble tip needs a new job too, and
+            // so does a new block for the node to build on in its place. The
             // short timeout keeps a hung midwimble node from slowing midstate.
-            let mw_tip = match (state_clone.midwimble_rpc.as_deref(), state_clone.midwimble_address.as_deref()) {
+            let (mw_tip, mw_base) = match (
+                state_clone.midwimble_rpc.as_deref(),
+                state_clone.midwimble_address.as_deref(),
+            ) {
                 (Some(rpc), Some(_)) => match client
                     .get(format!("{rpc}/state"))
                     .timeout(Duration::from_secs(1))
@@ -1538,17 +1830,33 @@ pub async fn run_stratum_pool(
                         .json::<serde_json::Value>()
                         .await
                         .ok()
-                        .and_then(|s| s["tip"].as_str().map(str::to_string))
+                        .and_then(|s| {
+                            let base = s["orphaning"]["prev_hash"].as_str().unwrap_or("");
+                            Some((s["tip"].as_str()?.to_string(), base.to_string()))
+                        })
                         .unwrap_or_default(),
-                    Err(_) => String::new(),
+                    Err(_) => Default::default(),
                 },
-                _ => String::new(),
+                _ => Default::default(),
             };
-            let mw_moved = !mw_tip.is_empty() && mw_tip != last_mw_tip;
+            let mw_moved = !mw_tip.is_empty() && (mw_tip != last_mw_tip || mw_base != last_mw_base);
+            // A new midwimble tip may settle the midwimble blocks this pool
+            // found, or have replaced one. Checked beside the job loop, so a
+            // slow midwimble node never holds up midstate's jobs.
+            if mw_moved && !MW_RECONCILING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let (state, client) = (state_clone.clone(), client.clone());
+                tokio::spawn(async move {
+                    if let Err(e) = reconcile_midwimble_blocks(&state, &client).await {
+                        tracing::warn!("could not reconcile midwimble blocks: {e}");
+                    }
+                    MW_RECONCILING.store(false, std::sync::atomic::Ordering::SeqCst);
+                });
+            }
 
             if (current_tip != last_network_tip || force_new_job || mw_moved) && !current_tip.is_empty() {
                 if !mw_tip.is_empty() {
                     last_mw_tip = mw_tip.clone();
+                    last_mw_base = mw_base.clone();
                 }
 
                  // Only reconcile if the network tip actually advanced
@@ -2922,12 +3230,16 @@ fn spawn_midwimble_submission(
     let Some(rpc) = state.midwimble_rpc.clone() else {
         return;
     };
+    // The midstate block whose proof of work the midwimble block carries:
+    // midwimble's explorer names it for the block, which is how the pool
+    // finds its block again (`reconcile_midwimble_blocks`).
+    let midstate_block = hex::encode(ext.final_hash);
     let body = serde_json::json!({
         "mining_hash": merge.mining_hash,
         "batch_template": job.batch_template,
         "commit_index": merge.commit_index,
         "nonce": ext.nonce,
-        "final_hash": hex::encode(ext.final_hash),
+        "final_hash": midstate_block,
     });
     let state = state.clone();
     tokio::spawn(async move {
@@ -2951,8 +3263,14 @@ fn spawn_midwimble_submission(
         match answer {
             Ok(reply) => {
                 tracing::info!("midwimble block accepted at height {}", reply["height"]);
-                if let Err(e) = record_midwimble_block(&state.db, reply["height"].as_u64().or(merge.height), &merge) {
-                    tracing::warn!("could not record the midwimble block for the dashboard: {e}");
+                // Watched until it settles: if midwimble replaces it, these
+                // scores go back (`reconcile_midwimble_blocks`).
+                let paid: &[(String, u64)] = if scores_taken { &merge.paid } else { &[] };
+                let height = reply["height"].as_u64().or(merge.height);
+                if let Err(e) =
+                    record_midwimble_block(&state.db, height, &merge, &midstate_block, paid)
+                {
+                    tracing::warn!("could not record the midwimble block: {e}");
                 }
                 // Midwimble's tip has moved, so this job's commitment is spent.
                 state.force_new_job.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -3652,6 +3970,11 @@ mod tests {
         found: Vec<serde_json::Value>,
         refuse_miners: bool,
         refuse_blocks: bool,
+        /// What the explorer says of each height (`/explorer/block/{h}`);
+        /// a height it has no block at is not found.
+        explorer: HashMap<u64, serde_json::Value>,
+        /// The height `/state` reports; `None` serves no `/state`.
+        tip: Option<u64>,
     }
     type Shared = Arc<std::sync::Mutex<Mock>>;
 
@@ -3690,9 +4013,34 @@ mod tests {
             }
             (StatusCode::OK, Json(serde_json::json!({ "accepted": true, "height": 7, "merged_mined": true })))
         }
+        async fn explorer_block(
+            State((_, mock)): State<(String, Shared)>,
+            axum::extract::Path(height): axum::extract::Path<u64>,
+        ) -> (StatusCode, Json<serde_json::Value>) {
+            match mock.lock().unwrap().explorer.get(&height) {
+                Some(block) => (StatusCode::OK, Json(block.clone())),
+                None => (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": "block not found" })),
+                ),
+            }
+        }
+        async fn chain_state(
+            State((_, mock)): State<(String, Shared)>,
+        ) -> (StatusCode, Json<serde_json::Value>) {
+            match mock.lock().unwrap().tip {
+                Some(height) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "height": height })),
+                ),
+                None => (StatusCode::NOT_FOUND, Json(serde_json::json!({}))),
+            }
+        }
         let app = Router::new()
             .route("/merge/job", post(job))
             .route("/merge/found", post(found))
+            .route("/explorer/block/:height", get(explorer_block))
+            .route("/state", get(chain_state))
             .with_state((pool, mock));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3792,6 +4140,7 @@ mod tests {
             paid: Arc::new(paid),
             claimed: Arc::new(AtomicBool::new(false)),
             height: Some(7),
+            orphans: 0,
             reward: Some(23_932_616),
             note: None,
         };
@@ -3851,6 +4200,233 @@ mod tests {
             sorted(vec![(ALICE.into(), 1), (pool.clone(), 1)]),
             "a share with no midwimble address counts for the pool"
         );
+    }
+
+    /// The midwimble blocks this pool found, oldest first.
+    fn mw_blocks(db: &Database) -> Vec<serde_json::Value> {
+        let txn = db.begin_read().unwrap();
+        let table = txn.open_table(MW_BLOCKS_TABLE).unwrap();
+        let rows = table.iter().unwrap();
+        rows.flatten()
+            .map(|(_, v)| serde_json::from_str(v.value()).unwrap())
+            .collect()
+    }
+
+    /// What midwimble's explorer says of a block at height 7: merge-mined
+    /// with the proof of work of `midstate_block`, under `full_weight` blocks
+    /// that counted in full.
+    fn explorer_says(midstate_block: &str, full_weight: u64) -> serde_json::Value {
+        serde_json::json!({
+            "height": 7,
+            "hash": "33".repeat(32),
+            "confirmations": full_weight + 1,
+            "full_weight_confirmations": full_weight,
+            "finalized": false,
+            "merged": { "midstate_block": midstate_block },
+        })
+    }
+
+    /// Midwimble replaces runs of over-cap blocks on sight (its
+    /// `core/orphan.rs`), so a block it took from the pool can vanish later.
+    /// The pool watches each block it found until it settles. Nothing
+    /// changes while the node cannot say (down, or not back up to the
+    /// block's height), the block is still there unsettled, or another block
+    /// holds its height unsettled. Once that other block has settled, the
+    /// scores the pool's block took go back, once. A block buried under
+    /// enough full-weight blocks keeps them and is no longer watched.
+    #[tokio::test]
+    async fn a_midwimble_block_that_is_replaced_gives_its_scores_back() {
+        let (_dir, db) = test_db();
+        let pool = pool_mw();
+        let mock: Shared = Default::default();
+        let rpc = stand_in_midwimble(pool.clone(), mock.clone()).await;
+        let state = test_state(db.clone(), rpc, pool.clone());
+        let client = reqwest::Client::new();
+        settle_midwimble_scores(&db, &[(ALICE.into(), 3), (BOB.into(), 1)], true).unwrap();
+        serve_winning_job(&state, 1, midwimble_scores(&db)).await;
+
+        // ALICE's share wins block 7, which takes the scores it pays.
+        process_share(&state, [1; 32], "rig", Some(ALICE), 1, 11)
+            .await
+            .unwrap();
+        settled(&mock, 1).await;
+        let ours = mock.lock().unwrap().found[0]["final_hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(midwimble_scores(&db), vec![(ALICE.to_string(), 1)]);
+        assert_eq!(mw_blocks(&db)[0]["status"], "pending");
+        assert_eq!(mw_blocks(&db)[0]["midstate_block"], ours.as_str());
+
+        // The node has no block 7 to show; then it shows ours, unsettled.
+        reconcile_midwimble_blocks(&state, &client).await.unwrap();
+        mock.lock()
+            .unwrap()
+            .explorer
+            .insert(7, explorer_says(&ours, 3));
+        reconcile_midwimble_blocks(&state, &client).await.unwrap();
+        assert_eq!(mw_blocks(&db)[0]["status"], "pending");
+        assert_eq!(midwimble_scores(&db), vec![(ALICE.to_string(), 1)]);
+
+        // Another block holds height 7, but that fork is not decided yet:
+        // ours could still win it, so nothing comes back.
+        let other = "44".repeat(32);
+        mock.lock()
+            .unwrap()
+            .explorer
+            .insert(7, explorer_says(&other, 1));
+        reconcile_midwimble_blocks(&state, &client).await.unwrap();
+        assert_eq!(mw_blocks(&db)[0]["status"], "pending");
+        assert_eq!(midwimble_scores(&db), vec![(ALICE.to_string(), 1)]);
+
+        // That block has settled: ours was replaced. Its scores come back,
+        // and only once.
+        mock.lock()
+            .unwrap()
+            .explorer
+            .insert(7, explorer_says(&other, MW_SETTLED_FULL_WEIGHT));
+        reconcile_midwimble_blocks(&state, &client).await.unwrap();
+        reconcile_midwimble_blocks(&state, &client).await.unwrap();
+        assert_eq!(mw_blocks(&db)[0]["status"], "orphaned");
+        assert_eq!(
+            sorted(midwimble_scores(&db)),
+            sorted(vec![(ALICE.into(), 4), (BOB.into(), 1)])
+        );
+
+        // The next block the pool finds settles: it keeps what it took.
+        serve_winning_job(&state, 2, midwimble_scores(&db)).await;
+        process_share(&state, [1; 32], "rig", Some(ALICE), 2, 12)
+            .await
+            .unwrap();
+        settled(&mock, 2).await;
+        let ours = mock.lock().unwrap().found[1]["final_hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let taken = midwimble_scores(&db);
+        assert_eq!(taken, vec![(ALICE.to_string(), 1)]);
+        mock.lock()
+            .unwrap()
+            .explorer
+            .insert(7, explorer_says(&ours, MW_SETTLED_FULL_WEIGHT));
+        reconcile_midwimble_blocks(&state, &client).await.unwrap();
+        assert_eq!(mw_blocks(&db)[1]["status"], "confirmed");
+        assert_eq!(midwimble_scores(&db), taken);
+        mock.lock()
+            .unwrap()
+            .explorer
+            .insert(7, explorer_says(&"55".repeat(32), 0));
+        reconcile_midwimble_blocks(&state, &client).await.unwrap();
+        assert_eq!(
+            midwimble_scores(&db),
+            taken,
+            "a settled block is no longer watched"
+        );
+
+        // A node that never describes the block (an endpoint with no
+        // explorer) leaves it pending until the chain is past any node's
+        // orphaning depth above it; then it is let go, refunding nothing.
+        serve_winning_job(&state, 3, midwimble_scores(&db)).await;
+        process_share(&state, [1; 32], "rig", Some(ALICE), 3, 13)
+            .await
+            .unwrap();
+        settled(&mock, 3).await;
+        let taken = midwimble_scores(&db);
+        // (The node's height counts blocks: at 108, 101 blocks bury block 7.)
+        mock.lock().unwrap().explorer.remove(&7);
+        mock.lock().unwrap().tip = Some(7 + MW_SETTLED_DEPTH);
+        reconcile_midwimble_blocks(&state, &client).await.unwrap();
+        assert_eq!(mw_blocks(&db)[2]["status"], "pending");
+        mock.lock().unwrap().tip = Some(8 + MW_SETTLED_DEPTH);
+        reconcile_midwimble_blocks(&state, &client).await.unwrap();
+        assert_eq!(mw_blocks(&db)[2]["status"], "unverified");
+        assert_eq!(midwimble_scores(&db), taken);
+
+        let stats = midwimble_stats(&state).await;
+        assert_eq!(
+            (
+                stats["blocks_found"].clone(),
+                stats["blocks_orphaned"].clone()
+            ),
+            (3.into(), 1.into())
+        );
+    }
+
+    #[test]
+    fn a_block_settles_under_full_weight_blocks_or_past_the_orphaning_depth() {
+        let block = |full: Option<u64>, confirmations: u64, finalized: bool| {
+            serde_json::json!({
+                "full_weight_confirmations": full,
+                "confirmations": confirmations,
+                "finalized": finalized,
+            })
+        };
+        assert!(!midwimble_block_settled(&block(Some(9), 50, false)));
+        assert!(midwimble_block_settled(&block(Some(10), 10, false)));
+        // Over-cap blocks above it, however many, settle nothing...
+        assert!(!midwimble_block_settled(&block(Some(0), 100, false)));
+        // ...until it is past any node's orphaning depth.
+        assert!(midwimble_block_settled(&block(Some(0), 101, false)));
+        // A node that does not count full-weight confirmations.
+        assert!(!midwimble_block_settled(
+            &serde_json::json!({ "confirmations": 30 })
+        ));
+        assert!(midwimble_block_settled(&block(None, 2, true)));
+    }
+
+    #[test]
+    fn a_pending_block_is_judged_by_what_holds_its_height() {
+        let (ours, other) = ("aa".repeat(32), "bb".repeat(32));
+        let fate = |shown: Option<serde_json::Value>, node_height: u64| {
+            midwimble_block_fate(&ours, 7, shown.as_ref(), Some(node_height))
+        };
+        let full = MW_SETTLED_FULL_WEIGHT;
+        // Ours, unsettled and then settled.
+        assert_eq!(fate(Some(explorer_says(&ours, 3)), 10), None);
+        assert_eq!(
+            fate(Some(explorer_says(&ours, full)), 20),
+            Some("confirmed")
+        );
+        // Another block replaced ours only once it has settled in turn,
+        // merge-mined or not.
+        assert_eq!(fate(Some(explorer_says(&other, 3)), 10), None);
+        assert_eq!(
+            fate(Some(explorer_says(&other, full)), 20),
+            Some("orphaned")
+        );
+        let native = serde_json::json!({
+            "hash": "33".repeat(32),
+            "merged": null,
+            "full_weight_confirmations": full,
+        });
+        assert_eq!(fate(Some(native), 20), Some("orphaned"));
+
+        // A node that counts no full-weight confirmations: past the
+        // orphaning depth, whatever holds the height keeps it.
+        let bare = |midstate_block: &str| {
+            serde_json::json!({
+                "hash": "33".repeat(32),
+                "merged": { "midstate_block": midstate_block },
+            })
+        };
+        // The node's height counts blocks: at 108, 101 blocks bury block 7.
+        let deep = 8 + MW_SETTLED_DEPTH;
+        assert_eq!(fate(Some(bare(&ours)), deep - 1), None);
+        assert_eq!(fate(Some(bare(&ours)), deep), Some("confirmed"));
+        assert_eq!(fate(Some(bare(&other)), deep - 1), None);
+        assert_eq!(fate(Some(bare(&other)), deep), Some("orphaned"));
+
+        // Nothing tells ours from another: no block to show, or an explorer
+        // that does not say which blocks are merge-mined. It is let go past
+        // that depth, refunding nothing, never taken for replaced.
+        let unknown =
+            serde_json::json!({ "hash": "33".repeat(32), "full_weight_confirmations": full });
+        assert_eq!(fate(Some(unknown.clone()), deep - 1), None);
+        assert_eq!(fate(Some(unknown), deep), Some("unverified"));
+        assert_eq!(fate(None, deep - 1), None);
+        assert_eq!(fate(None, deep), Some("unverified"));
+        // Nor is it with the node's height unknown.
+        assert_eq!(midwimble_block_fate(&ours, 7, None, None), None);
     }
 
     #[tokio::test]
@@ -3946,6 +4522,7 @@ mod tests {
             paid: Arc::new(Vec::new()),
             claimed: Arc::new(AtomicBool::new(false)),
             height: Some(7),
+            orphans: 0,
             reward: Some(23_932_616),
             note: None,
         };
@@ -4095,7 +4672,13 @@ mod tests {
         let refused = MergeStatus::of_job(None, Some("bonded mining is required from height 1"), 5);
         assert_eq!(
             refused,
-            MergeStatus { active: false, note: Some("bonded mining is required from height 1".into()), height: None, updated: 5 }
+            MergeStatus {
+                active: false,
+                note: Some("bonded mining is required from height 1".into()),
+                height: None,
+                orphans: 0,
+                updated: 5
+            }
         );
         let no_room = MergeStatus::of_job(None, None, 6);
         assert!(!no_room.active && no_room.note.is_some());
@@ -4107,6 +4690,7 @@ mod tests {
             paid: Arc::new(Vec::new()),
             claimed: Arc::new(AtomicBool::new(false)),
             height: Some(9),
+            orphans: 3,
             reward: None,
             payouts: Arc::new(vec![(pool_mw(), 1)]),
             note: Some("the node refused the miners' payouts".into()),
@@ -4114,7 +4698,13 @@ mod tests {
         let live = MergeStatus::of_job(Some(&merge), None, 7);
         assert_eq!(
             live,
-            MergeStatus { active: true, note: merge.note.clone(), height: Some(9), updated: 7 }
+            MergeStatus {
+                active: true,
+                note: merge.note.clone(),
+                height: Some(9),
+                orphans: 3,
+                updated: 7
+            }
         );
     }
 

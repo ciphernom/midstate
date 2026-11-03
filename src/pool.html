@@ -340,7 +340,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-sp
           <tbody id="mw-blocks"><tr class="empty-row"><td colspan="3">Loading...</td></tr></tbody>
         </table>
       </div>
-      <div class="ref-note">Every share also earns midwimble score for the address your miner gives with <span class="mono">--midwimble-address</span>; shares without one count for the pool. A midwimble block pays at most 31 addresses: anyone with 1/31 of the score is paid exactly, the rest by a draw that gives each its share on average. Midwimble amounts are confidential, so blocks show each address's share.</div>
+      <div class="ref-note">Every share also earns midwimble score for the address your miner gives with <span class="mono">--midwimble-address</span>; shares without one count for the pool. A midwimble block pays at most 31 addresses: anyone with 1/31 of the score is paid exactly, the rest by a draw that gives each its share on average. Midwimble amounts are confidential, so blocks show each address's share. A block midwimble replaces pays nobody, so the scores it took go back to the table for the next block.</div>
     </div>
 
     <div class="pool-box">
@@ -1193,12 +1193,20 @@ function renderMidwimble(data) {
   const starting = !Number(mw.updated);
   $('mw-badge').className = 'badge ' + (mw.active ? 'ok' : (starting ? 'wait' : 'bad'));
   $('mw-badge-text').textContent = mw.active ? 'merge-mining' : (starting ? 'starting' : 'paused · mining midstate alone');
-  $('mw-note').textContent = mw.note || (mw.active ? 'every share is also a chance at a midwimble block' : '');
+  // Past a run of over-cap blocks at midwimble's tip, the job's block builds
+  // on the block before them, and replaces the lot.
+  const orphans = Number(mw.orphans) || 0;
+  const past = orphans > 0
+    ? 'building past ' + fmtInt(orphans) + ' over-cap midwimble block' + (orphans === 1 ? '' : 's') + ': a block from this job replaces them'
+    : 'every share is also a chance at a midwimble block';
+  $('mw-note').textContent = mw.note || (mw.active ? past : '');
 
   $('mw-height').textContent = (mw.height != null) ? ('#' + fmtInt(mw.height)) : '--';
   const blocks = mw.recent_blocks || [];
   $('mw-found').textContent = fmtInt(mw.blocks_found);
-  $('mw-found-sub').textContent = blocks.length ? ('last ' + relAge(blocks[0].timestamp)) : 'merge-mined by this pool';
+  const orphaned = Number(mw.blocks_orphaned) || 0;
+  $('mw-found-sub').textContent = (blocks.length ? ('last ' + relAge(blocks[0].timestamp)) : 'merge-mined by this pool') +
+    (orphaned ? ' · ' + fmtInt(orphaned) + ' replaced' : '');
 
   const scores = mw.scores || [];
   const total = Number(mw.total_score) || 0;
@@ -1225,8 +1233,15 @@ function renderMidwimble(data) {
           const pct = sum > 0 ? (Number(p.weight) / sum * 100) : 0;
           return '<div class="pay"><span>' + label(p.address) + '</span><span class="amt">' + pct.toFixed(2) + '%</span></div>';
         }).join('') || '--';
+        // Settling, or replaced on midwimble (its scores went back to the
+        // table, for the next block to pay).
+        const state = b.status === 'orphaned'
+          ? '<span class="fee-tag" title="Midwimble replaced this block. The scores it paid went back to the table, for the next block to pay.">orphaned</span>'
+          : b.status === 'pending'
+            ? '<span class="fee-tag" title="Not settled yet: if midwimble replaces it, the scores it paid go back to the table.">settling</span>'
+            : '';
         return '<tr><td class="num">' + relAge(b.timestamp) + '</td>' +
-          '<td class="num">' + ((b.height != null) ? ('#' + fmtInt(b.height)) : '--') + '</td>' +
+          '<td class="num">' + ((b.height != null) ? ('#' + fmtInt(b.height)) : '--') + state + '</td>' +
           '<td>' + paid + '</td></tr>';
       }).join('')
     : '<tr class="empty-row"><td colspan="3">No midwimble blocks found yet.</td></tr>';
