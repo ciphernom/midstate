@@ -179,6 +179,27 @@ pub fn check_terms(mds_amount: u64, mdw_amount: u64) -> Result<()> {
     Ok(())
 }
 
+/// Midstate height from which a [`Side::SellMds`] swap may start.
+///
+/// # Reasoning
+/// The maker's MDS goes behind `compile_mwb_or_lock`, which uses
+/// `OP_MERKLE_ROOT`. Below `V6_ACTIVATION_HEIGHT` that opcode makes the whole
+/// script invalid, claim and refund alike, so nobody can spend the lock
+/// until then. A swap started from this height only ever spends its lock
+/// where the script is valid. The AND lock ([`Side::SellMdw`]) uses no
+/// height-gated opcode.
+pub const SELL_MDS_FROM: u64 = midstate::core::types::V6_ACTIVATION_HEIGHT;
+
+/// Checks that a swap on `side` may start at midstate height `mds_tip`, for
+/// the maker placing or answering and the taker taking alike.
+pub fn check_side_open(side: Side, mds_tip: u64) -> Result<()> {
+    ensure!(
+        side != Side::SellMds || mds_tip >= SELL_MDS_FROM,
+        "selling MDS opens at midstate block {SELL_MDS_FROM}, where its lock becomes spendable (the tip is {mds_tip})"
+    );
+    Ok(())
+}
+
 /// An order heard on the bus.
 #[derive(Clone, Debug)]
 pub struct BookEntry {

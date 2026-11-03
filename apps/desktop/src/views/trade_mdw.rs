@@ -14,6 +14,7 @@ use crate::theme::{self, compact_units, short_hex};
 use crate::views::mdw::{self as m, mdw, parse_mdw, COIN};
 use eframe::egui::{self, FontId, RichText, TextEdit, Ui};
 use midstate_walletd::api::{MwbBookEntryView, MwbSwapView};
+use midstate_walletd::mwb_trade::SELL_MDS_FROM;
 
 const TABS: [&str; 3] = ["Order book", "My orders", "Swaps"];
 
@@ -118,8 +119,13 @@ fn account_strip(app: &mut App, ui: &mut Ui, ctx: &egui::Context) -> bool {
     true
 }
 
+/// Whether a swap on `side` can start at `tip` (`mwb_trade::check_side_open`).
+fn side_open(side: &str, tip: u64) -> bool {
+    side != "sell_mds" || tip >= SELL_MDS_FROM
+}
+
 fn takeable(e: &MwbBookEntryView, tip: u64) -> bool {
-    !e.mine && e.expires > tip
+    !e.mine && e.expires > tip && side_open(&e.side, tip)
 }
 
 fn book(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
@@ -167,6 +173,8 @@ fn book(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
                                 app.mwb_take_armed = Some(e.order_id.clone());
                             }
                         }
+                    } else if !side_open(&e.side, tip) {
+                        ui.label(theme::mono(format!("from {SELL_MDS_FROM}")).size(11.0).color(theme::muted()));
                     } else {
                         ui.label("");
                     }
@@ -196,6 +204,7 @@ fn book(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
 
 fn place_panel(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
     let syncing = app.sync.as_ref().map(|s| s.is_syncing).unwrap_or(true);
+    let tip = app.sync.as_ref().map_or(0, |s| s.height);
     egui::CollapsingHeader::new("Make an order")
         .id_salt("mwb_place")
         .default_open(app.mwb_orders.iter().all(|o| o.status != "open"))
@@ -233,6 +242,18 @@ fn place_panel(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
                     }
                     _ => {}
                 }
+                let open = side_open(if app.mwb_side == 0 { "sell_mds" } else { "sell_mdw" }, tip);
+                if !open {
+                    ui.label(
+                        RichText::new(format!(
+                            "Selling MDS opens at midstate block {SELL_MDS_FROM}, {} blocks from now. \
+                             Selling MDW works today.",
+                            SELL_MDS_FROM.saturating_sub(tip)
+                        ))
+                        .size(12.0)
+                        .color(theme::amber()),
+                    );
+                }
                 theme::hint(
                     ui,
                     if app.mwb_side == 0 {
@@ -246,7 +267,7 @@ fn place_panel(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
                     },
                 );
                 theme::right_aligned(ui, |ui| {
-                    let can = !app.busy && !syncing && mds.is_ok() && mdw_units.is_ok();
+                    let can = !app.busy && !syncing && open && mds.is_ok() && mdw_units.is_ok();
                     if ui.add_enabled(can, egui::Button::new("Publish order")).clicked() {
                         app.busy = true;
                         app.error.clear();

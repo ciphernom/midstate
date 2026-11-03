@@ -18,6 +18,7 @@ use midstate_walletd::mwb_account::{BlockView, MwbAccount};
 use midstate_walletd::mwb_negotiate::{Ctx, Negotiation, Step};
 use midstate_walletd::mwb_trade::{
     build_mds_spend, decide, observe, Act, Chains, Leg, MdsSpendKind, MwbOrder, MwbSwap, OrderStatus, Phase,
+    SELL_MDS_FROM,
 };
 use midstate_walletd::mwb_wire::{maker_session, parse, Frame, KeyPair, Msg, Outgoing, Reassembler, Route, Side};
 use midwimble::core::mw::builder::build_coinbase;
@@ -562,5 +563,58 @@ fn every_message_of_the_negotiation_is_checked() -> Result<()> {
     // An expired order cannot be taken.
     let expired = MwbOrder { expires: sim.mds.height, ..order };
     assert!(Negotiation::take(&expired.advert()?, &taker_key, &mut Wallet::ctx(&taker.keys, &mut taker.account, &sim)).is_err());
+    Ok(())
+}
+
+/// Selling MDS locks behind `OP_MERKLE_ROOT`, which no script may use below
+/// `SELL_MDS_FROM`: neither side starts such a swap before then. Selling MDW
+/// is open at any height.
+#[test]
+fn selling_mds_waits_for_its_opcode() -> Result<()> {
+    let mut sim = Sim::new();
+    let (mut maker, mut taker) = wallets(Side::SellMds, &mut sim);
+    let order_key = KeyPair::random();
+    let order = |side| MwbOrder {
+        id: [9; 16],
+        side,
+        mds_amount: MDS_AMOUNT,
+        mdw_amount: MDW_AMOUNT,
+        key: order_key.to_bytes(),
+        created: 0,
+        expires: SELL_MDS_FROM + 100,
+        status: OrderStatus::Open,
+        last_advert: 0,
+    };
+    let sell_mds = order(Side::SellMds);
+    let taker_key = KeyPair::random();
+
+    // One block short: the taker will not take it.
+    sim.mds.height = SELL_MDS_FROM - 1;
+    let err = Negotiation::take(&sell_mds.advert()?, &taker_key, &mut Wallet::ctx(&taker.keys, &mut taker.account, &sim))
+        .err()
+        .expect("refused");
+    assert!(err.to_string().contains("selling MDS opens"), "{err}");
+
+    // A take made at the height (an older taker's, say) reaches a maker one
+    // block short: the maker will not answer it.
+    sim.mds.height = SELL_MDS_FROM;
+    let (_, out) = Negotiation::take(&sell_mds.advert()?, &taker_key, &mut Wallet::ctx(&taker.keys, &mut taker.account, &sim))?;
+    let (route, sealed) = deliver(&mut maker.inbox, &out).pop().expect("the take arrives");
+    let session = maker_session(&order_key, &sell_mds.id, &taker_key.public)?;
+    let Msg::Take(take) = route.open(&session, &sealed)? else { bail!("not a take") };
+    sim.mds.height = SELL_MDS_FROM - 1;
+    let err = Negotiation::answer(&sell_mds, take.clone(), session.clone(), &mut Wallet::ctx(&maker.keys, &mut maker.account, &sim))
+        .err()
+        .expect("refused");
+    assert!(err.to_string().contains("selling MDS opens"), "{err}");
+    // At the height it answers.
+    sim.mds.height = SELL_MDS_FROM;
+    Negotiation::answer(&sell_mds, take, session, &mut Wallet::ctx(&maker.keys, &mut maker.account, &sim))?;
+
+    // Selling MDW is open below it.
+    let mut sim = Sim::new();
+    sim.mds.height = SELL_MDS_FROM - 1;
+    let (_, mut taker) = wallets(Side::SellMdw, &mut sim);
+    Negotiation::take(&order(Side::SellMdw).advert()?, &KeyPair::random(), &mut Wallet::ctx(&taker.keys, &mut taker.account, &sim))?;
     Ok(())
 }
