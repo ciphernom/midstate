@@ -18,7 +18,10 @@
 //! builds the template from the embedded node's chain and mempool, signs it
 //! with the wallet's bond, and hands a found block back to the node. So the
 //! bond's secret never leaves the unlocked wallet, and the embedded node
-//! needs no restart to take it.
+//! needs no restart to take it. Like the node's own templates, a job builds
+//! past a run of other producers' over-cap blocks at the tip, on the block
+//! before it, whenever the bond's block there counts in full: one such
+//! block outweighs the whole run and replaces it (`midwimble::core::orphan`).
 //!
 //! # The mining key
 //!
@@ -315,7 +318,8 @@ pub fn register_once(
 
 /// Serves what a midstate pool asks a bonded midwimble node when it
 /// merge-mines (`docs/POOL_MERGED_MINING.md`): `GET /state` for the tip it
-/// refreshes jobs on, `POST /merge/job` for what to commit to, and `POST
+/// refreshes jobs on (and the block jobs build on in its place, past a run
+/// of over-cap blocks), `POST /merge/job` for what to commit to, and `POST
 /// /merge/found` for a share that made a block. Loopback only, and only to
 /// requests naming a loopback host, so no web page can reach it through a
 /// name of its own.
@@ -333,6 +337,10 @@ struct MergeCtx {
     /// Templates handed out, by mining hash, newest last (as the node keeps
     /// them: a pool refreshes on either tip, so a handful is plenty).
     jobs: Arc<Mutex<VecDeque<([u8; 32], BlockTemplate)>>>,
+    /// The tip, and the bond, for which a block on the orphan base would not
+    /// have counted in full or outweighed the run there
+    /// (`midwimble::core::orphan`): jobs on that tip go straight to the tip.
+    declined: Arc<Mutex<Option<([u8; 32], [u8; 32])>>>,
 }
 
 type ApiResult = std::result::Result<Json<Value>, (StatusCode, Json<Value>)>;
@@ -350,7 +358,7 @@ impl MergeServer {
             feed_relay(&node, b);
         }
         let bond = Arc::new(RwLock::new(bond));
-        let ctx = MergeCtx { node: node.clone(), bond: bond.clone(), jobs: Arc::default() };
+        let ctx = MergeCtx { node: node.clone(), bond: bond.clone(), jobs: Arc::default(), declined: Arc::default() };
         let app = Router::new()
             .route("/state", get(merge_state))
             .route("/merge/job", post(merge_job))
@@ -426,11 +434,21 @@ async fn loopback_only(request: axum::extract::Request, next: axum::middleware::
 }
 
 async fn merge_state(AxState(c): AxState<MergeCtx>) -> Json<Value> {
-    let s = c.node.state();
+    let info = c.node.info();
+    let s = &info.state;
     Json(json!({
         "height": s.height,
         "tip": hex::encode(s.header_hash),
         "target": hex::encode(s.target),
+        // While the tip ends a run of other producers' over-cap blocks: the
+        // block jobs build on instead, and how many blocks a block there
+        // replaces, as midwimble's node says it. The node can work it out a
+        // moment after the tip arrives, so the pool refreshes on it too.
+        "orphaning": info.orphan_base.as_ref().filter(|b| b.tip == s.header_hash).map(|b| json!({
+            "height": b.height(),
+            "prev_hash": hex::encode(b.parent()),
+            "replaces": b.replaces(),
+        })),
     }))
 }
 
@@ -461,8 +479,15 @@ fn hex32(s: &str) -> std::result::Result<[u8; 32], (StatusCode, Json<Value>)> {
 }
 
 /// A template paying `body`'s payouts, signed with the wallet's bond, built
-/// as midwimble's node builds one for a merged-mining pool.
-async fn build_template(c: &MergeCtx, body: JobBody) -> std::result::Result<BlockTemplate, (StatusCode, Json<Value>)> {
+/// as midwimble's node builds one for a merged-mining pool: while the tip is
+/// a run of other producers' over-cap blocks, on the last block before the
+/// run, where the bond's block counts in full and outweighs the whole run
+/// (`midwimble::core::orphan`); otherwise on the tip. With it, how many
+/// blocks its block would replace (0 on the tip).
+async fn build_template(
+    c: &MergeCtx,
+    body: JobBody,
+) -> std::result::Result<(BlockTemplate, u64), (StatusCode, Json<Value>)> {
     let bond = c
         .bond
         .read()
@@ -484,6 +509,12 @@ async fn build_template(c: &MergeCtx, body: JobBody) -> std::result::Result<Bloc
         return Err(bad("node is syncing"));
     }
     let state = info.state;
+    // Past a run of over-cap blocks, unless this bond was already found not
+    // to count in full there: the same for every job on this tip.
+    let declined = *c.declined.lock().map_err(bad)?;
+    let base = info
+        .orphan_base
+        .filter(|b| b.tip == state.header_hash && declined != Some((b.tip, bond.bond_id)));
     let timestamps = c
         .node
         .storage()
@@ -491,18 +522,28 @@ async fn build_template(c: &MergeCtx, body: JobBody) -> std::result::Result<Bloc
         .map_err(bad)?;
     let pool = c.node.mempool().await.map_err(bad)?;
     let feed = c.node.relay_feed();
-    let (template, _) = tokio::task::spawn_blocking(move || {
-        use midwimble::core::types::{KERNEL_WEIGHT, MAX_BLOCK_WEIGHT, OUTPUT_WEIGHT};
+    let decline = c.declined.clone();
+    let built = tokio::task::spawn_blocking(move || {
         let feed = feed.read().map_err(|e| anyhow!("relay feed: {e}"))?;
-        let registration_weight = std::iter::once((bond.bond_id, bond.registration.as_ref()))
-            .chain(bond.co_bonds.iter().map(|c| (c.bond_id, c.registration.as_ref())))
-            .filter(|(id, _)| !state.bonds.contains_key(id))
-            .find_map(|(_, r)| r)
-            .map_or(0, |r| r.weight());
-        let relay_weight = feed.next_for(&state.relay).map_or(0, |r| r.weight());
-        let budget = (MAX_BLOCK_WEIGHT - (payouts.len() as u64) * OUTPUT_WEIGHT - KERNEL_WEIGHT)
-            .saturating_sub(registration_weight)
-            .saturating_sub(relay_weight);
+        if let Some(base) = &base {
+            let orphaning = midwimble::core::orphan::orphan_template(
+                base,
+                &pool,
+                &payouts,
+                extra,
+                Some(&bond),
+                Some(&feed),
+            );
+            match orphaning {
+                Some((template, _)) => return Ok((template, base.replaces())),
+                None => {
+                    if let Ok(mut d) = decline.lock() {
+                        *d = Some((base.tip, bond.bond_id));
+                    }
+                }
+            }
+        }
+        let budget = midwimble::core::template::transaction_budget(&state, payouts.len(), Some(&bond), Some(&feed));
         let txs = midwimble::core::template::select_transactions(&pool, state.height, budget);
         let build = |txs: &[midwimble::core::mw::Transaction]| {
             midwimble::core::template::build_template_relayed(
@@ -516,25 +557,35 @@ async fn build_template(c: &MergeCtx, body: JobBody) -> std::result::Result<Bloc
                 Some(&feed),
             )
         };
-        build(&txs).or_else(|_| build(&[]))
+        build(&txs).or_else(|_| build(&[])).map(|(template, _)| (template, 0))
     })
     .await
     .map_err(bad)?
     .map_err(bad)?;
-    Ok(template)
+    Ok(built)
 }
 
 async fn merge_job(AxState(c): AxState<MergeCtx>, Json(body): Json<JobBody>) -> ApiResult {
-    let template = build_template(&c, body).await?;
+    let (template, orphans) = build_template(&c, body).await?;
     let commitment = merge_commitment(&template.mining_hash);
     let answer = json!({
         "commitment": hex::encode(commitment),
         "target": hex::encode(template.batch.target),
         "mining_hash": hex::encode(template.mining_hash),
         "height": template.height,
+        // The block it builds on, and how many over-cap blocks after that
+        // one it replaces: 0 for a block on the tip.
+        "prev_hash": hex::encode(template.batch.prev_header_hash),
+        "orphans": orphans,
         "reward": template.subsidy.saturating_add(template.fees),
         "pow": midwimble::core::types::pow_algo_at(template.height).name(),
     });
+    if orphans > 0 {
+        tracing::debug!(
+            "merged-mining job builds on midwimble block {} past {orphans} over-cap block(s)",
+            template.height - 1
+        );
+    }
     let mut jobs = c.jobs.lock().map_err(bad)?;
     jobs.push_back((template.mining_hash, template));
     while jobs.len() > 16 {

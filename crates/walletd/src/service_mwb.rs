@@ -115,6 +115,25 @@ fn harmless(e: &anyhow::Error) -> bool {
     ["already in pool", "already being validated", "not found or already spent", "duplicate"].iter().any(|m| s.contains(m))
 }
 
+/// How many of midwimble's blocks from `height` up to the tip of a chain
+/// `tip` blocks long counted in full in fork choice, as `node` stores them
+/// (`midwimble::core::orphan::full_weight_blocks`). A block deeper than any
+/// reorganisation the node makes is as settled as a block gets, and counts
+/// as more than anything asks of it.
+fn mwb_full_weight(node: &midwimble::node::NodeHandle, height: u64, tip: u64) -> u64 {
+    if height >= tip {
+        return 0;
+    }
+    if tip - height > midwimble::sync::MAX_REORG_DEPTH {
+        return u64::MAX;
+    }
+    node.storage()
+        .full_weight_confirmations(height, tip, midwimble::sync::MAX_REORG_DEPTH)
+        .ok()
+        .flatten()
+        .unwrap_or(0)
+}
+
 /// Both chains as one tick sees them.
 struct LiveChains<'a> {
     mds: midstate::core::State,
@@ -164,6 +183,9 @@ impl Chains for LiveChains<'_> {
     }
     fn mwb_output(&self, c: &Point32) -> Option<(u64, Point32)> {
         self.mwb.utxos.get(c).map(|e| (e.height, e.owner_key))
+    }
+    fn mwb_full_weight(&self, height: u64) -> u64 {
+        mwb_full_weight(self.mwb_node, height, self.mwb.height)
     }
     fn mwb_kernel(&self, excess: &Point32, owner_excess: &Point32, from: u64) -> (Option<Kernel>, u64) {
         let find = |tx: &MwbTx| tx.body.kernels.iter().find(|k| &k.excess == excess && &k.owner_excess == owner_excess).cloned();
@@ -389,12 +411,31 @@ impl Service {
         }
         let tip = self.mwb_tip().unwrap_or(0);
         let mut rows = self.mwb.store.account.history(tip, &self.mwb_swap_outputs());
-        // Coins found before the account kept block times: ask the chain.
         if let Some(h) = self.mwb_node.as_ref() {
+            // Coins found before the account kept block times: ask the chain.
             for r in rows.iter_mut().filter(|r| r.time == 0 && r.incoming) {
                 if let Some(height) = r.height {
                     if let Ok(Some(header)) = h.storage().load_header(height) {
                         r.time = header.timestamp;
+                    }
+                }
+            }
+            // How settled each is: its confirmations at full weight, none
+            // past the deepest reorganisation the node makes. One read of the
+            // headers from the deepest serves them all: this runs every few
+            // seconds, and a mining wallet has a row for each block it found.
+            let in_block = |r: &MwbHistoryView| matches!(r.status.as_str(), "confirmed" | "maturing");
+            let counted = |height: u64| height < tip && tip - height <= midwimble::sync::MAX_REORG_DEPTH;
+            let heights = rows.iter().filter(|r| in_block(r)).filter_map(|r| r.height);
+            let deepest = heights.filter(|&x| counted(x)).min();
+            if let Some(from) = deepest {
+                let start = from.saturating_sub(1);
+                if let Ok(headers) = h.storage().load_headers(start, tip - start) {
+                    for r in rows.iter_mut().filter(|r| in_block(r)) {
+                        if let Some(height) = r.height.filter(|&x| counted(x)) {
+                            let n = midwimble::core::orphan::full_weight_blocks(&headers, height);
+                            r.full_weight_confirmations = Some(n);
+                        }
                     }
                 }
             }

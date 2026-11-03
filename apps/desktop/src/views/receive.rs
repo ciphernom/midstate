@@ -312,7 +312,10 @@ fn receive_mdw(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
             for h in &rows {
                 ui.label(theme::mono(format!("+{}", mdw(h.amount))).size(12.0).color(theme::ink()));
                 theme::badge(ui, m::kind_label(&h.kind), theme::muted());
-                ui.label(theme::mono(m::status_text(h)).size(11.0).color(theme::muted()));
+                let status = ui.label(theme::mono(m::status_line(h)).size(11.0).color(theme::muted()));
+                if h.full_weight_confirmations.is_some() {
+                    status.on_hover_text(m::FULL_WEIGHT_HINT);
+                }
                 ui.label(RichText::new(if h.time > 0 { ago(h.time) } else { "—".into() }).size(11.0).color(theme::muted()));
                 m::explorer_button(
                     ui,

@@ -174,10 +174,14 @@ async fn a_wallet_registers_its_bond_and_merge_mines_mdw_with_it() {
     let height_before = h.state().height;
     let found = tokio::task::spawn_blocking(move || {
         let mw = RpcClient::new(rpc);
-        assert!(mw.get("/state").unwrap()["tip"].is_string(), "the pool refreshes jobs on this");
+        let state = mw.get("/state").unwrap();
+        assert!(state["tip"].is_string(), "the pool refreshes jobs on this");
+        // No run of over-cap blocks at the tip: nothing to build past.
+        assert!(state.get("orphaning").is_some_and(Value::is_null), "{state}");
         let job = mw
             .post("/merge/job", &json!({ "payouts": [{ "address": payout, "weight": 1 }] }))
             .expect("/merge/job");
+        assert_eq!((&job["prev_hash"], &job["orphans"]), (&state["tip"], &json!(0)), "a job on the tip");
         let commitment = bytes32(&job["commitment"]).unwrap();
         let target = bytes32(&job["target"]).unwrap();
         let mining_hash = bytes32(&job["mining_hash"]).unwrap();

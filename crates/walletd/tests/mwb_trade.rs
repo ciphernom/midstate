@@ -39,6 +39,10 @@ struct Sim {
     mwb: MwbState,
     mwb_blocks: Vec<(u64, MwbTx)>,
     mwb_mempool: Vec<MwbTx>,
+    /// Midwimble blocks over their signer's cap, by height: valid, but next
+    /// to nothing in fork choice. `over_cap` mines the next ones so.
+    mwb_over_cap: std::collections::BTreeSet<u64>,
+    over_cap: bool,
 }
 
 impl Sim {
@@ -65,6 +69,8 @@ impl Sim {
             mwb,
             mwb_blocks: Vec::new(),
             mwb_mempool: Vec::new(),
+            mwb_over_cap: Default::default(),
+            over_cap: false,
         }
     }
 
@@ -126,6 +132,9 @@ impl Sim {
                 self.mwb_blocks.push((self.mwb.height, tx));
             }
         }
+        if self.over_cap {
+            self.mwb_over_cap.insert(self.mwb.height);
+        }
         self.mwb.height += 1;
         self.mds.height += 1;
     }
@@ -161,6 +170,9 @@ impl Chains for Sim {
     }
     fn mwb_output(&self, c: &Point32) -> Option<(u64, Point32)> {
         self.mwb.utxos.get(c).map(|e| (e.height, e.owner_key))
+    }
+    fn mwb_full_weight(&self, height: u64) -> u64 {
+        (height..self.mwb.height).filter(|h| !self.mwb_over_cap.contains(h)).count() as u64
     }
     fn mwb_kernel(&self, excess: &Point32, owner_excess: &Point32, from: u64) -> (Option<Kernel>, u64) {
         let in_blocks = self.mwb_blocks.iter().filter(|(h, _)| *h >= from).map(|(_, t)| t);
@@ -428,6 +440,37 @@ fn a_taker_who_never_locks_costs_the_maker_only_time() -> Result<()> {
             Side::SellMdw => assert!(mwb_received(&maker.keys, &sim) > MDW_AMOUNT - MWB_FEE),
         }
     }
+    Ok(())
+}
+
+/// A midwimble lock buried under nothing but over-cap blocks is not
+/// confirmed: they add next to nothing to fork choice, and one full-weight
+/// block on the block below replaces them, lock and all. Selling MDS, the
+/// maker reveals the secret by claiming the taker's MDW lock, so it waits
+/// for blocks that counted in full, however many over-cap ones pile up.
+#[test]
+fn a_midwimble_lock_under_over_cap_blocks_alone_is_not_confirmed() -> Result<()> {
+    let mut sim = Sim::new();
+    let (mut maker, mut taker) = wallets(Side::SellMds, &mut sim);
+    negotiate(Side::SellMds, &sim, &mut maker, &mut taker)?;
+    sim.over_cap = true;
+    for _ in 0..12 {
+        turn(&mut maker, &mut sim, false)?;
+        turn(&mut taker, &mut sim, false)?;
+        sim.mine();
+    }
+    let lock = taker.swap.as_ref().unwrap().view.commitment;
+    let (height, _) = sim.mwb_output(&lock).expect("the taker's lock is in a block");
+    assert!(sim.mwb.height >= height + 5, "buried under over-cap blocks");
+    let m = maker.swap.as_ref().unwrap();
+    assert_eq!(m.phase, Phase::MineLocked, "the maker waits");
+    assert!(!m.reveal_sent, "and has not revealed the secret");
+
+    // Blocks that count in full: the maker claims, and both settle.
+    sim.over_cap = false;
+    run(&mut sim, &mut maker, &mut taker, false, false)?;
+    let (m, t) = (maker.swap.as_ref().unwrap(), taker.swap.as_ref().unwrap());
+    assert_eq!((m.phase.clone(), t.phase.clone()), (Phase::Done, Phase::Done));
     Ok(())
 }
 

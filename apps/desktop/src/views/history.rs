@@ -422,7 +422,14 @@ fn history_mdw(app: &mut App, ui: &mut Ui) {
                 });
                 cell(ui, W_WHERE, |ui| {
                     let colour = if h.status == "pending" { theme::bright() } else { theme::muted() };
-                    ui.label(theme::mono(m::status_text(h)).size(11.0).color(colour));
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.label(theme::mono(m::status_text(h)).size(11.0).color(colour));
+                        if let Some(settled) = m::settled_text(h) {
+                            ui.label(RichText::new(settled).size(9.5).color(theme::faint()))
+                                .on_hover_text(m::FULL_WEIGHT_HINT);
+                        }
+                    });
                 });
                 let is_open = open == Some(*i);
                 if ui.button(RichText::new(if is_open { "hide" } else { "detail" }).size(10.5)).clicked() {
@@ -474,7 +481,7 @@ fn mdw_detail(ui: &mut Ui, h: &MwbHistoryView) {
                 if h.fee > 0 {
                     theme::hint(ui, &format!("· fee {}", mdw(h.fee)));
                 }
-                theme::hint(ui, &format!("· {}", m::status_text(h)));
+                theme::hint(ui, &format!("· {}", m::status_line(h)));
             });
             if let Some(to) = &h.to {
                 line(ui, "TO", to);

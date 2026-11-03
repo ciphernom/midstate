@@ -758,6 +758,13 @@ pub struct MwbHistoryView {
     pub time: u64,
     /// "pending" | "confirmed" | "failed" | "maturing"
     pub status: String,
+    /// In a block: how many blocks from its own to the tip counted in full
+    /// in midwimble's fork choice, its own included. Only those take bonds
+    /// to undo: an over-cap block adds next to nothing, and a run of them is
+    /// replaced by one full-weight block. `None` before it has a block, and
+    /// for one deeper than any reorganisation the node makes.
+    #[serde(default)]
+    pub full_weight_confirmations: Option<u64>,
     /// Who a send paid.
     pub to: Option<String>,
     /// An incoming coin's commitment: its page in the explorer.
