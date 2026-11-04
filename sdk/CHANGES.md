@@ -1,3 +1,56 @@
+# Midstate SDK 2.11.0 — Launchpad
+
+Version 2.10.1 → 2.11.0. For node v6.2.0 and later: launches use `OP_MERKLE_ROOT`,
+which activates at height 371,500.
+
+Test suites: `npm test` — 22 codec + 34 wallet + 89 reorg/recovery/contract + 59
+miner/pool + 30 DEX + 26 launcher + 37 compiler/VM + 44 pump + 41 launchpad =
+**382 tests**, all offline.
+
+## `Launchpad` (`src/launchpad.js`): launches that work on chain
+
+A pump.fun-style launch is one script. A bonding curve sells T tokens (the k-th
+costs (k−1)·P MDS). When it has sold them all, the MDS it raised and T/2
+reserved tokens become a constant-product pool. The pool opens at the curve's
+last price and charges a 0.3% fee that stays in the pool. Holders are rows in a
+Merkle ledger checked with `OP_MERKLE_ROOT`.
+
+- **The state is in the address.** The bytecode is `PUSH(state) DROP code`. The
+  witness carries a copy of `code`, and the script checks
+  `hash(PUSH ‖ state ‖ DROP ‖ code) == this_address()`. From that it works out
+  the next state's address and requires the whole reserve to move there.
+  `sum_input_value() == x + seed` means every trade spends every reserve coin.
+- **Every trade leaves a receipt.** Output 0 is a zero-value state coin at the
+  next address holding `owner24 ‖ le8(balance)`, and the script requires it.
+  Nodes serve blocks without witnesses. With the receipts, `Launch.applyTx`
+  can rebuild a launch from those blocks alone.
+- `Launch` builds trades with `prepareTrade`, and the wallet adds a site-key
+  signature. It also builds the launch transaction (`launchOutputs`) and
+  follows a launch on chain (`applyTx`, `launchesInTx`).
+- Also included: `quote`, `tokensFor`, `spotPrice`, the `MLP1` announcement
+  codec and the registry address.
+- `tests/launchpad_vectors.rs` in the node repository replays every spend from
+  `test-launchpad.mjs` on the node's own VM, with real MSS signatures.
+  Regenerate them with `WRITE_VECTORS=1 node test-launchpad.mjs`.
+
+## The older curves cannot pay out on chain
+
+Consensus runs a script once per input, and an input only sees its own state.
+That breaks the state-thread-plus-reserve-coin design used by `Pump`
+(`pump.js`) and `Launcher.CURVE_CONTRACT_SOURCE`:
+- The reserve coin has no state, so its run fails at `READ_INPUT_STATE`.
+- Only a curve's first buy goes through. Every later trade has to spend the
+  reserve coin, so none of them can pay out.
+
+Use `Launchpad` instead. The old modules are still exported, with this noted in
+their headers.
+
+## VM
+
+- `ADD` and `MUL` fail on u64 overflow, as the node's `checked_add` /
+  `checked_mul` do. Before this, the SDK VM produced a wider number. A pool
+  check that overflows on chain passed here.
+
 # Midstate SDK 2.10.0 — Midstate Walk (node v6.0.0 "Anselmo")
 
 Version 2.9.1 → 2.10.0.

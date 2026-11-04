@@ -1,6 +1,6 @@
 {
   "name": "midstate-sdk",
-  "version": "2.10.1",
+  "version": "2.11.0",
   "description": "Official JavaScript SDK for the Midstate Blockchain",
   "main": "src/index.js",
   "type": "module",
@@ -19,13 +19,14 @@
     "./compiler": "./src/compiler.js",
     "./vm": "./src/vm.js",
     "./pump": "./src/pump.js",
+    "./launchpad": "./src/launchpad.js",
     "./bundle": "./dist/midstate-sdk.bundle.js"
   },
   "files": ["pkg",
              "src",
              "dist"],
   "scripts": {
-    "test": "node test-bincode.mjs && node test-wallet.mjs && node test-reorg.mjs && node test-miner.mjs && node test-dex.mjs && node test-launcher.mjs && node test-compiler.mjs && node test-pump.mjs",
+    "test": "node test-bincode.mjs && node test-wallet.mjs && node test-reorg.mjs && node test-miner.mjs && node test-dex.mjs && node test-launcher.mjs && node test-compiler.mjs && node test-pump.mjs && node test-launchpad.mjs",
     "test:codec": "node test-bincode.mjs",
     "test:wallet": "node test-wallet.mjs",
     "test:live": "node test.js",
@@ -36,7 +37,8 @@
     "test:dex": "node test-dex.mjs",
     "test:launcher": "node test-launcher.mjs",
     "test:compiler": "node test-compiler.mjs",
-    "test:pump": "node test-pump.mjs"
+    "test:pump": "node test-pump.mjs",
+    "test:launchpad": "node test-launchpad.mjs"
   },
   "keywords": [
     "midstate",

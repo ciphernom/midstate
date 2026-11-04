@@ -1,5 +1,11 @@
 // pump.js — Bonding-curve token launcher with an unforgeable holder ledger.
 //
+// ⚠ ON CHAIN THIS CURVE STOPS AFTER ITS FIRST BUY. Consensus runs the script
+// once per input with only that input's own state; the reserve is a plain value
+// coin, so its run fails at READ_INPUT_STATE, and every trade after the first
+// has to spend it. Use launchpad.js, which keeps the state in the address so
+// every reserve coin can check the trade.
+//
 // ═══════════════════════════════════════════════════════════════════════════
 //  Reasoning (module level)
 // ═══════════════════════════════════════════════════════════════════════════

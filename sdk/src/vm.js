@@ -85,6 +85,14 @@ const hexLEToInt = (h) => {
 
 const isTrue = (h) => !!h && h.match(/.{2}/g).some((b) => parseInt(b, 16) !== 0);
 
+// The node's ADD and MUL are `checked_add` / `checked_mul` on u64: a result past
+// 2^64 - 1 is a MathOverflow error, not a wider number.
+const U64_MAX = (1n << 64n) - 1n;
+const u64 = (v) => {
+    if (v > U64_MAX) throw new Error('Math overflow (result exceeds u64)');
+    return v;
+};
+
 /**
  * Execute a compiled contract.
  *
@@ -244,7 +252,7 @@ export function execute(asm, ctx = {}) {
                     if (a !== b) throw new Error(`EQUALVERIFY failed (${a} != ${b})`);
                     break;
                 }
-                case 'ADD': { const b = pop(), a = pop(); push(intToHexLE(hexLEToInt(a) + hexLEToInt(b))); break; }
+                case 'ADD': { const b = pop(), a = pop(); push(intToHexLE(u64(hexLEToInt(a) + hexLEToInt(b)))); break; }
                 case 'SUB': {
                     const b = pop(), a = pop();
                     const d = hexLEToInt(a) - hexLEToInt(b);
@@ -253,7 +261,7 @@ export function execute(asm, ctx = {}) {
                     if (d < 0n) throw new Error('Math overflow (SUB went negative)');
                     push(intToHexLE(d)); break;
                 }
-                case 'MUL': { const b = pop(), a = pop(); push(intToHexLE(hexLEToInt(a) * hexLEToInt(b))); break; }
+                case 'MUL': { const b = pop(), a = pop(); push(intToHexLE(u64(hexLEToInt(a) * hexLEToInt(b)))); break; }
                 case 'DIV': {
                     const b = pop(), a = pop(); const bv = hexLEToInt(b);
                     if (bv === 0n) throw new Error('Division by zero');
