@@ -2,9 +2,10 @@
 
 Version 2.9.1 → 2.10.0.
 
-> Node v6.2.0 moves the switch forward from 420,000 to height 371,500. The
-> SDK mines whatever each template's `pow` field names, so 2.10.0 needs no
-> update. The heights below are as 2.10.0 shipped.
+> **2.10.1.** Node v6.2.0 moves both the Walk (from 420,000) and the v6
+> opcodes (from 400,000) to height 371,500. `V6_ACTIVATION_HEIGHT` in the
+> compiler and the VM follows. Mining needed no change: it follows each
+> template's `pow` field. The heights below are as 2.10.0 shipped.
 
 From height 420,000 the node verifies Midstate Walk instead of the BLAKE3 chain
 (`docs/MIDSTATE_WALK.md` in the node repository). Templates and pool jobs from

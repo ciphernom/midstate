@@ -57,7 +57,7 @@ impl Sim {
                 commitments: UtxoAccumulator::new(),
                 depth: 0,
                 target: [0xff; 32],
-                // OP_MERKLE_ROOT is live from 400,000.
+                // OP_MERKLE_ROOT is live from V6_ACTIVATION_HEIGHT.
                 height: 450_000,
                 timestamp: 0,
                 commitment_heights: Default::default(),
