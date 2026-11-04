@@ -1469,7 +1469,7 @@
                     <button type="button" onclick="bondUntilForDays(30)">30 days</button>
                     <button type="button" onclick="bondUntilForDays(90)">90 days</button>
                     <button type="button" onclick="bondUntilForDays(180)">180 days</button>
-                    <button type="button" onclick="bondUntilForDays(360)">360 days</button>
+                    <button type="button" onclick="bondUntilForDays(330)">330 days</button>
                 </div>
                 <div id="bondReadout" class="bond-hint"></div>
                 <input type="text" id="bondLabel" placeholder="Label (optional)">
@@ -1885,11 +1885,34 @@ if ('serviceWorker' in navigator) {
         //  Mining bonds (the worker does the work: see worker.js "Mining bonds")
         // ═══════════════════════════════════════════════════════════════
 
-        // Midwimble's launch parameters, as in worker.js: guidance for the form only.
-        const BOND_MW_MIN = 2 ** 24, BOND_MW_REMAIN = 2880, BOND_MW_MARGIN = 10080,
-              BOND_MW_HORIZON = 525600, BOND_GENESIS_TS = 1772274770;
+        // Midwimble's bond rules: the same functions as worker.js ("Midwimble's
+        // bond rules"), which says where each comes from. Guidance for the form only.
+        // Mainnet since 31 Oct 2026: 128 gMDS with 30 days of lock left. From
+        // 30 Nov 2026 a new registration may need up to 512 gMDS, by midwimble's
+        // difficulty, which this wallet cannot see: midwimble publishes it.
+        const BOND_MW_EARLY_UNTIL = 1793404800, BOND_MW_EARLY_MIN = 2 ** 24, BOND_MW_EARLY_LOCK = 2880,
+              BOND_MW_MIN = 2 ** 37, BOND_MW_LOCK = 43200,
+              BOND_MW_RETARGET_FROM = BOND_MW_EARLY_UNTIL + 30 * 86400, BOND_MW_MAX = 2 ** 39,
+              BOND_MW_MARGIN = 10080, BOND_MW_HORIZON = 525600, BOND_GENESIS_TS = 1772274770;
+        const BOND_MW_EXPLORER = 'mw.cypherpunk.gold, under Bonds';
         const bondMwEst = (ts) => Math.floor(Math.max(0, ts - BOND_GENESIS_TS) / 60) + BOND_MW_MARGIN;
-        const bondMwCountsUntil = (u) => { const h = u - BOND_MW_REMAIN - BOND_MW_MARGIN; return h < 0 ? null : BOND_GENESIS_TS + h * 60 + 59; };
+        const bondMwMinBond = (ts) => ts < BOND_MW_EARLY_UNTIL ? BOND_MW_EARLY_MIN : BOND_MW_MIN;
+        const bondMwMinLock = (ts) => ts < BOND_MW_EARLY_UNTIL ? BOND_MW_EARLY_LOCK : BOND_MW_LOCK;
+        const bondMwEligible = (value, until, ts) => value >= bondMwMinBond(ts) && until >= bondMwEst(ts) + bondMwMinLock(ts);
+        /** Last unix time midwimble counts a bond, possibly past; null if never. */
+        function bondMwCountsUntil(value, until) {
+            const lastFor = (lock) => { const h = until - lock - BOND_MW_MARGIN; return h < 0 ? null : BOND_GENESIS_TS + h * 60 + 59; };
+            if (value >= BOND_MW_MIN) {
+                const t = lastFor(BOND_MW_LOCK);
+                if (t !== null && t >= BOND_MW_EARLY_UNTIL) return t;
+            }
+            if (value >= BOND_MW_EARLY_MIN) {
+                const t = lastFor(BOND_MW_EARLY_LOCK);
+                if (t !== null) return Math.min(t, BOND_MW_EARLY_UNTIL - 1);
+            }
+            return null;
+        }
+        const bondLockDays = (ts) => Math.round(bondMwMinLock(ts) / 1440);
         let bondState = { height: 0, spendable: 0, bonds: [] };
         let bondPollTimer = null;
 
@@ -1914,23 +1937,24 @@ if ('serviceWorker' in navigator) {
 
         function bondFillAmounts() {
             const sel = document.getElementById('bondAmount');
-            const keep = sel.value || String(BOND_MW_MIN);
-            const top = Math.max(24, Math.floor(Math.log2(Math.max(1, bondState.spendable))));
+            const min = bondMwMinBond(Math.floor(Date.now() / 1000));
+            const keep = sel.value || String(min);
+            const top = Math.max(Math.log2(min), Math.floor(Math.log2(Math.max(1, bondState.spendable))));
             sel.innerHTML = '';
             for (let e = 10; e <= top; e++) {
                 const v = 2 ** e;
-                const note = v < BOND_MW_MIN ? '  ·  rehearsal only' : (v > bondState.spendable ? '  ·  more than you hold' : '');
+                const note = v < min ? '  ·  rehearsal only' : (v > bondState.spendable ? '  ·  more than you hold' : '');
                 const o = document.createElement('option');
                 o.value = String(v);
                 o.textContent = bondFmt(v) + note;
                 sel.appendChild(o);
             }
-            sel.value = [...sel.options].some(o => o.value === keep) ? keep : String(BOND_MW_MIN);
+            sel.value = [...sel.options].some(o => o.value === keep) ? keep : String(min);
         }
 
         function bondUntilForDays(days) {
             const now = Math.floor(Date.now() / 1000);
-            document.getElementById('bondUntil').value = bondMwEst(now) + BOND_MW_REMAIN + 1440 + days * 1440;
+            document.getElementById('bondUntil').value = bondMwEst(now) + bondMwMinLock(now) + 1440 + days * 1440;
             bondReadout();
         }
 
@@ -1947,13 +1971,17 @@ if ('serviceWorker' in navigator) {
             else if (u > horizon) lines.push(`Too far ahead: midwimble registers bonds locked at most a year out (block ${horizon} today).`);
             else {
                 lines.push(`Unlocks in about ${bondHuman((u - h) * 60)} (block ${u}).`);
-                if (v < BOND_MW_MIN) {
-                    lines.push(`Below midwimble's minimum bond of ${bondFmt(BOND_MW_MIN)}: it will never count for mining. Fine for a rehearsal.`);
+                const min = bondMwMinBond(now), days = bondLockDays(now), registered = now + 1440 * 60;
+                if (v < min) {
+                    lines.push(`Below midwimble's minimum bond of ${bondFmt(min)}: it will never count for mining. Fine for a rehearsal.`);
                 } else {
-                    const t = bondMwCountsUntil(u), registered = now + 1440 * 60;
+                    const t = bondMwCountsUntil(v, u);
                     lines.push(t && t > registered
-                        ? `Midwimble counts it for mining for about ${bondHuman(t - registered)} after it registers (about a day from now). It stops counting two days before unlocking, by a clock that runs a week ahead.`
-                        : `Too short to count for mining: midwimble stops counting a bond once fewer than two days of its lock remain, by a clock that runs a week ahead. Fine for a rehearsal.`);
+                        ? `Midwimble counts it for mining for about ${bondHuman(t - registered)} after it registers (about a day from now). It stops counting ${days} days before unlocking, by a clock that runs a week ahead.`
+                        : `Too short to count for mining: midwimble stops counting a bond once fewer than ${days} days of its lock remain, by a clock that runs a week ahead. Fine for a rehearsal.`);
+                    if (registered >= BOND_MW_RETARGET_FROM && v < BOND_MW_MAX) {
+                        lines.push(`From 30 November midwimble may ask more to register a new bond, up to ${bondFmt(BOND_MW_MAX)} as its difficulty rises: check its current minimum (${BOND_MW_EXPLORER}) before locking.`);
+                    }
                 }
             }
             el.textContent = lines.join(' ');
@@ -1998,13 +2026,17 @@ if ('serviceWorker' in navigator) {
                 head.appendChild(el('span', null, String(b.status).replace('_', ' ').toUpperCase())).style.cssText = 'font-size: 10px; color: var(--accent); letter-spacing: 1px;';
                 item.appendChild(head);
                 let text = BOND_STATUS_TEXT[b.status] || b.status;
+                const canCount = !!(b.countsUntil && b.countsUntil > now);
                 if (b.status === 'locked') {
                     const left = Math.max(0, b.until - bondHeight());
-                    text = `Locked until block ${b.until} (about ${bondHuman(left * 60)}).` + (b.belowMin
-                        ? " Below midwimble's minimum bond, so it never counts for mining (fine for a rehearsal)."
-                        : (b.countsUntil && b.countsUntil > now
-                            ? ` Midwimble counts it for mining for about ${bondHuman(b.countsUntil - now)} more, once registered.`
-                            : ' Midwimble no longer counts it: less than two days of its lock remain by its clock.'));
+                    text = `Locked until block ${b.until} (about ${bondHuman(left * 60)}).` + (canCount
+                        ? ` Midwimble counts it for mining for about ${bondHuman(b.countsUntil - now)} more, once registered.`
+                        : (b.belowMin
+                            ? (b.countsUntil
+                                // It met the early phase's smaller minimum, and stopped counting when that ended.
+                                ? ` Midwimble no longer counts it: since ${new Date(BOND_MW_EARLY_UNTIL * 1000).toISOString().slice(0, 10)} a bond needs at least ${bondFmt(bondMwMinBond(now))}.`
+                                : ` Below midwimble's minimum bond of ${bondFmt(bondMwMinBond(now))}, so it never counts for mining (fine for a rehearsal).`)
+                            : ` Midwimble no longer counts it: less than ${bondLockDays(now)} days of its lock remain by its clock.`));
                 }
                 item.appendChild(el('div', 'bond-hint', text)).style.margin = '0';
                 const kv = (k, v, copyWhat) => {
@@ -2024,7 +2056,7 @@ if ('serviceWorker' in navigator) {
                 item.appendChild(kv('owner key', b.ownerPk, 'Owner key'));
                 item.appendChild(kv('bond id', b.coinId, 'Bond id'));
                 item.appendChild(kv('salt', b.salt, 'Salt'));
-                if ((b.status === 'locking' || b.status === 'locked') && !b.belowMin) {
+                if ((b.status === 'locking' || b.status === 'locked') && canCount) {
                     item.appendChild(el('div', 'bond-hint',
                         'Register it with midwimble: run this once the lock confirms, and again a day later to finish. For a co-bond, use the file `midwimble bond new --mining-pubkey` made, then give that file to the pool.')).style.margin = '6px 0 4px 0';
                     item.appendChild(el('div', 'bond-cmd', b.registerCmd));
@@ -2034,7 +2066,7 @@ if ('serviceWorker' in navigator) {
                     bondSay('Unbonding…');
                     worker.postMessage({ type: 'BOND_UNBOND', payload: { id: b.coinId } });
                 }, true));
-                if ((b.status === 'locking' || b.status === 'locked') && !b.belowMin) actions.appendChild(btn('Copy register command', () => bondCopy(b.registerCmd, 'Command')));
+                if ((b.status === 'locking' || b.status === 'locked') && canCount) actions.appendChild(btn('Copy register command', () => bondCopy(b.registerCmd, 'Command')));
                 actions.appendChild(btn('Copy for another wallet', () => bondCopy(b.exportLine, 'Bond')));
                 if (b.status === 'unbonded' || b.status === 'not_funded') actions.appendChild(btn('Forget', () => {
                     if (confirm('Forget this bond? Its record holds the salt needed to spend it, so only forget a bond whose coin is gone.')) {
