@@ -40628,7 +40628,11 @@ genSwitch(sw) {
  * `require_signed_by` and friends are available without an import.
  *
  * @param {string} source
- * @returns {{bytecode: string, asm: string[], sizeBytes: number, sigops: number}}
+ * @param {Object} [opts]
+ * @param {BigInt} [opts.height=0n] Target height: from V6_ACTIVATION_HEIGHT the
+ *   compiler may use the v6 opcodes, which changes the bytecode and address.
+ * @returns {{bytecode: string, asm: string[], sizeBytes: number, sigops: number,
+ *   sourceMap: number[]}} `sourceMap[i]` is the source line of `asm[i]`.
  * @throws If the source does not compile, or the result exceeds MAX_SCRIPT_SIZE.
  */
 function compile(source, opts = {}) {
@@ -40648,6 +40652,7 @@ function compile(source, opts = {}) {
         asm,
         sizeBytes,
         sigops: asm.filter((i) => i === 'CHECKSIG' || i === 'CHECKSIGVERIFY').length,
+        sourceMap: gen.sourceMap.slice(),
     };
 }
 
@@ -40699,9 +40704,9 @@ const MAX_SIGOPS_PER_SCRIPT = 3;
 const COVENANT_SUM_ACTIVATION_HEIGHT = 300_000n;
 
 /**
- * v6 opcode bank: NIP, TUCK, NOT, LESS_THAN, MERKLE_VERIFY.
+ * v6 opcode bank: NIP, TUCK, NOT, LESS_THAN, MERKLE_ROOT.
  *
- * MERKLE_VERIFY is the reason this bank exists. A Merkle proof written with
+ * MERKLE_ROOT is the reason this bank exists. A Merkle proof written with
  * `repeat(D) { merkle_step(); }` costs a flat 60 bytes per level, which is
  * what caps the pump ledger at depth 9 and 512 holders — a script-size
  * artifact, not a protocol limit. Verifying a proof in one opcode makes depth
@@ -40710,7 +40715,7 @@ const COVENANT_SUM_ACTIVATION_HEIGHT = 300_000n;
 const V6_ACTIVATION_HEIGHT = 371_500n; // node v6.2.0; 400,000 before it
 
 /**
- * Largest proof MERKLE_VERIFY will walk. 32 levels is 4 billion leaves and a
+ * Largest proof MERKLE_ROOT will walk. 32 levels is 4 billion leaves and a
  * 1,056-byte proof; the bound exists so a malformed witness cannot make a
  * verifier loop for longer than a script's step budget allows.
  */
@@ -40983,38 +40988,35 @@ function execute(asm, ctx = {}) {
                     const b = pop(), a = pop();
                     push(hexLEToInt(a) < hexLEToInt(b) ? '01' : '00'); break;
                 }
-                case 'MERKLE_VERIFY': {
-                    requireV6('OP_MERKLE_VERIFY');
-                    // Stack: [leaf, proof, root] -> [bool]
+                case 'MERKLE_ROOT': {
+                    requireV6('OP_MERKLE_ROOT');
+                    // Stack: [leaf, proof] -> [root], exactly as core/script.rs
+                    // folds it; a script compares the result with its root.
                     //
                     // `proof` is a flat blob of (32-byte sibling || 1-byte dir)
                     // records, walked from the leaf upward. dir=1 means the
-                    // sibling is on the left. An empty proof means the leaf is
-                    // the root, which is a legal depth-0 tree.
-                    const root = pop(), proof = pop(), leaf = pop();
-                    if (root.length !== 64) throw new Error('MERKLE_VERIFY: root must be 32 bytes');
-                    if (leaf.length !== 64) throw new Error('MERKLE_VERIFY: leaf must be 32 bytes');
+                    // sibling is on the left. An empty proof leaves the leaf as
+                    // the root, a legal depth-0 tree. Every malformed input is
+                    // VerifyFailed on chain, so it is an error here too.
+                    const proof = pop(), leaf = pop();
+                    if (leaf.length !== 64) throw new Error('VerifyFailed: MERKLE_ROOT leaf must be 32 bytes');
                     if (proof.length % 66 !== 0) {
-                        throw new Error('MERKLE_VERIFY: proof must be a whole number of 33-byte records');
+                        throw new Error('VerifyFailed: MERKLE_ROOT proof must be a whole number of 33-byte records');
                     }
                     const levels = proof.length / 66;
                     if (levels > MAX_MERKLE_DEPTH) {
-                        throw new Error(`MERKLE_VERIFY: proof depth ${levels} exceeds ${MAX_MERKLE_DEPTH}`);
+                        throw new Error(`VerifyFailed: MERKLE_ROOT proof depth ${levels} exceeds ${MAX_MERKLE_DEPTH}`);
                     }
                     let acc = leaf;
                     for (let lv = 0; lv < levels; lv++) {
                         const rec = proof.slice(lv * 66, lv * 66 + 66);
                         const sib = rec.slice(0, 64);
                         const dir = rec.slice(64, 66);
-                        // Only 0 and 1 are meaningful. The node rejects any
-                        // other flag rather than treating it as falsey, so the
-                        // simulator must too or it would accept proofs that
-                        // consensus refuses.
                         if (dir === '00') acc = blake3_hash_hex(acc + sib);
                         else if (dir === '01') acc = blake3_hash_hex(sib + acc);
-                        else throw new Error(`MERKLE_VERIFY: direction byte must be 00 or 01, got ${dir}`);
+                        else throw new Error(`VerifyFailed: MERKLE_ROOT direction byte must be 00 or 01, got ${dir}`);
                     }
-                    push(acc === root.toLowerCase() ? '01' : '00'); break;
+                    push(acc); break;
                 }
                 default: throw new Error(`Unknown opcode: ${op}`);
             }
