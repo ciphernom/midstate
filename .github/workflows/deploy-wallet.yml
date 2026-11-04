@@ -7,6 +7,9 @@ on:
       - 'wasm-wallet/**'
       - 'src/core/**'
       - 'src/wallet/**'
+      # The IDE runs the SDK's compiler and VM (copied below).
+      - 'sdk/src/compiler.js'
+      - 'sdk/src/vm.js'
       - '.github/workflows/deploy-wallet.yml'
       - '.github/scripts/check-site.js'
   # Lets a failed or skipped deploy be re-run from the Actions tab.
@@ -78,6 +81,12 @@ jobs:
           cp wasm-wallet/light_client.bundle.js staging/wallet/
           cp wasm-wallet/pool_client.bundle.js staging/wallet/
           cp -r wasm-wallet/pkg staging/wallet/
+
+          # 3a. The IDE (ide.html) compiles and runs scripts with the SDK's
+          #     compiler and VM. vm.js imports ../pkg/wasm_wallet.js: the
+          #     wallet's own build, copied just above.
+          mkdir -p staging/wallet/sdk
+          cp sdk/src/compiler.js sdk/src/vm.js staging/wallet/sdk/
 
           # 3b. Give every deploy its own service-worker cache. sw.js serves
           #     worker.js and the WASM cache-first, so returning users only pick

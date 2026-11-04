@@ -75,6 +75,7 @@ function toggleTheme(){
   <option value="advanced_staking_gov">Advanced Staking Governance</option>
   <option value="merkle_ledger">Merkle Ledger</option>
   <option value="merkle_whitelist">Merkle Whitelist</option>
+  <option value="merkle_root_v6">Merkle Allowlist (v6: MERKLE_ROOT)</option>
   </select>
   <div class="tb-sep"></div>
   <div class="tb-stat">Size&nbsp;<b id="statSize">—</b></div>
@@ -259,75 +260,31 @@ function toggleTheme(){
   <span id="tb-clock"></span>
 </div>
 
-<!-- WASM -->
+<!-- WASM + SDK -->
+<!-- The IDE compiles and runs scripts with the SDK's compiler and VM
+     (sdk/src/compiler.js and vm.js, deployed to wallet/sdk/), so it has every
+     opcode the node has and cannot drift from the SDK. vm.js imports
+     ../pkg/wasm_wallet.js: the same module as below, initialised once. -->
 <script type="module">
-  import init, { blake3_hash_hex } from './wallet/pkg/wasm_wallet.js';
-
   try {
-    await init();
-    window.blake3_hash_hex = blake3_hash_hex;
-    
+    const wasm = await import('./wallet/pkg/wasm_wallet.js');
+    await wasm.default();
+    const compiler = await import('./wallet/sdk/compiler.js');
+    const vm = await import('./wallet/sdk/vm.js');
+    window.blake3_hash_hex = wasm.blake3_hash_hex;
+    window.SDK = { ...compiler, ...vm };
+
     document.getElementById('loader').style.opacity = '0';
     setTimeout(()=>document.getElementById('loader').style.display='none', 400);
     window.wasmLoaded = true;
     window.loadTemplate();
   } catch (e) {
-    console.error("Fatal: Failed to load Midstate WASM runtime", e);
-    document.getElementById('loader').innerHTML = "<h2 style='color:var(--fail)'>FATAL ERROR</h2><p>Failed to load core cryptography engine. Check console for 404 errors on the WASM files.</p>";
+    console.error("Fatal: Failed to load the Midstate WASM runtime or SDK", e);
+    document.getElementById('loader').innerHTML = "<h2 style='color:var(--fail)'>FATAL ERROR</h2><p>Failed to load the WASM runtime or the SDK's compiler and VM. Check the console for 404 errors under wallet/pkg/ and wallet/sdk/.</p>";
   }
 </script>
 
 <script>
-    const STD_LIB = `
-// ═════════════════════════════════════════════════════════════════════
-// MIDSTATE STANDARD LIBRARY (Auto-injected)
-// ═════════════════════════════════════════════════════════════════════
-
-// ── MATH ──
-macro min(x, y) { if (x < y) { x; } else { y; } }
-macro max(x, y) { if (x > y) { x; } else { y; } }
-
-// ── SECURITY PRIMITIVES ──
-macro require_signed_by(pk) {
-    pk; CHECKSIGVERIFY;
-}
-macro require_length(data, expected_len) {
-    assert(size(data) == expected_len);
-}
-
-macro require_timelock(blocks) {
-    blocks; CHECKTIMEVERIFY;
-}
-
-macro require_funds_transferred(amount, address) {
-    assert(sum_to_addr(address) >= amount);
-}
-
-// ── CRYPTO: MERKLE TREES ──
-// Standard step for verifying a static Merkle Proof
-// Expected Stack: [..., Sibling, Dir, Current]
-macro merkle_step() {
-    swap();
-    if (pop_int() == 1) { } else { swap(); }
-    concat();
-    hash();
-}
-
-// Advanced step for SIMULTANEOUSLY verifying an old root and calculating a new root.
-// Expected Stack: [..., Sibling, Dir, Old_Acc, New_Acc] (New_Acc is on top)
-macro merkle_update_step() {
-    swap(); 
-    rot();
-    if (pop_int() == 1) { 
-        rot(); dup(); rot(); concat(); hash(); 
-        rot(); rot(); swap(); concat(); hash();
-    } else { 
-        rot(); dup(); rot(); swap(); concat(); hash(); 
-        rot(); rot(); concat(); hash();
-    }
-}
-// ═════════════════════════════════════════════════════════════════════
-`;
 // ═══════════════════════════════════════════
 // WINDOW MANAGER
 // ═══════════════════════════════════════════
@@ -473,58 +430,40 @@ window._ace = editor;
 // Disable default JS syntax checker
 editor.session.setUseWorker(false);
 
-// Custom Midscript Linter
+// Midscript linter: the SDK's parser and code generator, at the target height
 let validateTimeout;
+let lintMarkers = [];
 function validateMidscript() {
+    if (!window.SDK) return;
+    const { Lexer, Parser, CodeGen, STD_LIB } = window.SDK;
     const code = editor.getValue();
     const annotations = [];
+    lintMarkers.forEach(id => editor.session.removeMarker(id));
+    lintMarkers = [];
 
     try {
-        // Parse STD_LIB and user code independently
-        const stdAst = new Parser(new Lexer(STD_LIB).tokenize()).parse();
-        const userAst = new Parser(new Lexer(code).tokenize()).parse();
-        const ast = [...stdAst, ...userAst];
-        
-        // Run CodeGen to catch Semantic Errors (Type Mismatches, Stack Depth, etc)
-        const gen = new CodeGen();
-        gen.generate(ast);
-
+        // Parse STD_LIB and user code independently so user lines start at 1
+        const ast = [...new Parser(new Lexer(STD_LIB).tokenize()).parse(),
+                     ...new Parser(new Lexer(code).tokenize()).parse()];
+        // CodeGen catches semantic errors (type mismatches, stack depth, ...)
+        new CodeGen({ height: targetHeight() }).generate(ast);
     } catch (e) {
-        let row = 0;
-        let column = 0;
-        let text = e.toString();
-
-        // This regex now catches both "Syntax Error at L:C" and "Semantic Error at L:C"
-        const match = text.match(/at (\d+):(\d+)/);
-        if (match) {
-            row = parseInt(match[1], 10) - 1;    // Ace rows are 0-indexed
-            column = parseInt(match[2], 10) - 1; // Ace columns are 0-indexed
-        }
-
-        annotations.push({
-            row: row,
-            column: column,
-            text: text,
-            type: "error" // Creates the red "x" in the gutter
-        });
-        editor.session.addMarker(new ace.Range(row, column, row, column + 10), "ace_error-marker", "text");
+        const text = e.toString();
+        const match = text.match(/at (\d+):(\d+)/);       // "Syntax/Semantic Error at L:C"
+        const row = match ? parseInt(match[1], 10) - 1 : 0;   // Ace is 0-indexed
+        const column = match ? parseInt(match[2], 10) - 1 : 0;
+        annotations.push({ row, column, text, type: "error" });
+        lintMarkers.push(editor.session.addMarker(new ace.Range(row, column, row, column + 10), "ace_error-marker", "text"));
     }
 
     editor.session.setAnnotations(annotations);
 }
 
-// Run linter on code change (debounced by 300ms)
+// Run linter on code change (debounced by 300ms); loading a template changes the code too
 editor.session.on('change', () => {
     clearTimeout(validateTimeout);
     validateTimeout = setTimeout(validateMidscript, 300);
 });
-
-// Run linter when loading a template
-const originalLoadTemplate = window.loadTemplate;
-window.loadTemplate = function() {
-    originalLoadTemplate();
-    validateMidscript();
-};
 
 // ═══════════════════════════════════════════
 // TEMPLATES
@@ -650,7 +589,9 @@ route {
 true;`,
     witness: 'ffff, 0303030303030303030303030303030303030303030303030303030303030303, 00',
     inputState: '28fd0000000000000a00000000000000f4010000000000000000000000000000',
-    outputs: 'aa000000000000000000000000000000000000000000000000000000000000aa:1000000:28fd0000000000000a00000000000000bc020000000000000000000000000000, dd000000000000000000000000000000000000000000000000000000000000dd:200',
+    // On chain an output carries state or value, not both, so the state
+    // output keeps its index (value 0) and its value follows at the end.
+    outputs: 'aa000000000000000000000000000000000000000000000000000000000000aa:0:28fd0000000000000a00000000000000bc020000000000000000000000000000, dd000000000000000000000000000000000000000000000000000000000000dd:200, aa000000000000000000000000000000000000000000000000000000000000aa:1000000',
     height: '65535'
   },
 
@@ -708,7 +649,9 @@ true;`,
     // Trade 10 X for Y. dx = 10. Fee taken. 
     // Output X = 20. Output Y = 51 (User withdrew 49 Y).
     // x_adj = 19970, y_adj = 51000. 19970 * 51000 = 1,018,470,000 >= 1,000,000,000. (Valid!)
-    outputs: 'aa000000000000000000000000000000000000000000000000000000000000aa:20:1400000000000000330000000000000000000000000000000000000000000000'
+    // On chain an output carries state or value, not both, so the state
+    // output keeps its index (value 0) and its value follows at the end.
+    outputs: 'aa000000000000000000000000000000000000000000000000000000000000aa:0:1400000000000000330000000000000000000000000000000000000000000000, aa000000000000000000000000000000000000000000000000000000000000aa:20'
   },
 
   tokens: {
@@ -906,7 +849,9 @@ true;`,
     witness: '',
     height: '65100',
     inputState: '0a00000000000000780000000000000000000000000000000000000000000000',
-    outputs: '00:0, 00:0, 00:0, aa00000000000000000000000000000000000000000000000000000000000004:15:0f00000000000000500000000000000000000000000000000000000000000000'
+    // On chain an output carries state or value, not both, so the state
+    // output keeps its index (value 0) and its value follows at the end.
+    outputs: '00:0, 00:0, 00:0, aa00000000000000000000000000000000000000000000000000000000000004:0:0f00000000000000500000000000000000000000000000000000000000000000, aa00000000000000000000000000000000000000000000000000000000000004:15'
   },
 
   options_vault: {
@@ -949,7 +894,9 @@ true;`,
     witness: '00',
     height: '65100',
     inputState: '0a00000000000000000000000000000010110100000000000000000000000000',
-    outputs: 'aa00000000000000000000000000000000000000000000000000000000000001:0, aa00000000000000000000000000000000000000000000000000000000000002:0, 00:0, aa00000000000000000000000000000000000000000000000000000000000004:15:0f00000000000000500000000000000000000000000000000000000000000000, dd00000000000000000000000000000000000000000000000000000000000000:10'
+    // On chain an output carries state or value, not both, so the state
+    // output keeps its index (value 0) and its value follows at the end.
+    outputs: 'aa00000000000000000000000000000000000000000000000000000000000001:0, aa00000000000000000000000000000000000000000000000000000000000002:0, 00:0, aa00000000000000000000000000000000000000000000000000000000000004:0:0f00000000000000500000000000000000000000000000000000000000000000, dd00000000000000000000000000000000000000000000000000000000000000:10, aa00000000000000000000000000000000000000000000000000000000000004:15'
   },
 
   options_token: {
@@ -1153,12 +1100,15 @@ macro merkle_step() {
 
 route {
   case 0: { // PATH 0: AUTHORIZED SPEND
-    // 1. Consume the signature first to expose the PubKey underneath
-    var my_pk = pop_hex();
-    require_sig(my_pk); 
-    
-    // 2. Push PK back to stack and hash it to create the starting Leaf
-    my_pk;
+    // 1. Stack: [..., Signature, PubKey]. Keep a copy of the key beneath
+    //    the signature and check the signature with the other copy.
+    //    (Binding the key with 'var my_pk = pop_hex()' and then calling
+    //    require_sig(my_pk) would check the key against itself: the copy
+    //    lands on the key, not on the signature.)
+    dup(); rot(); swap();
+    CHECKSIGVERIFY;
+
+    // 2. Hash the key to create the starting Leaf
     hash();
 
     // 3. Unroll the Merkle Proof! (Assuming a tree depth of 3 for this example)
@@ -1177,14 +1127,14 @@ route {
 // This proves the stack mechanics work without bloating the on-chain bytecode.
 test "Validates a Left-Sibling Merkle Step" {
     // Setup Mock Stack: [Sibling(AA), Direction(Left=1), Current(BB)]
-    push_hex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-    push_int(1); 
-    push_hex("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    1;
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     
     merkle_step();
     
     // Because sibling was left (1), the concat order should have been AA || BB.
-    push_hex("7e244b7fa716d86fb5a0f274291c984caebef9df451e0ff0d48cb96d66e74b3e"); 
+    "03cd87c307477458bf196d0de50b2e6d057f564628427aadf35e7c00f6c3f828";
     
     assert(pop_hex() == pop_hex()); 
 }
@@ -1199,6 +1149,63 @@ true;`,
   },
   
   
+  merkle_root_v6: {
+    code:`// =====================================================================
+// MERKLE ALLOWLIST — one opcode (v6, from block 371,500)
+// =====================================================================
+// The Merkle Whitelist template walks its proof with repeat(3) and
+// merkle_step(), about 60 bytes of script per level, so a deeper tree
+// means a bigger script. From block 371,500, MERKLE_ROOT folds a proof of
+// any depth in one byte: this script stays the same size whether the
+// allowlist holds eight keys or eight million.
+//
+// The state holds the root of a tree whose leaves are hash(public key).
+// To spend, a member provides their key, their signature and a proof:
+// 33 bytes per level, from the leaf up — a 32-byte sibling, then 00 if
+// the sibling is on the right or 01 if it is on the left.
+//
+// Below block 371,500 MERKLE_ROOT does not exist: set Block Height to
+// 371499 and the VM refuses it, as a node would.
+
+state Registry { root: 32 }
+
+route {
+  case 0: { // A MEMBER SPENDS
+    // Stack: [proof, signature, pk]
+    // 1. Keep a copy of the key beneath the signature, check the signature
+    //    with the other copy: [proof, pk, signature, pk] -> [proof, pk]
+    dup(); rot(); swap();
+    CHECKSIGVERIFY;
+
+    // 2. Fold hash(pk) up the proof: [proof, leaf] -> [leaf, proof] -> [root]
+    hash();
+    swap();
+    MERKLE_ROOT;
+
+    // 3. The member is in the set iff the fold reaches the stored root
+    assert(pop_hex() == Registry.root);
+  }
+  default: { fail(); }
+}
+
+// ── TEST SUITE ──
+test "One level folds as hash(leaf || right sibling)" {
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb00";
+    MERKLE_ROOT;
+    "03cd87c307477458bf196d0de50b2e6d057f564628427aadf35e7c00f6c3f828";
+    assert(pop_hex() == pop_hex());
+}
+
+true;`,
+    // WITNESS STACK ORDER: [Proof, Signature, PubKey, Routing_Int]
+    // A three-level proof for member 5 of an eight-key tree. The emulator
+    // checks a signature by comparing it with the key; a node verifies it.
+    witness: '4d047fd649acda1957b5c1fb2b8f722a621acebf78c41d65e6358016ab0f3db50131b4933489cf1b881f8c32f1b95bf817567fe1a34bf5a1014b3bcf383269676c00aa1ee3ab8edf9a32220ed0cbadc8c25c3e571e09cdf1af99d167f01d2919db2d01, a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5, a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5, 00',
+    inputState: '85908a528f85baa5eaca2d79a101b64a732433777507fa9fa429c2679aee3bbc',
+    outputs: '',
+    height: '371500'
+  },
 };
 
 window.loadTemplate = function() {
@@ -1230,21 +1237,6 @@ window.loadTemplate = function() {
 // ═══════════════════════════════════════════
 // UTILS
 // ═══════════════════════════════════════════
-function intToHexLE(n){
-  if(typeof n !== 'bigint') n = BigInt(n);
-  if(n === 0n) return '00';
-  let h = n.toString(16);
-  if(h.length % 2) h = '0' + h;
-  return h.match(/.{2}/g).reverse().join('');
-}
-function hexLEToInt(h){
-  if(!h) return 0n;
-  // Enforce Rust VM's strict 8-byte limit on math opcodes to prevent crashes
-  if(h.length > 16) throw 'InvalidOpcode (Math operations require inputs of 8 bytes or less)';
-  return BigInt('0x' + h.match(/.{2}/g).reverse().join(''));
-}
-function isTrue(h){if(!h)return false;return h.match(/.{2}/g).some(b=>parseInt(b,16)!==0);}
-
 function setAddr(a) {
   const short = a.length>32 ? a.slice(0,30)+'…' : a;
   document.getElementById('sv-addr').textContent = short;
@@ -1282,784 +1274,90 @@ function setVmStatus(msg,cls='neu') {
 }
 
 // ═══════════════════════════════════════════
-// ASSEMBLER
+// COMPILE  (the SDK's compiler: window.SDK.compile)
 // ═══════════════════════════════════════════
-const OPS={PUSH_DATA:0x01,DROP:0x10,DUP:0x11,SWAP:0x12,OVER:0x13,ROT:0x14,SLICE:0x15,CONCAT:0x16,PICK:0x17,EQUAL:0x20,VERIFY:0x21,EQUALVERIFY:0x22,ADD:0x23,GREATER_OR_EQUAL:0x24,SUB:0x25,MUL:0x26,DIV:0x27,MOD:0x28,SIZE:0x29,HASH:0x30,CHECKSIG:0x31,CHECKSIGVERIFY:0x32,CHECKTIMEVERIFY:0x33,IF:0x40,ELSE:0x41,ENDIF:0x42,SUM_TO_ADDR:0x50,READ_INPUT_STATE:0x51,READ_OUTPUT_STATE:0x52,INPUT_VALUE:0x53,OUTPUT_ADDRESS:0x54,THIS_ADDRESS:0x55};
-function assembleBytecode(asm) {
-  let bc=[];
-  for(let inst of asm){
-    let [op,...rest]=inst.split(' ');
-    if(op==='PUSH_HEX'||op==='PUSH_INT'){
-      bc.push(OPS.PUSH_DATA);
-      let hex=op==='PUSH_INT'?intToHexLE(BigInt(rest[0])):rest[0].toLowerCase();
-      if (hex.length % 2 !== 0) throw `Syntax Error: Hex string must have an even number of characters ('${hex}')`;
-      if (!/^[0-9a-f]*$/.test(hex)) throw `Syntax Error: Invalid hex characters in '${hex}'`;
-      let len=hex.length/2, lh=len.toString(16).padStart(4,'0');
-      bc.push(parseInt(lh.slice(2,4),16),parseInt(lh.slice(0,2),16));
-      for(let i=0;i<hex.length;i+=2)bc.push(parseInt(hex.slice(i,i+2),16));
-    } else {
-      if(OPS[op]===undefined)throw`Unknown opcode: ${op}`;
-      bc.push(OPS[op]);
-    }
-  }
-  return bc.map(b=>b.toString(16).padStart(2,'0')).join('');
+let compiled = null;   // compile() result, plus the height it targeted
+let run = null;        // execute() result with its trace, replayed by Step
+let pc = 0, isHalted = false;
+
+const esc = (x) => String(x).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const fmtH = (h) => BigInt(h).toLocaleString('en');
+
+// The block height in the context window is both the height the VM runs at and
+// the height the compiler targets: from V6_ACTIVATION_HEIGHT it may use the v6
+// opcodes, which changes the bytecode and therefore the address.
+function targetHeight() {
+  try { return BigInt(document.getElementById('ctxHeight').value || '0'); } catch { return 0n; }
 }
 
-// ═══════════════════════════════════════════
-// LEXER
-// ═══════════════════════════════════════════
-class Lexer {
-  constructor(src){
-    this.src=src.replace(/\/\*[\s\S]*?\*\//g,'').replace(/\/\/.*/g,'');
-    this.pos=0;this.line=1;this.col=1;
-  }
-  adv(){let c=this.src[this.pos++];if(c==='\n'){this.line++;this.col=1;}else this.col++;return c;}
-  tokenize(){
-    const toks=[];
-    // ONLY true raw opcodes that never take (args) in high-level code
-    const RAW_OPS=['PUSH_INT','PUSH_HEX','DUP','DROP','SWAP','OVER','ROT','PICK','SLICE','CONCAT','EQUAL','EQUALVERIFY','CHECKSIG','CHECKSIGVERIFY','ADD','SUB','MUL','DIV','MOD','SIZE','GREATER_OR_EQUAL','HASH','CHECKTIMEVERIFY','VERIFY','INPUT_VALUE','OUTPUT_ADDRESS','THIS_ADDRESS'];
-    const KWS=['if','else','repeat','true','false','macro','let','var','state','struct','switch','case','default','assert','route','test'];
-    while(this.pos<this.src.length){
-      let c=this.src[this.pos];
-      if(/\s/.test(c)){this.adv();continue;}
-      let sl=this.line,sc=this.col;
-      if(/\d/.test(c)){let n='';while(this.pos<this.src.length&&/\d/.test(this.src[this.pos]))n+=this.adv();toks.push({t:'NUM',v:parseInt(n),l:sl,c:sc});continue;}
-      if(c==='"'||c==="'"){let q=this.adv(),s='';while(this.pos<this.src.length&&this.src[this.pos]!==q)s+=this.adv();if(this.pos>=this.src.length)throw`Unterminated string at ${sl}:${sc}`;this.adv();toks.push({t:'HEX',v:s,l:sl,c:sc});continue;}
-      if(c==='='&&this.src[this.pos+1]==='='){toks.push({t:'OP',v:'==',l:sl,c:sc});this.adv();this.adv();continue;}
-      if(c==='>'&&this.src[this.pos+1]==='='){toks.push({t:'OP',v:'>=',l:sl,c:sc});this.adv();this.adv();continue;}
-      if(c==='&'&&this.src[this.pos+1]==='&'){toks.push({t:'OP',v:'&&',l:sl,c:sc});this.adv();this.adv();continue;}
-      if(c==='|'&&this.src[this.pos+1]==='|'){toks.push({t:'OP',v:'||',l:sl,c:sc});this.adv();this.adv();continue;}
-      // FIXED: Added ':' to punctuation list (required for "field: size" in state/struct)
-      if(['+','-','*','/','%','{','}','(',')','.',';',',',':'].includes(c)){
-        if(c==='.') toks.push({t:'DOT',v:'.',l:sl,c:sc});
-        else toks.push({t:'P',v:c,l:sl,c:sc});
-        this.adv();continue;
-      }
-      if(c==='='||c==='>'||c==='<'){let op=this.adv();if(this.src[this.pos]==='=')op+=this.adv();toks.push({t:'ROP',v:op,l:sl,c:sc});continue;}
-      if(/[a-zA-Z_]/.test(c)){let id='';while(this.pos<this.src.length&&/[a-zA-Z0-9_]/.test(this.src[this.pos]))id+=this.adv();
-        if(RAW_OPS.includes(id))toks.push({t:'ASM',v:id,l:sl,c:sc});
-        else if(KWS.includes(id))toks.push({t:'KW',v:id,l:sl,c:sc});
-        else toks.push({t:'ID',v:id,l:sl,c:sc});continue;}
-      throw`Unknown char '${c}' at ${this.line}:${this.col}`;
-    }
-    return toks;
-  }
+// The emulator context, in the shape the SDK's execute() takes.
+function vmContext() {
+  const val = (id) => document.getElementById(id).value.trim();
+  const big = (id, d) => { try { return BigInt(val(id) || d); } catch { return BigInt(d); } };
+  const witness = val('ctxWitness') ? val('ctxWitness').split(',').map(w => w.trim().toLowerCase()) : [];
+  const outputs = val('ctxOutputs').split(',').map(o => o.trim()).filter(Boolean).map(o => {
+    const [address = '', value = '0', state = ''] = o.split(':').map(x => x.trim());
+    let v; try { v = BigInt(value || '0'); } catch { v = 0n; }
+    return { address: address.toLowerCase(), value: v, state: state ? state.toLowerCase() : null };
+  });
+  return {
+    witness,
+    height: targetHeight(),
+    inputValue: big('ctxInputValue', '0'),
+    inputState: val('ctxInputState').toLowerCase() || null,
+    thisAddress: val('ctxThisAddress').toLowerCase() || null,
+    outputs,
+  };
 }
 
-// ═══════════════════════════════════════════
-// PARSER
-// ═══════════════════════════════════════════
-
-class Parser {
-  constructor(toks){this.toks=toks;this.pos=0;}
-  pk(){return this.toks[this.pos];}
-  consume(et,ev){let t=this.toks[this.pos];if(!t)throw'Unexpected EOF';if(et&&t.t!==et)throw`Syntax Error at ${t.l}:${t.c}: Expected ${et}, got '${t.v}'`;if(ev&&t.v!==ev)throw`Syntax Error at ${t.l}:${t.c}: Expected '${ev}', got '${t.v}'`;return this.toks[this.pos++];}
-  match(v){if(this.pk()&&this.pk().v===v){this.pos++;return true;}return false;}
-  parse(){let s=[];while(this.pos<this.toks.length){let st=this.parseStmt();if(st)s.push(st);}return s;}
-
-  parseStmt(){
-    let t=this.pk();if(!t)return null;
-
-    if(t.t==='KW'&&t.v==='let'){
-      this.consume();
-      let id=this.consume('ID').v;
-      this.consume('ROP','=');
-      let expr=this.parseExpr();
-      this.match(';');
-      return {type:'LetStmt', id, expr};
-    }
-
-    if(t.t==='KW'&&t.v==='var'){
-      this.consume();
-      let id=this.consume('ID').v;
-      this.consume('ROP','=');
-      let expr=this.parseExpr();
-      this.match(';');
-      return {type:'VarDecl', id, expr};
-    }
-// Check for bare assignment: identifier = expr
-if (t.t === 'ID' && this.toks[this.pos + 1]?.v === '=') {
-    const id = this.consume('ID').v;
-    this.consume('ROP', '=');
-    const expr = this.parseExpr();
-    this.match(';');
-    return { type: 'AssignStmt', id, expr, l: t.l, c: t.c }; 
+// Which height-gated opcodes a height has, for the log.
+function opcodeBanks(h) {
+  const { STATE_THREAD_ACTIVATION_HEIGHT: ST, COVENANT_SUM_ACTIVATION_HEIGHT: CS, V6_ACTIVATION_HEIGHT: V6 } = window.SDK;
+  const on = (from) => h >= from ? 'on' : `off until ${fmtH(from)}`;
+  return `Opcodes at height ${fmtH(h)}: state threads ${on(ST)}; SUM_INPUT_VALUE ${on(CS)}; ` +
+         `v6 (NIP, TUCK, NOT, LESS_THAN, MERKLE_ROOT) ${on(V6)}`;
 }
-    if(t.t==='KW'&&t.v==='macro'){
-      this.consume();
-      let name=this.consume('ID').v;
-      this.consume('P','(');
-      let params = [];
-      while(this.pk() && this.pk().v !== ')') {
-          params.push(this.consume('ID').v);
-          if (this.match(',')) continue;
-      }
-      this.consume('P',')');
-      let body=this.parseBlock();
-      return {type:'MacroDefStmt', name, params, body};
-    }
-
-    if(t.t==='KW'&&t.v==='state'){
-      this.consume();
-      let name=this.consume('ID').v;
-      this.consume('P','{');
-      let fields={}; let offset=0;
-      while(this.pk()&&this.pk().v!=='}'){
-        let fname=this.consume('ID').v;
-        this.consume('P',':');
-        let size=this.consume('NUM').v;
-        fields[fname]={offset, size};
-        offset += size;
-        this.match(',');
-      }
-      this.consume('P','}');
-      return {type:'StateDef', name, fields};
-    }
-
-    if(t.t==='KW'&&t.v==='struct'){
-      this.consume();
-      let name=this.consume('ID').v;
-      this.consume('P','{');
-      let fields={}; let offset=0;
-      while(this.pk()&&this.pk().v!=='}'){
-        let fname=this.consume('ID').v;
-        this.consume('P',':');
-        let size=this.consume('NUM').v;
-        fields[fname]={offset, size};
-        offset += size;
-        this.match(',');
-      }
-      this.consume('P','}');
-      return {type:'StructDef', name, fields};
-    }
-
-    if(t.t==='KW'&&t.v==='if')return this.parseIf();
-    if(t.t==='KW'&&t.v==='repeat')return this.parseRepeat();
-    if(t.t==='KW'&&t.v==='switch')return this.parseSwitch();
-    if(t.t==='KW'&&t.v==='route')return this.parseRoute();
-    if(t.t==='KW'&&t.v==='test') {
-      this.consume();
-      let name = this.consume('HEX').v; // Reusing your string tokenizer for the description
-      let body = this.parseBlock();
-      return {type: 'TestDef', name, body};
-    }
-if(t.t==='KW'&&t.v==='assert'){
-      this.consume();
-      this.consume('P','(');
-      let expr=this.parseExpr();
-      this.consume('P',')');
-      this.match(';');
-      return {type:'AssertStmt', expr, l: t.l, c: t.c}; 
-    }
-    if(t.t==='P'&&t.v==='{')return this.parseBlock();
-    if(t.t==='P'&&t.v===';'){this.consume();return null;}
-
-    if(t.t==='ASM'){
-      this.consume();
-      if(t.v==='PUSH_HEX'||t.v==='PUSH_INT'){
-        if(this.match('(')){let a=this.consume();if(!this.match(')'))throw`Expected ')' after ${t.v} arg`;this.match(';');return{type:'RawASM',op:t.v,arg:a.v.toString()};}
-        let a=this.consume();this.match(';');return{type:'RawASM',op:t.v,arg:a.v.toString()};
-      }
-      if(this.match('(')){if(!this.match(')'))throw`ASM '${t.v}' takes no args — expected ')'`;}
-      this.match(';');return{type:'RawASM',op:t.v};
-    }
-    if(t.t==='P'&&t.v==='+'){this.consume();this.match(';');return{type:'RawASM',op:'ADD'};}
-    if(t.t==='ROP'&&t.v==='=='){this.consume();this.match(';');return{type:'RawASM',op:'EQUAL'};}
-    if(t.t==='ROP'&&t.v==='>='){this.consume();this.match(';');return{type:'RawASM',op:'GREATER_OR_EQUAL'};}
-
-    let expr=this.parseExpr();this.match(';');return{type:'ExprStmt',expr};
-  }
-
-  parseSwitch(){
-    let t = this.consume('KW','switch');
-    if(!this.match('('))throw`Expected '(' after 'switch'`;
-    let expr=this.parseExpr();
-    if(!this.match(')'))throw`Expected ')'`;
-    if(!this.match('{'))throw`Expected '{' after switch`;
-    let cases=[];
-    while(this.pk()&&this.pk().v!=='}'){
-      if(this.match('case')){
-        let val=this.parseExpr();
-        this.consume('P',':');
-        let body=this.parseBlock()||this.parseStmt();
-        cases.push({val,body});
-      } else if(this.match('default')){
-        this.consume('P',':');
-        let body=this.parseBlock()||this.parseStmt();
-        cases.push({isDefault:true,body});
-      } else break;
-    }
-    if(!this.match('}'))throw`Missing '}' for switch`;
-    return {type:'SwitchStmt',expr,cases, l: t.l, c: t.c}; 
-  }
-  parseRoute(){
-    let t = this.consume('KW','route'); // <-- Capture token t here
-    if(!this.match('{'))throw `Expected '{' after route`;
-    let cases=[];
-    while(this.pk()&&this.pk().v!=='}'){
-      if(this.match('case')){
-        let val=this.parseExpr();
-        this.consume('P',':');
-        let body=this.parseBlock()||this.parseStmt();
-        cases.push({val,body});
-      } else if(this.match('default')){
-        this.consume('P',':');
-        let body=this.parseBlock()||this.parseStmt();
-        cases.push({isDefault:true,body});
-      } else break;
-    }
-    this.consume('P','}');
-    
-    return {type:'SwitchStmt', expr: {type:'ImplicitTop'}, cases, l: t.l, c: t.c}; 
-  }
-
-  parseBlock(){let s=this.consume('P','{');let stmts=[];while(this.pos<this.toks.length&&(!this.pk()||this.pk().v!=='}')){let st=this.parseStmt();if(st)stmts.push(st);}if(!this.match('}'))throw`Missing '}' for block at ${s.l}`;return{type:'BlockStmt',stmts};}
-  parseIf(){let t=this.consume('KW','if');if(!this.match('('))throw`Expected '(' after 'if'`;let cond=this.parseExpr();if(!this.match(')'))throw`Expected ')' after if condition`;let thenB=this.parseBlock(),elseB=null;if(this.match('else')){if(this.pk()&&this.pk().v==='if')elseB=this.parseIf();else elseB=this.parseBlock();}return{type:'IfStmt',cond,thenB,elseB};}
-  parseRepeat(){let t=this.consume('KW','repeat');if(!this.match('('))throw`Expected '(' after 'repeat'`;let n=this.consume('NUM');if(!this.match(')'))throw`Expected ')'`;return{type:'RepeatStmt',count:n.v,body:this.parseBlock()};}
-  parseExpr(){return this.parseLOr();}
-  parseLOr(){let e=this.parseLAnd();while(this.match('||'))e={type:'Bin',l:e,op:'||',r:this.parseLAnd()};return e;}
-  parseLAnd(){let e=this.parseEq();while(this.match('&&'))e={type:'Bin',l:e,op:'&&',r:this.parseEq()};return e;}
-  parseEq(){
-    let e=this.parseAdd();
-    while(this.match('==')||this.match('>=')||this.match('>')||this.match('<=')||this.match('<')){   
-      let op=this.toks[this.pos-1].v;
-      e={type:'Bin',l:e,op,r:this.parseAdd()};
-    }
-    return e;
-  }
-  parseAdd(){
-    let e=this.parseMul();
-    while(this.match('+')||this.match('-')){
-      let op=this.toks[this.pos-1].v;
-      let r=this.parseMul();
-      // Fold constants if both sides are static integers
-      if(e.type==='Lit' && r.type==='Lit' && e.k==='int' && r.k==='int') {
-          e = {type:'Lit', v: op==='+' ? e.v+r.v : e.v-r.v, k:'int'};
-      } else {
-          e={type:'Bin',l:e,op,r};
-      }
-    }
-    return e;
-  }
-  
-  parseMul(){
-    let e=this.parsePrim();
-    while(this.match('*')||this.match('/')||this.match('%')){
-      let op=this.toks[this.pos-1].v;
-      let r=this.parsePrim();
-      // Fold constants if both sides are static integers
-      if(e.type==='Lit' && r.type==='Lit' && e.k==='int' && r.k==='int') {
-          let val = 0;
-          if (op === '*') val = e.v * r.v;
-          else if (op === '/') val = Math.floor(e.v / r.v);
-          else if (op === '%') val = e.v % r.v;
-          e = {type:'Lit', v: val, k:'int'};
-      } else {
-          e={type:'Bin',l:e,op,r};
-      }
-    }
-    return e;
-  }
-parsePrim(){
-    let t=this.pk();if(!t)throw'Unexpected EOF in expression';
-    if(this.match('(')){let e=this.parseExpr();if(!this.match(')'))throw`Missing ')' at ${t.l}:${t.c}`;return e;}
-    t=this.consume();
-    if(t.t==='NUM')return{type:'Lit',v:t.v,k:'int',l:t.l,c:t.c};
-    if(t.t==='HEX')return{type:'Lit',v:t.v,k:'hex',l:t.l,c:t.c};
-    if(t.t==='KW'&&t.v==='true')return{type:'Lit',v:1,k:'int',l:t.l,c:t.c};
-    if(t.t==='KW'&&t.v==='false')return{type:'Lit',v:0,k:'int',l:t.l,c:t.c};
-    if(t.t==='ID'){
-      if(this.match('.')){
-        let field=this.consume('ID').v;
-        return {type:'FieldAccess', base:t.v, field, l:t.l, c:t.c};
-      }
-      if(this.match('(')){
-          let args=[];
-          while(this.pk()&&this.pk().v!==')'){
-              args.push(this.parseExpr());this.match(',');
-          }
-          if(!this.match(')'))throw`Missing ')' for '${t.v}'`;
-          return{type:'Call',name:t.v,args,l:t.l,c:t.c};
-      }
-      return{type:'Lit',v:t.v,k:'hex',l:t.l,c:t.c};
-    }
-    throw`Syntax Error at ${t.l}:${t.c}: Unexpected token '${t.v}'`;
-  }
-}
-
-// ═══════════════════════════════════════════
-// CODE GEN
-// ═══════════════════════════════════════════
-class CodeGen {
-  constructor(){
-    this.asm = [];
-    this.sourceMap = [];
-    this.macros = {};
-    this.constants = {};
-    this.structs = {};
-    this.locals = [];           // list of active var names (stack order)
-    this.stateDefs = {};
-    this.stackDepthOffset = 0;
-    this.simulatedStackDepth = 0;
-  }
-  emit(op, line){
-    this.asm.push(op);
-    this.sourceMap.push(line || 0);
-    
-    // Calculate stack effect of this operation
-    let baseOp = op.split(' ')[0];
-    
-    if (baseOp.startsWith('PUSH_') || baseOp === 'DUP' || baseOp === 'READ_INPUT_STATE' || baseOp === 'SIZE' || baseOp === 'INPUT_VALUE' || baseOp === 'THIS_ADDRESS') {
-        this.simulatedStackDepth += 1;
-    } else if (baseOp === 'DROP' || baseOp === 'ADD' || baseOp === 'SUB' || baseOp === 'MUL' || baseOp === 'DIV' || baseOp === 'MOD' || baseOp === 'EQUAL' || baseOp === 'EQUALVERIFY' || baseOp === 'GREATER_OR_EQUAL' || baseOp === 'CONCAT' || baseOp === 'CHECKSIG' || baseOp === 'CHECKSIGVERIFY' || baseOp === 'CHECKTIMEVERIFY' || baseOp === 'VERIFY') {
-        this.simulatedStackDepth -= 1;
-    } else if (baseOp === 'SLICE') {
-        this.simulatedStackDepth -= 2; 
-    }
-    // SWAP, OVER, ROT, PICK, HASH, SUM_TO_ADDR, READ_OUTPUT_STATE, OUTPUT_ADDRESS have a net 0 effect.
-    // (OUTPUT_ADDRESS pops index, pushes address — net 0.)
-
-    if (this.simulatedStackDepth > 64) {
-        throw `Fatal Compiler Error: Maximum stack depth of 64 exceeded at line ${line || 'unknown'}. (Current depth: ${this.simulatedStackDepth})`;
-    }
-  }
-  
-  generate(ast) {
-    for(let n of ast) if(n) this.genStmt(n);
-    return this.optimize(this.asm);
-  }
-
-  optimize(asm) {
-    let opt = [];
-    for(let i=0; i<asm.length; i++) {
-      let curr = asm[i];
-      let next = asm[i+1];
-      
-      // Strip ONLY pure stack redundancies, leave math alone (used for type-casting)
-      if (curr === 'SWAP' && next === 'SWAP') { i++; continue; }
-      if (curr === 'DUP' && next === 'DROP') { i++; continue; }
-      
-      opt.push(curr);
-    }
-    return opt;
-  }
-
-  genStmt(s){
-    if(s.type==='TestDef') {
-      this.tests = this.tests || {};
-      this.tests[s.name] = s.body;
-      return; 
-    }
-    if(s.type==='MacroDefStmt'){this.macros[s.name]={params: s.params, body: s.body};}
-    else if(s.type==='LetStmt'){this.constants[s.id]=s.expr;}
-    else if(s.type==='VarDecl'){
-      // Prevent Shadowing
-      const existing = this.locals.find(l => l.id === s.id);
-      if (existing) {
-          throw `Semantic Error at ${s.l}:${s.c}: Cannot redeclare variable '${s.id}'. Shadowing is forbidden in Midscript.`;
-      }
-
-      let tType = this.genExpr(s.expr); 
-      this.locals.push({id: s.id, type: tType});
-    }
-    else if(s.type==='StateDef' || s.type==='StructDef'){
-      this.structs[s.name]=s.fields;
-      if(s.type==='StateDef') this.stateDefs[s.name]=s.fields;
-    }
-    else if(s.type==='BlockStmt') {
-      let initialLocals = this.locals.length; 
-      for(let c of s.stmts) this.genStmt(c);
-      let toDrop = this.locals.length - initialLocals;
-      for(let i=0; i<toDrop; i++) {
-        this.emit('DROP', s.l); // Pass line
-        this.locals.pop(); 
-      }
-    }
-    else if (s.type === 'AssignStmt') {
-        const idx = this.locals.findIndex(l => l.id === s.id);
-        if (idx === -1) throw `Semantic Error at ${s.l}:${s.c}: Assignment to undeclared variable '${s.id}'`;
-        
-        // Push the new value to the top of the stack
-        let newType = this.genExpr(s.expr);
-        
-        // Calculate depth to the old variable (remember we just pushed 1 new item!)
-        const depth = this.locals.length - idx; 
-
-        if (depth === 1) {
-            // It was already on top. Just swap the new one in and drop the old.
-            this.emit('SWAP', s.l);
-            this.emit('DROP', s.l);
-        } else if (depth === 2) {
-            // It's the second item. ROT pulls it to the top so we can drop it, 
-            // then we SWAP to put the new value in its place.
-            this.emit('ROT', s.l);
-            this.emit('DROP', s.l);
-            this.emit('SWAP', s.l);
-        } else {
-            // Deep assignment. We have to pull it up with a targeted ROT, 
-            // drop it, and push the new value down. 
-            // Midstate script doesn't have OP_ROLL, so deep mutable state 
-            // is restricted. Best practice: shadow variables instead of mutating them.
-            throw `Semantic Error at ${s.l}:${s.c}: Cannot reassign '${s.id}' (depth ${depth}). To mutate deep variables, redeclare them (e.g. 'var ${s.id} = ...').`;
-        }
-        this.locals[idx].type = newType;
-    }
-    else if(s.type==='AssertStmt'){
-      this.genExpr(s.expr);
-      this.emit('VERIFY', s.l); // VERIFY is usually where runtime errors happen!
-    }
-    else if(s.type==='ExprStmt')this.genExpr(s.expr);
-    else if(s.type==='RawASM')this.emit(s.arg!==undefined?`${s.op} ${s.arg}`:s.op, s.l);
-    else if(s.type==='IfStmt'){
-      this.genExpr(s.cond);
-      this.emit('IF', s.l);
-      this.genStmt(s.thenB);
-      if(s.elseB){this.emit('ELSE', s.l); this.genStmt(s.elseB);}
-      this.emit('ENDIF', s.l);
-    }
-    else if(s.type==='RepeatStmt'){for(let i=0;i<s.count;i++)this.genStmt(s.body);}
-    else if(s.type==='SwitchStmt'){this.genSwitch(s);}
-  } 
-
-genSwitch(sw) {
-  this.genExpr(sw.expr); // Push routing value
-  let cases = sw.cases.filter(c => !c.isDefault);
-  let def = sw.cases.find(c => c.isDefault);
-  
-  for(let i=0; i<cases.length; i++) {
-    this.emit('DUP', sw.l); 
-    this.genExpr(cases[i].val);
-    this.emit('EQUAL', sw.l); 
-    this.emit('IF', sw.l); 
-    this.emit('DROP', sw.l); 
-    this.genStmt(cases[i].body);
-    this.emit('ELSE', sw.l); 
-  }
-  
-  this.emit('DROP', sw.l); 
-  if (def) this.genStmt(def.body);
-  
-  for(let i=0; i<cases.length; i++) {
-    this.emit('ENDIF', sw.l); 
-  }
-}
-
-  genExpr(e){
-    if(e.type==='ImplicitTop') return 'unknown'; 
-    
-    if(e.type==='Lit'){
-      const idx = this.locals.findIndex(l => l.id === e.v);
-      if (idx !== -1) {
-          const depth = this.locals.length - 1 - idx + this.stackDepthOffset;
-          const varType = this.locals[idx].type;
-          
-          if (depth === 0) {
-              this.emit('DUP', e.l);
-          } else if (depth === 1) {
-              this.emit('OVER', e.l);
-          } else {
-              this.emit(`PUSH_INT ${depth}`, e.l);
-              this.emit('PICK', e.l);
-          }
-          return varType;
-      }
-      
-      if (e.v === 'READ_INPUT_STATE') { this.emit('READ_INPUT_STATE', e.l); return 'hex'; }
-      if (e.v === 'READ_OUTPUT_STATE') { this.emit('READ_OUTPUT_STATE', e.l); return 'hex'; }
-
-      if(this.constants[e.v]) {
-        return this.genExpr(this.constants[e.v]);
-      } else {
-        if (e.k === 'hex' && !/^[0-9a-fA-F]*$/.test(e.v)) {
-          throw `Semantic Error at ${e.l}:${e.c}: Undeclared identifier or invalid hex '${e.v}'`;
-        }
-        this.emit(e.k==='int'?`PUSH_INT ${e.v}`:`PUSH_HEX ${e.v}`, e.l);
-        return e.k;
-      }
-    }
-    else if(e.type==='Bin'){
-      let lType = this.genExpr(e.l);
-      this.stackDepthOffset++; 
-      let rType = this.genExpr(e.r);
-      this.stackDepthOffset--; 
-
-      const isMath = ['+', '-', '*', '/'].includes(e.op);
-      const isComparison = ['==', '>=', '>', '<=', '<'].includes(e.op);
-      const isLogical = ['&&', '||'].includes(e.op);
-      
-      const line = e.l.l || 'unknown';
-      const col = e.l.c || 'unknown';
-
-      if (isMath && ((lType !== 'int' && lType !== 'unknown') || (rType !== 'int' && rType !== 'unknown'))) {
-          throw `Semantic Error at ${line}:${col}: Type Mismatch. Math ('${e.op}') requires both sides to be integers.`;
-      }
-      
-      if (isComparison && lType !== rType && lType !== 'unknown' && rType !== 'unknown') {
-          throw `Semantic Error at ${line}:${col}: Type Mismatch. Cannot compare an '${lType}' with an '${rType}'.`;
-      }
-
-      if (isLogical && (lType === 'hex' || rType === 'hex')) {
-          throw `Semantic Error at ${line}:${col}: Type Mismatch. Logical operators ('${e.op}') require evaluated boolean/int expressions, not raw hex.`;
-      }
-      
-      if(e.op==='==')this.emit('EQUAL', e.l);
-      if(e.op==='>=')this.emit('GREATER_OR_EQUAL', e.l);
-      if(e.op==='>'){
-        this.emit('PUSH_INT 1', e.l); 
-        this.emit('ADD', e.l); 
-        this.emit('GREATER_OR_EQUAL', e.l);
-      }
-      if(e.op==='<='){
-        this.emit('SWAP', e.l); 
-        this.emit('GREATER_OR_EQUAL', e.l);
-      }
-      if(e.op==='<'){
-        this.emit('SWAP', e.l); 
-        this.emit('PUSH_INT 1', e.l); 
-        this.emit('ADD', e.l); 
-        this.emit('GREATER_OR_EQUAL', e.l);
-      }
-      
-      
-      if(e.op==='+')this.emit('ADD', e.l);
-      if(e.op==='-')this.emit('SUB', e.l);
-      if(e.op==='*')this.emit('MUL', e.l);
-      if(e.op==='/')this.emit('DIV', e.l);
-      if(e.op==='%')this.emit('MOD', e.l);
-      if(e.op==='&&'){this.emit('ADD', e.l); this.emit('PUSH_INT 2', e.l); this.emit('EQUAL', e.l);}
-      if(e.op==='||'){this.emit('ADD', e.l); this.emit('PUSH_INT 1', e.l); this.emit('GREATER_OR_EQUAL', e.l);}
-      
-      return 'int';
-    }
-    else if(e.type==='Call'){
-      const fn=e.name;
-      if(this.macros[fn]){
-        const mac = this.macros[fn];
-        if (e.args.length !== mac.params.length) throw `Semantic Error at ${e.l}:${e.c}: Macro '${fn}' expects ${mac.params.length} arguments.`;
-
-        let macroLocalsSnapshot = this.locals.length; 
-        
-        for (let i = 0; i < e.args.length; i++) {
-            let argType = this.genExpr(e.args[i]);
-            this.locals.push({id: mac.params[i], type: argType});
-        }
-        
-        this.genStmt(mac.body);
-        
-        let toDrop = this.locals.length - macroLocalsSnapshot;
-        for(let i=0; i<toDrop; i++) {
-            this.emit('DROP', e.l);
-            this.locals.pop();
-        }
-        return 'unknown';
-      }
-      else if(fn==='pop') {
-          throw `Semantic Error at ${e.l}:${e.c}: Use 'pop_int()' or 'pop_hex()' to ensure type safety. Generic 'pop()' is unsafe.`;
-      }
-      else if(fn==='pop_int') {
-          return 'int';
-      }
-      else if(fn==='pop_hex') {
-          return 'hex';
-      }
-      else if(fn==='size') { 
-          this.genExpr(e.args[0]); 
-          this.emit('SIZE', e.l); 
-          this.emit('SWAP', e.l); 
-          this.emit('DROP', e.l); 
-          return 'int'; 
-      }
-      else if(fn==='input_value') { 
-          this.emit('INPUT_VALUE', e.l); 
-          return 'int'; 
-      }
-      else if(fn==='pick') {
-          this.genExpr(e.args[0]);
-          this.emit('PICK', e.l);
-          return 'unknown';
-      }
-      else if(fn==='peek') { this.emit('DUP', e.l); return 'unknown'; }
-      else if(fn==='dup') { this.emit('DUP', e.l); return 'unknown'; }
-      else if(fn==='drop') { this.emit('DROP', e.l); return 'unknown'; }
-      else if(fn==='swap') { this.emit('SWAP', e.l); return 'unknown'; }
-      else if(fn==='over') { this.emit('OVER', e.l); return 'unknown'; }
-      else if(fn==='rot') { this.emit('ROT', e.l); return 'unknown'; }
-      else if(fn==='slice') { 
-          // Slice usually pops: [value, offset, length]
-          // We need to generate expressions for arguments if they exist
-          if(e.args.length === 3) {
-             this.genExpr(e.args[0]); this.stackDepthOffset++;
-             this.genExpr(e.args[1]); this.stackDepthOffset++;
-             this.genExpr(e.args[2]); this.stackDepthOffset -= 2;
-          }
-          this.emit('SLICE', e.l); return 'hex'; 
-      }
-      else if(fn==='concat') {
-          if (e.args && e.args.length === 2) {
-              this.genExpr(e.args[0]);
-              this.stackDepthOffset++;
-              this.genExpr(e.args[1]);
-              this.stackDepthOffset--;
-          }
-          this.emit('CONCAT', e.l); return 'hex';
-      }
-      else if(fn==='add') { this.emit('ADD', e.l); return 'int'; }
-      else if(fn==='sub') { this.emit('SUB', e.l); return 'int'; }
-      else if(fn==='mul') { this.emit('MUL', e.l); return 'int'; }
-      else if(fn==='div') { this.emit('DIV', e.l); return 'int'; }
-      else if(fn==='hash') {
-          if (e.args && e.args.length > 0) this.genExpr(e.args[0]);
-          this.emit('HASH', e.l); return 'hex';
-      }
-      else if(fn==='fail'){
-          this.emit('PUSH_INT 0', e.l);
-          this.emit('VERIFY', e.l);   
-          return 'unknown';
-      }
-      else if(fn==='verify_gte'){
-          this.genExpr(e.args[0]);
-          this.emit('GREATER_OR_EQUAL', e.l);
-          this.emit('VERIFY', e.l); 
-          return 'unknown';
-      }
-      else if(fn==='require_preimage'){
-          this.emit('HASH', e.l);
-          this.genExpr(e.args[0]);
-          this.emit('EQUALVERIFY', e.l); 
-          return 'unknown';
-      }
-      else if(fn==='require_time'){
-          this.genExpr(e.args[0]);
-          this.emit('CHECKTIMEVERIFY', e.l); 
-          return 'unknown';
-      }
-      else if(fn==='require_sig'){
-          this.genExpr(e.args[0]);
-          this.emit('CHECKSIGVERIFY', e.l); 
-          return 'unknown';
-      }
-      else if(fn==='check_sig'){
-          this.genExpr(e.args[0]);
-          this.emit('CHECKSIG', e.l); 
-          return 'int';
-      }
-      else if(fn==='require_transfer'){
-        this.genExpr(e.args[0]);
-        this.emit('SUM_TO_ADDR', e.l); 
-        this.stackDepthOffset++;
-        this.genExpr(e.args[1]);
-        this.stackDepthOffset--;
-        this.emit('EQUALVERIFY', e.l);
-        return 'unknown';
-      }
-      else if(fn==='sum_to_addr'){this.genExpr(e.args[0]); this.emit('SUM_TO_ADDR', e.l); return 'int';}
-      else if(fn==='read_input_state'){this.emit('READ_INPUT_STATE', e.l); return 'hex';}
-      else if(fn==='read_output_state'){this.genExpr(e.args[0]); this.emit('READ_OUTPUT_STATE', e.l); return 'hex';}
-      else if(fn==='output_address'){this.genExpr(e.args[0]); this.emit('OUTPUT_ADDRESS', e.l); return 'hex';}
-      else if(fn==='this_address'){this.emit('THIS_ADDRESS', e.l); return 'hex';}
-      else throw `Semantic Error at ${e.l}:${e.c}: Unknown function or macro '${fn}'`;
-    }
-    else if(e.type==='FieldAccess'){
-      let def = this.structs[e.base] || this.stateDefs[e.base];
-      if(!def || !def[e.field]) throw `Semantic Error at ${e.l}:${e.c}: Unknown field '${e.field}' on '${e.base}'`;
-      let f = def[e.field];
-      this.emit('READ_INPUT_STATE', e.l);
-      this.emit(`PUSH_INT ${f.offset}`, e.l);
-      this.emit(`PUSH_INT ${f.size}`, e.l);
-      this.emit('SLICE', e.l);
-      
-      if (f.size <= 8) {
-          this.emit('PUSH_INT 0', e.l);
-          this.emit('ADD', e.l);
-          return 'int';
-      }
-      return 'hex';
-    }
-  }
-}
-    
-
-
-// ═══════════════════════════════════════════
-// COMPILE
-// ═══════════════════════════════════════════
-let compiledTokens=[], stack=[], execStack=[], pc=0, isHalted=false;
+const V6_OPS = ['NIP', 'TUCK', 'NOT', 'LESS_THAN', 'MERKLE_ROOT'];
 
 async function runTests() {
   if(!window.wasmLoaded) return;
   log('--- Running Test Suite ---', 'i');
-  
+
   try {
-    const ast = new Parser(new Lexer(editor.getValue()).tokenize()).parse();
-    const mainGen = new CodeGen();
+    const { Lexer, Parser, CodeGen, STD_LIB, execute } = window.SDK;
+    const height = targetHeight();
+    const ast = [...new Parser(new Lexer(STD_LIB).tokenize()).parse(),
+                 ...new Parser(new Lexer(editor.getValue()).tokenize()).parse()];
+    const mainGen = new CodeGen({ height });
     mainGen.generate(ast); // Collects macros, structs, and tests
-    
+
     if (!mainGen.tests || Object.keys(mainGen.tests).length === 0) {
         log('No tests found. Use: test "Description" { ... }', 'w');
         return;
     }
-    
+
     let passed = 0, failed = 0;
-    
-    for (let [name, body] of Object.entries(mainGen.tests)) {
-        let testGen = new CodeGen();
+    for (const [name, body] of Object.entries(mainGen.tests)) {
         // Inherit global context so tests can use macros/structs defined outside
+        const testGen = new CodeGen({ height });
         testGen.macros = mainGen.macros;
         testGen.constants = mainGen.constants;
         testGen.structs = mainGen.structs;
         testGen.stateDefs = mainGen.stateDefs;
-        
-        let testAsm = testGen.generate([body]);
-        
-        let testTokens = testAsm.map(inst => {
-            let p = inst.split(' ');
-            return p.length > 1 ? {op: p[0], arg: p[1]} : {op: p[0]};
-        });
-        
-        // Push a silent success code to the end. If the test doesn't fail early, it passes.
-        testTokens.push({op: 'PUSH_INT', arg: '1'});
-        
-        // Prepare a clean, headless VM state
-        stack = []; execStack = []; pc = 0; isHalted = false; window.runtimeSigops = 0;
-        
-        let testError = null;
-        while(!isHalted && pc < testTokens.length) {
-            try {
-                let tok = testTokens[pc];
-                let exec = execStack.every(e => e === true);
-                
-                if(tok.op==='IF'){ if(exec){ execStack.push(isTrue(stack.pop())); } else execStack.push(false); }
-                else if(tok.op==='ELSE'){ let pe = execStack.length<=1 || execStack.slice(0,-1).every(e=>e===true); if(pe) execStack[execStack.length-1] = !execStack[execStack.length-1]; }
-                else if(tok.op==='ENDIF'){ execStack.pop(); }
-                else if(exec) {
-                    if (tok.op === 'CHECKSIG' || tok.op === 'CHECKSIGVERIFY') {
-                        window.runtimeSigops++;
-                        if (window.runtimeSigops > 3) throw 'VerifyFailed: MAX_SIGOPS_PER_SCRIPT exceeded';
-                    }
-                    await execOp(tok);
-                }
-                pc++;
-            } catch(e) {
-                testError = e;
-                break;
-            }
-        }
-        
-        if (!testError && stack.length === 1 && stack[0] === '01') {
-            log(`✓ PASS: ${name}`, 's'); 
-            passed++;
-        } else {
-            let reason = testError || `Clean Stack Rule failed: [${stack.join(', ')}]`;
-            log(`✗ FAIL: ${name} -> ${reason}`, 'e'); 
-            failed++;
-        }
+
+        // A test runs on an empty stack and passes if it ends on exactly [01]:
+        // a trailing PUSH_INT 1 is that [01] when nothing failed earlier.
+        const asm = [...testGen.generate([body]), 'PUSH_INT 1'];
+        const r = execute(asm, { ...vmContext(), witness: [] });
+        if (r.ok) { log(`✓ PASS: ${name}`, 's'); passed++; }
+        else { log(`✗ FAIL: ${name} -> ${r.error}`, 'e'); failed++; }
     }
-    
+
     log(`Results: ${passed} passed, ${failed} failed.`, failed > 0 ? 'e' : 's');
-    
+
     // Restore the IDE to normal compilation mode when done
-    compileCode(); 
-    
+    compileCode();
+
   } catch(e) {
     log(`Test compilation failed: ${e}`, 'e');
   }
@@ -2068,59 +1366,54 @@ async function runTests() {
 async function compileCode() {
   if(!window.wasmLoaded){showToast('WASM not ready','error');return;}
   log('Starting compilation...','i');
+  const height = targetHeight();
   try {
-const rawCode = editor.getValue();
+    const c = window.SDK.compile(editor.getValue(), { height });
+    compiled = { ...c, height };
+    window._sourceMap = c.sourceMap;
+    document.getElementById('bytecodeOutput').textContent = c.bytecode;
 
-    // 1. Tokenize and parse the Standard Library and User Code independently.
-    // This ensures the Lexer starts at Line 1 for the user's code.
-    const stdAst = new Parser(new Lexer(STD_LIB).tokenize()).parse();
-    const userAst = new Parser(new Lexer(rawCode).tokenize()).parse();
-
-    // 2. Merge the syntax trees sequentially
-    const ast = [...stdAst, ...userAst];
-    const mainGen = new CodeGen();
-    const asm = mainGen.generate(ast);
-    window._sourceMap = mainGen.sourceMap;
-    const hex = assembleBytecode(asm);
-    document.getElementById('bytecodeOutput').textContent = hex;
-    
     // one-time copy buttons
-if (!document.getElementById('btnCopyBc')) {
-  const bcBox = document.getElementById('bytecodeOutput');
-  const copyBc = document.createElement('button');
-  copyBc.className = 'tb-btn';
-  copyBc.style.cssText = 'position:absolute;top:8px;right:8px;font-size:9px;padding:2px 6px;';
-  copyBc.innerHTML = '📋';
-  copyBc.onclick = () => { navigator.clipboard.writeText(bcBox.textContent); showToast('Bytecode copied','info'); };
-  copyBc.id = 'btnCopyBc';
-  bcBox.parentElement.style.position = 'relative';
-  bcBox.parentElement.appendChild(copyBc);
-}
-    
-    const addr = window.blake3_hash_hex(hex);
+    if (!document.getElementById('btnCopyBc')) {
+      const bcBox = document.getElementById('bytecodeOutput');
+      const copyBc = document.createElement('button');
+      copyBc.className = 'tb-btn';
+      copyBc.style.cssText = 'position:absolute;top:8px;right:8px;font-size:9px;padding:2px 6px;';
+      copyBc.innerHTML = '📋';
+      copyBc.onclick = () => { navigator.clipboard.writeText(bcBox.textContent); showToast('Bytecode copied','info'); };
+      copyBc.id = 'btnCopyBc';
+      bcBox.parentElement.style.position = 'relative';
+      bcBox.parentElement.appendChild(copyBc);
+    }
+
+    const addr = window.blake3_hash_hex(c.bytecode);
     setAddr(addr);
-    const size=hex.length/2, sigops=asm.filter(i=>i==='CHECKSIG'||i==='CHECKSIGVERIFY').length;
-    const ss=document.getElementById('sv-size'); ss.textContent=`${size} B`; ss.className='sv'+(size>1024?' err':'');
-    document.getElementById('statSize').textContent=`${size} B`;
-    document.getElementById('statSigops').textContent=sigops;
-    if(size>1024)throw`MAX_SCRIPT_SIZE exceeded (${size} B)`;
+    const ss=document.getElementById('sv-size'); ss.textContent=`${c.sizeBytes} B`; ss.className='sv';
+    document.getElementById('statSize').textContent=`${c.sizeBytes} B`;
+    document.getElementById('statSigops').textContent=c.sigops;
     updateCliInstructions(addr);
 
-    compiledTokens=[];
-    let html='';
-    asm.forEach((inst,i)=>{
-      const parts=inst.split(' ');
-      compiledTokens.push(parts.length>1?{op:parts[0],arg:parts[1]}:{op:parts[0]});
-      const disp=parts.length>1?`${parts[0]} <span style="color:var(--warn)">${parts[1]}</span>`:parts[0];
-      html+=`<div class="asm-line" id="aln-${i}"><span class="ln">${i}</span>${disp}</div>`;
-    });
-    document.getElementById('asmOutput').innerHTML=html||"<div class='sempty'>No instructions</div>";
+    document.getElementById('asmOutput').innerHTML = c.asm.map((inst, i) => {
+      const [op, ...rest] = inst.split(' ');
+      const arg = rest.join(' ');
+      const disp = arg ? `${esc(op)} <span style="color:var(--warn)">${esc(arg)}</span>` : esc(op);
+      return `<div class="asm-line" id="aln-${i}"><span class="ln">${i}</span>${disp}</div>`;
+    }).join('') || "<div class='sempty'>No instructions</div>";
     resetVM();
     setVmStatus('Compiled — ready to run.','ok');
-    log(`Compiled: ${size} B, ${sigops} sigops`,'s');
+    log(`Compiled for height ${fmtH(height)}: ${c.sizeBytes} B, ${c.sigops} sigops`,'s');
+    log(opcodeBanks(height),'i');
+    const v6Used = [...new Set(c.asm.map(i => i.split(' ')[0]).filter(op => V6_OPS.includes(op)))];
+    if (v6Used.length) {
+      log(`Uses ${v6Used.join(', ')}: a node refuses this script below block ${fmtH(window.SDK.V6_ACTIVATION_HEIGHT)}, ` +
+          `refund branches included. Don't fund it before then.`, 'w');
+    }
     showToast('Compiled successfully','success');
   } catch(e) {
-    document.getElementById('asmOutput').innerHTML=`<div style="color:var(--fail);padding:12px;font-size:11px;line-height:1.7">Error:<br>${e}</div>`;
+    compiled = null;
+    const out = document.getElementById('asmOutput');
+    out.innerHTML = `<div style="color:var(--fail);padding:12px;font-size:11px;line-height:1.7">Error:<br><span></span></div>`;
+    out.querySelector('span').textContent = String(e);
     document.getElementById('bytecodeOutput').textContent='Compilation failed.';
     setAddr('—');
     setVmStatus('Compilation error','err');
@@ -2131,202 +1424,96 @@ if (!document.getElementById('btnCopyBc')) {
 }
 
 function resetVM() {
-    editor.session.clearAnnotations();
-  window.runtimeSigops = 0;
-  stack=[];execStack=[];pc=0;isHalted=false;
-  const ws=document.getElementById('ctxWitness').value;
-  if(ws.trim())ws.split(',').forEach(w=>stack.push(w.trim().toLowerCase()));
-  updateStackUI();
+  editor.session.clearAnnotations();
+  run = null; pc = 0; isHalted = false;
+  const witness = vmContext().witness;
+  showStack(witness);
   document.getElementById('btnStep').disabled=false;
   document.getElementById('btnRun').disabled=false;
   document.querySelectorAll('.asm-line').forEach(el=>el.className='asm-line');
-  log(`VM reset. Witness: [${stack.join(', ')}]`,'i');
+  log(`VM reset. Witness: [${witness.join(', ')}]`,'i');
 }
 
 // ═══════════════════════════════════════════
-// VM
+// VM  (the SDK's VM: window.SDK.execute)
 // ═══════════════════════════════════════════
+// execute() runs the whole script once and records each instruction with the
+// stack before it; Step replays that trace one instruction at a time.
+const END_RULE = /^(script ended with|clean stack rule|script must finish)/;
+
+// Index of the instruction that failed; -1 when the run reached the end (and
+// any failure is the end-of-script rule); -2 when the context was refused
+// before the first instruction.
+function failedAt(r) {
+  if (r.ok) return -1;
+  if (!r.trace.length) return -2;
+  if (r.trace.length === compiled.asm.length && END_RULE.test(r.error || '')) return -1;
+  return r.trace.length - 1;
+}
+
+function isTrueHex(h) { return !!h && h.match(/.{2}/g).some(b => parseInt(b, 16) !== 0); }
+
 async function vmStep() {
-  if(isHalted||pc>=compiledTokens.length){endVM();return;}
-  const tok=compiledTokens[pc];
-  const exec=execStack.every(e=>e===true);
+  if (isHalted || !compiled) return;
+  if (!run) {
+    run = window.SDK.execute(compiled.asm, { ...vmContext(), trace: true });
+    if (failedAt(run) === -2) {
+      // The context was refused before the script ran: no source line to mark.
+      isHalted = true;
+      document.getElementById('btnStep').disabled = true;
+      document.getElementById('btnRun').disabled = true;
+      setVmStatus(`✗ Context: ${run.error}`,'err');
+      log(`FATAL (context): ${run.error}`,'e');
+      return;
+    }
+  }
+  if (pc >= run.trace.length) { endVM(); return; }
+
+  const t = run.trace;
+  const e = t[pc];
+  const branch = ['IF','ELSE','ENDIF'].includes(e.op);
   document.querySelectorAll('.asm-line').forEach((el,i)=>{
-    if(i<pc)el.className='asm-line done';
-    else if(i===pc)el.className='asm-line active';
-    else el.className='asm-line'+(!exec&&!['IF','ELSE','ENDIF'].includes(tok.op)?' skipped':'');
+    if (i < pc) el.className = 'asm-line ' + (t[i].live || ['IF','ELSE','ENDIF'].includes(t[i].op) ? 'done' : 'skipped');
+    else if (i === pc) el.className = 'asm-line active';
+    else el.className = 'asm-line';
   });
   const activeEl=document.getElementById('aln-'+pc);
   if(activeEl)activeEl.scrollIntoView({behavior:'smooth',block:'nearest'});
-  const opStr=tok.arg?`${tok.op} <${tok.arg}>`:tok.op;
-  if(!exec&&!['IF','ELSE','ENDIF'].includes(tok.op)) log(`[${pc}] skip: ${opStr}`,'w');
+
+  const opStr = e.arg ? `${e.op} <${e.arg}>` : e.op;
+  if (!e.live && !branch) log(`[${pc}] skip: ${opStr}`,'w');
   else log(`[${pc}] exec: ${opStr}`,'i');
-try {
-    if(tok.op==='IF'){if(exec){const c=stack.pop();execStack.push(isTrue(c));log(`  → condition: ${isTrue(c)}`,'i');}else execStack.push(false);}
-    else if(tok.op==='ELSE'){const pe=execStack.length<=1||execStack.slice(0,-1).every(e=>e===true);if(pe)execStack[execStack.length-1]=!execStack[execStack.length-1];}
-    else if(tok.op==='ENDIF'){execStack.pop();}
-    else if(exec){
-      // Enforce dynamic SigOp limit before execution
-      if (tok.op === 'CHECKSIG' || tok.op === 'CHECKSIGVERIFY') {
-          window.runtimeSigops++;
-          if (window.runtimeSigops > 3) throw 'VerifyFailed: MAX_SIGOPS_PER_SCRIPT exceeded';
-      }
-      await execOp(tok);
-    }
-    pc++;updateStackUI();
-    if(pc>=compiledTokens.length)endVM();
-  } catch(e) {log(`[${pc}] FATAL: ${e}`,'e');haltVM(`✗ ${e}`);}
-}
 
-async function execOp(tok) {
-  const pop = () => { if(!stack.length) throw 'Stack underflow'; return stack.pop(); };
-  
-  // FIX 1 & 2: Enforce Stack Depth and Item Size limits on every push
-  const push = v => {
-      if (stack.length >= 64) throw 'Stack overflow (depth exceeds 64)';
-      // v.length is hex string length, so divide by 2 for bytes
-      if (v.length / 2 > 1536) throw 'Item too large (exceeds 1536 bytes)'; 
-      stack.push(v);
-  };
-
-  // Helper to enforce v3 opcode activation rules
-  const requireV3 = () => {
-      const cur = BigInt(document.getElementById('ctxHeight').value);
-      if (cur < 60000n) throw `InvalidOpcode: ${tok.op} activates at height 60,000`;
-  };
-
-  switch(tok.op){
-    case 'PUSH_HEX':push(tok.arg.toLowerCase());break;
-    case 'PUSH_INT':push(intToHexLE(BigInt(tok.arg)));break;
-    case 'DROP':{let a=pop();log(`  → dropped: ${a}`,'i');break;}
-    case 'DUP':{let a=pop();push(a);push(a);break;}
-    case 'SWAP':{let a=pop(),b=pop();push(a);push(b);break;}
-    
-    case 'OVER':{requireV3(); if(stack.length<2)throw'Stack underflow';push(stack[stack.length-2]);break;}
-    case 'ROT':{requireV3(); if(stack.length<3)throw'Stack underflow';push(stack.splice(stack.length-3,1)[0]);break;}
-    case 'PICK':{
-      requireV3();
-      let n=Number(hexLEToInt(pop()));
-      if(n<0 || n>=stack.length) throw 'Stack underflow (PICK)';
-      push(stack[stack.length-1-n]);
-      break;
-    }
-    case 'SIZE':{
-      requireV3();
-      let a=pop();
-      push(a);
-      push(intToHexLE(BigInt(a.length/2)));
-      break;
-    }
-    case 'INPUT_VALUE':{
-      requireV3();
-      let val = BigInt(document.getElementById('ctxInputValue').value || 0);
-      push(intToHexLE(val));
-      break;
-    }
-    case 'OUTPUT_ADDRESS':{
-      requireV3();
-      let idx = Number(hexLEToInt(pop()));
-      let outs = document.getElementById('ctxOutputs').value.split(',');
-      if (idx >= outs.length) throw 'InvalidStateRead (OUTPUT_ADDRESS index out of bounds)';
-      let parts = outs[idx].split(':');
-      let addr = parts[0].trim().toLowerCase();
-      if (addr.length !== 64) throw 'InvalidStateRead (output address must be 32 bytes / 64 hex chars)';
-      push(addr);
-      log(`  → output ${idx} address: ${addr.slice(0,8)}...`,'i');
-      break;
-    }
-    case 'THIS_ADDRESS':{
-      requireV3();
-      let addr = document.getElementById('ctxThisAddress').value.trim().toLowerCase();
-      if (addr.length !== 64) throw 'InvalidStateRead (this_address must be 32 bytes / 64 hex chars)';
-      push(addr);
-      log(`  → this_address: ${addr.slice(0,8)}...`,'i');
-      break;
-    }
-    case 'SLICE':{
-      requireV3();
-      let len=Number(hexLEToInt(pop())), off=Number(hexLEToInt(pop())), a=pop();
-      if(off*2 + len*2 > a.length) throw 'SLICE out of bounds';
-      push(a.slice(off*2, off*2 + len*2)); 
-      break;
-    }
-    case 'CONCAT':{requireV3(); let b=pop(), a=pop(); push(a+b); break;}
-    
-    case 'EQUAL':{let b=pop(),a=pop();push(a===b?'01':'00');break;}
-    case 'VERIFY':{if(!isTrue(pop()))throw'VERIFY failed';break;}
-    case 'EQUALVERIFY':{let b=pop(),a=pop();if(a!==b)throw`EQUALVERIFY failed (${a} ≠ ${b})`;break;}
-    case 'ADD':{let b=pop(),a=pop();push(intToHexLE(hexLEToInt(a)+hexLEToInt(b)));break;}
-    case 'GREATER_OR_EQUAL':{let b=pop(),a=pop();push(hexLEToInt(a)>=hexLEToInt(b)?'01':'00');break;}
-    
-    case 'SUB':{requireV3(); let b=pop(),a=pop();let d=hexLEToInt(a)-hexLEToInt(b);if(d<0n)throw'Math overflow';push(intToHexLE(d));break;}
-    case 'MUL':{requireV3(); let b=pop(),a=pop();push(intToHexLE(hexLEToInt(a)*hexLEToInt(b)));break;}
-    case 'DIV':{requireV3(); let b=pop(),a=pop();let bv=hexLEToInt(b);if(bv===0n)throw'Division by zero';push(intToHexLE(hexLEToInt(a)/bv));break;}
-    case 'MOD':{requireV3(); let b=pop(),a=pop();let bv=hexLEToInt(b);if(bv===0n)throw'Modulo by zero';push(intToHexLE(hexLEToInt(a)%bv));break;}
-    case 'HASH':{
-      let a=pop(),hex=a;
-      if(!/^[0-9A-Fa-f]+$/.test(a)||a.length%2!==0)hex=Array.from(new TextEncoder().encode(a)).map(b=>b.toString(16).padStart(2,'0')).join('');
-      let h=window.blake3_hash_hex(hex);push(h);log(`  → hash: ${h}`,'i');break;
-    }
-    case 'CHECKSIG':{
-      let pk=pop(),sig=pop();
-      push(pk===sig?'01':'00');
-      log(`  → CHECKSIG Emulator bypass: comparing string equality`,'w');
-      break;
-    }
-    case 'CHECKSIGVERIFY':{
-      let pk=pop(),sig=pop();
-      if(pk!==sig)throw`CHECKSIGVERIFY failed (sig '${sig}' ≠ pk '${pk}')`;
-      log(`  → CHECKSIGVERIFY Emulator bypass: comparing string equality`,'w');
-      break;
-    }
-    case 'CHECKTIMEVERIFY':{let r=hexLEToInt(pop()),cur=BigInt(document.getElementById('ctxHeight').value);if(cur<r)throw`CHECKTIMEVERIFY failed (height ${cur} < ${r})`;break;}
-    case 'SUM_TO_ADDR':{
-      let addr=pop(),sum=0n;
-        if (addr.length !== 64) throw 'VerifyFailed (SUM_TO_ADDR requires a 32-byte / 64-hex-char address)';
-
-      document.getElementById('ctxOutputs').value.split(',').forEach(o=>{let p=o.split(':');if(p.length>=2&&p[0].trim().toLowerCase()===addr.toLowerCase())sum+=BigInt(p[1]);});
-      push(intToHexLE(sum));log(`  → sum for ${addr.slice(0,8)}: ${sum}`,'i');break;
-    }
-    case 'READ_INPUT_STATE':{
-      let cur=BigInt(document.getElementById('ctxHeight').value);
-      if(cur < 65000n) throw 'InvalidOpcode (State Threads activate at height 65,000)';
-      let s = document.getElementById('ctxInputState').value.trim();
-      if(!s) throw 'InvalidStateRead (no input state provided in context)';
-      if(s.length !== 64) throw 'InvalidStateRead (state must be exactly 32 bytes / 64 hex chars)';
-      push(s.toLowerCase());
-      log(`  → read input state: ${s}`,'i');
-      break;
-    }
-    case 'READ_OUTPUT_STATE':{
-      let cur=BigInt(document.getElementById('ctxHeight').value);
-      if(cur < 65000n) throw 'InvalidOpcode (State Threads activate at height 65,000)';
-      let idx = Number(hexLEToInt(pop()));
-      let outs = document.getElementById('ctxOutputs').value.split(',');
-      if (idx >= outs.length) throw 'InvalidStateRead (output index out of bounds)';
-      let parts = outs[idx].split(':');
-      if (parts.length < 3 || !parts[2].trim()) throw 'InvalidStateRead (output has no state defined)';
-      let s = parts[2].trim();
-      if(s.length !== 64) throw 'InvalidStateRead (output state must be 32 bytes / 64 hex chars)';
-      push(s.toLowerCase());
-      log(`  → read output ${idx} state: ${s}`,'i');
-      break;
-    }
-    default:throw`Unknown opcode: ${tok.op}`;
+  if (pc === failedAt(run)) {
+    showStack(run.stack);
+    log(`[${pc}] FATAL: ${run.error}`,'e');
+    haltVM(`✗ ${run.error}`);
+    return;
   }
+  const after = pc + 1 < t.length ? t[pc + 1].stack : run.stack;
+  if (e.op === 'IF' && e.live) log(`  → condition: ${isTrueHex(e.stack[e.stack.length - 1])}`,'i');
+  else if (e.live && !branch && after.length &&
+           (after.length !== e.stack.length || after[after.length - 1] !== e.stack[e.stack.length - 1])) {
+    log(`  → ${after[after.length - 1]}`,'i');
+  }
+  showStack(after);
+  pc++;
+  if (pc >= t.length) endVM();
 }
 
 async function vmRun() {
+  if (!compiled) return;
   log('Running to completion...','i');
-  while(!isHalted&&pc<compiledTokens.length){
+  while (!isHalted) {
     await vmStep();
-    if(pc%5===0)await new Promise(r=>setTimeout(r,8));
+    if (pc % 5 === 0) await new Promise(r => setTimeout(r, 8));
   }
 }
 
-function updateStackUI() {
+function showStack(stack) {
   const sv=document.getElementById('stackView');
   if(!stack.length){sv.innerHTML='<div class="sempty">Stack Empty</div>';return;}
-  sv.innerHTML=stack.map((v,i)=>`<div class="sitem"><span class="si">[${i}]</span><span class="sv2">${v}</span></div>`).reverse().join('');
+  sv.innerHTML=stack.map((v,i)=>`<div class="sitem"><span class="si">[${i}]</span><span class="sv2">${esc(v)}</span></div>`).reverse().join('');
 }
 
 function endVM() {
@@ -2334,17 +1521,12 @@ function endVM() {
   document.getElementById('btnStep').disabled=true;
   document.getElementById('btnRun').disabled=true;
   document.querySelectorAll('.asm-line').forEach(el=>el.classList.remove('active'));
-  if(stack.length===1&&stack[0]==='01'){
+  if (run && run.ok) {
     setVmStatus('✓ Success — valid spend!','ok');
     log('Execution succeeded. Stack: [01]','s');
     showToast('✓ Valid spend!','success');
-  } else if(stack.length > 1) {
-    const msg=`✗ Clean Stack Rule violation (${stack.length} items left): [${stack.join(', ')}]`;
-    setVmStatus(msg,'err');
-    log(msg,'e');
-    showToast('Clean Stack Rule failed','error');
   } else {
-    const msg=`✗ Failed — Script must evaluate to [01]. Stack: [${stack.join(', ')}]`;
+    const msg = `✗ ${run ? run.error : 'not run'}`;
     setVmStatus(msg,'err');
     log(msg,'e');
     showToast('Script failed','error');

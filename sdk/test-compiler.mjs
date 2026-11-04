@@ -89,13 +89,13 @@ await t('an oversized script is refused at MAX_SCRIPT_SIZE', () => {
     assert(threw, `did not enforce the ${MAX_SCRIPT_SIZE} B limit`);
 });
 
-await t('all 17 IDE templates compile', async () => {
+await t('all 18 IDE templates compile', async () => {
     const html = await fs.readFile('../wasm-wallet/website/ide.html', 'utf8');
     const tpl = {};
     const re = /\n {2}(\w+)\s*:\s*\{\s*\n?\s*code\s*:\s*`(.*?)`,/gs;
     let m;
     while ((m = re.exec(html)) !== null) tpl[m[1]] = m[2];
-    assert(Object.keys(tpl).length === 17, `found ${Object.keys(tpl).length} templates, expected 17`);
+    assert(Object.keys(tpl).length === 18, `found ${Object.keys(tpl).length} templates, expected 18`);
     for (const [name, code] of Object.entries(tpl)) {
         try { compile(code); } catch (e) { throw new Error(`${name}: ${e.message || e}`); }
     }
@@ -205,6 +205,41 @@ await t('the sigop limit is enforced', () => {
 await t('a runaway script hits the step limit', () => {
     const res = execute(Array(200).fill('PUSH_INT 1'), { maxSteps: 50 });
     assert(!res.ok && /Step limit/.test(res.error), `got: ${res.error}`);
+});
+
+// OP_MERKLE_ROOT, as core/script.rs runs it: [leaf, proof] -> [root].
+const V6 = 371_500n;
+const LEAF = '11'.repeat(32), S1 = '22'.repeat(32), S2 = '33'.repeat(32);
+const merkleProbe = (proof, root, height = V6) =>
+    execute(['PUSH_HEX ' + LEAF, 'PUSH_HEX ' + proof, 'MERKLE_ROOT', 'PUSH_HEX ' + root, 'EQUAL'], { height });
+
+await t('MERKLE_ROOT folds dir 00 as hash(acc‖sib) and 01 as hash(sib‖acc)', () => {
+    const want = W.blake3_hash_hex(S2 + W.blake3_hash_hex(LEAF + S1));
+    const res = merkleProbe(S1 + '00' + S2 + '01', want);
+    assert(res.ok, `failed: ${res.error}`);
+    // The other order is a different root.
+    const swapped = W.blake3_hash_hex(W.blake3_hash_hex(S1 + LEAF) + S2);
+    assert(!merkleProbe(S1 + '01' + S2 + '00', want).ok && merkleProbe(S1 + '01' + S2 + '00', swapped).ok,
+        'direction bytes were not honoured');
+});
+
+await t('MERKLE_ROOT with an empty proof is the leaf itself', () => {
+    const res = execute(['PUSH_HEX ' + LEAF, 'PUSH_HEX ', 'MERKLE_ROOT', 'PUSH_HEX ' + LEAF, 'EQUAL'], { height: V6 });
+    assert(res.ok, `failed: ${res.error}`);
+});
+
+await t('MERKLE_ROOT is refused below the v6 activation height', () => {
+    const res = merkleProbe(S1 + '00', W.blake3_hash_hex(LEAF + S1), V6 - 1n);
+    assert(!res.ok && /InvalidOpcode/.test(res.error), `got: ${res.error}`);
+});
+
+await t('MERKLE_ROOT rejects malformed proofs as the node does', () => {
+    const root = W.blake3_hash_hex(LEAF + S1);
+    assert(/direction/.test(merkleProbe(S1 + '02', root).error), 'accepted direction byte 02');
+    assert(/33-byte/.test(merkleProbe(S1, root).error), 'accepted a partial record');
+    const short = execute(['PUSH_HEX 11', 'PUSH_HEX ' + S1 + '00', 'MERKLE_ROOT'], { height: V6, allowDirtyStack: true });
+    assert(/32 bytes/.test(short.error), 'accepted a short leaf');
+    assert(/exceeds/.test(merkleProbe((S1 + '00').repeat(33), root).error), 'walked 33 levels');
 });
 
 await t('an empty final stack is a failure, not a pass', () => {

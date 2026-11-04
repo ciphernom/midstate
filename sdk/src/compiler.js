@@ -1071,7 +1071,11 @@ genSwitch(sw) {
  * `require_signed_by` and friends are available without an import.
  *
  * @param {string} source
- * @returns {{bytecode: string, asm: string[], sizeBytes: number, sigops: number}}
+ * @param {Object} [opts]
+ * @param {BigInt} [opts.height=0n] Target height: from V6_ACTIVATION_HEIGHT the
+ *   compiler may use the v6 opcodes, which changes the bytecode and address.
+ * @returns {{bytecode: string, asm: string[], sizeBytes: number, sigops: number,
+ *   sourceMap: number[]}} `sourceMap[i]` is the source line of `asm[i]`.
  * @throws If the source does not compile, or the result exceeds MAX_SCRIPT_SIZE.
  */
 export function compile(source, opts = {}) {
@@ -1091,6 +1095,7 @@ export function compile(source, opts = {}) {
         asm,
         sizeBytes,
         sigops: asm.filter((i) => i === 'CHECKSIG' || i === 'CHECKSIGVERIFY').length,
+        sourceMap: gen.sourceMap.slice(),
     };
 }
 
