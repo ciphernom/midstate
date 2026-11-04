@@ -383,6 +383,9 @@ export function contractAddress(bytecodeHex) {
  * accepted, underpayment and over-refund are rejected, and a buy/sell round trip
  * returns the reserve to its starting value.
  */
+// ⚠ On chain this curve stops once its reserve coin has to be spent: that coin
+// carries no state, and consensus runs the script per input, so its run has
+// nothing to read. Use launchpad.js for launches.
 export const CURVE_CONTRACT_SOURCE = `// Pump-style bonding curve: batch buy/sell, contract holds its own reserve.\nstate Curve { supply: 8, reserve: 8, pad: 16 }\n\nmacro new_supply() { read_output_state(0); 0; 8; slice(); 0; add(); }\nmacro new_reserve() { read_output_state(0); 8; 8; slice(); 0; add(); }\n\n{\n    var s = Curve.supply;\n    var r = Curve.reserve;\n    var ns = new_supply();\n    var nr = new_reserve();\n\n    // The state cannot lie about the MDS it claims to hold.\n    // Reserve lives in a SEPARATE standard output at this address: consensus
     // gives OutputData::Confidential no value field at all, so a state thread
     // cannot also hold the MDS it describes. sum_input_value() rather than
