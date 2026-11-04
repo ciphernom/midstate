@@ -5599,13 +5599,21 @@ document.getElementById('btnExport').onclick = () => {
     setTimeout(function () { try { window.close(); } catch (_) {} }, 400);
   }
   // Stream worker progress for the active request out to the dApp.
-  function progressToDapp(reqId) {
+  // `extra` (optional) adds fields to a connect result once the site key is ready.
+  function progressToDapp(reqId, extra) {
     var W = window.__midstateWallet;
     if (!W || !W.onWorker) return;
     W.onWorker(function (data) {
       if (!active || active.id !== reqId) return;
       if (data.type === "CONTRACT_TX_PROGRESS" && data.payload && data.payload.reqId === reqId) {
         reply(active.source, active.origin, { type: "progress", id: reqId, message: data.payload.msg });
+      } else if (data.type === "SITE_KEY" && data.payload && data.payload.reqId === reqId) {
+        var p = data.payload;
+        reply(active.source, active.origin, { type: "result", id: reqId, data: Object.assign({}, extra || {}, {
+          sitePk: p.sitePk, siteKeyLeft: p.siteKeyLeft, siteSigBytes: p.siteSigBytes,
+          siteKeyGeneration: p.siteKeyGeneration, sitePks: p.sitePks
+        }) });
+        done();
       } else if (data.type === "CONTRACT_TX_COMPLETE" && data.payload && data.payload.reqId === reqId) {
         reply(active.source, active.origin, { type: "result", id: reqId, data: { txid: data.payload.txid } });
         done();
@@ -5624,11 +5632,47 @@ document.getElementById('btnExport').onclick = () => {
 
       if (req.action === "connect") {
         var addr = W.primaryAddress();
+        var wantKey = !!(req.params && req.params.siteKey);
         showApproval("Allow this site to see your public address?<br><br>" +
-          "<span style='color:var(--accent);word-break:break-all;'>" + esc(addr) + "</span>", origin);
+          "<span style='color:var(--accent);word-break:break-all;'>" + esc(addr) + "</span>" +
+          (wantKey ? "<br><br>It also asks for a <b>signing key for this site</b>. The key is made from your " +
+            "recovery phrase, belongs to this site only, and signs nothing without your approval each time." : ""), origin);
         bindApproval(
-          function () { reply(source, origin, { type: "result", id: req.id, data: { address: addr } }); done(); },
+          function () {
+            if (!wantKey) { reply(source, origin, { type: "result", id: req.id, data: { address: addr } }); done(); return; }
+            progressToDapp(req.id, { address: addr });
+            W.post({ type: "SITE_KEY_GET", payload: { reqId: req.id, origin: origin } });
+          },
           function () { reply(source, origin, { type: "error", id: req.id, message: "User rejected the connection." }); done(); }
+        );
+        return;
+      }
+
+      if (req.action === "fund" && Array.isArray((req.params || {}).fundings)) {
+        var f = req.params;
+        var printable = function (hex) {
+          var h = String(hex || "").replace(/^0x/, ""), s = "";
+          for (var i = 0; i + 1 < h.length; i += 2) {
+            var c = parseInt(h.substr(i, 2), 16);
+            s += (c >= 32 && c < 127) ? String.fromCharCode(c) : "·";
+          }
+          return s;
+        };
+        var lines = f.fundings.map(function (x) {
+          return "&bull; " + esc(x.amount) + " MDS &rarr; <span style='word-break:break-all;'>" + esc(String(x.address || "").slice(0, 16)) + "&hellip;</span>";
+        }).join("<br>");
+        var burns = (f.burns || []).map(function (b) {
+          return "&bull; <span style='color:#888;word-break:break-all;'>" + esc(printable(b)) + "</span>";
+        }).join("<br>");
+        showApproval((f.summary ? "<b>" + esc(f.summary) + "</b><br><br>" : "") +
+          "Payments:<br>" + lines + (burns ? "<br><br>Public data in the transaction:<br>" + burns : "") +
+          "<br><br><span style='color:#888'>Plus the network fee.</span>", origin);
+        bindApproval(
+          function () {
+            progressToDapp(req.id);
+            W.post({ type: "FUND_CONTRACT", payload: { reqId: req.id, fundings: f.fundings, burns: f.burns || [] } });
+          },
+          function () { reply(source, origin, { type: "error", id: req.id, message: "User rejected the funding request." }); done(); }
         );
         return;
       }
@@ -5651,18 +5695,44 @@ document.getElementById('btnExport').onclick = () => {
 
       if (req.action === "spend") {
         var s = req.params || {};
-        var outs = (s.outputs || []).map(function (o) {
-          return "&bull; " + esc(o.value || 0) + " &rarr; " + esc(String(o.address || "").slice(0, 16)) + "&hellip;" +
-                 (o.state ? " <span style='color:#888'>(state)</span>" : "");
+        // One line per destination: a reserve split into power-of-two coins
+        // would otherwise be a screenful of lines to the same address.
+        var byAddr = [], seen = {};
+        (s.outputs || []).forEach(function (o) {
+          var a = String(o.address || "");
+          if (!seen[a]) { seen[a] = { a: a, value: 0, coins: 0, states: 0 }; byAddr.push(seen[a]); }
+          seen[a].value += Number(o.value || 0);
+          if (o.state) seen[a].states++; else seen[a].coins++;
+        });
+        var outs = byAddr.map(function (g) {
+          return "&bull; " + esc(g.value.toLocaleString()) + " MDS &rarr; " + esc(g.a.slice(0, 16)) + "&hellip;" +
+                 (g.coins > 1 ? " <span style='color:#888'>(" + g.coins + " coins)</span>" : "") +
+                 (g.states ? " <span style='color:#888'>(+ state)</span>" : "");
         }).join("<br>");
-        showApproval("Execute contract<br>" +
+        // With explicit inputs the net is known: what the outputs ask for beyond
+        // what the contract's own coins bring in is paid from this wallet, and
+        // anything left over comes back to it as change.
+        var explicit = Array.isArray(s.inputs) && s.inputs.length;
+        var net = "";
+        if (explicit) {
+          var tin = 0, tout = 0;
+          s.inputs.forEach(function (i) { tin += Number(i.value || 0); });
+          (s.outputs || []).forEach(function (o) { tout += Number(o.value || 0); });
+          net = tout > tin
+            ? "<br><br>You pay <b>" + esc((tout - tin).toLocaleString()) + " MDS</b> plus the network fee."
+            : "<br><br>You receive <b>" + esc((tin - tout).toLocaleString()) + " MDS</b>, less the network fee.";
+        }
+        showApproval((s.summary ? "<b>" + esc(s.summary) + "</b><br><br>" : "") + "Execute contract<br>" +
           "<span style='color:var(--accent);word-break:break-all;'>" + esc(s.contractAddress || "(from bytecode)") + "</span><br><br>" +
-          (outs ? ("Outputs:<br>" + outs) : "No value outputs (state-only execution)."), origin);
+          (outs ? ("Outputs:<br>" + outs) : "No value outputs (state-only execution).") + net +
+          (s.siteSig ? "<br><br>Signed with your key for this site." : ""), origin);
         bindApproval(
           function () {
             progressToDapp(req.id);
-            W.post({ type: "WATCH_CONTRACT", payload: { address: s.contractAddress } });
-            W.post({ type: "SPEND_CONTRACT", payload: Object.assign({ reqId: req.id }, s) });
+            // Explicit inputs need no discovery; watching would trigger a full rescan per trade.
+            if (!explicit) W.post({ type: "WATCH_CONTRACT", payload: { address: s.contractAddress } });
+            // The origin comes from the browser, after the site's own fields, so a site cannot name another.
+            W.post({ type: "SPEND_CONTRACT", payload: Object.assign({ reqId: req.id }, s, { origin: origin }) });
           },
           function () { reply(source, origin, { type: "error", id: req.id, message: "User rejected the execution request." }); done(); }
         );
