@@ -889,8 +889,14 @@ pub const COVENANT_SUM_ACTIVATION_HEIGHT: u64 = COMMIT_WEIGHT_CAP_ACTIVATION_HEI
 /// the compiler clean up macro arguments in one byte instead of two.
 ///
 /// # Safety / Invariants
-/// - **Consensus-critical:** every node must gate at exactly this height.
-pub const V6_ACTIVATION_HEIGHT: u64 = 400_000;
+/// - **Consensus-critical (hard fork):** every node must gate at exactly
+///   this height.
+/// - Equal to [`WALK_ACTIVATION_HEIGHT`] (checked at compile time): every
+///   node upgrades for the Walk anyway, so both share one deadline. Moved
+///   forward from 400,000 in v6.2.0; v6.0.0 to v6.1.1 still gate at 400,000.
+pub const V6_ACTIVATION_HEIGHT: u64 = 371_500;
+#[cfg(not(feature = "fast-mining"))]
+const _: () = assert!(V6_ACTIVATION_HEIGHT == WALK_ACTIVATION_HEIGHT);
 
 /// True iff a state at the given height should hash with V2 rules.
 /// Single source of truth for V2 activation across the codebase.
@@ -922,9 +928,9 @@ pub const EXTENSION_ITERATIONS: u64 = 100;
 /// - **Consensus-critical (hard fork):** every node must switch at exactly
 ///   this height; nodes that have not upgraded reject the first Walk block.
 /// - Moved forward from 420,000: scheduled about 9,400 blocks (~6.6 days)
-///   past the tip at the time of writing (~362,060), so it now activates
-///   before `V6_ACTIVATION_HEIGHT`, which it does not depend on. Releases
-///   v6.0.0 to v6.1.1 still switch at 420,000.
+///   past the tip at the time of writing (~362,060). The v6 opcode bank
+///   (`V6_ACTIVATION_HEIGHT`) activates at the same height. Releases v6.0.0
+///   to v6.1.1 still switch at 420,000.
 /// - Midwimble mirrors it as `MIDSTATE_WALK_ACTIVATION_HEIGHT`.
 #[cfg(not(feature = "fast-mining"))]
 pub const WALK_ACTIVATION_HEIGHT: u64 = 371_500;

@@ -1,6 +1,6 @@
 {
   "name": "midstate-sdk",
-  "version": "2.10.0",
+  "version": "2.10.1",
   "description": "Official JavaScript SDK for the Midstate Blockchain",
   "main": "src/index.js",
   "type": "module",

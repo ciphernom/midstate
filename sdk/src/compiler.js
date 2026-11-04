@@ -112,7 +112,7 @@ function isTrue(h) {
  * still compiles to bytecode the current network accepts; pass
  * `{ height }` to compile() to opt in.
  */
-export const V6_ACTIVATION_HEIGHT = 400_000n;
+export const V6_ACTIVATION_HEIGHT = 371_500n; // node v6.2.0; 400,000 before it
 const MERKLE_ACTIVATION_HEIGHT = V6_ACTIVATION_HEIGHT;
 
 const STACK_EFFECT = {

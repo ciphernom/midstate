@@ -39673,7 +39673,7 @@ function intToHexLE$1(n) {
  * still compiles to bytecode the current network accepts; pass
  * `{ height }` to compile() to opt in.
  */
-const V6_ACTIVATION_HEIGHT$1 = 400_000n;
+const V6_ACTIVATION_HEIGHT$1 = 371_500n; // node v6.2.0; 400,000 before it
 const MERKLE_ACTIVATION_HEIGHT = V6_ACTIVATION_HEIGHT$1;
 
 const STACK_EFFECT = {
@@ -40707,7 +40707,7 @@ const COVENANT_SUM_ACTIVATION_HEIGHT = 300_000n;
  * artifact, not a protocol limit. Verifying a proof in one opcode makes depth
  * a function of witness size instead.
  */
-const V6_ACTIVATION_HEIGHT = 400_000n;
+const V6_ACTIVATION_HEIGHT = 371_500n; // node v6.2.0; 400,000 before it
 
 /**
  * Largest proof MERKLE_VERIFY will walk. 32 levels is 4 billion leaves and a
