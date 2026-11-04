@@ -1,0 +1,852 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Midstate | Launchpad</title>
+<script>
+(function(){try{var t=localStorage.getItem('midstate-theme');if(t)document.documentElement.setAttribute('data-theme',t);}catch(e){}})();
+function toggleTheme(){
+  var d=document.documentElement, n=d.getAttribute('data-theme')==='light'?'dark':'light';
+  d.setAttribute('data-theme',n);
+  try{localStorage.setItem('midstate-theme',n);}catch(e){}
+}
+</script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root[data-theme="light"] {
+  --bg: #ffffff; --bg-alt: #f7f7f7; --border: #e3e3e3; --border-bright: #cfcfcf;
+  --text-max: #111111; --text-main: #111111; --text-bright: #383838; --text-muted: #565656; --text-faint: #a2a2a2;
+  --highlight: #efefef; --invert-bg: #111111; --invert-fg: #ffffff;
+}
+:root[data-theme="dark"] {
+  --bg: #0a0a0a; --bg-alt: #141414; --border: #262626; --border-bright: #363636;
+  --text-max: #f5f5f5; --text-main: #f5f5f5; --text-bright: #cfcfcf; --text-muted: #9a9a9a; --text-faint: #5a5a5a;
+  --highlight: #1f1f1f; --invert-bg: #f5f5f5; --invert-fg: #0a0a0a;
+}
+*, *::before, *::after { box-sizing: border-box; border-radius: 0 !important; box-shadow: none !important; transition: none !important; animation: none !important; }
+* { margin: 0; padding: 0; }
+html, body { background: var(--bg); color: var(--text-main); }
+body { font-family: 'Inter', -apple-system, sans-serif; font-size: 14px; line-height: 1.5; min-height: 100vh; }
+.mono, h1, h2, h3, button, input, select, th { font-family: 'JetBrains Mono', ui-monospace, monospace; }
+a { color: var(--text-max); }
+button {
+  background: transparent; color: var(--text-max); border: 1px solid var(--border-bright);
+  padding: 7px 12px; font-size: 12px; cursor: pointer; letter-spacing: .02em;
+}
+button:hover:not(:disabled) { background: var(--highlight); }
+button.primary { background: var(--invert-bg); color: var(--invert-fg); border-color: var(--invert-bg); }
+button.primary:hover:not(:disabled) { opacity: .88; background: var(--invert-bg); }
+button:disabled { opacity: .35; cursor: not-allowed; }
+input, select {
+  background: var(--bg); color: var(--text-max); border: 1px solid var(--border-bright);
+  padding: 8px 10px; font-size: 13px; width: 100%; min-width: 0;
+}
+input:focus, select:focus, button:focus-visible { outline: 1px solid var(--text-max); outline-offset: 0; }
+label { display: block; font-size: 11px; color: var(--text-muted); margin: 0 0 4px; text-transform: uppercase; letter-spacing: .06em; font-family: 'JetBrains Mono', monospace; }
+
+header {
+  display: flex; align-items: center; gap: 14px; padding: 12px 20px;
+  border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--bg); z-index: 5; flex-wrap: wrap;
+}
+header h1 { font-size: 14px; letter-spacing: .14em; font-weight: 700; }
+header h1 span { color: var(--text-muted); font-weight: 400; }
+header .grow { flex: 1; }
+.chip { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-muted); border: 1px solid var(--border); padding: 3px 8px; white-space: nowrap; }
+nav.links a { font-size: 12px; color: var(--text-muted); margin-right: 12px; text-decoration: none; font-family: 'JetBrains Mono', monospace; }
+nav.links a:hover { color: var(--text-max); }
+
+#gate { border-bottom: 1px solid var(--border); padding: 12px 20px; background: var(--bg-alt); font-size: 13px; display: none; }
+#gate b { font-family: 'JetBrains Mono', monospace; }
+
+main { display: grid; grid-template-columns: 340px 1fr; min-height: calc(100vh - 54px); }
+aside { border-right: 1px solid var(--border); display: flex; flex-direction: column; min-width: 0; }
+.aside-head { padding: 14px 16px; border-bottom: 1px solid var(--border); display: flex; gap: 8px; }
+.aside-head input { flex: 1; }
+#list { overflow-y: auto; flex: 1; }
+.item { padding: 12px 16px; border-bottom: 1px solid var(--border); cursor: pointer; display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; }
+.item:hover { background: var(--bg-alt); }
+.item.sel { background: var(--highlight); }
+.item .tk { font-family: 'JetBrains Mono', monospace; font-weight: 700; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.item .nm { color: var(--text-muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.item .px { font-family: 'JetBrains Mono', monospace; font-size: 12px; text-align: right; }
+.item .bar { grid-column: 1 / -1; margin-top: 6px; }
+.bar { height: 4px; background: var(--border); position: relative; }
+.bar i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--text-max); }
+#scan { padding: 10px 16px; border-top: 1px solid var(--border); font-size: 11px; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; }
+
+#detail { min-width: 0; }
+.empty { padding: 60px 28px; color: var(--text-muted); max-width: 640px; }
+.empty h2 { font-size: 16px; color: var(--text-max); margin-bottom: 10px; }
+.empty p { margin-bottom: 10px; }
+.d-head { padding: 20px 24px 14px; border-bottom: 1px solid var(--border); }
+.d-head h2 { font-size: 20px; letter-spacing: .02em; word-break: break-word; }
+.d-head h2 small { font-family: 'Inter', sans-serif; font-weight: 400; color: var(--text-muted); font-size: 15px; margin-left: 8px; }
+.d-meta { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-muted); margin-top: 6px; word-break: break-all; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); border-bottom: 1px solid var(--border); }
+.stat { padding: 12px 24px; border-right: 1px solid var(--border); border-bottom: 1px solid var(--border); margin-bottom: -1px; }
+.stat .k { font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; }
+.stat .v { font-family: 'JetBrains Mono', monospace; font-size: 15px; margin-top: 2px; overflow-wrap: anywhere; }
+.stat .sub { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-muted); }
+.grid2 { display: grid; grid-template-columns: minmax(0, 1fr) 340px; border-bottom: 1px solid var(--border); }
+.chartbox { padding: 16px 24px; border-right: 1px solid var(--border); min-width: 0; }
+.chartbox svg { width: 100%; height: auto; display: block; }
+.chartbox .cap { font-size: 11px; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; margin-top: 6px; }
+.trade { padding: 16px 20px; }
+.tabs { display: grid; grid-template-columns: 1fr 1fr; margin-bottom: 14px; }
+.tabs button { border-color: var(--border-bright); }
+.tabs button.on { background: var(--invert-bg); color: var(--invert-fg); border-color: var(--invert-bg); }
+.row { display: flex; gap: 8px; margin-bottom: 10px; }
+.row > * { flex: 1; }
+.row select { flex: 0 0 96px; }
+.quick { display: flex; gap: 6px; margin-bottom: 12px; }
+.quick button { flex: 1; padding: 5px 0; }
+.quote { font-family: 'JetBrains Mono', monospace; font-size: 12px; border: 1px solid var(--border); padding: 10px 12px; margin-bottom: 12px; min-height: 76px; }
+.quote div { display: flex; justify-content: space-between; gap: 10px; }
+.quote div span:first-child { color: var(--text-muted); }
+.quote .err { color: var(--text-max); display: block; }
+.trade .go { width: 100%; padding: 11px; font-size: 13px; }
+.note { font-size: 12px; color: var(--text-muted); margin-top: 10px; }
+details { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 10px; }
+summary { cursor: pointer; font-size: 12px; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; }
+details[open] summary { margin-bottom: 10px; }
+.tables { display: grid; grid-template-columns: 1fr 1fr; }
+.tables > div { min-width: 0; border-right: 1px solid var(--border); }
+.tables > div:last-child { border-right: 0; }
+.tables h3 { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; padding: 12px 24px; border-bottom: 1px solid var(--border); color: var(--text-muted); }
+table { width: 100%; border-collapse: collapse; font-size: 12px; }
+th, td { padding: 7px 24px; text-align: left; border-bottom: 1px solid var(--border); white-space: nowrap; }
+th { font-size: 10px; color: var(--text-muted); font-weight: 500; text-transform: uppercase; letter-spacing: .06em; }
+td.n, th.n { text-align: right; }
+td { font-family: 'JetBrains Mono', monospace; }
+tr.me td { background: var(--highlight); }
+.tblwrap { overflow-x: auto; max-height: 420px; overflow-y: auto; }
+
+#create { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 20; align-items: flex-start; justify-content: center; padding: 40px 16px; overflow-y: auto; }
+#create.open { display: flex; }
+.sheet { background: var(--bg); border: 1px solid var(--border-bright); width: 100%; max-width: 620px; }
+.sheet h2 { font-size: 14px; letter-spacing: .1em; padding: 16px 20px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+.sheet .body { padding: 18px 20px; }
+.form2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 14px; margin-bottom: 14px; }
+.form2 .full { grid-column: 1 / -1; }
+.preview { border: 1px solid var(--border); font-family: 'JetBrains Mono', monospace; font-size: 12px; padding: 10px 12px; margin-bottom: 14px; }
+.preview div { display: flex; justify-content: space-between; gap: 10px; padding: 2px 0; }
+.preview div span:first-child { color: var(--text-muted); }
+.sheet .foot { display: flex; gap: 10px; justify-content: flex-end; padding: 14px 20px; border-top: 1px solid var(--border); }
+
+#toasts { position: fixed; right: 16px; bottom: 16px; display: flex; flex-direction: column; gap: 8px; z-index: 30; max-width: min(420px, calc(100vw - 32px)); }
+.toast { background: var(--bg); border: 1px solid var(--border-bright); padding: 10px 12px; font-size: 12px; font-family: 'JetBrains Mono', monospace; word-break: break-word; }
+.toast.bad { border-color: var(--text-max); }
+
+.how { padding: 18px 24px 40px; color: var(--text-muted); font-size: 13px; max-width: 900px; }
+.how h3 { color: var(--text-max); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; margin: 14px 0 6px; }
+.how p { margin-bottom: 8px; }
+.how code { font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--text-bright); }
+
+@media (max-width: 1100px) {
+  .grid2 { grid-template-columns: 1fr; }
+  .chartbox { border-right: 0; border-bottom: 1px solid var(--border); }
+  .tables { grid-template-columns: 1fr; }
+  .tables > div { border-right: 0; }
+}
+@media (max-width: 820px) {
+  main { grid-template-columns: 1fr; }
+  aside { border-right: 0; border-bottom: 1px solid var(--border); max-height: 46vh; }
+  header { padding: 10px 16px; }
+  .d-head, .stat, .chartbox, .tables h3 { padding-left: 16px; padding-right: 16px; }
+  th, td { padding-left: 16px; padding-right: 16px; }
+  .trade { padding: 16px; }
+  .form2 { grid-template-columns: 1fr; }
+}
+</style>
+<script src="midstate-provider.js"></script>
+</head>
+<body>
+
+<header>
+  <h1>MIDSTATE <span>// LAUNCHPAD</span></h1>
+  <nav class="links"><a href="./index.html">Protocol</a><a href="./ide.html" target="_blank">IDE</a><a href="./wallet/" target="_blank">Wallet</a></nav>
+  <div class="grow"></div>
+  <span class="chip" id="tipChip">connecting…</span>
+  <button id="btnNew" disabled>＋ New launch</button>
+  <button id="btnConnect" class="primary">Connect wallet</button>
+  <button onclick="toggleTheme()" title="Theme" aria-label="Toggle theme">◐</button>
+</header>
+
+<div id="gate"></div>
+
+<main>
+  <aside>
+    <div class="aside-head">
+      <input id="search" placeholder="Search ticker or name" autocomplete="off">
+      <select id="sort" style="width:auto">
+        <option value="new">Newest</option>
+        <option value="raised">Most raised</option>
+        <option value="active">Most trades</option>
+      </select>
+    </div>
+    <div id="list"></div>
+    <div id="scan">—</div>
+  </aside>
+  <section id="detail"></section>
+</main>
+
+<div id="create" role="dialog" aria-modal="true" aria-labelledby="createTitle">
+  <div class="sheet">
+    <h2 id="createTitle">NEW LAUNCH <button id="btnCloseCreate" aria-label="Close">✕</button></h2>
+    <div class="body">
+      <div class="form2">
+        <div><label for="cTicker">Ticker</label><input id="cTicker" maxlength="12" placeholder="PEPE" autocomplete="off"></div>
+        <div><label for="cName">Name</label><input id="cName" maxlength="48" placeholder="Pepe on Midstate" autocomplete="off"></div>
+        <div><label for="cT">Tokens sold by the curve</label><input id="cT" value="1000000" inputmode="numeric"></div>
+        <div>
+          <label for="cRaise">Raise before the pool opens</label>
+          <div class="row" style="margin:0">
+            <input id="cRaise" value="512" inputmode="decimal">
+            <select id="cRaiseUnit"><option value="1">MDS</option><option value="1024">kMDS</option><option value="1048576">mMDS</option><option value="1073741824" selected>gMDS</option></select>
+          </div>
+        </div>
+        <div class="full">
+          <label for="cDepth">Holder rows</label>
+          <select id="cDepth">
+            <option value="12">4,096 holders</option>
+            <option value="14" selected>16,384 holders</option>
+            <option value="16">65,536 holders</option>
+          </select>
+        </div>
+      </div>
+      <div class="preview" id="cPreview"></div>
+      <p class="note">The name, ticker and numbers are written into the launch and cannot change. Launching costs 2 MDS and the network fee: 1 MDS stays with the launch for good, 1 MDS marks it in the public registry so this page can find it.</p>
+    </div>
+    <div class="foot"><button id="btnCancelCreate">Cancel</button><button id="btnLaunch" class="primary">Launch</button></div>
+  </div>
+</div>
+
+<div id="toasts" aria-live="polite"></div>
+
+<script type="module">
+// ═══════════════════════════════════════════════════════════════════════════
+//  Boot
+// ═══════════════════════════════════════════════════════════════════════════
+const $ = (id) => document.getElementById(id);
+const qs = new URLSearchParams(location.search);
+let wasm, compile, LP;
+try {
+  wasm = await import('./wallet/pkg/wasm_wallet.js');
+  await wasm.default();
+  ({ compile } = await import('./wallet/sdk/compiler.js'));
+  LP = await import('./wallet/sdk/launchpad.js');
+} catch (e) {
+  console.error(e);
+  $('detail').innerHTML = '<div class="empty"><h2>Could not load the Midstate runtime</h2><p>The page needs wallet/pkg/ and wallet/sdk/ beside it. Check the console for 404s.</p></div>';
+  throw e;
+}
+
+// Developer options: ?rpc=<url> for another node, ?from=<height> for a chain
+// whose v6 opcodes activate elsewhere (a fast-mining test chain).
+const RPC = (qs.get('rpc') || 'https://rpc.cypherpunk.gold').replace(/\/+$/, '');
+const FROM = qs.get('from') ? Number(qs.get('from')) : Number(LP.LAUNCHPAD_HEIGHT);
+if (window.Midstate) Midstate.configure({ walletUrl: new URL('wallet/', location.href).href });
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Formatting
+// ═══════════════════════════════════════════════════════════════════════════
+const UNITS = [['gMDS', 2 ** 30], ['mMDS', 2 ** 20], ['kMDS', 2 ** 10]];
+function fmtMds(v) {
+  const x = typeof v === 'bigint' ? Number(v) : v;
+  if (!Number.isFinite(x)) return '—';
+  const a = Math.abs(x);
+  for (const [u, s] of UNITS) if (a >= s) return (x / s).toLocaleString(undefined, { maximumFractionDigits: a / s >= 100 ? 1 : 3 }) + ' ' + u;
+  return x.toLocaleString(undefined, { maximumFractionDigits: a < 1 ? 4 : 2 }) + ' MDS';
+}
+const fmtInt = (v) => BigInt(v).toLocaleString();
+const short = (h, n = 8) => String(h || '').slice(0, n);
+const priceOf = (L, st = L.st) => { const p = LP.spotPrice(L.params, st); return Number(p.num) / Number(p.den); };
+const el = (tag, attrs = {}, ...kids) => {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === 'class') e.className = v; else if (k === 'text') e.textContent = v;
+    else if (k.startsWith('on')) e.addEventListener(k.slice(2), v); else e.setAttribute(k, v);
+  }
+  for (const k of kids) if (k != null) e.append(k);
+  return e;
+};
+function toast(msg, bad = false) {
+  const t = el('div', { class: 'toast' + (bad ? ' bad' : ''), text: msg });
+  $('toasts').append(t);
+  setTimeout(() => t.remove(), bad ? 12000 : 6000);
+  while ($('toasts').children.length > 4) $('toasts').firstChild.remove();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  The node: a small request governor (2 in flight, spaced, 429-aware)
+// ═══════════════════════════════════════════════════════════════════════════
+const gw = { q: [], active: 0, last: 0, cool: 0 };
+function pump() {
+  if (gw.active >= 2 || !gw.q.length) return;
+  const wait = Math.max(gw.cool - Date.now(), gw.last + 160 - Date.now(), 0);
+  if (wait > 0) { setTimeout(pump, wait); return; }
+  const job = gw.q.shift(); gw.active++; gw.last = Date.now();
+  job().finally(() => { gw.active--; pump(); });
+  pump();
+}
+function rpc(path, body) {
+  return new Promise((resolve, reject) => {
+    gw.q.push(async () => {
+      for (let attempt = 0; ; attempt++) {
+        let r = null, err = null;
+        try {
+          r = await fetch(RPC + path, body === undefined ? { cache: 'no-store' }
+            : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), cache: 'no-store' });
+        } catch (e) { err = e; }
+        if (r && r.status !== 429) {
+          const j = await r.json().catch(() => null);
+          if (!r.ok) { reject(new Error((j && j.error) || `HTTP ${r.status} for ${path}`)); return; }
+          resolve(j); return;
+        }
+        const ms = Math.min(1500 * 2 ** attempt + Math.random() * 400, 30000);
+        gw.cool = Date.now() + ms;
+        if (attempt >= 4) { reject(err || new Error('The node is rate-limiting this page; it will retry shortly.')); return; }
+        await new Promise((res) => setTimeout(res, ms));
+      }
+    });
+    pump();
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Following launches on chain
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Compact filters say which blocks touch the registry (new launches) or the
+// current address of a launch (its next trade). Only those blocks are fetched.
+// Blocks come with witnesses stripped; the launch's receipts make that enough.
+
+const S = {
+  tip: 0, scanned: FROM - 1, hashes: new Map(),
+  launches: new Map(),           // tag -> Launch
+  selected: qs.get('t') || null, // tag prefix from the URL
+  me: null,                      // { address, sitePk, siteSigBytes, siteKeyLeft, sitePks: [{pk,left,sigBytes}] }
+  side: 'buy', busy: false, scanning: false, error: null,
+};
+try { const m = JSON.parse(localStorage.getItem('launchpad-me') || 'null'); if (m && m.sitePk) S.me = m; } catch (_) {}
+
+const matcher = wasm.WebWallet.from_seed_hex(Array.from(crypto.getRandomValues(new Uint8Array(32)), (b) => b.toString(16).padStart(2, '0')).join(''));
+const codes = new Map();
+const codeFor = (p) => {
+  const k = `${p.depth}/${p.threshold}/${p.price}/${p.seed}`;
+  if (!codes.has(k)) codes.set(k, LP.compileLaunch(p, compile).code);
+  return codes.get(k);
+};
+const setWatch = () => matcher.set_watchlist(JSON.stringify(LP.watchAddresses([...S.launches.values()].filter((l) => !l.broken))));
+
+function processBlock(block, height) {
+  let changed = false;
+  for (const raw of block.transactions || []) {
+    const tx = LP.normalizeTx(raw);
+    if (!tx) continue;
+    if (height >= FROM) {
+      for (const L of LP.launchesInTx(tx, codeFor, height)) {
+        if (!S.launches.has(L.tag)) { S.launches.set(L.tag, L); changed = true; }
+      }
+    }
+    for (const L of S.launches.values()) {
+      if (L.broken) continue;
+      try { if (L.applyTx(tx, height)) changed = true; }
+      catch (e) { L.broken = e.message; changed = true; console.error(L.ticker, e); }
+    }
+  }
+  return changed;
+}
+
+async function scan() {
+  // A scan asked for while one runs (a trade just went through) runs right after it.
+  if (S.scanning) { S.again = true; return; }
+  S.scanning = true;
+  try {
+    const st = await rpc('/state');
+    const first = !S.tip;
+    S.tip = Number(st.height);
+    if (first) render();
+    await checkReorg();
+    let from = S.scanned + 1;
+    setWatch();
+    while (from <= S.tip) {
+      const fd = await rpc('/filters', { start_height: from, end_height: Math.min(from + 1000, S.tip + 1) });
+      const filters = fd.filters || [], counts = fd.element_counts || [], hashes = fd.block_hashes || [];
+      const start = fd.start_height ?? from;
+      if (!filters.length) break;
+      for (let i = 0; i < filters.length; i++) {
+        const h = start + i;
+        const fetch = !hashes[i] || !filters[i] || !counts[i] || matcher.check_filter(filters[i], hashes[i], counts[i]);
+        if (fetch) {
+          const block = await rpc(`/block/${h}`);
+          if (processBlock(block, h)) { setWatch(); render(); }
+        }
+        if (hashes[i]) S.hashes.set(h, hashes[i]);
+        S.scanned = h;
+        if (i % 200 === 0) renderScan();
+      }
+      from = start + filters.length;
+      renderScan();
+      await new Promise((r) => setTimeout(r, 400));
+    }
+    S.error = null;
+  } catch (e) {
+    S.error = e.message;
+  } finally {
+    S.scanning = false;
+    renderScan(); render();
+    if (S.again) { S.again = false; scanSoon(0); }
+  }
+}
+
+// A changed hash at a height already read means a reorg: read again from the start.
+async function checkReorg() {
+  if (S.scanned < FROM) return;
+  const back = Math.max(FROM, S.scanned - 6);
+  const fd = await rpc('/filters', { start_height: back, end_height: S.scanned + 1 });
+  const hs = fd.block_hashes || [], start = fd.start_height ?? back;
+  for (let i = 0; i < hs.length; i++) {
+    const known = S.hashes.get(start + i);
+    if (known && hs[i] && known !== hs[i]) {
+      toast('The chain reorganised; reading the launches again.');
+      S.launches.clear(); S.hashes.clear(); S.scanned = FROM - 1;
+      return;
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  The wallet
+// ═══════════════════════════════════════════════════════════════════════════
+const myKeys = () => (S.me ? (S.me.sitePks && S.me.sitePks.length ? S.me.sitePks : [{ pk: S.me.sitePk, left: S.me.siteKeyLeft, sigBytes: S.me.siteSigBytes }]) : []);
+const myOwners = () => new Map(myKeys().map((k) => [LP.ownerOf(k.pk), k]));
+/** The key that holds my row in this launch, else my current key. */
+function keyFor(L) {
+  const owners = myOwners();
+  for (const h of L.ledger.holders()) if (owners.has(h.owner)) return { ...owners.get(h.owner), slot: h.slot, balance: h.balance };
+  return { pk: S.me.sitePk, left: S.me.siteKeyLeft, sigBytes: S.me.siteSigBytes, slot: null, balance: 0n };
+}
+const live = () => S.tip >= FROM;
+
+$('btnConnect').addEventListener('click', () => {
+  if (!window.Midstate) { toast('The wallet connector did not load.', true); return; }
+  // connect() opens the popup synchronously: keep it inside the click.
+  Midstate.connect({ siteKey: true, onProgress: (m) => toast(m) }).then((r) => {
+    S.me = { address: r.address, sitePk: r.sitePk, siteSigBytes: r.siteSigBytes, siteKeyLeft: r.siteKeyLeft, sitePks: r.sitePks || [] };
+    try { localStorage.setItem('launchpad-me', JSON.stringify(S.me)); } catch (_) {}
+    toast('Wallet connected.');
+    render();
+    if ((S.me.siteKeyLeft ?? 99) < 32) toast(`Your key for this site has ${S.me.siteKeyLeft} signatures left. When it runs low the wallet makes a new one, and each launch offers to move your position to it.`);
+  }).catch((e) => toast(e.message || 'Connection failed.', true));
+});
+
+function txError(e) {
+  const m = e && e.message || String(e);
+  if (/not found or already spent|already spent|Coin .* not found/i.test(m)) {
+    return 'Someone traded first, so the price has moved. Check the new quote and try again.';
+  }
+  return m;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Rendering: the list
+// ═══════════════════════════════════════════════════════════════════════════
+function sorted() {
+  const q = $('search').value.trim().toLowerCase();
+  let ls = [...S.launches.values()].filter((l) => !q || l.ticker.toLowerCase().includes(q) || l.name.toLowerCase().includes(q));
+  const by = $('sort').value;
+  if (by === 'raised') ls.sort((a, b) => (b.st.x > a.st.x ? 1 : -1));
+  else if (by === 'active') ls.sort((a, b) => b.trades.length - a.trades.length);
+  else ls.sort((a, b) => (b.created || 0) - (a.created || 0));
+  return ls;
+}
+
+function renderList() {
+  const list = $('list');
+  list.replaceChildren();
+  const ls = sorted();
+  if (!ls.length) {
+    list.append(el('div', { class: 'empty', style: 'padding:24px 16px' },
+      el('p', { text: S.launches.size ? 'Nothing matches.' : (live() ? 'No launches yet. Be the first.' : 'Launches open at block ' + FROM.toLocaleString() + '.') })));
+    return;
+  }
+  for (const L of ls) {
+    const st = L.st, pct = Number(st.supply * 1000n / L.params.threshold) / 10;
+    const it = el('div', { class: 'item' + (S.selected && L.tag.startsWith(S.selected) ? ' sel' : ''), role: 'button', tabindex: '0' },
+      el('div', { class: 'tk', text: '$' + L.ticker }),
+      el('div', { class: 'px', text: fmtMds(priceOf(L)) }),
+      el('div', { class: 'nm', text: L.name || '—' }),
+      el('div', { class: 'px', style: 'color:var(--text-muted)', text: L.broken ? 'out of step' : (L.graduated ? 'pool' : pct.toFixed(1) + '%') }),
+      el('div', { class: 'bar' }, el('i', { style: `width:${L.graduated ? 100 : pct}%` })));
+    const pick = () => { S.selected = L.tag.slice(0, 16); history.replaceState(null, '', '?' + new URLSearchParams({ ...Object.fromEntries(qs), t: S.selected })); render(); };
+    it.addEventListener('click', pick);
+    it.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); } });
+    list.append(it);
+  }
+}
+
+function renderScan() {
+  const parts = [];
+  if (S.tip) parts.push(`tip ${S.tip.toLocaleString()}`);
+  if (S.tip && S.scanned < S.tip && S.scanned >= FROM) parts.push(`reading ${Math.max(0, S.tip - S.scanned).toLocaleString()} blocks…`);
+  else if (S.tip >= FROM) parts.push('up to date');
+  parts.push(`${S.launches.size} launch${S.launches.size === 1 ? '' : 'es'}`);
+  if (S.error) parts.push('node: ' + S.error);
+  $('scan').textContent = parts.join(' · ');
+  $('tipChip').textContent = S.tip ? `block ${S.tip.toLocaleString()}` : 'connecting…';
+  const gate = $('gate');
+  if (S.tip && !live()) {
+    const left = FROM - S.tip;
+    gate.style.display = 'block';
+    gate.innerHTML = '';
+    gate.append('Launches use the v6 opcodes, which activate at ', el('b', { text: 'block ' + FROM.toLocaleString() }),
+      `: ${left.toLocaleString()} blocks from now, about ${Math.max(1, Math.round(left / 1440 * 10) / 10)} days. Until then nothing can be launched or traded here.`);
+  } else gate.style.display = 'none';
+  $('btnNew').disabled = !live();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Rendering: one launch
+// ═══════════════════════════════════════════════════════════════════════════
+function current() {
+  if (!S.selected) return null;
+  for (const L of S.launches.values()) if (L.tag.startsWith(S.selected)) return L;
+  return null;
+}
+
+function stat(k, v, sub) {
+  return el('div', { class: 'stat' }, el('div', { class: 'k', text: k }), el('div', { class: 'v', text: v }),
+    sub ? el('div', { class: 'sub', text: sub }) : null);
+}
+
+function chart(L) {
+  // Price after each trade; the dashed line marks graduation.
+  const W = 640, Hh = 220, pad = 34;
+  const pts = [{ i: 0, p: 0 }];
+  let grad = null;
+  L.trades.forEach((t, i) => {
+    pts.push({ i: i + 1, p: priceOf(L, { supply: t.supply, x: t.x, y: t.y }) });
+    if (t.graduated) grad = i + 1;
+  });
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', `0 0 ${W} ${Hh}`);
+  svg.setAttribute('role', 'img');
+  svg.setAttribute('aria-label', `Price of ${L.ticker} after each trade`);
+  const n = Math.max(1, pts.length - 1), maxP = Math.max(...pts.map((p) => p.p), L.params.price * (L.params.threshold - 1n) > 0n ? Number(L.params.price * (L.params.threshold - 1n)) : 1);
+  const X = (i) => pad + (W - pad - 8) * (i / n), Y = (p) => Hh - pad + 6 - (Hh - pad - 14) * (p / maxP);
+  const add = (tag, a) => { const e = document.createElementNS('http://www.w3.org/2000/svg', tag); for (const [k, v] of Object.entries(a)) e.setAttribute(k, v); svg.append(e); return e; };
+  const ink = getComputedStyle(document.documentElement).getPropertyValue('--text-max').trim() || '#fff';
+  const faint = getComputedStyle(document.documentElement).getPropertyValue('--border-bright').trim() || '#444';
+  const muted = getComputedStyle(document.documentElement).getPropertyValue('--text-muted').trim() || '#999';
+  add('line', { x1: pad, y1: Hh - pad + 6, x2: W - 8, y2: Hh - pad + 6, stroke: faint });
+  add('line', { x1: pad, y1: 8, x2: pad, y2: Hh - pad + 6, stroke: faint });
+  // The graduation price, the level the curve climbs towards.
+  const gp = Number(L.params.price * (L.params.threshold - 1n));
+  add('line', { x1: pad, y1: Y(gp), x2: W - 8, y2: Y(gp), stroke: faint, 'stroke-dasharray': '2 4' });
+  const lab = add('text', { x: pad + 6, y: Y(gp) - 6, fill: muted, 'font-size': 13, 'text-anchor': 'start', 'font-family': 'JetBrains Mono, monospace' });
+  lab.textContent = 'pool opens at ' + fmtMds(gp);
+  if (grad) add('line', { x1: X(grad), y1: 8, x2: X(grad), y2: Hh - pad + 6, stroke: muted, 'stroke-dasharray': '4 3' });
+  let d = `M${X(0)},${Y(0)}`;
+  for (let k = 1; k < pts.length; k++) d += ` H${X(pts[k].i)} V${Y(pts[k].p)}`;
+  add('path', { d, fill: 'none', stroke: ink, 'stroke-width': 1.5 });
+  const xl = add('text', { x: W - 8, y: Hh - 8, fill: muted, 'font-size': 13, 'text-anchor': 'end', 'font-family': 'JetBrains Mono, monospace' });
+  xl.textContent = `${L.trades.length} trade${L.trades.length === 1 ? '' : 's'}`;
+  return svg;
+}
+
+function renderDetail() {
+  const box = $('detail');
+  const L = current();
+  // A scan re-renders this panel; keep what the user was typing.
+  const keep = { amt: $('amt') ? $('amt').value : '', unit: $('unit') ? $('unit').value : null,
+                 focus: document.activeElement && document.activeElement.id, tag: box.dataset.tag, side: box.dataset.side };
+  box.dataset.tag = L ? L.tag : ''; box.dataset.side = S.side;
+  box.replaceChildren();
+  const restore = () => {
+    if (!L || keep.tag !== L.tag || keep.side !== S.side) return;
+    if ($('amt')) { $('amt').value = keep.amt; if (keep.unit && $('unit')) $('unit').value = keep.unit; $('amt').dispatchEvent(new Event('input')); }
+    if (keep.focus && $(keep.focus)) $(keep.focus).focus();
+  };
+  if (!L) {
+    box.append(el('div', { class: 'empty' },
+      el('h2', { text: 'Launch a token, or pick one' }),
+      el('p', { text: 'Every launch starts on a bonding curve: the k-th token sold costs k−1 price steps. When the curve has sold all its tokens, the MDS it raised and a reserve of half as many tokens become a constant-product pool, at the price the curve ended on, and trading carries on there.' }),
+      el('p', { text: 'Everything is one Midstate script. There is no operator and no admin key: the script holds the MDS, checks every trade, and keeps the holder ledger. This page only reads the chain and asks your wallet to sign.' })),
+      howItWorks());
+    return;
+  }
+  const st = L.st, p = L.params;
+  const holders = L.ledger.holders();
+  const supplyAll = p.threshold + p.pool;
+  const mine = S.me ? keyFor(L) : null;
+
+  box.append(el('div', { class: 'd-head' },
+    el('h2', {}, '$' + L.ticker, el('small', { text: L.name })),
+    el('div', { class: 'd-meta', text: `launched at block ${(L.created || 0).toLocaleString()} · id ${short(L.tag, 16)} · ${fmtInt(L.ledger.size)} holder rows · now at ${short(L.address, 16)}…` }),
+    L.broken ? el('div', { class: 'd-meta', style: 'color:var(--text-max)', text: 'This page lost step with this launch (' + L.broken + '). Reload to read it again.' }) : null));
+
+  box.append(el('div', { class: 'stats' },
+    stat('Price', fmtMds(priceOf(L))),
+    stat(L.graduated ? 'Pool MDS' : 'Raised', fmtMds(st.x)),
+    L.graduated ? stat('Pool tokens', fmtInt(st.y)) : stat('Curve sold', fmtInt(st.supply), 'of ' + fmtInt(p.threshold)),
+    L.graduated ? stat('Phase', 'pool', '0.3% fee per trade') : stat('Phase', `curve ${(Number(st.supply * 1000n / p.threshold) / 10).toFixed(1)}%`, 'then the pool'),
+    stat('Holders', fmtInt(holders.length)),
+    stat('You hold', mine ? fmtInt(mine.balance) : '—')));
+
+  const grid = el('div', { class: 'grid2' });
+  grid.append(el('div', { class: 'chartbox' }, chart(L),
+    el('div', { class: 'cap', text: L.graduated ? 'Price after each trade. The dashed line is graduation.' : 'Price after each trade. The curve ends where the pool opens.' })));
+  grid.append(tradePanel(L, mine));
+  box.append(grid);
+
+  const owners = myOwners();
+  const hT = el('table', {}, el('tr', {}, el('th', { text: 'Holder' }), el('th', { class: 'n', text: 'Tokens' }), el('th', { class: 'n', text: 'Share' })));
+  for (const h of holders.slice(0, 100)) {
+    hT.append(el('tr', { class: owners.has(h.owner) ? 'me' : '' },
+      el('td', { text: owners.has(h.owner) ? 'you' : short(h.owner, 12) }),
+      el('td', { class: 'n', text: fmtInt(h.balance) }),
+      el('td', { class: 'n', text: (Number(h.balance * 10000n / supplyAll) / 100).toFixed(2) + '%' })));
+  }
+  const share = (v) => (Number(v * 10000n / supplyAll) / 100).toFixed(2) + '%';
+  hT.append(el('tr', {}, el('td', { text: L.graduated ? 'pool' : 'pool (opens at graduation)' }), el('td', { class: 'n', text: fmtInt(st.y) }), el('td', { class: 'n', text: share(st.y) })));
+  if (!L.graduated) hT.append(el('tr', {}, el('td', { text: 'unsold on the curve' }), el('td', { class: 'n', text: fmtInt(p.threshold - st.supply) }), el('td', { class: 'n', text: share(p.threshold - st.supply) })));
+  const tT = el('table', {}, el('tr', {}, el('th', { text: 'Block' }), el('th', { text: 'Trade' }), el('th', { class: 'n', text: 'Tokens' }), el('th', { class: 'n', text: 'MDS' }), el('th', { text: 'Who' })));
+  for (const t of L.trades.slice().reverse().slice(0, 100)) {
+    const kind = t.tokens > 0n ? 'buy' : t.tokens < 0n ? 'sell' : 'hand-over';
+    tT.append(el('tr', { class: owners.has(t.owner) || owners.has(t.oldOwner) ? 'me' : '' },
+      el('td', { text: t.height != null ? t.height.toLocaleString() : '—' }),
+      el('td', { text: kind + (t.graduated ? ' · graduated' : '') }),
+      el('td', { class: 'n', text: fmtInt(t.tokens < 0n ? -t.tokens : t.tokens) }),
+      el('td', { class: 'n', text: t.mds === 0n ? '—' : fmtMds(t.mds < 0n ? -t.mds : t.mds) }),
+      el('td', { text: owners.has(t.owner) ? 'you' : short(t.owner, 10) })));
+  }
+  box.append(el('div', { class: 'tables' },
+    el('div', {}, el('h3', { text: 'Holders' }), el('div', { class: 'tblwrap' }, hT)),
+    el('div', {}, el('h3', { text: 'Trades' }), el('div', { class: 'tblwrap' }, tT))));
+  box.append(howItWorks());
+  restore();
+}
+
+function tradePanel(L, mine) {
+  const wrap = el('div', { class: 'trade' });
+  const buy = el('button', { class: S.side === 'buy' ? 'on' : '', text: 'Buy' });
+  const sell = el('button', { class: S.side === 'sell' ? 'on' : '', text: 'Sell' });
+  buy.onclick = () => { S.side = 'buy'; renderDetail(); };
+  sell.onclick = () => { S.side = 'sell'; renderDetail(); };
+  wrap.append(el('div', { class: 'tabs' }, buy, sell));
+
+  const amt = el('input', { id: 'amt', inputmode: 'decimal', placeholder: S.side === 'buy' ? 'MDS to spend' : 'Tokens to sell', autocomplete: 'off', 'aria-label': 'Amount' });
+  const unit = el('select', { id: 'unit', 'aria-label': 'Unit' });
+  for (const [u, s] of [['MDS', 1], ['kMDS', 1024], ['mMDS', 1048576], ['gMDS', 1073741824]]) unit.append(el('option', { value: String(s), text: u }));
+  unit.value = String(1073741824);
+  const quote = el('div', { class: 'quote' });
+  const go = el('button', { class: 'primary go', text: S.side === 'buy' ? 'Buy $' + L.ticker : 'Sell $' + L.ticker });
+  if (S.side === 'buy') wrap.append(el('div', { class: 'row' }, amt, unit));
+  else {
+    wrap.append(el('div', { class: 'row' }, amt));
+    const q = el('div', { class: 'quick' });
+    for (const f of [25, 50, 100]) q.append(el('button', { text: f + '%', onclick: () => { amt.value = mine ? String(mine.balance * BigInt(f) / 100n) : ''; update(); } }));
+    wrap.append(q);
+  }
+  wrap.append(quote, go);
+
+  let plan = null;
+  function update() {
+    plan = null;
+    quote.replaceChildren();
+    const line = (k, v) => quote.append(el('div', {}, el('span', { text: k }), el('span', { text: v })));
+    const st = L.st;
+    try {
+      const raw = amt.value.replace(/[, _]/g, '');
+      if (!raw) { line('Price now', fmtMds(priceOf(L))); line(L.graduated ? 'Pool' : 'Left on the curve', L.graduated ? `${fmtInt(st.y)} tokens` : `${fmtInt(L.params.threshold - st.supply)} tokens`); return; }
+      if (!/^\d*\.?\d*$/.test(raw)) throw new Error('Numbers only.');
+      let n;
+      if (S.side === 'buy') {
+        const mds = BigInt(Math.floor(Number(raw) * Number(unit.value)));
+        n = LP.tokensFor(L.params, st, mds);
+        if (n === 0n) throw new Error(L.graduated || st.supply > 0n ? 'That buys less than one token.' : 'Try a little more: the first tokens are nearly free.');
+      } else {
+        if (raw.includes('.')) throw new Error('Tokens are whole numbers.');
+        n = BigInt(raw);
+        if (n <= 0n) throw new Error('Enter how many to sell.');
+        if (!mine || n > mine.balance) throw new Error(`You hold ${mine ? fmtInt(mine.balance) : 0}.`);
+      }
+      const q = LP.quote(L.params, st, S.side, n);
+      const avg = Number(q.mds < 0n ? -q.mds : q.mds) / Number(n);
+      const after = priceOf(L, q), before = priceOf(L);
+      line(S.side === 'buy' ? 'You get' : 'You sell', `${fmtInt(n)} ${L.ticker}`);
+      line(S.side === 'buy' ? 'You pay' : 'You get', fmtMds(q.mds < 0n ? -q.mds : q.mds) + (S.side === 'buy' ? ' + fee' : ' − fee'));
+      line('Average price', fmtMds(avg));
+      line('Price after', fmtMds(after) + (before > 0 ? ` (${after >= before ? '+' : ''}${((after / before - 1) * 100).toFixed(2)}%)` : ''));
+      if (!L.graduated && q.supply === L.params.threshold) line('Graduates', 'this trade opens the pool');
+      plan = { n, q };
+    } catch (e) {
+      quote.append(el('span', { class: 'err', text: e.message.replace(/^launchpad: /, '') }));
+    }
+    go.disabled = !plan || !S.me || !live() || S.busy || !!L.broken;
+  }
+  amt.addEventListener('input', update);
+  unit.addEventListener('change', update);
+
+  go.onclick = () => {
+    if (!plan || !S.me) return;
+    let t;
+    try {
+      const k = keyFor(L);
+      if (k.left !== undefined && k.left <= 0) throw new Error('Your key for this site has no signatures left. Connect again.');
+      t = L.prepareTrade({ side: S.side, n: plan.n, pubkey: k.pk, sigBytes: k.sigBytes });
+    } catch (e) { toast(e.message.replace(/^launchpad: /, ''), true); return; }
+    const what = `${S.side === 'buy' ? 'Buy' : 'Sell'} ${fmtInt(plan.n)} ${L.ticker} for about ${fmtMds(plan.q.mds < 0n ? -plan.q.mds : plan.q.mds)}`;
+    S.busy = true; go.disabled = true;
+    // spendContract opens the wallet popup synchronously: keep it in the click.
+    Midstate.spendContract({ ...t.spend, summary: what }, { onProgress: (m) => toast(m) })
+      .then(() => { usedSignature(t.spend.siteSig.pk); toast('Done: ' + what + '.'); scanSoon(); })
+      .catch((e) => toast(txError(e), true))
+      .finally(() => { S.busy = false; update(); });
+  };
+
+  if (!S.me) wrap.append(el('p', { class: 'note', text: 'Connect your wallet to trade. It makes a signing key for this site the first time.' }));
+  else if (!live()) wrap.append(el('p', { class: 'note', text: `Trading opens at block ${FROM.toLocaleString()}.` }));
+  else wrap.append(el('p', { class: 'note', text: 'One trade per block can win a given price: if someone trades first, the wallet stops and you try again at the new price.' }));
+
+  if (S.me && mine && mine.balance > 0n) {
+    const cur = S.me.sitePk;
+    const to = el('input', { placeholder: 'Their site public key, or owner id', autocomplete: 'off', 'aria-label': 'Recipient' });
+    const give = el('button', { text: 'Hand over all ' + fmtInt(mine.balance) });
+    give.onclick = () => handOver(L, mine, to.value.trim());
+    const det = el('details', {}, el('summary', { text: 'Give or move your whole position' }),
+      el('p', { class: 'note', style: 'margin:0 0 8px', text: 'Hands your entire row to another owner, with no MDS changing hands. They need its owner id: the first 24 bytes of the hash of their key for this site.' }),
+      el('div', { class: 'row' }, to), give);
+    if (mine.pk !== cur) {
+      det.append(el('p', { class: 'note', text: 'This position is held by an older key of yours.' }),
+        el('button', { text: 'Move it to your current key', onclick: () => handOver(L, mine, cur) }));
+    }
+    wrap.append(det);
+  }
+  setTimeout(update, 0);
+  return wrap;
+}
+
+/** The wallet keeps the real count; this keeps the page's copy roughly right until the next connect. */
+function usedSignature(pk) {
+  for (const k of myKeys()) if (k.pk === pk && typeof k.left === 'number') k.left--;
+  if (S.me && S.me.sitePk === pk && typeof S.me.siteKeyLeft === 'number') S.me.siteKeyLeft--;
+  try { localStorage.setItem('launchpad-me', JSON.stringify(S.me)); } catch (_) {}
+}
+
+function handOver(L, mine, target) {
+  let owner = String(target || '').replace(/^0x/, '').toLowerCase();
+  if (/^[0-9a-f]{64}$/.test(owner)) owner = LP.ownerOf(owner);
+  if (!/^[0-9a-f]{48}$/.test(owner)) { toast('Give a 32-byte public key or a 24-byte owner id, in hex.', true); return; }
+  let t;
+  try { t = L.prepareTrade({ side: 'buy', n: 0n, pubkey: mine.pk, sigBytes: mine.sigBytes, to: owner, slot: mine.slot }); }
+  catch (e) { toast(e.message.replace(/^launchpad: /, ''), true); return; }
+  const what = `Hand ${fmtInt(mine.balance)} ${L.ticker} to ${short(owner, 12)}…`;
+  Midstate.spendContract({ ...t.spend, summary: what }, { onProgress: (m) => toast(m) })
+    .then(() => { usedSignature(mine.pk); toast('Done: ' + what); scanSoon(); })
+    .catch((e) => toast(txError(e), true));
+}
+
+function howItWorks() {
+  return el('div', { class: 'how' },
+    el('h3', { text: 'How it works' }),
+    el('p', { text: 'A launch is one Midstate script. Its state (tokens sold, MDS held, pool tokens, the holder ledger\'s root) is pushed at the start of the script itself, so every state has its own address. A trade spends every coin at the current address and must send the whole reserve on to the address of the next state, which the script works out for itself. No coin can be left behind to fork from.' }),
+    el('p', { text: 'Holders are rows in a Merkle ledger that the script checks with OP_MERKLE_ROOT. Each trade also leaves a small receipt naming the new row, so anyone can rebuild the ledger from the chain, which is what this page does.' }),
+    el('p', { text: 'Your positions belong to a signing key your wallet makes for this site from your recovery phrase. Restoring the phrase restores the key.' }));
+}
+
+function renderMe() {
+  const b = $('btnConnect');
+  if (!S.me) { b.textContent = 'Connect wallet'; b.className = 'primary'; b.title = ''; return; }
+  b.textContent = short(S.me.address, 6) + '… · ' + (S.me.siteKeyLeft ?? '?') + ' sigs';
+  b.className = '';
+  b.title = 'Signatures left on your key for this site. Click to connect again.';
+}
+function render() { renderMe(); renderList(); renderDetail(); renderScan(); }
+$('search').addEventListener('input', renderList);
+$('sort').addEventListener('change', renderList);
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  New launch
+// ═══════════════════════════════════════════════════════════════════════════
+function draft() {
+  const T = BigInt(($('cT').value || '0').replace(/[, _]/g, '') || '0');
+  const raise = BigInt(Math.floor(Number(($('cRaise').value || '0').replace(/[, _]/g, '')) * Number($('cRaiseUnit').value)));
+  const steps = T * T - T;
+  const price = steps > 0n ? ((2n * raise) / steps > 0n ? (2n * raise) / steps : 1n) : 1n;
+  const params = { depth: Number($('cDepth').value), threshold: T, price, seed: 1n };
+  const v = LP.validateParams(params);
+  const ticker = $('cTicker').value.trim().toUpperCase(), name = $('cName').value.trim();
+  if (!ticker) throw new Error('Give it a ticker.');
+  if (!/^[A-Z0-9]{1,12}$/.test(ticker)) throw new Error('Tickers are letters and digits.');
+  const nonce = Array.from(crypto.getRandomValues(new Uint8Array(8)), (b) => b.toString(16).padStart(2, '0')).join('');
+  const payload = LP.encodeAnnouncement({ params: v, ticker, name, nonce });
+  return { v, ticker, name, payload };
+}
+function updatePreview() {
+  const box = $('cPreview');
+  box.replaceChildren();
+  const line = (k, val) => box.append(el('div', {}, el('span', { text: k }), el('span', { text: val })));
+  try {
+    const { v } = draft();
+    line('Curve sells', `${fmtInt(v.threshold)} tokens`);
+    line('Price step', fmtMds(v.price) + ' per token');
+    line('Last curve token', fmtMds(v.price * (v.threshold - 1n)));
+    line('Raise at graduation', fmtMds(v.raise));
+    line('Pool opens with', `${fmtMds(v.raise)} + ${fmtInt(v.pool)} tokens`);
+    line('Total supply', `${fmtInt(v.threshold + v.pool)} tokens`);
+    $('btnLaunch').disabled = !live();
+  } catch (e) {
+    box.append(el('div', {}, el('span', { text: e.message.replace(/^launchpad: /, '') })));
+    $('btnLaunch').disabled = true;
+  }
+}
+for (const id of ['cTicker', 'cName', 'cT', 'cRaise', 'cRaiseUnit', 'cDepth']) $(id).addEventListener('input', updatePreview);
+const openCreate = () => { $('create').classList.add('open'); updatePreview(); $('cTicker').focus(); };
+const closeCreate = () => $('create').classList.remove('open');
+$('btnNew').addEventListener('click', openCreate);
+$('btnCloseCreate').addEventListener('click', closeCreate);
+$('btnCancelCreate').addEventListener('click', closeCreate);
+$('create').addEventListener('click', (e) => { if (e.target === $('create')) closeCreate(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeCreate(); });
+
+$('btnLaunch').addEventListener('click', () => {
+  if (!live()) return;
+  let d, L, out;
+  try {
+    d = draft();
+    const a = LP.decodeAnnouncement(d.payload);
+    L = new LP.Launch(a, codeFor(a.params));
+    out = L.launchOutputs();
+  } catch (e) { toast(e.message.replace(/^launchpad: /, ''), true); return; }
+  // fundContract opens the wallet popup synchronously: keep it in the click.
+  Midstate.fundContract({ fundings: out.fundings, burns: out.burns, summary: `Launch $${d.ticker}` }, { onProgress: (m) => toast(m) })
+    .then(() => {
+      toast(`$${d.ticker} is launched. It appears here once its block is read.`);
+      closeCreate();
+      S.selected = L.tag.slice(0, 16);
+      scanSoon();
+    })
+    .catch((e) => toast(e.message || 'Launch failed.', true));
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Run
+// ═══════════════════════════════════════════════════════════════════════════
+// A scan every 20 s, and one soon after anything this page sends. A request
+// made while a scan runs must survive it, so the loop only reschedules itself
+// when nothing else has.
+let timer = null;
+function scanSoon(ms = 1500) { clearTimeout(timer); timer = setTimeout(loop, ms); }
+async function loop() {
+  clearTimeout(timer); timer = null;
+  await scan();
+  if (timer === null) timer = setTimeout(loop, 20000);
+}
+render();
+loop();
+</script>
+</body>
+</html>
