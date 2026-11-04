@@ -32,6 +32,13 @@ import { blake3_hash_hex } from '../pkg/wasm_wallet.js';
 export const STATE_THREAD_ACTIVATION_HEIGHT = 65_000n;
 /** The VM rejects a script that performs more than this many signature ops. */
 export const MAX_SIGOPS_PER_SCRIPT = 3;
+/**
+ * Consensus stack limits, as `stack_push` in core/script.rs applies them to
+ * every push, witness items included: a stack of at most this many items...
+ */
+export const MAX_STACK_DEPTH = 64;
+/** ...each at most this many bytes. */
+export const MAX_ITEM_SIZE = 1536;
 
 /**
  * `OP_SUM_INPUT_VALUE` is consensus-gated. Below this height a node returns
@@ -108,12 +115,17 @@ export function execute(asm, ctx = {}) {
         maxSteps = 100_000, trace: wantTrace = false,
     } = ctx;
 
-    const stack = witness.map((w) => String(w).replace(/^0x/, '').toLowerCase());
+    const stack = [];
     const execStack = [];
     const trace = [];
     let sigops = 0, steps = 0;
 
-    const push = (v) => stack.push(String(v).toLowerCase());
+    const push = (v) => {
+        const item = String(v).toLowerCase();
+        if (item.length / 2 > MAX_ITEM_SIZE) throw new Error(`ItemTooLarge: item exceeds ${MAX_ITEM_SIZE} bytes`);
+        if (stack.length >= MAX_STACK_DEPTH) throw new Error(`StackOverflow: stack depth exceeds ${MAX_STACK_DEPTH}`);
+        stack.push(item);
+    };
     const pop = () => {
         if (!stack.length) throw new Error('Stack underflow');
         return stack.pop();
@@ -161,6 +173,9 @@ export function execute(asm, ctx = {}) {
     }
 
     try {
+        // The witness goes on through the same checks as every other push.
+        for (const w of witness) push(String(w).replace(/^0x/, ''));
+
         for (let pc = 0; pc < asm.length; pc++) {
             if (++steps > maxSteps) throw new Error(`Step limit (${maxSteps}) exceeded`);
             const raw = asm[pc];
@@ -174,6 +189,10 @@ export function execute(asm, ctx = {}) {
             // Branch bookkeeping runs even in a dead branch, or nesting breaks.
             if (op === 'IF') {
                 execStack.push(live ? isTrue(pop()) : false);
+                // The node caps live nesting; a dead branch nests without the check.
+                if (live && execStack.length > MAX_STACK_DEPTH) {
+                    throw new Error(`UnbalancedConditional: IF nesting exceeds ${MAX_STACK_DEPTH}`);
+                }
                 continue;
             }
             if (op === 'ELSE') {
@@ -317,6 +336,7 @@ export function execute(asm, ctx = {}) {
                 case 'TUCK': {
                     requireV6('OP_TUCK');
                     if (stack.length < 2) throw new Error('Stack underflow (TUCK)');
+                    if (stack.length >= MAX_STACK_DEPTH) throw new Error(`StackOverflow: stack depth exceeds ${MAX_STACK_DEPTH}`);
                     stack.splice(stack.length - 2, 0, stack[stack.length - 1]); break;
                 }
                 case 'NOT': {

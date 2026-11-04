@@ -242,6 +242,33 @@ await t('MERKLE_ROOT rejects malformed proofs as the node does', () => {
     assert(/exceeds/.test(merkleProbe((S1 + '00').repeat(33), root).error), 'walked 33 levels');
 });
 
+// Stack limits, as core/script.rs's stack_push applies them: every push,
+// witness items included, may not exceed 1,536 bytes or a depth of 64.
+await t('a witness item over 1,536 bytes is refused, and 1,536 is not', () => {
+    const big = execute(['DROP', 'PUSH_INT 1'], { witness: ['00'.repeat(1537)] });
+    assert(!big.ok && /ItemTooLarge/.test(big.error), `got: ${big.error}`);
+    assert(execute(['DROP', 'PUSH_INT 1'], { witness: ['00'.repeat(1536)] }).ok, '1,536 bytes refused');
+});
+
+await t('the stack holds 64 items and no more', () => {
+    const full = Array(64).fill('01');
+    assert(execute(Array(63).fill('DROP'), { witness: full }).ok, '64 witness items refused');
+    const over = execute(['PUSH_INT 1'], { witness: full, allowDirtyStack: true });
+    assert(!over.ok && /StackOverflow/.test(over.error), `got: ${over.error}`);
+    const tuck = execute(['TUCK'], { witness: full, height: V6, allowDirtyStack: true });
+    assert(!tuck.ok && /StackOverflow/.test(tuck.error), `TUCK at 64: ${tuck.error}`);
+});
+
+await t('live IF nesting stops at 64; a dead branch nests freely', () => {
+    const nest = (n, cond) => [...Array(n).fill(null).flatMap(() => [`PUSH_INT ${cond}`, 'IF']), ...Array(n).fill('ENDIF'), 'PUSH_INT 1'];
+    assert(execute(nest(64, 1), {}).ok, '64 live IFs refused');
+    const deep = execute(nest(65, 1), {});
+    assert(!deep.ok && /UnbalancedConditional/.test(deep.error), `got: ${deep.error}`);
+    // One false IF, then 70 more inside it: only the first pops, the rest are dead.
+    const dead = ['PUSH_INT 0', 'IF', ...Array(70).fill('IF'), ...Array(71).fill('ENDIF'), 'PUSH_INT 1'];
+    assert(execute(dead, {}).ok, `dead nesting refused: ${execute(dead, {}).error}`);
+});
+
 await t('an empty final stack is a failure, not a pass', () => {
     assert(execute(['PUSH_INT 1', 'DROP'], {}).ok === false, 'empty stack reported ok');
 });
