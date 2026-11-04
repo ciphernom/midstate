@@ -6539,24 +6539,67 @@ const BOND_OWNER_HEIGHT = 4;               // 16 signatures: one unbond plus ret
 const BOND_OWNER_INDEX_BASE = 0x80000000;  // above every index this wallet's own trees use
 const BOND_OWNER_DOMAIN_HEX = Array.from(new TextEncoder().encode("midstate/bond-owner/v1"))
     .map(b => b.toString(16).padStart(2, '0')).join('');
-// Midwimble's launch parameters (midwimble core/types.rs, core/bond.rs): guidance
-// only, since midstate consensus knows nothing of them.
-const MW_MIN_MINING_BOND = 2 ** 24;
-const MW_MIN_REMAINING_BOND_LOCK = 2 * 1440;
+// Midwimble's bond rules (midwimble core/bond.rs, core/types.rs), mirrored
+// function for function: guidance only, since midstate consensus knows nothing
+// of them. index.html carries the same rules for the form; keep the two alike.
+//
+// The network opened with an early phase (small bonds, a two-day lock) that
+// ended at MW_EARLY_BONDS_UNTIL, when it became mainnet. From then a bond needs
+// 128 gMDS with 30 days of its lock left. From MW_BOND_RETARGET_FROM a *new*
+// registration may need more, doubling with midwimble's difficulty up to
+// MW_MAX_MINING_BOND; a bond already registered keeps the price it paid.
+// Midwimble publishes that figure (`registration_min_bond` at /bonds, and on
+// its explorer); this wallet cannot see midwimble's difficulty, so it applies
+// the floor and says when the figure may be higher.
+const MW_EARLY_BONDS_UNTIL = 1793404800;               // 2026-10-31 00:00 UTC
+const MW_EARLY_MIN_MINING_BOND = 2 ** 24;
+const MW_EARLY_MIN_REMAINING_BOND_LOCK = 2 * 1440;
+const MW_MIN_MINING_BOND = 2 ** 37;                    // 128 gMDS
+const MW_MIN_REMAINING_BOND_LOCK = 30 * 1440;          // 43,200 midstate blocks
+const MW_BOND_RETARGET_FROM = MW_EARLY_BONDS_UNTIL + 30 * 86400;   // 2026-11-30 00:00 UTC
+const MW_MAX_MINING_BOND = 2 ** 39;                    // the retarget's ceiling: 512 gMDS
 const MW_CLOCK_MARGIN = 7 * 1440;
 const MW_MAX_BOND_HORIZON = 365 * 1440;
 const MIDSTATE_GENESIS_TIMESTAMP = 1772274770;
 /** A never-seen bond can only be forgotten after this long. */
 const BOND_FORGET_AFTER_MS = 60 * 60 * 1000;
 
-/** Midwimble's estimate of midstate's height at unix time `ts`. */
+/** Midwimble's estimate of midstate's height at unix time `ts` (`est_midstate_height`). */
 function mwEstHeight(ts) {
     return Math.floor(Math.max(0, ts - MIDSTATE_GENESIS_TIMESTAMP) / 60) + MW_CLOCK_MARGIN;
 }
-/** Last unix time midwimble counts a bond locked until `until`, or null if never. */
-function mwCountsUntil(until) {
-    const h = until - MW_MIN_REMAINING_BOND_LOCK - MW_CLOCK_MARGIN;
-    return h < 0 ? null : MIDSTATE_GENESIS_TIMESTAMP + h * 60 + 59;
+/** Smallest bond that counts for a block stamped `ts` (`min_mining_bond`). */
+function mwMinBond(ts) {
+    return ts < MW_EARLY_BONDS_UNTIL ? MW_EARLY_MIN_MINING_BOND : MW_MIN_MINING_BOND;
+}
+/** Midstate blocks a bond must still be locked for at `ts` (`min_remaining_bond_lock`). */
+function mwMinLock(ts) {
+    return ts < MW_EARLY_BONDS_UNTIL ? MW_EARLY_MIN_REMAINING_BOND_LOCK : MW_MIN_REMAINING_BOND_LOCK;
+}
+/** Whether midwimble counts a bond of `value` locked until `until` at `ts` (`BondRules::eligible`). */
+function mwEligible(value, until, ts) {
+    return value >= mwMinBond(ts) && until >= mwEstHeight(ts) + mwMinLock(ts);
+}
+/**
+ * Last unix time midwimble counts a bond of `value` locked until `until`, or
+ * null if it never does. It may be in the past. Midwimble's rules only ever
+ * ask more as time passes, so a bond counts up to this second and never after.
+ */
+function mwCountsUntil(value, until) {
+    // The last second the lock alone allows, at a given minimum lock.
+    const lastFor = (lock) => {
+        const h = until - lock - MW_CLOCK_MARGIN;
+        return h < 0 ? null : MIDSTATE_GENESIS_TIMESTAMP + h * 60 + 59;
+    };
+    if (value >= MW_MIN_MINING_BOND) {
+        const t = lastFor(MW_MIN_REMAINING_BOND_LOCK);
+        if (t !== null && t >= MW_EARLY_BONDS_UNTIL) return t;
+    }
+    if (value >= MW_EARLY_MIN_MINING_BOND) {
+        const t = lastFor(MW_EARLY_MIN_REMAINING_BOND_LOCK);
+        if (t !== null) return Math.min(t, MW_EARLY_BONDS_UNTIL - 1);
+    }
+    return null;
 }
 
 /** n as `bytes` little-endian bytes, hex. */
@@ -6650,6 +6693,7 @@ function bondStatus(b) {
 function bondsPayload() {
     const held = Object.values(wState.utxos || {}).reduce((s, u) => s + Number(u.value), 0);
     const pending = pendingSends.reduce((s, tx) => s + tx.value + tx.fee, 0);
+    const now = Math.floor(Date.now() / 1000);
     return {
         height: networkHeight || 0,
         spendable: Math.max(0, held - pending),
@@ -6660,8 +6704,11 @@ function bondsPayload() {
                 status: bondStatus(b),
                 address: blake3_hash_hex(scriptHex),
                 script: scriptHex,
-                belowMin: b.value < MW_MIN_MINING_BOND,
-                countsUntil: b.value < MW_MIN_MINING_BOND ? null : mwCountsUntil(b.until),
+                // Below the minimum a bond needs today: it may have counted in
+                // the early phase, but it never will again.
+                belowMin: b.value < mwMinBond(now),
+                // Last second midwimble counts it, possibly past; null if never.
+                countsUntil: mwCountsUntil(Number(b.value), b.until),
                 registerCmd: `midwimble bond register --file bond.json --owner-pk ${b.ownerPk} --until ${b.until} `
                     + `--value ${b.value} --salt ${b.salt} --midstate-rpc <your midstate node, e.g. 127.0.0.1:8545>`,
                 exportLine: `${scriptHex} ${b.value} ${b.salt}`,
@@ -9119,13 +9166,43 @@ async function runSelfTests() {
 
     await test('bond_midwimble_clock', async () => {
         assertEqual(mwEstHeight(MIDSTATE_GENESIS_TIMESTAMP), MW_CLOCK_MARGIN, 'genesis');
-        const last = mwCountsUntil(400000);
-        assert(mwEstHeight(last) + MW_MIN_REMAINING_BOND_LOCK <= 400000, 'counts at its last second');
-        assert(mwEstHeight(last + 1) + MW_MIN_REMAINING_BOND_LOCK > 400000, 'and not after');
-        assert(mwCountsUntil(MW_MIN_REMAINING_BOND_LOCK + MW_CLOCK_MARGIN - 1) === null, 'never counted');
+        // A full bond locked well past the switch counts, under the mainnet
+        // rules, up to its last second and not after.
+        const until = mwEstHeight(MW_EARLY_BONDS_UNTIL) + MW_MIN_REMAINING_BOND_LOCK + 1000;
+        const last = mwCountsUntil(MW_MIN_MINING_BOND, until);
+        assert(last >= MW_EARLY_BONDS_UNTIL, 'counts under the mainnet rules');
+        assert(mwEligible(MW_MIN_MINING_BOND, until, last), 'counts at its last second');
+        assert(!mwEligible(MW_MIN_MINING_BOND, until, last + 1), 'and not after');
+        assert(mwCountsUntil(MW_MIN_MINING_BOND, MW_EARLY_MIN_REMAINING_BOND_LOCK + MW_CLOCK_MARGIN - 1) === null, 'never counted');
+        assert(mwCountsUntil(MW_EARLY_MIN_MINING_BOND - 1, until) === null, 'too small ever to count');
         let msg = '';
         try { parseMiningKeyHex('ab'.repeat(36)); } catch (e) { msg = e.message; }
         assert(/address/.test(msg), 'a pasted address is refused');
+    });
+
+    await test('bond_rules_match_midwimble', async () => {
+        // midwimble core/bond.rs `bond_rules_switch_at_their_early_until`,
+        // at mainnet's numbers.
+        const sw = MW_EARLY_BONDS_UNTIL;
+        assertEqual(sw, 1793404800, 'mainnet from 2026-10-31 00:00 UTC');
+        assertEqual(mwMinBond(sw - 1), 2 ** 24, 'early minimum bond');
+        assertEqual(mwMinBond(sw), 2 ** 37, 'mainnet minimum bond');
+        assertEqual(mwMinLock(sw - 1), 2880, 'early minimum lock');
+        assertEqual(mwMinLock(sw), 43200, 'mainnet minimum lock');
+        const lasting = Number.MAX_SAFE_INTEGER;
+        assert(mwEligible(2 ** 24, lasting, sw - 1), 'a small bond counts in the early phase');
+        assert(!mwEligible(2 ** 24, lasting, sw), 'too small from the switch');
+        const earlyLock = mwEstHeight(sw - 1) + 2880;
+        assert(mwEligible(2 ** 37, earlyLock, sw - 1), "the early lock counts before the switch");
+        assert(!mwEligible(2 ** 37, earlyLock, sw), 'too short from the switch');
+        const fullLock = mwEstHeight(sw) + 43200;
+        assert(mwEligible(2 ** 37, fullLock, sw - 1) && mwEligible(2 ** 37, fullLock, sw), 'the full lock counts on both sides');
+        // Bonds that only met the early rules stopped counting at the switch.
+        assertEqual(mwCountsUntil(2 ** 24, lasting), sw - 1, 'a small bond stopped at the switch');
+        assertEqual(mwCountsUntil(2 ** 37, earlyLock), sw - 1, 'a short lock stopped at the switch');
+        // The registration retarget: from 2026-11-30 00:00 UTC, up to 512 gMDS.
+        assertEqual(MW_BOND_RETARGET_FROM, 1795996800, 'retarget start');
+        assertEqual(MW_MAX_MINING_BOND, 2 ** 39, 'retarget ceiling');
     });
 
 
