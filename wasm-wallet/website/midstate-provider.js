@@ -241,10 +241,25 @@
 
     /**
      * Request the user's public MSS address.
-     * @returns {Promise<{address:string}>}
+     *
+     * With `{ siteKey: true }` the wallet also makes (once) a signing key for
+     * this site's origin: an MSS key derived from the user's recovery phrase,
+     * used only to sign transactions the wallet builds for this site. A
+     * contract that names an owner per position (the launchpad's ledger) uses
+     * its public key. The first connect takes about 20 seconds; progress
+     * arrives through `onProgress`.
+     *
+     * @param {{siteKey?:boolean, onProgress?:Function, resultTimeoutMs?:number}} [opts]
+     * @returns {Promise<{address:string, sitePk?:string, siteKeyLeft?:number,
+     *   siteSigBytes?:number, siteKeyGeneration?:number,
+     *   sitePks?:Array<{pk:string,left:number,sigBytes:number}>}>}
+     *   `sitePks` lists every key this site has had, newest last, so positions
+     *   held by an older one can be moved while it still has signatures.
      */
     connect: function (opts) {
-      return invoke("connect", {}, Object.assign({ resultTimeoutMs: 120_000 }, opts));
+      opts = opts || {};
+      return invoke("connect", { siteKey: !!opts.siteKey },
+        Object.assign({ resultTimeoutMs: opts.siteKey ? 10 * 60_000 : 120_000 }, opts));
     },
 
     /**
@@ -260,6 +275,20 @@
      * @returns {Promise<{txid:string}>}
      */
     fundContract: function (p, opts) {
+      // Several payments in one transaction, with optional coin salts and up to
+      // 80-byte public data outputs:
+      //   { fundings: [{ address, amount, salt? }], burns: [hex], summary? }
+      // A salt can only be chosen for an amount that is one power of two.
+      if (p && Array.isArray(p.fundings)) {
+        if (!p.fundings.length) return Promise.reject(new Error("Midstate.fundContract: fundings is empty."));
+        return invoke("fund", {
+          fundings: p.fundings.map(function (f) {
+            return { address: f.address, amount: String(f.amount), salt: f.salt || null };
+          }),
+          burns: p.burns || [],
+          summary: p.summary || null,
+        }, Object.assign({ resultTimeoutMs: 5 * 60_000 }, opts));
+      }
       if (!p || !p.contractAddress) {
         return Promise.reject(new Error("Midstate.fundContract: contractAddress is required."));
       }
@@ -280,10 +309,18 @@
      *     outputs: [{ address, value, state? }] }
      * Advanced dApps may pass explicit { inputs: [{ coinId, witness, inputState }] }.
      *
-     * Limitation: a contract branch that needs a signature over THIS tx's
-     * commitment can't be driven from a pre-typed witness (the commitment isn't
-     * known until the tx is built). Preimage / timelock / routing / state-covenant
-     * paths work today.
+     * A signature over THIS transaction's commitment comes from the site key
+     * (see connect({siteKey: true})): pass `siteSig: { item, pk }` and leave,
+     * at witness position `item` of every contract input, a placeholder of
+     * `siteSigBytes` zero bytes. The wallet builds the transaction, signs its
+     * commitment with that key and puts the signature in. Without `siteSig`,
+     * preimage / timelock / routing / state-covenant paths work as before.
+     *
+     * Explicit inputs: `inputs: [{ coinId, value, salt, witness }]`, the witness
+     * comma-separated hex, pushed left to right. Outputs:
+     * `[{ out_type: "standard"|"confidential", address, value, state?, salt? }]`;
+     * whatever the outputs need beyond the inputs is paid from the wallet, and
+     * anything left over comes back to it. `summary` is shown to the user.
      *
      * @param {object} p   must include `bytecode`
      * @returns {Promise<{txid:string}>}
