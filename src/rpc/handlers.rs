@@ -1176,6 +1176,7 @@ pub async fn axe_stats(State(node): State<AppState>) -> Json<AxeStatsResponse> {
             .into_iter()
             .map(str::to_string)
             .collect(),
+        backends: crate::core::cuda_walk::backend_status(total_nonces),
     })
 }
 
@@ -1190,7 +1191,7 @@ fn board_model() -> Option<String> {
 /// `vcgencmd get_throttled`'s flags (under-voltage, throttling), read at most
 /// every ten seconds: the dashboard polls every three, and the command is a
 /// round trip to the firmware. `None` where there is no `vcgencmd`.
-async fn throttled_flags() -> Option<u32> {
+pub(crate) async fn throttled_flags() -> Option<u32> {
     static LAST: std::sync::Mutex<Option<(std::time::Instant, Option<u32>)>> = std::sync::Mutex::new(None);
     if let Ok(last) = LAST.lock() {
         if let Some((at, flags)) = *last {

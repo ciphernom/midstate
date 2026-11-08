@@ -24,6 +24,14 @@ pub struct StratumStats {
     pub network_target: [u8; 32],
     pub accepted_shares: u64,
     pub rejected_shares: u64,
+    /// Connected to the pool now.
+    pub connected: bool,
+    /// The current job's block height (0 from a pool that does not send it).
+    pub job_height: u64,
+    /// Jobs received since the miner started.
+    pub jobs: u64,
+    /// Unix time of the last accepted share (0: none yet).
+    pub last_share_unix: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -225,6 +233,7 @@ pub async fn run_stratum_client(
         
         tracing::info!("stratum client connecting to {} (api: {})", host, api_host);
         if let Ok(mut stream) = TcpStream::connect(&host).await {
+            stats.write().unwrap().connected = true;
             let (read_half, mut write_half) = stream.split();
             // A line at a time, through `Lines`: its `next_line` keeps a
             // half-read line between calls, so it can wait in the select!
@@ -298,6 +307,8 @@ pub async fn run_stratum_client(
                             {
                                 let mut s = stats.write().unwrap();
                                 s.network_target = n_target;
+                                s.job_height = job_height;
+                                s.jobs += 1;
                             }
                             let calculated_hash = crate::core::types::compute_header_hash(&header);
                             
@@ -402,7 +413,13 @@ pub async fn run_stratum_client(
                             return;
                         } else if msg["result"].as_bool() == Some(true) && msg["id"].as_u64() == Some(2) {
                             tracing::info!("share accepted");
-                            stats.write().unwrap().accepted_shares += 1; 
+                            {
+                                let mut s = stats.write().unwrap();
+                                s.accepted_shares += 1;
+                                s.last_share_unix = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map_or(0, |t| t.as_secs());
+                            }
                         } else if let Some(err) = msg["error"].as_str() {
                             tracing::warn!("share rejected: {}", err);
                             stats.write().unwrap().rejected_shares += 1; 
@@ -417,6 +434,7 @@ pub async fn run_stratum_client(
                 }
             }
         }
+        stats.write().unwrap().connected = false;
         tracing::warn!("disconnected from stratum pool. reconnecting in 5s...");
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }

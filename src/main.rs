@@ -398,6 +398,11 @@ enum Command {
         /// multiprocessors and free memory (or MINER_CUDA_WALKS).
         #[arg(long)]
         cuda_walks: Option<u32>,
+        /// Where to serve the Axe dashboard: "127.0.0.1:8546" by default
+        /// (this machine only); "0.0.0.0:8546" to reach it from your network;
+        /// "off" for none. Or MINER_DASHBOARD.
+        #[arg(long)]
+        dashboard: Option<String>,
     },
     /// Measure this machine's proof-of-work speed: Midstate Walk attempts per
     /// second on one thread and on all of them, and the BLAKE3 chain it
@@ -1183,7 +1188,7 @@ async fn main() -> Result<()> {
             bench_pow(seconds, threads);
             Ok(())
         }
-        Command::Miner { pool_url, payout_address, worker, midwimble_address, threads, backend, cuda_devices, cuda_walks } => {
+        Command::Miner { pool_url, payout_address, worker, midwimble_address, threads, backend, cuda_devices, cuda_walks, dashboard } => {
             #[cfg(not(target_arch = "wasm32"))]
             {
                 use midstate::core::{cuda_walk, gpu_mining};
@@ -1308,6 +1313,29 @@ async fn main() -> Result<()> {
                 tracing::info!("starting hasher (threads: {})", if threads == 0 { "max".to_string() } else { threads.to_string() });
                 tracing::info!("press [ENTER] at any time to view dashboard");
 
+                // The Axe dashboard, read-only, beside the hasher (rpc::miner_mode).
+                let dashboard = dashboard
+                    .or_else(|| std::env::var("MINER_DASHBOARD").ok().filter(|s| !s.is_empty()))
+                    .unwrap_or_else(|| midstate::rpc::miner_mode::DEFAULT_BIND.to_string());
+                if !dashboard.eq_ignore_ascii_case("off") {
+                    let bind: std::net::SocketAddr = dashboard
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("--dashboard takes an ip:port, like 127.0.0.1:8546, or off"))?;
+                    let settings = midstate::rpc::miner_mode::MinerSettings {
+                        pool_url: pool_url.clone(),
+                        payout_address: payout_address.clone(),
+                        worker: worker.clone(),
+                        midwimble_address: midwimble_address.clone(),
+                        threads,
+                        backend: backend.to_ascii_lowercase(),
+                    };
+                    let (hc, st) = (hash_counter.clone(), stats.clone());
+                    tokio::spawn(async move {
+                        if let Err(e) = midstate::rpc::miner_mode::serve(bind, settings, hc, st).await {
+                            tracing::warn!("miner dashboard not available on {bind}: {e}");
+                        }
+                    });
+                }
                 
                 midstate::mining::run_stratum_client(pool_url, payout_address, worker, midwimble_address, threads, hash_counter, stats).await;
                 Ok(())
