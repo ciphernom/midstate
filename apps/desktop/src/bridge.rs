@@ -79,7 +79,8 @@ pub enum Action {
     LoadDexConfig,
     SetDexConfig { cfg: DexConfigView },
     LoadBonds,
-    CreateBond { mining_key: String, value: u64, until: u64, label: String },
+    /// `register`: ask midwimble to count it as soon as the lock confirms.
+    CreateBond { mining_key: String, value: u64, until: u64, label: String, register: bool },
     Unbond { id: String },
     ImportBond { text: String, label: String },
     RemoveBond { id: String },
@@ -200,7 +201,8 @@ pub enum Msg {
     /// A rental action finished; the text says what happened.
     RentalDone(String),
     /// A bond file for a pool operator, to put on the clipboard.
-    CoBondFile(String),
+    /// A bond's id and its co-bond file.
+    CoBondFile(String, String),
     Plans(midstate_walletd::api::PlansView),
     /// A plan or stream action finished; the text says what happened.
     PlansDone(String),
@@ -383,14 +385,21 @@ pub fn dispatch(
                 run!("dex settings", h.set_dex_config(cfg), |_| Msg::DexConfigSaved)
             }
             Action::LoadBonds => run!("bonds", h.bonds(), Msg::Bonds),
-            Action::CreateBond { mining_key, value, until, label } => {
-                run!("lock bond", h.create_bond(mining_key, value, until, label), |_| {
-                    Msg::BondDone(
-                        "Locking the bond: follow the send on the Send tab. Once it confirms, Register on \
-                         its card has midwimble count it."
-                            .into(),
-                    )
-                })
+            Action::CreateBond { mining_key, value, until, label, register } => {
+                match h.create_bond(mining_key, value, until, label).await {
+                    Ok(id) => {
+                        // Registration waits for the lock to confirm by
+                        // itself. If asking fails, the bond's card offers
+                        // Register instead.
+                        if register {
+                            if let Err(e) = h.register_bond(id).await {
+                                tracing::warn!("registering a new bond: {e:#}");
+                            }
+                        }
+                        out(Msg::BondDone("Locking: follow it on its card below.".into()))
+                    }
+                    Err(e) => out(Msg::Err { what: "lock bond", err: format!("{e:#}") }),
+                }
             }
             Action::Unbond { id } => run!("unbond", h.unbond(id), |_| {
                 Msg::BondDone("Unbonding: follow it on the Send tab.".into())
@@ -436,7 +445,9 @@ pub fn dispatch(
                         .into(),
                 )
             }),
-            Action::CopyCoBondFile { id } => run!("co-bond file", h.co_bond_file(id), Msg::CoBondFile),
+            Action::CopyCoBondFile { id } => {
+                run!("co-bond file", h.co_bond_file(id.clone()), |text| Msg::CoBondFile(id, text))
+            }
             Action::LoadPlans => run!("plans", h.plans(), Msg::Plans),
             Action::MakePayeeCode { name } => run!("make payee code", h.payee_code(name), Msg::PayeeCode),
             Action::CreatePlan { label, heirs, period_days, amount } => {
