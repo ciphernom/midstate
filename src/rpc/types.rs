@@ -416,6 +416,10 @@ pub struct AxeStatsResponse {
     /// `vcgencmd get_throttled`'s flags, where it can be read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub throttled: Option<u32>,
+    /// The Midstate Walk search's backends (CPU threads, CUDA GPUs) and their
+    /// attempts so far; empty before the node has mined the walk.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub backends: Vec<crate::core::cuda_walk::BackendStatus>,
     /// The same flags in words ("under-voltage now", …); empty when all is well.
     pub throttle: Vec<String>,
 }

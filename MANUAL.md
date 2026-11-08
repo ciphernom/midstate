@@ -178,6 +178,23 @@ CUDA needs only the NVIDIA driver: the kernels are built into midstate, and the 
 
 `midstate node --mine --backend …` uses the same backends.
 
+### The dashboard
+
+The miner serves the Axe dashboard at `http://127.0.0.1:8546/axe`:
+
+- the hashrate: in total, and for the CPU and for each GPU;
+- shares accepted and rejected, the last share, and the pool job;
+- uptime;
+- the board's temperature, clock and throttling;
+- whether the pool is merge-mining midwimble now. Merged mining pauses while the two chains are on different proofs of work: between midwimble's switch at its block 37,300 and midstate's at block 371,500.
+
+What only a node knows (peers, the chain, the mempool, blocks won) shows as unavailable.
+
+The miner's dashboard is read-only. Its settings are the miner's flags, and the node's settings panels (Wi-Fi, clocks, mining mode, the bench) are not served.
+
+- **Access.** It answers this machine only. To open it to your network, give `--dashboard 0.0.0.0:8546`, or `MINER_DASHBOARD`. `--dashboard off` turns it off.
+- **Cost.** The hashing threads only bump counters they already had. The board is read when the page asks, every few seconds, and the pool's stats at most every 30 seconds.
+
 ### As a service
 
 ```ini
@@ -192,6 +209,7 @@ ExecStart=/usr/local/bin/midstate miner --pool-url pool.example:3333 \
     --payout-address <mss address> --worker rig1 --midwimble-address mw1…
 # Uncomment to keep GPUs out (a shared desktop, say):
 #Environment=MINER_DISABLE_GPU=1
+#Environment=MINER_DASHBOARD=0.0.0.0:8546
 Restart=always
 RestartSec=10
 Nice=10

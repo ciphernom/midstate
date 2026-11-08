@@ -42,7 +42,7 @@ function toggleTheme(){var d=document.documentElement,n=d.getAttribute('data-the
             <button onclick="connectWifi()">Connect Wi-Fi</button>
         </div>
 
-        <div class="sidebar-section">
+        <div class="sidebar-section" id="mining-config-panel">
             <div class="title">Mining Configuration</div>
             <div class="field-group">
                 <label>Mode</label>
@@ -123,6 +123,7 @@ function toggleTheme(){var d=document.documentElement,n=d.getAttribute('data-the
                 <div class="card-label">Hashrate</div>
                 <div class="card-value" id="hashrate">— /s</div>
                 <div class="card-sub" id="hashrate-sub">attempts a second</div>
+                <div class="card-sub" id="backends-line"></div>
             </div>
             <div class="card green">
                 <div class="card-label">Blocks Mined</div>
@@ -453,6 +454,12 @@ async function pollStats() {
         fetchJson('/metrics'),
     ]);
 
+    // `midstate miner` serves this page too, with no node behind it.
+    if (axe && axe.mode === 'miner') {
+        renderMiner(axe);
+        return;
+    }
+
     // /state is the heartbeat — without it we are genuinely offline.
     if (!state) {
         document.getElementById('live-dot').style.background = 'var(--red)';
@@ -507,6 +514,7 @@ async function pollStats() {
         }
         lastNonces   = axe.total_nonces;
         lastPollTime = now;
+        renderBackends(axe, now);
 
         // Live CPU clock (reflects thermal throttling); falls back to the
         // persisted boot-config value, never a hardcoded guess.
@@ -658,6 +666,151 @@ async function pollStats() {
     // A rendering bug is not a dead node: log it, leave the status alone.
     console.error('pollStats error:', e);
   }
+}
+
+// ── Backends: CPU threads and CUDA GPUs, each with its own rate ──────
+let lastBackends = {};   // label -> [hashes, time]
+function renderBackends(axe, now) {
+    const el = document.getElementById('backends-line');
+    const list = axe.backends || [];
+    if (!list.length) { el.textContent = ''; return; }
+    el.textContent = list.map(b => {
+        const prev = lastBackends[b.label];
+        let rate = '';
+        if (prev && b.hashes >= prev[0] && now > prev[1]) rate = ' ' + fmtHashrate((b.hashes - prev[0]) / ((now - prev[1]) / 1000));
+        lastBackends[b.label] = [b.hashes, now];
+        return b.label + rate;
+    }).join(' · ');
+}
+
+// ── Standalone miner (`midstate miner`) ──────────────────────────────
+// The hasher's own numbers. What only a node knows shows as unavailable;
+// the settings panels are the node's and are hidden.
+let minerModeReady = false;
+function setCard(id, label, value, sub) {
+    const card = document.getElementById(id).closest('.card');
+    if (label != null) card.querySelector('.card-label').textContent = label;
+    if (value != null) document.getElementById(id).textContent = value;
+    if (sub != null) card.querySelector('.card-sub').textContent = sub;
+}
+function enterMinerMode() {
+    for (const id of ['hw-wifi-panel', 'hw-oc-panel', 'mining-config-panel']) {
+        const el = document.getElementById(id);
+        if (el) el.style.display = 'none';
+    }
+    const bench = document.getElementById('btn-bench');
+    if (bench) bench.style.display = 'none';
+    // In their place, what the miner was started with, read-only.
+    const side = document.getElementById('hw-wifi-panel').parentElement;
+    const panel = document.createElement('div');
+    panel.className = 'sidebar-section';
+    panel.id = 'miner-settings-panel';
+    side.insertBefore(panel, side.firstChild);
+    for (const id of ['chain-depth', 'safe-depth-val', 'txs-processed', 'batches-processed', 'invalid-total', 'reorgs']) {
+        const el = document.getElementById(id);
+        if (el) el.textContent = 'unavailable';
+    }
+    setCard('chain-depth', null, null, 'needs a node: this is a standalone miner');
+    setCard('safe-depth-val', null, null, 'needs a node');
+    document.getElementById('h-peers').textContent = 'n/a';
+    document.getElementById('h-safedepth').textContent = 'n/a';
+    log('Standalone miner: no node runs here, so chain figures are unavailable. Settings are read-only.', 'var(--blue)');
+    minerModeReady = true;
+}
+// Settings as `midstate miner` was started with them. Text only: nothing
+// here is sent anywhere.
+function renderMinerSettings(m) {
+    const panel = document.getElementById('miner-settings-panel');
+    if (!panel) return;
+    const rows = [
+        ['Pool', m.pool_url],
+        ['Payout', m.payout_address],
+        ['Worker', m.worker],
+        ['Midwimble', m.midwimble_address || 'not set'],
+        ['Backend', m.backend],
+        ['CPU threads', String(m.cpu_threads)],
+    ];
+    panel.replaceChildren();
+    const title = document.createElement('div');
+    title.className = 'title';
+    title.textContent = 'Miner (read-only)';
+    panel.appendChild(title);
+    for (const [k, v] of rows) {
+        const g = document.createElement('div');
+        g.className = 'field-group';
+        const l = document.createElement('label');
+        l.textContent = k;
+        const val = document.createElement('div');
+        val.textContent = v;
+        val.style.wordBreak = 'break-all';
+        val.style.fontSize = '12px';
+        g.append(l, val);
+        panel.appendChild(g);
+    }
+    const hint = document.createElement('div');
+    hint.className = 'field-group';
+    hint.style.opacity = '0.7';
+    hint.style.fontSize = '11px';
+    hint.textContent = 'Change these with midstate miner\'s flags (or its systemd unit) and restart it.';
+    panel.appendChild(hint);
+}
+
+function renderMiner(axe) {
+    if (!minerModeReady) enterMinerMode();
+    const m = axe.miner;
+    const now = Date.now();
+    renderMinerSettings(m);
+
+    document.getElementById('live-dot').style.background = m.connected ? 'var(--green)' : 'var(--orange)';
+    const st = document.getElementById('h-status');
+    st.textContent = m.connected ? 'POOL MINING' : 'CONNECTING';
+    st.style.color = m.connected ? 'var(--accent)' : 'var(--orange)';
+    document.getElementById('h-height').textContent = m.job_height ? m.job_height.toLocaleString() : '—';
+    document.getElementById('h-uptime').textContent = fmtUptime(axe.uptime_s);
+
+    let hashrate = 0;
+    if (lastNonces > 0 && axe.total_nonces >= lastNonces) {
+        const dt = (now - lastPollTime) / 1000.0;
+        if (dt > 0) hashrate = (axe.total_nonces - lastNonces) / dt;
+    }
+    if (axe.total_nonces > 0 || hashrate > 0) document.getElementById('hashrate').textContent = fmtHashrate(hashrate);
+    lastNonces = axe.total_nonces;
+    lastPollTime = now;
+    document.getElementById('hashrate-sub').textContent =
+        `${POW_NAMES[axe.pow] || axe.pow} · ${m.cpu_threads} CPU thread${m.cpu_threads === 1 ? '' : 's'} · backend ${m.backend}`;
+    if (lastPow && axe.pow !== lastPow) log(`Proof of work is now ${POW_NAMES[axe.pow] || axe.pow}.`, 'var(--accent)');
+    lastPow = axe.pow;
+    renderBackends(axe, now);
+
+    setCard('blocks-mined', 'Shares Accepted', m.accepted.toLocaleString(), `${m.rejected.toLocaleString()} rejected`);
+    setCard('avg-block-time', 'Last Share',
+        m.last_share_s == null ? '—' : fmtDuration(m.last_share_s * 1000) + ' ago',
+        `${m.jobs.toLocaleString()} job${m.jobs === 1 ? '' : 's'} from the pool`);
+    setCard('height', 'Pool Job', m.job_height ? m.job_height.toLocaleString() : '—', `${m.pool_url} · worker ${m.worker}`);
+
+    let merged = 'not set';
+    let mergedSub = 'no --midwimble-address: the pool keeps your MDW share';
+    if (m.merged) {
+        merged = m.merged.active ? 'ACTIVE' : 'PAUSED';
+        mergedSub = m.merged.note || (m.merged.active ? 'the pool merge-mines midwimble' : '');
+    } else if (m.midwimble_address) {
+        merged = 'unknown';
+        mergedSub = "the pool's stats are not reachable";
+    }
+    if (m.midwimble_address && m.merged) mergedSub = `MDW to ${m.midwimble_address.slice(0, 10)}… · ` + mergedSub;
+    setCard('mempool', 'Merged Mining', merged, mergedSub);
+
+    const tempEl = document.getElementById('temp');
+    tempEl.textContent = axe.temp_c > 0 ? axe.temp_c.toFixed(1) + '°C' : 'N/A';
+    if (axe.temp_c > 0) tempEl.style.color = axe.temp_c > 75 ? 'var(--red)' : axe.temp_c > 65 ? 'var(--orange)' : 'var(--text-max)';
+    document.getElementById('current-freq').textContent = axe.freq_mhz ? axe.freq_mhz + ' MHz live' : '—';
+    const words = axe.throttle || [];
+    const current = words.filter(w => w.endsWith(' now'));
+    const note = document.getElementById('throttle-note');
+    note.textContent = current.length ? '· ' + current.join(', ') : '';
+    note.className = current.length ? 'warn' : '';
+
+    if (!document.hidden) drawChart(hashrate, axe.temp_c > 0 ? axe.temp_c : 0);
 }
 
 // ── Config & hardware actions ─────────────────────────────────────
