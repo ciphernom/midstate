@@ -167,8 +167,12 @@ The knobs, if that margin needs widening:
   - `midstate miner` picks the algorithm from it.
   - A pool that sends four parameters is treated as a BLAKE3-chain pool.
 - **The pool's HTTP and WebRTC templates** carry `height` and `pow`.
-- **GPU backend.** `--backend gpu` and `Auto` mine Walk on the CPU, because
-  the wgpu kernel is the BLAKE3 chain's. A warning says so once.
+- **GPU backend.** The wgpu kernel is the BLAKE3 chain's. Walk runs on
+  NVIDIA GPUs through CUDA (`src/core/cuda_walk.rs`, the benchmark's kernels
+  loaded through the driver): `Auto` mines on them and the CPU threads,
+  `--backend gpu` on them alone, and with no usable GPU both mine on the CPU,
+  saying why once. Each GPU must reproduce the known answers before it
+  mines, and the CPU re-checks every hash it reports. MANUAL.md, section 6.
 - **Merged mining with midwimble.**
   - The pool reads `pow` from midwimble's `/merge/job` (absent means
     BLAKE3 chain).
@@ -245,7 +249,10 @@ definition rather than from the Rust, and a GPU benchmark:
   `qemu-aarch64 -cpu cortex-a76`.
 - **C++ and CUDA** (`cuda/`), ported from the C. CI
   (`.github/workflows/walk-reference.yml`) checks its known answers against
-  `walk.rs`, runs its CPU self-test and compiles its kernels.
+  `walk.rs`, runs its CPU self-test and compiles its kernels. The miner's
+  kernels (`src/core/cuda/walk_miner.cu`) are these; CI checks the PTX the
+  miner embeds is built from them, and runs them on the CPU as the miner
+  launches them, against the known answers.
 
 All three reproduce the golden vectors in `walk.rs`'s tests. So does the Rust code:
 

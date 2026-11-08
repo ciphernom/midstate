@@ -10,12 +10,14 @@ on:
     paths:
       - 'docs/walk-reference/**'
       - 'src/core/walk.rs'
+      - 'src/core/cuda/**'
       - '.github/workflows/walk-reference.yml'
   pull_request:
     branches: [ "main" ]
     paths:
       - 'docs/walk-reference/**'
       - 'src/core/walk.rs'
+      - 'src/core/cuda/**'
       - '.github/workflows/walk-reference.yml'
   workflow_dispatch:
 
@@ -40,3 +42,13 @@ jobs:
 
       - name: Kernels compile and stay in registers
         run: sh ci/kernels.sh
+
+      - name: The miner's PTX is built from these kernels
+        working-directory: .
+        run: sh src/core/cuda/gen_ptx.sh --check
+
+      - name: The miner's kernels, run on the CPU as the miner launches them, give the known answers
+        working-directory: src/core/cuda
+        run: |
+          g++ -O2 -std=c++17 -Wall -fsanitize=address,undefined -fno-sanitize-recover=undefined host_check.cpp -o "$RUNNER_TEMP/host_check"
+          "$RUNNER_TEMP/host_check"

@@ -149,3 +149,55 @@ From the dashboard, you can:
 3. See the board, whether it has the AES instructions the Walk needs, and whether its power supply keeps up (`vcgencmd get_throttled`). Under-voltage holds a Pi 5's clock down without saying so anywhere else: use the official 27 W supply.
 4. Overclock. The dashboard offers presets for the board it runs on, and limits for its family: 1,500–3,200 MHz and up to +100 mV (`over_voltage_delta`) on a Pi 5, smaller ranges and `over_voltage` up to 6 on older Pis. It writes them to a marked `[all]` block at the end of `config.txt` and reboots. It never sets `force_turbo`, which with any `over_voltage` permanently sets an older Pi's warranty bit. **Fit an active cooler before going past the stock clock.**
 5. **Test this unit.** Every core checks it computes the Walk's known answers, counts attempts for five seconds, then checks again while hot. A core that gets one wrong is past what it can do: it would lose shares, which the pool re-checks, and waste power. Test after every overclock. `midstate bench-pow` does the same check from the command line ("known answers: correct on all 4 threads").
+
+## 6. Mining Without a Node (`midstate miner`)
+
+`midstate miner` hashes for a pool and runs nothing else: no node, no chain, no sync. It is what a rig with only hashrate to offer runs, an Axe included.
+
+```bash
+midstate miner --pool-url pool.example:3333 --payout-address <mss address> \
+    --worker rig1 --midwimble-address mw1… --threads 0
+```
+
+### What hashes
+
+From block 371,500 the proof of work is Midstate Walk. It runs on the CPU, on NVIDIA GPUs through CUDA, or on both:
+
+| `--backend` | Midstate Walk | Below block 371,500 (the BLAKE3 chain) |
+|---|---|---|
+| `auto` (default) | every CUDA GPU **and** the CPU threads | GPUs through wgpu, else the CPU |
+| `gpu` | CUDA GPUs only; the CPU if there are none | GPUs through wgpu, else the CPU |
+| `cpu` | CPU threads only | CPU threads only |
+
+- `--threads N`: CPU threads (0, the default, uses every core). With `--backend gpu` none are used.
+- `--cuda-devices 0,2`: which GPUs (default: all; or `MINER_CUDA_DEVICES`).
+- `--cuda-walks N`: walks a GPU runs at once (default: sized to its multiprocessors and free memory; or `MINER_CUDA_WALKS`).
+- `MINER_DISABLE_GPU=1` keeps every GPU out, whatever `--backend` says.
+
+CUDA needs only the NVIDIA driver: the kernels are built into midstate, and the driver compiles them for the card it finds. Each GPU must reproduce the Walk's known answers before it mines. Every hash a GPU finds below a target is checked again on the CPU before it is sent, so a GPU that goes wrong (an overclock running hot) loses work, never a share or a block, and the log says which card. Where there is no driver, no GPU, or no GPU that passes, the miner says why once and mines on the CPU. The GPUs and the CPU threads never try the same nonce, and all of them drop a job as soon as the pool sends the next one.
+
+`midstate node --mine --backend …` uses the same backends.
+
+### As a service
+
+```ini
+# /etc/systemd/system/midstate-miner.service
+[Unit]
+Description=Midstate miner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/midstate miner --pool-url pool.example:3333 \
+    --payout-address <mss address> --worker rig1 --midwimble-address mw1…
+# Uncomment to keep GPUs out (a shared desktop, say):
+#Environment=MINER_DISABLE_GPU=1
+Restart=always
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`sudo systemctl enable --now midstate-miner`, then `journalctl -u midstate-miner -f` for the log. A pool's `--payout-address` and `--midwimble-address` are only ever read from the command line, so a restart keeps them.
