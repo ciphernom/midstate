@@ -31,6 +31,7 @@ pub mod mwb_node;
 pub mod mwb_trade;
 pub mod mwb_wire;
 pub mod node_host;
+pub mod rental;
 pub mod restore;
 pub mod sendplan;
 pub mod swap;

@@ -23,3 +23,6 @@ pub mod channel;
 
 // Cross-chain DEX order announcements (shared by native + wasm wallets).
 pub mod dex;
+
+// Midwimble mining bonds for rent: offers, announcements, takes.
+pub mod rental;

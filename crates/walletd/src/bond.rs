@@ -279,8 +279,11 @@ pub enum OwnerKind {
     #[default]
     Derived,
     /// One of the wallet's MSS trees (a bond made with `wallet generate-mss`
-    /// and imported here).
+    /// and imported here, or one this wallet rented out: `crate::rental`).
     WalletTree,
+    /// Someone else's key: a bond rented to this wallet's mining key
+    /// (`crate::rental`). It mines for this wallet; its owner unbonds it.
+    Rented,
 }
 
 /// One bond this wallet made or imported.

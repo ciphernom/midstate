@@ -27,6 +27,8 @@ mod mwb_glue;
 use mwb_glue::MwbLive;
 #[path = "service_mining.rs"]
 mod mining_glue;
+#[path = "service_rental.rs"]
+mod rental_glue;
 
 const TICK: Duration = Duration::from_secs(2);
 /// How long a commit monitor waits for the commitment to enter chain state
@@ -156,6 +158,10 @@ enum Cmd {
     RegisterBond { id: String, resp: oneshot::Sender<Result<String>> },
     BondRules(oneshot::Sender<BondRulesView>),
     CoBondFile { id: String, resp: oneshot::Sender<Result<String>> },
+    Rentals(oneshot::Sender<Result<RentalsView>>),
+    PostOffer { days: u64, rent: u64, resp: oneshot::Sender<Result<String>> },
+    CancelOffer { id: String, resp: oneshot::Sender<Result<String>> },
+    TakeOffer { id: String, resp: oneshot::Sender<Result<String>> },
     Internal(Internal),
 }
 
@@ -530,6 +536,26 @@ impl WalletdHandle {
     pub async fn co_bond_file(&self, id: String) -> Result<String> {
         ask!(self, CoBondFile { id: id })
     }
+
+    // ── Bonds for rent ──────────────────────────────────────────────────
+
+    /// The bond rental market, this wallet's offers and its rented bonds.
+    pub async fn rentals(&self) -> Result<RentalsView> {
+        ask!(self, Rentals)
+    }
+    /// Offers one coin as a mining bond for `days` of mining, for `rent`
+    /// base units. Returns the offer's id.
+    pub async fn post_offer(&self, days: u64, rent: u64) -> Result<String> {
+        ask!(self, PostOffer { days: days, rent: rent })
+    }
+    /// Cancels a listed offer, bringing its coin back. Returns the send's id.
+    pub async fn cancel_offer(&self, id: String) -> Result<String> {
+        ask!(self, CancelOffer { id: id })
+    }
+    /// Rents an offer for this wallet's miner. Returns the bond's id.
+    pub async fn take_offer(&self, id: String) -> Result<String> {
+        ask!(self, TakeOffer { id: id })
+    }
 }
 
 /// Spawn the actor. `wallet_path` is the single managed wallet file
@@ -579,6 +605,8 @@ pub fn spawn(
         ledger: Ledger::default(),
         swaps: SwapBook::default(),
         bonds: BondBook::default(),
+        rentals: Default::default(),
+        market: Default::default(),
         mining,
         events,
         self_tx: tx,
@@ -638,6 +666,10 @@ struct Service {
     /// Mining bonds (see `crate::bond`). Persisted: a bond's salt exists
     /// nowhere else once its locking send completes.
     bonds: BondBook,
+    /// Bonds offered for rent and rented (see `crate::rental`). Persisted.
+    rentals: crate::rental::RentalBook,
+    /// The bond rental market as read off the chain; rebuilt every run.
+    market: crate::rental::Market,
     /// Supervises the local Stratum pool and hasher child processes. Mining is
     /// deliberately out-of-process; see `crate::mining` for the payout and
     /// working-directory reasons.
@@ -1062,6 +1094,18 @@ impl Service {
             Cmd::BondRules(resp) => {
                 let _ = resp.send(self.bond_rules());
             }
+            Cmd::Rentals(resp) => {
+                let _ = resp.send(self.rentals_view().await);
+            }
+            Cmd::PostOffer { days, rent, resp } => {
+                let _ = resp.send(self.post_offer(days, rent).await);
+            }
+            Cmd::CancelOffer { id, resp } => {
+                let _ = resp.send(self.cancel_offer(&id).await);
+            }
+            Cmd::TakeOffer { id, resp } => {
+                let _ = resp.send(self.take_offer(&id).await);
+            }
             Cmd::CoBondFile { id, resp } => {
                 let r = crate::mwb_mining::parse_bond_id(&id).and_then(|raw| {
                     let b = self.bonds.find(&raw).ok_or_else(|| anyhow!("no such bond"))?;
@@ -1196,6 +1240,7 @@ impl Service {
         self.restore = Some(rs);
         self.sync_wots_hold();
         self.bonds = BondBook::load(&self.wallet_path).0;
+        self.rentals_load();
         self.scan_pos = 0;
         self.persist_scan_pos();
         Ok(())
@@ -1229,6 +1274,7 @@ impl Service {
         if let Some(text) = warning {
             let _ = self.events.send(WalletEvent::Warning { text });
         }
+        self.rentals_load();
         self.mwb_load();
         // Mining that ran through the lock signs MDW blocks again.
         self.refresh_merge_bond();
@@ -1761,6 +1807,7 @@ impl Service {
         let wallet_key = self.mining_key().ok();
         let w = self.wallet.as_ref().unwrap();
         let pending = |c: &Option<[u8; 32]>| c.is_some_and(|c| w.find_pending(&c).is_some());
+        let rented_out: HashSet<[u8; 32]> = self.rentals.offers.iter().map(|o| o.offer.owner_pk).collect();
         Ok(self
             .bonds
             .bonds
@@ -1802,7 +1849,15 @@ impl Service {
                         bond::midwimble::min_remaining_lock(now) / 1440
                     ),
                 };
+                let rented = b.owner == OwnerKind::Rented;
                 let status_text = match status {
+                    "locking" if rented => "Renting: the send is on its way (see the Send tab). The wallet \
+                                            registers the bond once it confirms."
+                        .to_string(),
+                    "unlocked" if rented => "Its lock is over: the bond no longer mines, and its owner takes the \
+                                             coin back."
+                        .to_string(),
+                    "unbonded" if rented => "Its owner has taken the coin back.".to_string(),
                     "locking" => "Locking: the send is on its way (see the Send tab). Midwimble can register \
                                   it once it confirms."
                         .to_string(),
@@ -1836,15 +1891,24 @@ impl Service {
                     below_min,
                     register_cmd: b.register_command(&rpc),
                     export_line: b.export_line(),
-                    can_unbond: status == "unlocked",
+                    can_unbond: status == "unlocked" && !rented,
                     can_remove: matches!(status, "unbonded" | "not_funded"),
                     wallet_key: wallet_key == Some(b.mining_key),
                     reg_phase: b.reg.phase.clone(),
                     reg_progress: b.reg.progress,
                     reg_note: b.reg.note.clone(),
+                    // A bond rented out is the renter's to register.
                     can_register: matches!(status, "locked" | "locking")
                         && counts_until.is_some()
-                        && b.reg.phase != "on_chain",
+                        && b.reg.phase != "on_chain"
+                        && !rented_out.contains(&b.owner_pk),
+                    rental: if rented {
+                        "rented".into()
+                    } else if rented_out.contains(&b.owner_pk) {
+                        "rented_out".into()
+                    } else {
+                        String::new()
+                    },
                 }
             })
             .collect())
@@ -1990,6 +2054,7 @@ impl Service {
             );
         }
         let sig_len = match rec.owner {
+            OwnerKind::Rented => bail!("this bond is rented: its owner takes the coin back when the lock ends"),
             OwnerKind::Derived => bond::mss_sig_len(bond::OWNER_HEIGHT),
             OwnerKind::WalletTree => {
                 self.verify_mss_indices().await?;
@@ -2064,6 +2129,7 @@ impl Service {
     async fn sign_bond_owner(&mut self, commitment: &[u8; 32]) -> Result<Vec<u8>> {
         let rec = self.bonds.by_unbond(commitment).cloned().ok_or_else(|| anyhow!("no bond for this unbond"))?;
         let (sig, next_leaf) = match rec.owner {
+            OwnerKind::Rented => bail!("this bond is rented: its owner unbonds it"),
             OwnerKind::Derived => {
                 let master = self
                     .wallet
@@ -2451,6 +2517,14 @@ impl Service {
                     let out: u64 = outputs.iter().map(|o| o.value()).sum();
                     (out, b.value.saturating_sub(out))
                 }
+                None if self.rentals.by_cancel(&commitment).is_some() => {
+                    let out: u64 = outputs.iter().map(|o| o.value()).sum();
+                    let bond = self.rentals.by_cancel(&commitment).map_or(0, |o| o.offer.bond);
+                    (out, bond.saturating_sub(out))
+                }
+                None if self.rentals.by_take(&commitment).is_some() => {
+                    (self.rentals.by_take(&commitment).map_or(0, |r| r.offer.rent), 0)
+                }
                 None => self
                     .wallet
                     .as_ref()
@@ -2498,7 +2572,12 @@ impl Service {
             }
             Internal::TryReveal(c) => self.try_reveal(c).await,
             Internal::RevealConfirmed(c) => {
-                let unbonded = self.bonds.by_unbond(&c).map(|b| b.value);
+                // A cancelled offer's coin comes back as an unbond's does.
+                let unbonded = self
+                    .bonds
+                    .by_unbond(&c)
+                    .map(|b| b.value)
+                    .or_else(|| self.rentals.by_cancel(&c).map(|o| o.offer.bond));
                 if let Some(w) = self.wallet.as_mut() {
                     let spent: Vec<[u8; 32]> = w
                         .find_pending(&c)
@@ -2539,6 +2618,7 @@ impl Service {
                                 }
                             }
                             self.set_stage(c, SendStage::Confirmed, "spend confirmed on-chain");
+                            self.rental_confirmed(c);
                             let _ = self.events.send(WalletEvent::WalletChanged);
                         }
                         Err(e) => {
@@ -2558,6 +2638,14 @@ impl Service {
 
         if self.bonds.by_unbond(&commitment).is_some() {
             self.reveal_unbond(commitment, pending).await;
+            return;
+        }
+        if self.rentals.by_take(&commitment).is_some() {
+            self.reveal_take(commitment, pending).await;
+            return;
+        }
+        if self.rentals.by_cancel(&commitment).is_some() {
+            self.reveal_cancel(commitment, pending).await;
             return;
         }
 
@@ -6916,6 +7004,7 @@ impl Service {
         self.check_new_mss_trees();
         self.refresh_bonds_live().await;
         self.advance_registrations().await;
+        self.tick_rentals(tip).await;
 
         // A restore pass records the window it starts with at height 0; one
         // whose start was never recorded (interrupted between passes) restarts.
