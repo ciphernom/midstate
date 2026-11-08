@@ -189,6 +189,12 @@ fn attempt_batch(algo: PowAlgo, midstate: [u8; 32], nonces: &[u64]) -> Vec<(u64,
 ///
 /// `height` is the height of the block being mined: it selects the proof of
 /// work ([`pow_algo_at`]).
+/// A random nonce for a CPU thread. Below 2^63: the CUDA miner's nonces
+/// (`cuda_walk`) have the top bit set, so the two never try the same one.
+pub fn cpu_nonce() -> u64 {
+    rand::random::<u64>() >> 1
+}
+
 pub fn mine_extension(
     height: u64,
     midstate: [u8; 32], 
@@ -231,7 +237,7 @@ pub fn mine_extension(
                     // Generate N random nonces where N = SIMD width (4 NEON, 8 AVX2)                   
                     let mut nonces = [0u64; 8]; // Max width for AVX2. Stack allocated.
                     for i in 0..lanes {
-                        nonces[i] = rand::random();
+                        nonces[i] = cpu_nonce();
                     }
                     
                     attempts += lanes as u64;
@@ -314,7 +320,7 @@ fn mine_extension_single(
 
         let mut nonces = [0u64; 8];
         for i in 0..lanes {
-            nonces[i] = rand::random();
+            nonces[i] = cpu_nonce();
         }
 
         attempts += lanes as u64;

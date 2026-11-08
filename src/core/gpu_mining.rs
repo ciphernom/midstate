@@ -1522,9 +1522,11 @@ pub fn backend() -> Backend {
 /// `threads` is forwarded to the CPU path and ignored by the GPU path (the GPU
 /// is the parallelism). `MINER_DISABLE_GPU=1` also forces CPU regardless.
 ///
-/// `height` is the height of the block being mined. The GPU kernel computes
-/// the BLAKE3 chain only, so from `WALK_ACTIVATION_HEIGHT` on every backend
-/// mines Midstate Walk on the CPU.
+/// `height` is the height of the block being mined. This module's wgpu
+/// kernel computes the BLAKE3 chain; from `WALK_ACTIVATION_HEIGHT` on, the
+/// job goes to [`crate::core::cuda_walk`] instead: NVIDIA GPUs through CUDA,
+/// beside `threads` CPU threads under `Auto`, alone under `Gpu`, and the CPU
+/// alone under `Cpu`, or wherever no CUDA GPU is usable.
 pub fn mine(
     height: u64,
     midstate: [u8; 32],
@@ -1535,16 +1537,16 @@ pub fn mine(
     hash_counter: Arc<AtomicU64>,
 ) -> Option<MiningResult> {
     if crate::core::types::pow_algo_at(height) == crate::core::types::PowAlgo::Walk {
-        if backend() == Backend::Gpu {
-            static WARNED: std::sync::Once = std::sync::Once::new();
-            WARNED.call_once(|| {
-                tracing::warn!(
-                    "GPU backend requested, but Midstate Walk (from height {}) is CPU-only; mining on CPU",
-                    crate::core::types::WALK_ACTIVATION_HEIGHT
-                )
-            });
-        }
-        return mine_extension(height, midstate, target, pool_target, threads, cancel, hash_counter);
+        // Midstate Walk runs on NVIDIA GPUs through CUDA (core::cuda_walk),
+        // beside the CPU threads unless told otherwise; wgpu's kernels are
+        // the BLAKE3 chain's only.
+        use crate::core::cuda_walk::{mine_walk, Split};
+        let split = match backend() {
+            Backend::Cpu => Split::Cpu,
+            Backend::Gpu => Split::Gpu,
+            Backend::Auto => Split::Both,
+        };
+        return mine_walk(split, midstate, target, pool_target, threads, cancel, hash_counter);
     }
     let want_gpu = backend() != Backend::Cpu;
     if want_gpu {

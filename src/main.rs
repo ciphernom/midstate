@@ -381,9 +381,23 @@ enum Command {
         /// merge-mines it. Without one, the pool keeps your midwimble share.
         #[arg(long)]
         midwimble_address: Option<String>,
-        /// Number of hashing threads. 0 uses every detected core.
+        /// Number of CPU hashing threads. 0 uses every detected core.
         #[arg(long, default_value = "0")]
         threads: usize,
+        /// What hashes: "auto" (NVIDIA GPUs through CUDA where the driver is
+        /// installed, beside the CPU threads), "gpu" (GPUs only; the CPU if
+        /// there are none) or "cpu". MINER_DISABLE_GPU=1 keeps GPUs out
+        /// whatever this says.
+        #[arg(long, default_value = "auto")]
+        backend: String,
+        /// CUDA GPUs to mine on, by number: "0,2". Default: every one
+        /// (or MINER_CUDA_DEVICES).
+        #[arg(long)]
+        cuda_devices: Option<String>,
+        /// Walks each GPU runs at once. Default: sized to the GPU's
+        /// multiprocessors and free memory (or MINER_CUDA_WALKS).
+        #[arg(long)]
+        cuda_walks: Option<u32>,
     },
     /// Measure this machine's proof-of-work speed: Midstate Walk attempts per
     /// second on one thread and on all of them, and the BLAKE3 chain it
@@ -1169,9 +1183,25 @@ async fn main() -> Result<()> {
             bench_pow(seconds, threads);
             Ok(())
         }
-        Command::Miner { pool_url, payout_address, worker, midwimble_address, threads } => {
+        Command::Miner { pool_url, payout_address, worker, midwimble_address, threads, backend, cuda_devices, cuda_walks } => {
             #[cfg(not(target_arch = "wasm32"))]
             {
+                use midstate::core::{cuda_walk, gpu_mining};
+                gpu_mining::set_backend(match backend.to_ascii_lowercase().as_str() {
+                    "gpu" => gpu_mining::Backend::Gpu,
+                    "cpu" => gpu_mining::Backend::Cpu,
+                    "auto" => gpu_mining::Backend::Auto,
+                    other => anyhow::bail!("unknown --backend '{other}': use auto, gpu or cpu"),
+                });
+                if let Some(list) = &cuda_devices {
+                    let devices: Vec<usize> = list
+                        .split(',')
+                        .map(|s| s.trim().parse())
+                        .collect::<Result<_, _>>()
+                        .map_err(|_| anyhow::anyhow!("--cuda-devices takes numbers, like 0,2"))?;
+                    cuda_walk::set_devices(Some(devices));
+                }
+                cuda_walk::set_walks(cuda_walks);
                 // Checked here so a typo fails now, not as a refused login.
                 let midwimble_address = match midwimble_address {
                     Some(a) => Some(midstate::pool::parse_midwimble_address(&a)
@@ -1277,6 +1307,7 @@ async fn main() -> Result<()> {
 
                 tracing::info!("starting hasher (threads: {})", if threads == 0 { "max".to_string() } else { threads.to_string() });
                 tracing::info!("press [ENTER] at any time to view dashboard");
+
                 
                 midstate::mining::run_stratum_client(pool_url, payout_address, worker, midwimble_address, threads, hash_counter, stats).await;
                 Ok(())

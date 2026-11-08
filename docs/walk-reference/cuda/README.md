@@ -2,7 +2,10 @@
 
 Measures Midstate Walk, midstate's proof of work from block 371,500, on an
 NVIDIA GPU, so that GPUs can be compared with CPUs. It is a benchmark, not a
-miner. The specification is [`docs/MIDSTATE_WALK.md`](../../MIDSTATE_WALK.md),
+miner; the miner (`src/core/cuda_walk.rs`) runs this same walk,
+`walk_core.h`, through `src/core/cuda/walk_miner.cu`. After changing
+`walk_core.h` or `blake3_small.h`, rebuild the miner's PTX with
+`src/core/cuda/gen_ptx.sh`: CI checks it was. The specification is [`docs/MIDSTATE_WALK.md`](../../MIDSTATE_WALK.md),
 whose [GPUs](../../MIDSTATE_WALK.md#gpus) section has the results so far.
 
 ## Build
