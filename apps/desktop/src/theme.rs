@@ -311,6 +311,17 @@ pub fn fmt_dt(ts: u64) -> String {
     format!("{:04}-{:02}-{:02} {:02}:{:02}", y, m, d, secs / 3600, (secs % 3600) / 60)
 }
 
+/// Unix seconds → "14 Mar 2027" (UTC).
+pub fn fmt_date(ts: u64) -> String {
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let s = fmt_dt(ts);
+    let (Some(y), Some(m), Some(d)) = (s.get(0..4), s.get(5..7), s.get(8..10)) else {
+        return s;
+    };
+    let m = m.parse::<usize>().ok().and_then(|m| MONTHS.get(m.wrapping_sub(1))).copied().unwrap_or("");
+    format!("{} {m} {y}", d.trim_start_matches('0'))
+}
+
 // ── Small widgets ───────────────────────────────────────────────────────────
 
 pub fn mono(t: impl ToString) -> RichText {

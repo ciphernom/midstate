@@ -252,7 +252,13 @@ pub struct App {
     pub bond_key: String,
     /// The bond's value is `1 << bond_exp`: one coin, so a power of two.
     pub bond_exp: u32,
-    pub bond_until: String,
+    /// Days of mining the new bond is locked for.
+    pub bond_days: u64,
+    /// A test bond: the smallest coin, unlocking a few blocks out.
+    pub bond_test: bool,
+    /// The new-bond form is open (it always is while there are no bonds).
+    pub bond_form_open: bool,
+    /// A co-bond's pool name, kept as the bond's label.
     pub bond_label: String,
     /// "Lock bond" was pressed once; the next press locks.
     pub bond_confirm: bool,
@@ -517,7 +523,9 @@ impl App {
             bonds: Vec::new(),
             bond_key: String::new(),
             bond_exp: midstate_walletd::bond::midwimble::min_bond(theme::now_secs()).trailing_zeros(),
-            bond_until: String::new(),
+            bond_days: 90,
+            bond_test: false,
+            bond_form_open: false,
             bond_label: String::new(),
             bond_confirm: false,
             bond_import: String::new(),
@@ -1071,8 +1079,9 @@ impl App {
                 self.bond_confirm = false;
                 if self.bond_notice.starts_with("Locking") {
                     self.bond_key.clear();
-                    self.bond_until.clear();
                     self.bond_label.clear();
+                    self.bond_test = false;
+                    self.bond_form_open = false;
                 }
                 if self.bond_notice.starts_with("Imported") {
                     self.bond_import.clear();
@@ -1169,12 +1178,13 @@ impl App {
                 }
                 self.bond_rules = Some(r);
             }
-            Msg::CoBondFile(text) => {
+            Msg::CoBondFile(id, text) => {
                 self.busy = false;
-                ctx.copy_text(text);
-                self.bond_notice = "Co-bond file copied. Save it as a .json file and give it to the pool \
-                                    operator: it holds no secret, and only your phrase can unbond the coin."
-                    .into();
+                ctx.copy_text(text.clone());
+                self.bond_notice = match views::bonds::save_co_bond_file(&id, &text) {
+                    Ok(path) => format!("Saved {} and copied it. Send it to your pool.", path.display()),
+                    Err(_) => "Co-bond file copied. Paste it into a .json file and send it to your pool.".into(),
+                };
             }
             Msg::MwbRescanOk => {
                 self.busy = false;

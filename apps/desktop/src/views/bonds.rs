@@ -3,15 +3,29 @@
 //! of the lock remains, and only this wallet's recovery phrase can spend the
 //! coin once it unlocks. This is the CLI's `generate-mss` → `send` →
 //! `spend-script` flow, with the owner key and the script handled here.
+//!
+//! The tab is meant to be read at a glance. A new bond is three choices (who
+//! mines with it, how much, for how long) and one button, and registration
+//! starts by itself. Each bond is a card showing where it is on Lock →
+//! Register → Mine → Unbond, with the one thing to do next.
 
 use crate::app::App;
 use crate::bridge::Action;
 use crate::theme::{self, compact_units, short_hex};
-use eframe::egui::{self, RichText, TextEdit, Ui};
-use midstate_walletd::bond::{blocks_human, midwimble, secs_human};
+use eframe::egui::{self, CornerRadius, FontId, Frame, Margin, RichText, Sense, Stroke, TextEdit, Ui};
+use midstate_walletd::api::BondView;
+use midstate_walletd::bond::{midwimble, parse_mining_key};
+use midstate_walletd::rental;
 
-/// Smallest amount offered: a rehearsal coin.
-const MIN_EXP: u32 = 10;
+/// A test bond: the smallest coin, unlocking this many blocks out.
+const TEST_EXP: u32 = 10;
+const TEST_BLOCKS: u64 = 10;
+/// Mining times offered, in days. The longest midwimble takes is added.
+const DAYS: [u64; 3] = [30, 90, 180];
+/// At most this many sizes, from the smallest midwimble registers now.
+const MAX_SIZES: usize = 4;
+/// Line width of the cards' borders and the track.
+const HAIR: f32 = 1.0;
 
 pub fn show(app: &mut App, ui: &mut Ui) {
     let ctx = ui.ctx().clone();
@@ -24,444 +38,793 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         .map(|s| s.is_syncing || s.restore_pass > 0)
         .unwrap_or(true);
 
-    let views = ["Your bonds", "Bonds for rent"];
+    let views = ["Your bonds", "Rent"];
     theme::segmented(ui, &views, &mut app.bonds_view);
     ui.add_space(8.0);
+    if blocked {
+        theme::hint(ui, "Bonds can be locked, rented and unbonded once the node has synced.");
+    }
+    let notice = if app.bonds_view == 1 { app.rental_notice.clone() } else { app.bond_notice.clone() };
+    status_lines(app, ui, &notice);
     if app.bonds_view == 1 {
         super::rent::show(app, ui, &ctx, height, blocked);
-    } else {
-        lock_form(app, ui, &ctx, height, blocked);
-        ui.add_space(10.0);
-        bond_list(app, ui, &ctx, blocked);
-        ui.add_space(10.0);
-        import_form(app, ui, &ctx);
+        return;
     }
 
+    let now = theme::now_secs();
+    let bonds = app.bonds.clone();
+    for b in &bonds {
+        bond_card(app, ui, &ctx, b, blocked, now);
+        ui.add_space(8.0);
+    }
+
+    if bonds.is_empty() || app.bond_form_open {
+        new_bond(app, ui, &ctx, height, blocked);
+    } else if ui.add(primary("+  New bond")).clicked() {
+        app.bond_form_open = true;
+        app.bond_confirm = false;
+    }
+
+    ui.add_space(16.0);
+    import_form(app, ui, &ctx);
+}
+
+/// The spinner while an action runs, then its outcome.
+fn status_lines(app: &App, ui: &mut Ui, notice: &str) {
     if app.busy {
-        ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.spinner();
             theme::hint(ui, "working…");
         });
     }
-    if !app.bond_notice.is_empty() {
-        ui.label(RichText::new(&app.bond_notice).size(12.0).color(theme::bright()));
+    if !notice.is_empty() {
+        ui.label(RichText::new(notice).size(12.5).color(theme::ink()));
     }
     if !app.error.is_empty() {
-        ui.label(RichText::new(&app.error).size(12.0).color(theme::muted()));
+        ui.label(RichText::new(&app.error).size(12.5).color(theme::muted()));
+    }
+    if app.busy || !notice.is_empty() || !app.error.is_empty() {
+        ui.add_space(6.0);
     }
 }
 
-// ── Lock ────────────────────────────────────────────────────────────────
+// ── A new bond ──────────────────────────────────────────────────────────
 
-fn lock_form(app: &mut App, ui: &mut Ui, ctx: &egui::Context, height: u64, blocked: bool) {
+fn new_bond(app: &mut App, ui: &mut Ui, ctx: &egui::Context, height: u64, blocked: bool) {
     let now = theme::now_secs();
+    let rules = app.bond_rules.clone();
+    let spendable = app.balance.as_ref().map(|b| b.confirmed).unwrap_or(0);
+    let wallet_key = rules.as_ref().map(|r| r.mining_key.clone()).unwrap_or_default();
+    // A wallet made before recovery phrases has no mining key of its own.
+    let wallet_can_mine = !wallet_key.is_empty() || rules.is_none();
+    if !wallet_can_mine {
+        app.bond_key_mode = 1;
+    }
+
+    // The sizes: what midwimble registers now, doubling up to the most its
+    // price can ever ask. A bigger bond mines no more than the smallest.
+    let needed = rules.as_ref().map_or(midwimble::min_bond(now), |r| r.registration_min);
+    let ceiling = rules.as_ref().map_or(midwimble::MAX_BOND, |r| r.max_bond).max(needed);
+    let sizes: Vec<u32> = (exp_at_least(needed)..=exp_at_least(ceiling)).take(MAX_SIZES).collect();
+    if !sizes.contains(&app.bond_exp) {
+        app.bond_exp = sizes[0];
+    }
+
+    // The mining times: a month, three, six, and the longest midwimble
+    // takes (a lock at most a year out, less its month of unbonding).
+    let longest = midwimble::horizon(now).saturating_sub(midwimble::until_for_days(now, 0)) / 1440;
+    let mut days: Vec<u64> = DAYS.iter().copied().filter(|d| *d < longest).collect();
+    if longest > 0 {
+        days.push(longest);
+    }
+    if !days.is_empty() && !days.contains(&app.bond_days) {
+        app.bond_days = days.iter().copied().find(|d| *d >= app.bond_days).unwrap_or(days[days.len() - 1]);
+    }
+
     theme::panel_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.label(RichText::new("Lock a mining bond").font(theme::font_medium(14.0)));
-        theme::hint(
-            ui,
-            "One coin, locked until a block height, naming a midwimble mining key. Midwimble lets \
-             that key sign blocks while enough of the lock remains. Only this wallet's recovery \
-             phrase can spend the coin, and only once it unlocks.",
-        );
-        ui.add_space(6.0);
-
-        ui.label(RichText::new("Mining key").size(12.0).color(theme::muted()));
-        let modes = ["This wallet mines with it", "Another key (a pool's co-bond)"];
-        if theme::segmented(ui, &modes, &mut app.bond_key_mode) {
-            app.bond_confirm = false;
-        }
-        let wallet_key = app.bond_rules.as_ref().map(|r| r.mining_key.clone()).unwrap_or_default();
-        if app.bond_key_mode == 0 && wallet_key.is_empty() && app.bond_rules.is_some() {
-            theme::hint(
-                ui,
-                "This wallet predates recovery phrases, so it has no mining key of its own: lock on \
-                 another key, or mine from a wallet made with a phrase.",
-            );
-        } else if app.bond_key_mode == 0 {
-            ui.horizontal(|ui| {
-                ui.label(theme::mono(short_hex(&wallet_key, 14)).size(11.5).color(theme::bright()));
-                if !wallet_key.is_empty() && ui.small_button("Copy").clicked() {
-                    ui.ctx().copy_text(wallet_key.clone());
-                }
-            });
-            theme::hint(
-                ui,
-                "This wallet's own mining key, from your recovery phrase. Once the bond registers, mining \
-                 on this machine's pool (Node tab) mines MDW with it, and a restored wallet mines with it \
-                 again. Every bond on it signs as the same key, which links them on chain.",
-            );
-        } else {
-            ui.add(
-                TextEdit::singleline(&mut app.bond_key)
-                    .hint_text("your pool's mining key to co-bond, or one `midwimble bond new` printed")
-                    .font(egui::TextStyle::Monospace)
-                    .desired_width(f32::INFINITY),
-            );
-        }
-
-        ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Amount").size(12.0).color(theme::muted()));
-            let spendable = app.balance.as_ref().map(|b| b.confirmed).unwrap_or(0);
-            let top = if spendable == 0 { MIN_EXP } else { (63 - spendable.leading_zeros()).max(MIN_EXP) };
-            let needed = app.bond_rules.as_ref().map_or(midwimble::min_bond(now), |r| r.registration_min);
-            if app.bond_exp < MIN_EXP {
-                app.bond_exp = needed.trailing_zeros();
-            }
-            egui::ComboBox::from_id_salt("bond_amount")
-                .selected_text(theme::mono(compact_units(1u64 << app.bond_exp)).size(11.5))
-                .show_ui(ui, |ui| {
-                    for e in MIN_EXP..=top.max(app.bond_exp).max(needed.trailing_zeros()) {
-                        let v = 1u64 << e;
-                        let note = if v < needed {
-                            "  ·  rehearsal only"
-                        } else if v > spendable {
-                            "  ·  more than you hold"
-                        } else {
-                            ""
-                        };
-                        let text = format!("{}{note}", compact_units(v));
-                        if ui.selectable_label(app.bond_exp == e, theme::mono(text).size(11.5)).clicked() {
-                            app.bond_exp = e;
-                        }
+            ui.label(RichText::new("New bond").font(theme::font_medium(15.0)));
+            if !app.bonds.is_empty() {
+                theme::right_aligned(ui, |ui| {
+                    if ui.small_button("Close").clicked() {
+                        app.bond_form_open = false;
+                        app.bond_confirm = false;
                     }
                 });
-            theme::hint(ui, "one coin, so a power of two");
+            }
         });
+        ui.add_space(6.0);
 
-        ui.add_space(4.0);
+        // 1. Who mines with it.
+        section(ui, "Who mines with it");
+        let w = (ui.available_width() - 10.0) / 2.0;
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Unlocks at block").size(12.0).color(theme::muted()));
-            let r = ui.add(
-                TextEdit::singleline(&mut app.bond_until)
-                    .hint_text("height")
-                    .font(egui::TextStyle::Monospace)
-                    .desired_width(110.0),
-            );
-            if r.changed() {
-                app.bond_until.retain(|c| c.is_ascii_digit());
+            let caption = if wallet_can_mine { "Mine MDW on this computer" } else { "Needs a wallet with a recovery phrase" };
+            if choice(ui, "who_wallet", w, app.bond_key_mode == 0, wallet_can_mine, "This wallet", caption) {
+                app.bond_key_mode = 0;
                 app.bond_confirm = false;
             }
-            theme::hint(ui, "or count for:");
-            for (label, days) in [("30 days", 30u64), ("90 days", 90), ("180 days", 180), ("360 days", 360)] {
-                if ui.small_button(label).clicked() {
-                    app.bond_until = midwimble::until_for_days(now, days).to_string();
+            if choice(ui, "who_pool", w, app.bond_key_mode == 1, true, "A pool (co-bond)", "Back your pool's mining key") {
+                app.bond_key_mode = 1;
+                app.bond_confirm = false;
+            }
+        });
+        if app.bond_key_mode == 1 {
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                let r = ui.add(
+                    TextEdit::singleline(&mut app.bond_key)
+                        .hint_text("pool's mining key")
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width((ui.available_width() - 10.0) * 0.7),
+                );
+                if r.changed() {
+                    app.bond_confirm = false;
+                }
+                ui.add(
+                    TextEdit::singleline(&mut app.bond_label)
+                        .hint_text("pool name (optional)")
+                        .desired_width(ui.available_width()),
+                );
+            });
+            if !app.bond_key.trim().is_empty() {
+                if let Err(e) = parse_mining_key(&app.bond_key) {
+                    let why = format!("{e:#}");
+                    let mut c = why.chars();
+                    let why = c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default();
+                    theme::hint(ui, &format!("{why}."));
+                }
+            }
+        }
+
+        // 2. How much.
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            section(ui, "Size");
+            theme::right_aligned(ui, |ui| {
+                ui.label(theme::mono(format!("available {}", compact_units(spendable))).size(11.0).color(theme::muted()));
+            });
+        });
+        let n = sizes.len() + 1;
+        let w = ((ui.available_width() - 10.0 * (n - 1) as f32) / n as f32).min(210.0);
+        ui.horizontal(|ui| {
+            for &e in &sizes {
+                let v = 1u64 << e;
+                let caption = if v >= spendable {
+                    "more than you have"
+                } else if e == sizes[0] {
+                    "minimum"
+                } else {
+                    "mines the same"
+                };
+                let picked = !app.bond_test && app.bond_exp == e;
+                if choice(ui, ("size", e), w, picked, v < spendable, &compact_units(v), caption) {
+                    app.bond_exp = e;
+                    app.bond_test = false;
+                    app.bond_confirm = false;
+                }
+            }
+            let test = 1u64 << TEST_EXP;
+            let caption = format!("{}, back in minutes", compact_units(test));
+            if choice(ui, "size_test", w, app.bond_test, test < spendable, "Test", &caption) {
+                app.bond_test = true;
+                app.bond_confirm = false;
+            }
+        });
+
+        // 3. For how long.
+        ui.add_space(10.0);
+        section(ui, "Mining time");
+        let n = days.len().max(1);
+        let w = ((ui.available_width() - 10.0 * (n - 1) as f32) / n as f32).min(210.0);
+        ui.horizontal(|ui| {
+            for &d in &days {
+                let back = back_at(midwimble::until_for_days(now, d), height, now);
+                let picked = !app.bond_test && app.bond_days == d;
+                let caption = format!("back ~{}", theme::fmt_date(back));
+                if choice(ui, ("days", d), w, picked, !app.bond_test, &months_label(d), &caption) {
+                    app.bond_days = d;
                     app.bond_confirm = false;
                 }
             }
         });
 
-        let until: Option<u64> = app.bond_until.parse().ok();
-        let value = 1u64 << app.bond_exp;
-        if let Some(until) = until {
-            let needed = app.bond_rules.as_ref().map_or(midwimble::min_bond(now), |r| r.registration_min);
-            for line in readout(until, value, needed, height, now) {
-                theme::hint(ui, &line);
-            }
-        }
+        // What it comes to, and the button.
+        let value = 1u64 << if app.bond_test { TEST_EXP } else { app.bond_exp };
+        let until = if app.bond_test { height + TEST_BLOCKS } else { midwimble::until_for_days(now, app.bond_days) };
+        let back = back_at(until, height, now);
+        let key = if app.bond_key_mode == 0 { wallet_key.clone() } else { app.bond_key.trim().to_string() };
+        let key_ok = parse_mining_key(&key).is_ok();
+        let affordable = value < spendable;
+        let ready = !app.busy && !blocked && key_ok && affordable && (app.bond_test || !days.is_empty());
 
+        ui.add_space(12.0);
+        ui.separator();
         ui.add_space(4.0);
-        ui.add(
-            TextEdit::singleline(&mut app.bond_label)
-                .hint_text("label (optional)")
-                .desired_width(f32::INFINITY),
-        );
-
-        ui.add_space(6.0);
-        let key_text = if app.bond_key_mode == 0 { wallet_key.clone() } else { app.bond_key.clone() };
-        let key_ok = key_text.trim().trim_start_matches("mining key").trim().len() == 64;
-        let until_ok = until.is_some_and(|u| u > height && u <= midwimble::horizon(now));
-        theme::right_aligned(ui, |ui| {
-            let can = !app.busy && !blocked && key_ok && until_ok;
-            if app.bond_confirm {
-                if ui.button("Cancel").clicked() {
-                    app.bond_confirm = false;
-                }
-                if ui.add_enabled(can, egui::Button::new("Confirm and lock")).clicked() {
-                    app.busy = true;
-                    app.bond_confirm = false;
-                    app.error.clear();
-                    app.bond_notice.clear();
-                    app.go(
-                        ctx,
-                        Action::CreateBond {
-                            mining_key: key_text.trim().to_string(),
-                            value,
-                            until: until.unwrap_or(0),
-                            label: app.bond_label.trim().to_string(),
-                        },
-                    );
-                }
+        ui.horizontal(|ui| {
+            fact(ui, "Locks", &compact_units(value));
+            if app.bond_test {
+                fact(ui, "Mines", "no");
+                fact(ui, "Back", &format!("in ~{}", about(TEST_BLOCKS)));
             } else {
-                if ui.add_enabled(can, egui::Button::new("Lock bond")).clicked() {
+                fact(ui, "Mines", &format!("~{} days", app.bond_days));
+                fact(ui, "Back", &format!("~{}", theme::fmt_date(back)));
+            }
+            theme::right_aligned(ui, |ui| {
+                if app.bond_confirm {
+                    if ui.add_enabled(ready, primary("Confirm")).clicked() {
+                        let label = if app.bond_test {
+                            "test".to_string()
+                        } else if app.bond_key_mode == 1 {
+                            app.bond_label.trim().to_string()
+                        } else {
+                            String::new()
+                        };
+                        // Midwimble can count it: have the wallet register it
+                        // as soon as the lock confirms.
+                        let register = !app.bond_test
+                            && value >= midwimble::min_bond(now)
+                            && rules.as_ref().is_some_and(|r| r.rpc_on);
+                        app.busy = true;
+                        app.bond_confirm = false;
+                        app.error.clear();
+                        app.bond_notice.clear();
+                        app.go(ctx, Action::CreateBond { mining_key: key.clone(), value, until, label, register });
+                    }
+                    if ui.button("Cancel").clicked() {
+                        app.bond_confirm = false;
+                    }
+                } else if ui.add_enabled(ready, primary(&format!("Lock {}", compact_units(value)))).clicked() {
                     app.bond_confirm = true;
                 }
-                if ui.add_enabled(!app.busy && !blocked, egui::Button::new("Rehearse the exit")).clicked() {
-                    app.bond_exp = MIN_EXP;
-                    app.bond_until = (height + 10).to_string();
-                    app.bond_label = "rehearsal".into();
-                    app.bond_confirm = false;
-                }
-            }
+            });
         });
+
         if app.bond_confirm {
-            let key = key_text.trim().trim_start_matches("mining key").trim().to_string();
-            theme::hint(
-                ui,
-                &format!(
-                    "Lock {} until block {} on mining key {}? The coin cannot move before then. \
-                     Check the key: a bond on the wrong key is locked money that cannot mine.",
-                    compact_units(value),
-                    until.unwrap_or(0),
-                    short_hex(&key, 10)
-                ),
-            );
+            let mut line = if app.bond_test {
+                format!("Locks {} for about {}. It does not mine.", compact_units(value), about(TEST_BLOCKS))
+            } else {
+                format!("The coin can't move until ~{}.", theme::fmt_date(back))
+            };
+            if app.bond_key_mode == 1 {
+                line.push_str(&format!(" It mines for the pool key {}.", short_hex(&key, 8)));
+            }
+            ui.label(RichText::new(line).size(12.5).color(theme::ink()));
+        } else if !affordable && spendable > 0 {
+            ui.horizontal(|ui| {
+                theme::hint(ui, &format!("You have {}.", compact_units(spendable)));
+                if !app.bond_test && ui.small_button("Rent a bond instead").clicked() {
+                    app.bonds_view = 1;
+                }
+            });
+        } else if !affordable {
+            ui.horizontal(|ui| {
+                theme::hint(ui, "Nothing to lock yet.");
+                if ui.small_button("Rent a bond instead").clicked() {
+                    app.bonds_view = 1;
+                }
+            });
         }
-        if blocked {
-            theme::hint(ui, "Bonds can be locked once the node is synced and any restore scan has finished.");
-        }
-        theme::hint(
-            ui,
-            "Before locking a real bond, rehearse the exit: lock a small coin a few blocks out and \
-             unbond it, to see this wallet open its own bonds.",
-        );
     });
 }
 
-/// What a lock height means, line by line. `needed` is what a new bond
-/// must hold to register now.
-fn readout(until: u64, value: u64, needed: u64, height: u64, now: u64) -> Vec<String> {
-    let mut out = Vec::new();
-    if until <= height {
-        out.push(format!("That is not in the future: the chain is at block {height}."));
-        return out;
+/// The exponent of the smallest coin holding at least `v`.
+fn exp_at_least(v: u64) -> u32 {
+    v.max(1).checked_next_power_of_two().map_or(63, u64::trailing_zeros)
+}
+
+/// "1 month", "3 months", "11 months"; "7 days" under half a month.
+pub(super) fn months_label(days: u64) -> String {
+    match (days + 15) / 30 {
+        0 => format!("{days} days"),
+        1 => "1 month".into(),
+        m => format!("{m} months"),
     }
-    let horizon = midwimble::horizon(now);
-    if until > horizon {
-        out.push(format!(
-            "Too far ahead: midwimble registers bonds locked at most a year out (block {horizon} today)."
-        ));
-        return out;
+}
+
+/// About how long `blocks` take, a block a minute: "10 minutes", "an hour".
+fn about(blocks: u64) -> String {
+    match blocks.max(1) {
+        1 => "a minute".into(),
+        m @ 2..=59 => format!("{m} minutes"),
+        60..=119 => "an hour".into(),
+        m @ 120..=2879 => format!("{} hours", m / 60),
+        m => format!("{} days", m / 1440),
     }
-    out.push(format!("Unlocks in about {} (block {until}).", blocks_human(until - height)));
-    if value < needed {
-        out.push(format!(
-            "Below the {} a new bond needs to register now: it will never count for mining. Fine for a \
-             rehearsal.",
-            compact_units(needed)
-        ));
-        return out;
-    }
-    // It registers about a day after it is locked.
-    let registered = now + midwimble::REGISTRATION_DELAY_BLOCKS * 60;
-    let days = midwimble::min_remaining_lock(now) / 1440;
-    match midwimble::counts_until(until, now) {
-        Some(t) if t > registered => out.push(format!(
-            "Midwimble counts it for mining for about {} after it registers (about a day from now). It \
-             stops counting {days} days before unlocking, by a clock that runs a week ahead.",
-            secs_human(t - registered)
-        )),
-        _ => out.push(format!(
-            "Too short to count for mining: midwimble stops counting a bond once {days} days or fewer of \
-             its lock remain, by a clock that runs a week ahead. Fine for a rehearsal."
-        )),
-    }
-    out
+}
+
+/// About when a coin locked until `until` can move again (unix seconds).
+fn back_at(until: u64, height: u64, now: u64) -> u64 {
+    now + rental::locked_days(until, height, now) * 86_400
 }
 
 // ── Bonds ───────────────────────────────────────────────────────────────
 
-fn bond_list(app: &mut App, ui: &mut Ui, ctx: &egui::Context, blocked: bool) {
-    if app.bonds.is_empty() {
-        theme::panel_frame().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            theme::hint(ui, "No bonds yet.");
-        });
-        return;
+#[derive(Clone, Copy, PartialEq)]
+enum Step {
+    Done,
+    Now,
+    Next,
+    /// Not for this bond: a test bond never registers or mines.
+    Skip,
+}
+
+enum Next {
+    Register,
+    CoBondFile,
+    Unbond,
+    Forget,
+}
+
+/// Where a bond stands, read off its view.
+struct Stage {
+    /// How far along Lock → Register → Mine → Unbond it is; 4 when done.
+    at: usize,
+    skip_mining: bool,
+    badge: &'static str,
+    line: String,
+    next: Option<Next>,
+    progress: Option<f32>,
+}
+
+fn stage(b: &BondView, now: u64) -> Stage {
+    let unlock = if b.blocks_left < 2 * 1440 {
+        format!("unlocks in about {}", about(b.blocks_left))
+    } else {
+        format!("unlocks ~{}", theme::fmt_date(now + b.blocks_left * 60))
+    };
+    let counting = b.counts_until > now;
+    let rented = b.rental == "rented";
+    let co_bond = !b.wallet_key && b.rental.is_empty();
+    let mut s = Stage { at: 0, skip_mining: b.below_min, badge: "", line: String::new(), next: None, progress: None };
+    let set = |s: &mut Stage, at: usize, badge: &'static str, line: String| {
+        s.at = at;
+        s.badge = badge;
+        s.line = line;
+    };
+    match b.status.as_str() {
+        "not_funded" => {
+            set(&mut s, 0, "failed", "The lock never confirmed.".into());
+            s.next = b.can_remove.then_some(Next::Forget);
+        }
+        "locking" => set(&mut s, 0, "locking", "Waiting for the send to confirm.".into()),
+        "unbonding" => set(&mut s, 3, "unbonding", "Coming back to your balance.".into()),
+        "unbonded" => {
+            let line = if rented { "Its owner has taken the coin back." } else { "Back in your balance." };
+            set(&mut s, 4, "done", line.into());
+            s.next = b.can_remove.then_some(Next::Forget);
+        }
+        "unlocked" => {
+            let line = if rented { "Its lock is over: its owner takes the coin back." } else { "Unbond it to bring the coin back." };
+            set(&mut s, 3, "unlocked", line.into());
+            s.next = b.can_unbond.then_some(Next::Unbond);
+        }
+        _ if b.below_min => set(&mut s, 3, "test", format!("A test bond: it doesn't mine, and {unlock}.")),
+        _ if b.rental == "rented_out" => set(&mut s, 2, "rented out", format!("Earning rent: the renter mines with it. It {unlock}.")),
+        _ if !counting && b.reg_phase == "on_chain" => set(&mut s, 3, "done mining", format!("Finished mining. It {unlock}.")),
+        _ if !counting => {
+            s.skip_mining = true;
+            set(&mut s, 3, "locked", format!("Too short to mine. It {unlock}."));
+        }
+        _ => match b.reg_phase.as_str() {
+            "on_chain" => {
+                let until = theme::fmt_date(b.counts_until);
+                let line = if rented {
+                    format!("Mining for you until ~{until}.")
+                } else if co_bond {
+                    format!("Mining with your pool until ~{until}. It {unlock}.")
+                } else {
+                    format!("Mines when you mine, until ~{until}. It {unlock}.")
+                };
+                set(&mut s, 2, "mining", line);
+            }
+            "ready" if co_bond => {
+                set(&mut s, 1, "send to pool", "Save the co-bond file and send it to your pool.".into());
+                s.next = Some(Next::CoBondFile);
+            }
+            "ready" => set(
+                &mut s,
+                2,
+                "ready",
+                "Ready: start mining on the Node tab, and your first MDW block registers it.".into(),
+            ),
+            "burying" => {
+                set(&mut s, 1, "registering", format!("Registering: about a day in all, {}% done.", b.reg_progress));
+                s.progress = Some(b.reg_progress as f32 / 100.0);
+            }
+            "waiting" => set(&mut s, 1, "registering", "Registering: proving the lock.".into()),
+            "failed" => set(&mut s, 1, "retrying", "Registering hit a problem; the wallet tries again by itself.".into()),
+            _ if b.can_register => {
+                set(&mut s, 1, "not registered", "Register it so midwimble counts it.".into());
+                s.next = Some(Next::Register);
+            }
+            _ => set(&mut s, 1, "locked", format!("It {unlock}.")),
+        },
     }
-    let bonds = app.bonds.clone();
-    for b in &bonds {
-        theme::panel_frame().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                let title = if b.label.is_empty() { "Bond".to_string() } else { b.label.clone() };
-                ui.label(RichText::new(title).font(theme::font_medium(14.0)));
-                ui.label(theme::mono(compact_units(b.value)).color(theme::ink()));
-                theme::badge(ui, &b.status.replace('_', " "), theme::ink());
-                match b.rental.as_str() {
-                    "rented" => theme::badge(ui, "rented", theme::muted()),
-                    "rented_out" => theme::badge(ui, "rented out", theme::muted()),
-                    _ => {}
-                }
-            });
-            theme::hint(ui, &b.status_text);
-            ui.add_space(4.0);
+    s
+}
 
-            let row = |ui: &mut Ui, k: &str, v: &str, copy: Option<&str>| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(k).size(11.5).color(theme::muted()));
-                    ui.label(theme::mono(v).size(11.5));
-                    if let Some(c) = copy {
-                        if ui.small_button("Copy").clicked() {
-                            ui.ctx().copy_text(c.to_string());
-                        }
-                    }
-                });
-            };
-            row(ui, "unlocks at block", &b.bonded_until.to_string(), None);
-            row(ui, "mining key", &short_hex(&b.mining_key, 10), Some(&b.mining_key));
-            row(ui, "owner key", &short_hex(&b.owner_pk, 10), Some(&b.owner_pk));
-            row(ui, "bond id", &short_hex(&b.id, 10), Some(&b.id));
-            row(ui, "salt", &short_hex(&b.salt, 10), Some(&b.salt));
-
-            registration(app, ui, ctx, b);
-
+fn bond_card(app: &mut App, ui: &mut Ui, ctx: &egui::Context, b: &BondView, blocked: bool, now: u64) {
+    let st = stage(b, now);
+    let rpc_on = app.bond_rules.as_ref().is_none_or(|r| r.rpc_on);
+    theme::panel_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(compact_units(b.value)).font(theme::font_mono_medium(16.0)).color(theme::ink()));
+            let quiet = matches!(st.badge, "failed" | "retrying" | "done");
+            theme::badge(ui, st.badge, if quiet { theme::muted() } else { theme::ink() });
             theme::right_aligned(ui, |ui| {
-                if b.can_remove && ui.add_enabled(!app.busy, egui::Button::new("Forget")).clicked() {
-                    app.busy = true;
-                    app.error.clear();
-                    app.go(ctx, Action::RemoveBond { id: b.id.clone() });
-                }
-                if b.can_unbond
-                    && ui.add_enabled(!app.busy && !blocked, egui::Button::new("Unbond")).clicked()
-                {
+                ui.label(RichText::new(who(b)).size(12.0).color(theme::muted()));
+            });
+        });
+        ui.add_space(2.0);
+        let steps: Vec<(&str, Step)> = ["Lock", "Register", "Mine", "Unbond"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let step = if st.skip_mining && (i == 1 || i == 2) {
+                    Step::Skip
+                } else if i < st.at {
+                    Step::Done
+                } else if i == st.at {
+                    Step::Now
+                } else {
+                    Step::Next
+                };
+                (*name, step)
+            })
+            .collect();
+        track(ui, &steps);
+        if let Some(p) = st.progress {
+            theme::progress_bar(ui, p);
+        }
+        ui.label(RichText::new(&st.line).size(12.5).color(theme::bright()));
+        if b.reg_phase == "failed" && !b.reg_note.is_empty() {
+            theme::hint(ui, &b.reg_note);
+        }
+        if matches!(st.next, Some(Next::Register)) && !rpc_on {
+            theme::hint(ui, "Registering needs this app's node RPC, which is off (MIDSTATE_RPC_PORT=none).");
+        }
+
+        let open_id = egui::Id::new(("bond_details", &b.id));
+        let mut open = ui.data_mut(|d| *d.get_temp_mut_or(open_id, false));
+        ui.horizontal(|ui| {
+            if ui.small_button(if open { "Hide details" } else { "Details" }).clicked() {
+                open = !open;
+                ui.data_mut(|d| d.insert_temp(open_id, open));
+            }
+            theme::right_aligned(ui, |ui| {
+                let idle = !app.busy;
+                let go = |app: &mut App, a: Action| {
                     app.busy = true;
                     app.error.clear();
                     app.bond_notice.clear();
-                    app.go(ctx, Action::Unbond { id: b.id.clone() });
-                }
-                if ui.small_button("Copy for another wallet").clicked() {
-                    ui.ctx().copy_text(b.export_line.clone());
+                    app.go(ctx, a);
+                };
+                match st.next {
+                    Some(Next::Unbond) => {
+                        if ui.add_enabled(idle && !blocked, primary("Unbond")).clicked() {
+                            go(app, Action::Unbond { id: b.id.clone() });
+                        }
+                    }
+                    Some(Next::CoBondFile) => {
+                        if ui.add_enabled(idle, primary("Save co-bond file")).clicked() {
+                            go(app, Action::CopyCoBondFile { id: b.id.clone() });
+                        }
+                    }
+                    Some(Next::Register) => {
+                        if ui.add_enabled(idle && rpc_on, primary("Register")).clicked() {
+                            go(app, Action::RegisterBond { id: b.id.clone() });
+                        }
+                    }
+                    Some(Next::Forget) => {
+                        if ui.add_enabled(idle, egui::Button::new("Forget")).clicked() {
+                            go(app, Action::RemoveBond { id: b.id.clone() });
+                        }
+                    }
+                    None => {}
                 }
             });
         });
-        ui.add_space(6.0);
+        if open {
+            details(app, ui, ctx, b);
+        }
+    });
+}
+
+/// Whose miner the bond is for, as the card's corner says it.
+fn who(b: &BondView) -> String {
+    let who = match b.rental.as_str() {
+        "rented" => "rented".to_string(),
+        "rented_out" => "rented out".to_string(),
+        _ if b.wallet_key => "this wallet".to_string(),
+        _ => format!("co-bond · {}", short_hex(&b.mining_key, 6)),
+    };
+    if b.label.is_empty() || b.label == "test" {
+        who
+    } else {
+        format!("{} · {who}", b.label)
     }
 }
 
-/// A bond's registration with midwimble: where it stands, and the button
-/// that starts (or hurries) it.
-fn registration(app: &mut App, ui: &mut Ui, ctx: &egui::Context, b: &midstate_walletd::api::BondView) {
-    let phase = b.reg_phase.as_str();
-    if phase.is_empty() && !b.can_register {
-        return;
-    }
+/// Everything about a bond, for whoever wants it: keys, ids, and the ways
+/// to take it elsewhere.
+fn details(app: &mut App, ui: &mut Ui, ctx: &egui::Context, b: &BondView) {
     ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("Midwimble").size(12.0).color(theme::muted()));
-        let (badge, colour) = match phase {
-            "" => ("not registered", theme::muted()),
-            "waiting" => ("registering", theme::bright()),
-            "burying" => ("burying the proof", theme::bright()),
-            "ready" => ("ready to register", theme::ink()),
-            "on_chain" => ("registered", theme::ink()),
-            _ => ("retrying", theme::muted()),
+    egui::Grid::new(("bond_grid", &b.id)).num_columns(3).spacing([12.0, 4.0]).show(ui, |ui| {
+        let row = |ui: &mut Ui, k: &str, v: String, copy: Option<&str>| {
+            ui.label(RichText::new(k).size(11.5).color(theme::muted()));
+            ui.label(theme::mono(v).size(11.5));
+            if let Some(c) = copy {
+                if ui.small_button("Copy").clicked() {
+                    ui.ctx().copy_text(c.to_string());
+                }
+            } else {
+                ui.label("");
+            }
+            ui.end_row();
         };
-        theme::badge(ui, badge, colour);
-        if b.wallet_key {
-            theme::badge(ui, "mines from this wallet", theme::muted());
+        row(ui, "unlocks at block", b.bonded_until.to_string(), None);
+        if b.counts_until > 0 {
+            row(ui, "counts for mining until", theme::fmt_dt(b.counts_until), None);
+        }
+        row(ui, "mining key", short_hex(&b.mining_key, 10), Some(&b.mining_key));
+        row(ui, "owner key", short_hex(&b.owner_pk, 10), Some(&b.owner_pk));
+        row(ui, "bond id", short_hex(&b.id, 10), Some(&b.id));
+        row(ui, "salt", short_hex(&b.salt, 10), Some(&b.salt));
+    });
+    if !b.reg_note.is_empty() && b.reg_phase != "failed" {
+        theme::hint(ui, &b.reg_note);
+    }
+    ui.horizontal(|ui| {
+        if ui.small_button("Copy for another wallet").clicked() {
+            ui.ctx().copy_text(b.export_line.clone());
+        }
+        let co_bond = !b.wallet_key && b.rental.is_empty();
+        if co_bond && b.reg_phase == "on_chain" && ui.add_enabled(!app.busy, egui::Button::new("Save co-bond file").small()).clicked() {
+            app.busy = true;
+            app.error.clear();
+            app.go(ctx, Action::CopyCoBondFile { id: b.id.clone() });
+        }
+        if b.reg_phase != "on_chain" && !b.below_min && ui.small_button("Copy register command").clicked() {
+            ui.ctx().copy_text(b.register_cmd.clone());
         }
     });
-    if phase == "burying" {
-        theme::progress_bar(ui, b.reg_progress as f32 / 100.0);
-    }
-    if !b.reg_note.is_empty() {
-        theme::hint(ui, &b.reg_note);
-    } else if phase.is_empty() {
-        theme::hint(
-            ui,
-            "Register it so midwimble counts it: the wallet takes a proof of the lock from your node, waits \
-             for a day of midwimble's work above it, and then the first block mined with it carries it in.",
-        );
-    }
-    if phase == "ready" && !b.wallet_key {
-        theme::hint(
-            ui,
-            "It names another key, so it registers in a block that key's owner mines: give the pool its \
-             co-bond file.",
-        );
-    }
-    let rpc_off = app.bond_rules.as_ref().is_some_and(|r| !r.rpc_on);
-    if b.can_register && rpc_off {
-        theme::hint(
-            ui,
-            "Registering reads midstate through this app's node RPC, which is off this session \
-             (MIDSTATE_RPC_PORT=none). Turn it on to register here, or use the command line below.",
-        );
-    }
-    let co_bond = matches!(phase, "ready" | "on_chain") && !b.wallet_key;
-    if co_bond || b.can_register {
-        theme::right_aligned(ui, |ui| {
-            if co_bond && ui.add_enabled(!app.busy, egui::Button::new("Copy co-bond file")).clicked() {
-                app.busy = true;
-                app.error.clear();
-                app.go(ctx, Action::CopyCoBondFile { id: b.id.clone() });
-            }
-            if b.can_register {
-                let label = if phase.is_empty() { "Register with midwimble" } else { "Check now" };
-                if ui.add_enabled(!app.busy && !rpc_off, egui::Button::new(label)).clicked() {
-                    app.busy = true;
-                    app.error.clear();
-                    app.bond_notice.clear();
-                    app.go(ctx, Action::RegisterBond { id: b.id.clone() });
-                }
-            }
-        });
-    }
-    if phase == "on_chain" {
-        return;
-    }
-    egui::CollapsingHeader::new(RichText::new("Register with midwimble's command line instead").size(11.0))
-        .id_salt(format!("cli_{}", b.id))
-        .show(ui, |ui| {
-            theme::hint(ui, "Run it once the lock confirms, and again a day later to finish.");
-            ui.add(egui::Label::new(theme::mono(&b.register_cmd).size(10.5).color(theme::bright())).wrap());
-            if ui.small_button("Copy command").clicked() {
-                ui.ctx().copy_text(b.register_cmd.clone());
-            }
-        });
+}
+
+/// Saves a bond's co-bond file where people look for downloads, under a
+/// name of its own, and says where.
+pub fn save_co_bond_file(id: &str, text: &str) -> std::io::Result<std::path::PathBuf> {
+    let dir = dirs::download_dir()
+        .or_else(dirs::home_dir)
+        .ok_or_else(|| std::io::Error::other("no downloads folder"))?;
+    let path = dir.join(format!("midstate-co-bond-{}.json", id.get(..12).unwrap_or(id)));
+    std::fs::write(&path, text)?;
+    Ok(path)
 }
 
 // ── Import ──────────────────────────────────────────────────────────────
 
 fn import_form(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
-    theme::panel_frame().show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.label(RichText::new("Import a bond").font(theme::font_medium(14.0)));
-        theme::hint(
-            ui,
-            "A bond this phrase made elsewhere (after a restore, or in the web wallet): paste \
-             midwimble's bond.json once `bond register` has filled it in, or the \
-             `<script> <value> <salt>` line another wallet copied.",
-        );
-        ui.add(
-            TextEdit::multiline(&mut app.bond_import)
-                .hint_text("bond.json, or <script> <value> <salt>")
-                .font(egui::TextStyle::Monospace)
-                .desired_rows(3)
-                .desired_width(f32::INFINITY),
-        );
-        ui.horizontal(|ui| {
+    egui::CollapsingHeader::new(RichText::new("Import a bond").size(12.5).color(theme::muted()))
+        .id_salt("bond_import")
+        .show(ui, |ui| {
+            theme::hint(ui, "A bond this phrase made elsewhere: midwimble's bond.json, or a line another wallet copied.");
             ui.add(
-                TextEdit::singleline(&mut app.bond_import_label)
-                    .hint_text("label (optional)")
-                    .desired_width(ui.available_width() - 90.0),
+                TextEdit::multiline(&mut app.bond_import)
+                    .hint_text("bond.json, or <script> <value> <salt>")
+                    .font(egui::TextStyle::Monospace)
+                    .desired_rows(3)
+                    .desired_width(f32::INFINITY),
             );
-            let can = !app.busy && !app.bond_import.trim().is_empty();
-            if ui.add_enabled(can, egui::Button::new("Import")).clicked() {
-                app.busy = true;
-                app.error.clear();
-                app.bond_notice.clear();
-                app.go(
-                    ctx,
-                    Action::ImportBond {
-                        text: app.bond_import.trim().to_string(),
-                        label: app.bond_import_label.trim().to_string(),
-                    },
+            ui.horizontal(|ui| {
+                ui.add(
+                    TextEdit::singleline(&mut app.bond_import_label)
+                        .hint_text("label (optional)")
+                        .desired_width(ui.available_width() - 90.0),
                 );
-            }
+                let can = !app.busy && !app.bond_import.trim().is_empty();
+                if ui.add_enabled(can, egui::Button::new("Import")).clicked() {
+                    app.busy = true;
+                    app.error.clear();
+                    app.bond_notice.clear();
+                    app.go(
+                        ctx,
+                        Action::ImportBond {
+                            text: app.bond_import.trim().to_string(),
+                            label: app.bond_import_label.trim().to_string(),
+                        },
+                    );
+                }
+            });
         });
+}
+
+// ── Pieces shared with the Rent view ────────────────────────────────────
+
+/// A small capital label over a group of choices.
+pub(super) fn section(ui: &mut Ui, text: &str) {
+    ui.label(RichText::new(text.to_uppercase()).font(FontId::monospace(10.0)).color(theme::muted()));
+}
+
+/// One choice of a group, drawn as a card with a title and a caption. The
+/// picked one is inked in, as the segmented control is. True when clicked.
+pub(super) fn choice(
+    ui: &mut Ui,
+    id: impl std::hash::Hash,
+    width: f32,
+    picked: bool,
+    enabled: bool,
+    title: &str,
+    caption: &str,
+) -> bool {
+    let (fill, stroke, fg, sub) = match (picked, enabled) {
+        (true, true) => (theme::ink(), theme::ink(), theme::on_ink(), theme::on_ink().gamma_multiply(0.7)),
+        (true, false) => (theme::panel2(), theme::bright(), theme::muted(), theme::muted()),
+        (false, true) => (theme::panel2(), theme::border2(), theme::ink(), theme::muted()),
+        (false, false) => (theme::panel2(), theme::border(), theme::faint(), theme::faint()),
+    };
+    let rect = Frame::default()
+        .fill(fill)
+        .stroke(Stroke::new(HAIR, stroke))
+        .corner_radius(CornerRadius::ZERO)
+        .inner_margin(Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.set_width((width - 26.0).max(40.0));
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.label(RichText::new(title).font(theme::font_medium(13.5)).color(fg));
+                ui.label(RichText::new(if caption.is_empty() { " " } else { caption }).size(11.0).color(sub));
+            });
+        })
+        .response
+        .rect;
+    let resp = ui.interact(rect, egui::Id::new(("bond_choice", id)), if enabled { Sense::click() } else { Sense::hover() });
+    if !enabled {
+        return false;
+    }
+    if !picked && resp.hovered() {
+        ui.painter().rect_stroke(rect, CornerRadius::ZERO, Stroke::new(HAIR, theme::ink()), egui::StrokeKind::Inside);
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+}
+
+/// A labelled figure, for a row summing up what a button will do.
+pub(super) fn fact(ui: &mut Ui, label: &str, value: &str) {
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 1.0;
+        ui.label(RichText::new(label.to_uppercase()).font(FontId::monospace(10.0)).color(theme::muted()));
+        ui.label(RichText::new(value).font(theme::font_mono_medium(15.0)).color(theme::ink()));
     });
+    ui.add_space(18.0);
+}
+
+/// The one button that moves things on.
+pub(super) fn primary(text: &str) -> egui::Button<'static> {
+    egui::Button::new(RichText::new(text.to_string()).font(theme::font_medium(13.0)).color(theme::on_ink()))
+        .fill(theme::ink())
+        .stroke(Stroke::new(HAIR, theme::ink()))
+}
+
+/// Lock → Register → Mine → Unbond, as squares on a line: filled behind,
+/// ringed where the bond is now, hollow ahead. Monochrome, as the send
+/// timeline is.
+fn track(ui: &mut Ui, steps: &[(&str, Step)]) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        for (i, (name, step)) in steps.iter().enumerate() {
+            if i > 0 {
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(18.0, 16.0), Sense::hover());
+                let lit = matches!(step, Step::Done | Step::Now);
+                let col = if lit { theme::bright() } else { theme::border2() };
+                ui.painter().hline(rect.x_range(), rect.center().y, Stroke::new(HAIR, col));
+            }
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 16.0), Sense::hover());
+            let sq = egui::Rect::from_center_size(rect.center(), egui::vec2(8.0, 8.0));
+            let p = ui.painter();
+            match step {
+                Step::Done => {
+                    p.rect_filled(sq, CornerRadius::ZERO, theme::bright());
+                }
+                Step::Now => {
+                    p.rect_filled(sq, CornerRadius::ZERO, theme::ink());
+                    p.rect_stroke(sq.expand(2.5), CornerRadius::ZERO, Stroke::new(HAIR, theme::ink()), egui::StrokeKind::Inside);
+                }
+                Step::Next => {
+                    p.rect_stroke(sq, CornerRadius::ZERO, Stroke::new(HAIR, theme::faint()), egui::StrokeKind::Inside);
+                }
+                Step::Skip => {
+                    p.hline(sq.x_range(), sq.center().y, Stroke::new(HAIR, theme::faint()));
+                }
+            }
+            let text = RichText::new(*name);
+            let text = match step {
+                Step::Done => text.font(FontId::monospace(11.0)).color(theme::bright()),
+                Step::Now => text.font(theme::font_mono_medium(11.0)).color(theme::ink()),
+                Step::Next => text.font(FontId::monospace(11.0)).color(theme::faint()),
+                Step::Skip => text.font(FontId::monospace(11.0)).color(theme::faint()).strikethrough(),
+            };
+            ui.label(text);
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bond(status: &str, reg: &str) -> BondView {
+        BondView {
+            status: status.into(),
+            reg_phase: reg.into(),
+            value: 1 << 37,
+            blocks_left: 90 * 1440,
+            counts_until: theme::now_secs() + 60 * 86_400,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn sizes_and_times_read_as_people_say_them() {
+        assert_eq!(exp_at_least(1 << 37), 37);
+        assert_eq!(exp_at_least((1 << 37) + 1), 38);
+        assert_eq!(exp_at_least(0), 0);
+        assert_eq!(months_label(30), "1 month");
+        assert_eq!(months_label(90), "3 months");
+        assert_eq!(months_label(334), "11 months");
+        assert_eq!(months_label(7), "7 days");
+        assert_eq!(about(0), "a minute");
+        assert_eq!(about(10), "10 minutes");
+        assert_eq!(about(60), "an hour");
+        assert_eq!(about(1500), "25 hours");
+        assert_eq!(about(3 * 1440), "3 days");
+    }
+
+    #[test]
+    fn the_longest_time_offered_fits_midwimble_s_horizon() {
+        let now = theme::now_secs();
+        let longest = midwimble::horizon(now).saturating_sub(midwimble::until_for_days(now, 0)) / 1440;
+        assert!(longest > 180, "a year's horizon leaves room for six months");
+        assert!(midwimble::until_for_days(now, longest) <= midwimble::horizon(now));
+        assert!(midwimble::until_for_days(now, longest + 1) > midwimble::horizon(now));
+    }
+
+    #[test]
+    fn each_bond_has_one_place_and_one_next_thing() {
+        let now = theme::now_secs();
+        let s = stage(&bond("locking", "waiting"), now);
+        assert_eq!((s.at, s.badge), (0, "locking"));
+
+        let mut b = bond("locked", "");
+        b.can_register = true;
+        let s = stage(&b, now);
+        assert_eq!((s.at, s.badge), (1, "not registered"));
+        assert!(matches!(s.next, Some(Next::Register)));
+
+        let mut b = bond("locked", "ready");
+        b.wallet_key = false;
+        let s = stage(&b, now);
+        assert_eq!(s.badge, "send to pool");
+        assert!(matches!(s.next, Some(Next::CoBondFile)));
+
+        let mut b = bond("locked", "ready");
+        b.wallet_key = true;
+        assert!(stage(&b, now).next.is_none(), "a ready bond of this wallet waits for mining");
+
+        assert_eq!(stage(&bond("locked", "on_chain"), now).badge, "mining");
+
+        let mut b = bond("locked", "on_chain");
+        b.counts_until = 0;
+        assert_eq!(stage(&b, now).at, 3, "past its mining, waiting to unlock");
+
+        let mut b = bond("unlocked", "on_chain");
+        b.can_unbond = true;
+        assert!(matches!(stage(&b, now).next, Some(Next::Unbond)));
+
+        let mut b = bond("locked", "");
+        b.below_min = true;
+        let s = stage(&b, now);
+        assert!(s.skip_mining && s.badge == "test");
+    }
 }
