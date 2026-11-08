@@ -197,21 +197,6 @@ await check('state threads are active at this height', () => {
     return `height ${state.height}`;
 });
 
-await check('the pump curve avoids consensus-gated opcodes', async () => {
-    // COVENANT_SUM_ACTIVATION_HEIGHT = 300,000. The curve derives its reserve
-    // from supply precisely so it needs no sum_input_value() and can deploy
-    // below that height; this confirms the shipped contract still does.
-    const { compile } = await import('./src/compiler.js');
-    const { pumpContractSource, MAX_DEPTH } = await import('./src/pump.js');
-    const asm = compile(pumpContractSource(MAX_DEPTH)).asm.join(' ');
-    if (/SUM_INPUT_VALUE/.test(asm) && state.height < 300_000) {
-        throw new Error(`curve uses SUM_INPUT_VALUE but height is ${state.height} < 300,000`);
-    }
-    return /SUM_INPUT_VALUE/.test(asm)
-        ? `uses SUM_INPUT_VALUE; active at height ${state.height}`
-        : `no gated opcodes — deployable at height ${state.height}`;
-});
-
 // ── Mining template ────────────────────────────────────────────────────────
 console.log('\n━━━ mining template ━━━');
 

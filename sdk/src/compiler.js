@@ -6,11 +6,9 @@
 //
 // # Reasoning
 //
-// A launcher cannot pre-compile its contracts. Every token needs its own curve
-// with that token's asset id, treasury and parameters baked in, which means a
-// distinct script and a distinct address per launch. Compiling by hand in the
-// IDE works for one contract and not for a thousand, so the compiler has to be
-// callable from code.
+// A contract with its parameters baked in is a distinct script and a distinct
+// address per use. Compiling by hand in the IDE works for one contract and not
+// for a thousand, so the compiler has to be callable from code.
 //
 // The opcode table is checked against the node's `core/script.rs` at load rather
 // than trusted: a table that has drifted produces bytecode that assembles

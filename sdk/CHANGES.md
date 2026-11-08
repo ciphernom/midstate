@@ -1,3 +1,32 @@
+# Midstate SDK 3.0.0 — the launcher modules are gone
+
+Version 2.11.0 → 3.0.0. A breaking release: three exports are removed.
+
+Test suites: `npm test` — 22 codec + 34 wallet + 89 reorg/recovery/contract + 59
+miner/pool + 30 DEX + 25 compiler/VM = **259 tests**, all offline.
+
+## Removed
+
+- **`Launcher`** (`src/launcher.js`) and **`Pump`** (`src/pump.js`). Their
+  curves keep their reserve in a coin that cannot read the contract's state,
+  so on chain each stopped after its first buy: anything built on them locked
+  its MDS at an address that could never trade again.
+- **`Launchpad`** (`src/launchpad.js`), with the site's `launch.html` and
+  `docs/LAUNCHPAD.md`. It worked, but it was an intricate, unaudited script
+  holding MDS with no admin key, and a token-launch venue is not something the
+  project wants to run.
+- The tests and vectors that went with them: `test-launcher.mjs`,
+  `test-pump.mjs`, `test-launchpad.mjs`, `test-vectors/launchpad.json`, the
+  demos, and `tests/launchpad_vectors.rs` in the node repository. The compiler
+  suite drops its AMM-quote and curve sections, which exercised `Launcher`.
+- The web wallet's per-site signing key (`connect({ siteKey: true })`,
+  `spendContract({ siteSig })`), which existed only to sign trades on the
+  launchpad's holder ledger. The wallet signs nothing for a page's contract
+  now. Keys it made before stay derivable from the recovery phrase.
+
+Nothing changes on chain: the v6 opcodes (`OP_MERKLE_ROOT` and the rest) are
+consensus and stay.
+
 # Midstate SDK 2.11.0 — Launchpad
 
 Version 2.10.1 → 2.11.0. For node v6.2.0 and later: launches use `OP_MERKLE_ROOT`,

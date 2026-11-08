@@ -5599,21 +5599,13 @@ document.getElementById('btnExport').onclick = () => {
     setTimeout(function () { try { window.close(); } catch (_) {} }, 400);
   }
   // Stream worker progress for the active request out to the dApp.
-  // `extra` (optional) adds fields to a connect result once the site key is ready.
-  function progressToDapp(reqId, extra) {
+  function progressToDapp(reqId) {
     var W = window.__midstateWallet;
     if (!W || !W.onWorker) return;
     W.onWorker(function (data) {
       if (!active || active.id !== reqId) return;
       if (data.type === "CONTRACT_TX_PROGRESS" && data.payload && data.payload.reqId === reqId) {
         reply(active.source, active.origin, { type: "progress", id: reqId, message: data.payload.msg });
-      } else if (data.type === "SITE_KEY" && data.payload && data.payload.reqId === reqId) {
-        var p = data.payload;
-        reply(active.source, active.origin, { type: "result", id: reqId, data: Object.assign({}, extra || {}, {
-          sitePk: p.sitePk, siteKeyLeft: p.siteKeyLeft, siteSigBytes: p.siteSigBytes,
-          siteKeyGeneration: p.siteKeyGeneration, sitePks: p.sitePks
-        }) });
-        done();
       } else if (data.type === "CONTRACT_TX_COMPLETE" && data.payload && data.payload.reqId === reqId) {
         reply(active.source, active.origin, { type: "result", id: reqId, data: { txid: data.payload.txid } });
         done();
@@ -5632,16 +5624,11 @@ document.getElementById('btnExport').onclick = () => {
 
       if (req.action === "connect") {
         var addr = W.primaryAddress();
-        var wantKey = !!(req.params && req.params.siteKey);
         showApproval("Allow this site to see your public address?<br><br>" +
-          "<span style='color:var(--accent);word-break:break-all;'>" + esc(addr) + "</span>" +
-          (wantKey ? "<br><br>It also asks for a <b>signing key for this site</b>. The key is made from your " +
-            "recovery phrase, belongs to this site only, and signs nothing without your approval each time." : ""), origin);
+          "<span style='color:var(--accent);word-break:break-all;'>" + esc(addr) + "</span>", origin);
         bindApproval(
           function () {
-            if (!wantKey) { reply(source, origin, { type: "result", id: req.id, data: { address: addr } }); done(); return; }
-            progressToDapp(req.id, { address: addr });
-            W.post({ type: "SITE_KEY_GET", payload: { reqId: req.id, origin: origin } });
+            reply(source, origin, { type: "result", id: req.id, data: { address: addr } }); done();
           },
           function () { reply(source, origin, { type: "error", id: req.id, message: "User rejected the connection." }); done(); }
         );
@@ -5724,8 +5711,7 @@ document.getElementById('btnExport').onclick = () => {
         }
         showApproval((s.summary ? "<b>" + esc(s.summary) + "</b><br><br>" : "") + "Execute contract<br>" +
           "<span style='color:var(--accent);word-break:break-all;'>" + esc(s.contractAddress || "(from bytecode)") + "</span><br><br>" +
-          (outs ? ("Outputs:<br>" + outs) : "No value outputs (state-only execution).") + net +
-          (s.siteSig ? "<br><br>Signed with your key for this site." : ""), origin);
+          (outs ? ("Outputs:<br>" + outs) : "No value outputs (state-only execution).") + net, origin);
         bindApproval(
           function () {
             progressToDapp(req.id);

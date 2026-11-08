@@ -877,9 +877,9 @@ pub const COVENANT_SUM_ACTIVATION_HEIGHT: u64 = COMMIT_WEIGHT_CAP_ACTIVATION_HEI
 /// # Reasoning
 /// `OP_MERKLE_VERIFY` is the reason this bank exists. A Merkle proof written in
 /// script costs a flat 60 bytes per level, because the language has no jumps
-/// and must unroll the walk. Measured against the pump ledger: depth 1 compiles
-/// to 486 B and each further level adds exactly 60, reaching 966 B of the
-/// 1024 B limit at depth 9. That is what caps a token launch at 512 holders —
+/// and must unroll the walk. Measured against a script-written Merkle ledger:
+/// depth 1 compiles to 486 B and each further level adds exactly 60, reaching
+/// 966 B of the 1024 B limit at depth 9. That caps such a ledger at 512 rows —
 /// a script-size artifact, not a protocol rule. Verifying a proof in one opcode
 /// makes depth a function of witness size instead, and returns roughly half the
 /// script budget to the contract.
