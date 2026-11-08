@@ -4036,6 +4036,7 @@ dependencies = [
  "hex",
  "im",
  "lazy_static",
+ "libloading",
  "libp2p",
  "libp2p-core",
  "libp2p-stream",
@@ -4116,7 +4117,7 @@ dependencies = [
 [[package]]
 name = "midwimble"
 version = "0.1.0"
-source = "git+https://github.com/ciphernom/midwimble#ea1ee330591a939dff39d0e011d5a6ab5ad8daaa"
+source = "git+https://github.com/ciphernom/midwimble#2184a9fbf4c7e1061a8ff64706b9f9a132d2c324"
 dependencies = [
  "anyhow",
  "argon2",
