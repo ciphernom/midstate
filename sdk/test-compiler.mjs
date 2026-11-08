@@ -1,17 +1,9 @@
 // test-compiler.mjs — Contract compiler and headless VM.
 //
-// Two independent ground truths are used, because a compiler validated only
-// against its own VM proves nothing:
-//
-//   - All 17 IDE templates must compile. They are real contracts a human wrote
-//     and the IDE accepted, so a language regression shows up here.
-//   - The IDE's worked AMM example must EXECUTE to the same verdict the IDE's
-//     own annotation claims (accept at Y=51, reject at Y=50). That ties the VM
-//     to observed behaviour rather than to my reading of the opcode table.
-//
-// The curve contract is then verified by execution rather than by inspection:
-// exact-cost trades accepted, underpayment and over-refund rejected, and a
-// buy/sell round trip returning the reserve exactly.
+// A compiler validated only against its own VM proves nothing, so the IDE's
+// templates are the outside ground truth: real contracts a human wrote and the
+// IDE accepted, all of which must compile. The VM is then held to the node's
+// semantics opcode by opcode (core/script.rs).
 //
 // Run: node test-compiler.mjs
 
@@ -19,7 +11,6 @@ import fs from 'fs/promises';
 import initWasm, * as W from './pkg/wasm_wallet.js';
 import { compile, MAX_SCRIPT_SIZE, OPS } from './src/compiler.js';
 import { execute } from './src/vm.js';
-import * as L from './src/launcher.js';
 
 await initWasm({ module_or_path: await fs.readFile('./pkg/wasm_wallet_bg.wasm') });
 
@@ -35,7 +26,6 @@ function assert(c, m) { if (!c) throw new Error(m || 'assertion failed'); }
 // fact that a real node returns InvalidOpcode for the opcode entirely.
 const TEST_HEIGHT = 350_000n;
 
-const AMM_ADDR = 'aa000000000000000000000000000000000000000000000000000000000000aa';
 
 console.log('\n━━━ compiler ━━━');
 
@@ -99,58 +89,6 @@ await t('all 18 IDE templates compile', async () => {
     for (const [name, code] of Object.entries(tpl)) {
         try { compile(code); } catch (e) { throw new Error(`${name}: ${e.message || e}`); }
     }
-});
-
-console.log('\n━━━ VM against the IDE worked example ━━━');
-
-async function ammTemplate() {
-    const html = await fs.readFile('../wasm-wallet/website/ide.html', 'utf8');
-    const m = /\n {2}amm_uniswap\s*:\s*\{\s*\n?\s*code\s*:\s*`(.*?)`,/s.exec(html);
-    return m[1];
-}
-
-await t("accepts the IDE's annotated trade (X 10→20, Y 100→51)", async () => {
-    const r = compile(await ammTemplate());
-    const res = execute(r.asm, {
-        inputValue: 10n,
-        inputState: L.encodeState(L.LAYOUTS.AMM, { reserveX: 10n, reserveY: 100n }),
-        thisAddress: AMM_ADDR, height: TEST_HEIGHT, allowValueBearingState: true,
-        outputs: [{ address: AMM_ADDR, value: 20n, state: L.encodeState(L.LAYOUTS.AMM, { reserveX: 20n, reserveY: 51n }) }],
-    });
-    assert(res.ok, `rejected a trade the IDE says is valid: ${res.error}`);
-});
-
-await t('rejects one unit more output than the IDE example', async () => {
-    const r = compile(await ammTemplate());
-    const res = execute(r.asm, {
-        inputValue: 10n,
-        inputState: L.encodeState(L.LAYOUTS.AMM, { reserveX: 10n, reserveY: 100n }),
-        thisAddress: AMM_ADDR, height: TEST_HEIGHT, allowValueBearingState: true,
-        outputs: [{ address: AMM_ADDR, value: 20n, state: L.encodeState(L.LAYOUTS.AMM, { reserveX: 20n, reserveY: 50n }) }],
-    });
-    assert(!res.ok, 'accepted an over-payout');
-});
-
-await t('the SDK quote and the contract agree, across many trades', async () => {
-    // The property that matters for a launcher: a quote this SDK produces is
-    // one the deployed contract actually accepts.
-    const r = compile(await ammTemplate());
-    let checked = 0;
-    for (const [x, y] of [[10n, 100n], [1000n, 1000n], [50n, 7777n]]) {
-        for (const dx of [1n, 3n, 10n, x, x * 2n]) {
-            const out = L.getAmountOut(x, y, dx);
-            if (out <= 0n) continue;
-            const res = execute(r.asm, {
-                inputValue: x,
-                inputState: L.encodeState(L.LAYOUTS.AMM, { reserveX: x, reserveY: y }),
-                thisAddress: AMM_ADDR, height: TEST_HEIGHT, allowValueBearingState: true,
-                outputs: [{ address: AMM_ADDR, value: x + dx, state: L.encodeState(L.LAYOUTS.AMM, { reserveX: x + dx, reserveY: y - out }) }],
-            });
-            assert(res.ok, `contract rejected our quote: x=${x} y=${y} dx=${dx} out=${out} (${res.error})`);
-            checked++;
-        }
-    }
-    assert(checked >= 10, `only ${checked} trades exercised`);
 });
 
 console.log('\n━━━ VM semantics ━━━');
@@ -303,114 +241,6 @@ await t('emitting CHECKSIGVERIFY directly does verify the signature', () => {
     const bad = execute(c.asm, { allowDirtyStack: true, witness: ['07', 'aa'.repeat(32), 'bb'.repeat(32)], height: TEST_HEIGHT });
     assert(good.ok, `a matching signature was rejected: ${good.error}`);
     assert(!bad.ok, 'a mismatched signature was accepted');
-});
-
-console.log('\n━━━ bonding curve contract (executed) ━━━');
-
-const curve = compile(L.CURVE_CONTRACT_SOURCE);
-const CURVE_ADDR = W.blake3_hash_hex(curve.bytecode);
-const curveState = (s, r) => L.encodeState(L.CURVE_STATE_LAYOUT, { supply: s, reserve: r });
-// Two outputs at the contract address: a zero-value state thread and a separate
-// standard coin holding the reserve. Consensus forbids combining them.
-const runCurve = (s, r, ns, nr) => execute(curve.asm, {
-    inputValue: 0n, sumInputValue: r, inputState: curveState(s, r),
-    thisAddress: CURVE_ADDR, height: TEST_HEIGHT,
-    outputs: [{ address: CURVE_ADDR, value: 0n, state: curveState(ns, nr) },
-              { address: CURVE_ADDR, value: nr }],
-});
-
-await t('compiles within the script size limit', () => {
-    assert(curve.sizeBytes <= MAX_SCRIPT_SIZE, `${curve.sizeBytes} B`);
-    assert(curve.sizeBytes < 400, `${curve.sizeBytes} B is larger than expected`);
-});
-
-await t('accepts an exact-cost buy at every supply level', () => {
-    for (const [s, n] of [[0n, 1n], [0n, 5n], [5n, 3n], [100n, 10n], [1000n, 1n]]) {
-        const tr = L.curveTrade({ supply: s, reserve: L.curveBuyCost(0n, s), amount: n, side: 'buy' });
-        const res = runCurve(s, tr.inputValue, tr.newSupply, tr.newReserve);
-        assert(res.ok, `s=${s} n=${n} cost=${tr.cost}: ${res.error}`);
-    }
-});
-
-await t('rejects underpayment by a single unit', () => {
-    for (const [s, n] of [[0n, 5n], [5n, 3n], [100n, 10n]]) {
-        const r0 = L.curveBuyCost(0n, s);
-        const tr = L.curveTrade({ supply: s, reserve: r0, amount: n, side: 'buy' });
-        assert(!runCurve(s, r0, tr.newSupply, tr.newReserve - 1n).ok, `s=${s} n=${n}: underpayment accepted`);
-    }
-});
-
-await t('rejects claiming more supply than was paid for', () => {
-    const tr = L.curveTrade({ supply: 5n, reserve: 10n, amount: 3n, side: 'buy' });
-    assert(!runCurve(5n, 10n, tr.newSupply + 1n, tr.newReserve).ok, 'free mint accepted');
-});
-
-await t('accepts an exact sell', () => {
-    for (const [s, n] of [[5n, 3n], [10n, 10n], [100n, 1n]]) {
-        const r0 = L.curveBuyCost(0n, s);
-        const tr = L.curveTrade({ supply: s, reserve: r0, amount: n, side: 'sell' });
-        const res = runCurve(s, r0, tr.newSupply, tr.newReserve);
-        assert(res.ok, `s=${s} n=${n} refund=${tr.refund}: ${res.error}`);
-    }
-});
-
-await t('rejects an over-refund by a single unit', () => {
-    const r0 = L.curveBuyCost(0n, 8n);
-    const tr = L.curveTrade({ supply: 8n, reserve: r0, amount: 3n, side: 'sell' });
-    assert(!runCurve(8n, r0, tr.newSupply, tr.newReserve - 1n).ok, 'over-refund accepted');
-});
-
-await t('the reserve cannot be drained by a round trip', () => {
-    // Buy then sell the same amount must return the reserve exactly. If the
-    // legs were not mirrors, repeated round trips would bleed the curve.
-    for (const [s, n] of [[0n, 7n], [5n, 3n], [50n, 20n]]) {
-        const r0 = L.curveBuyCost(0n, s);
-        const buy = L.curveTrade({ supply: s, reserve: r0, amount: n, side: 'buy' });
-        assert(runCurve(s, r0, buy.newSupply, buy.newReserve).ok, 'buy leg rejected');
-        const sell = L.curveTrade({ supply: buy.newSupply, reserve: buy.newReserve, amount: n, side: 'sell' });
-        assert(runCurve(buy.newSupply, buy.newReserve, sell.newSupply, sell.newReserve).ok, 'sell leg rejected');
-        assert(sell.newReserve === r0, `round trip changed the reserve: ${r0} → ${sell.newReserve}`);
-        assert(sell.newSupply === s, `round trip changed the supply: ${s} → ${sell.newSupply}`);
-    }
-});
-
-await t('the state cannot lie about the MDS it holds', () => {
-    // input_value() == reserve and sum_to_addr(this) == new_reserve are what
-    // tie the claimed reserve to the coin's real value.
-    const tr = L.curveTrade({ supply: 5n, reserve: 10n, amount: 3n, side: 'buy' });
-    const wrongIn = execute(curve.asm, {
-        inputValue: 0n, sumInputValue: 999n, inputState: curveState(5n, 10n),
-        thisAddress: CURVE_ADDR, height: TEST_HEIGHT,
-        outputs: [{ address: CURVE_ADDR, value: 0n, state: curveState(tr.newSupply, tr.newReserve) },
-                  { address: CURVE_ADDR, value: tr.newReserve }],
-    });
-    assert(!wrongIn.ok, 'accepted a state whose reserve does not match the input coin');
-    const wrongOut = execute(curve.asm, {
-        inputValue: 0n, sumInputValue: 10n, inputState: curveState(5n, 10n),
-        thisAddress: CURVE_ADDR, height: TEST_HEIGHT,
-        outputs: [{ address: CURVE_ADDR, value: 0n, state: curveState(tr.newSupply, tr.newReserve) },
-                  { address: CURVE_ADDR, value: 1n }],
-    });
-    assert(!wrongOut.ok, 'accepted an output whose value does not match the new reserve');
-});
-
-await t('SDK arithmetic and the contract never disagree (fuzz)', () => {
-    let checked = 0;
-    for (let s = 0n; s < 40n; s += 3n) {
-        const r0 = L.curveBuyCost(0n, s);
-        for (const n of [1n, 2n, 7n, 13n]) {
-            const buy = L.curveTrade({ supply: s, reserve: r0, amount: n, side: 'buy' });
-            assert(runCurve(s, r0, buy.newSupply, buy.newReserve).ok,
-                `buy s=${s} n=${n} rejected by the contract`);
-            if (n <= s) {
-                const sell = L.curveTrade({ supply: s, reserve: r0, amount: n, side: 'sell' });
-                assert(runCurve(s, r0, sell.newSupply, sell.newReserve).ok,
-                    `sell s=${s} n=${n} rejected by the contract`);
-            }
-            checked++;
-        }
-    }
-    assert(checked >= 40, `only ${checked} cases`);
 });
 
 console.log(`\n━━━ ${pass} passed, ${fail} failed ━━━\n`);

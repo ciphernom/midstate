@@ -4394,12 +4394,6 @@ else if (type === 'L2_OPEN_CHANNEL') {
             finally { releaseSendLock(); }
         }
 
-        else if (type === 'SITE_KEY_GET') {
-            // payload: { reqId, origin } — the bridge supplies the origin, never the site.
-            const prog = (msg) => self.postMessage({ type: 'CONTRACT_TX_PROGRESS', payload: { reqId: payload.reqId, msg } });
-            const info = await ensureSiteKey(payload.origin, prog);
-            self.postMessage({ type: 'SITE_KEY', payload: { reqId: payload.reqId, ...info } });
-        }
         // ── Mining bonds ─────────────────────────────────────────────────────
         else if (type === 'BONDS_LIST') {
             try {
@@ -6327,148 +6321,6 @@ async function performSend(toAddress, amount, burnDataHex = null, burnValue = 0,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  Site keys (MidstateConnect)
-// ═══════════════════════════════════════════════════════════════════════════════
-//
-// A contract that keeps an owner per row (the launchpad's holder ledger) needs
-// the same public key to sign every trade on that row, so a one-time WOTS key
-// will not do, and the wallet's own receiving keys should not be signing for a
-// website. Each site origin therefore gets its own MSS tree, derived from the
-// recovery phrase like bond owner trees are, and used ONLY to sign transactions
-// this wallet builds and the user approves for that site.
-//
-// When a key runs low, the next generation is made current. The older ones
-// stay listed so the site can move rows held by them to the new key while they
-// still have signatures (SITE_KEY_ROLL_AT are kept for that).
-
-const SITE_KEY_HEIGHT = 8;                    // 256 signatures per key
-const SITE_KEY_INDEX_BASE = 0xC0000000;       // above bond owner trees (0x80000000 + 2^30)
-const SITE_KEY_ROLL_AT = 16;
-const SITE_KEY_DOMAIN_HEX = Array.from(new TextEncoder().encode("midstate/site-key/v1"))
-    .map(b => b.toString(16).padStart(2, '0')).join('');
-const mssSigBytes = (height) => 8 + 32 + 576 + 4 + 32 * height;
-
-function siteKeyIndex(origin, generation) {
-    const o = Array.from(new TextEncoder().encode(String(origin))).map(b => b.toString(16).padStart(2, '0')).join('');
-    const h = blake3_hash_hex(SITE_KEY_DOMAIN_HEX + o + leHex(generation, 4));
-    const x = parseInt(h.slice(6, 8) + h.slice(4, 6) + h.slice(2, 4) + h.slice(0, 2), 16);
-    return SITE_KEY_INDEX_BASE + (x % 0x40000000);
-}
-
-const siteKeyLeft = (k) => (1 << k.height) - k.nextLeaf;
-
-/** Put a site key's tree into the WASM cache: from IndexedDB, else rebuilt from the phrase. */
-async function loadSiteTree(k, prog) {
-    if (wallet.has_mss_cache(k.address)) return;
-    const blob = await idbGet(`site_${k.address}`).catch(() => null);
-    if (blob) { wallet.import_mss_bytes(k.address, blob); return; }
-    prog && prog("Rebuilding this site's signing key (about 20 seconds)…");
-    let last = 0;
-    const addr = wallet.get_mss_address(k.index, k.height, (cur, total) => {
-        const now = Date.now();
-        if (prog && now - last > 1000) { last = now; prog(`Rebuilding this site's signing key… ${Math.round(100 * cur / total)}%`); }
-    });
-    if (addr !== k.address) throw new Error("This recovery phrase does not hold that site key.");
-    await idbPut(`site_${k.address}`, wallet.export_mss_bytes(k.address));
-}
-
-/**
- * The current signing key for a site, made on first use.
- * @returns {{sitePk, siteKeyLeft, siteSigBytes, siteKeyGeneration, sitePks}}
- */
-async function ensureSiteKey(origin, prog) {
-    if (!origin || typeof origin !== 'string') throw new Error("No site origin.");
-    wState.siteKeys = wState.siteKeys || {};
-    const site = wState.siteKeys[origin] || (wState.siteKeys[origin] = { keys: [] });
-    let cur = site.keys[site.keys.length - 1];
-    if (cur) await loadSiteTree(cur, prog);
-    // A restored wallet re-derives the same keys; the node may know how many
-    // signatures each has already made, so keep rolling until one has room.
-    for (let guard = 0; (!cur || siteKeyLeft(cur) <= SITE_KEY_ROLL_AT) && guard < 8; guard++) {
-        const generation = site.keys.length;
-        const index = siteKeyIndex(origin, generation);
-        prog && prog(`Creating a signing key for ${origin} (once, about 20 seconds)…`);
-        let last = 0;
-        const address = wallet.get_mss_address(index, SITE_KEY_HEIGHT, (c, t) => {
-            const now = Date.now();
-            if (prog && now - last > 1000) { last = now; prog(`Creating a signing key for ${origin}… ${Math.round(100 * c / t)}%`); }
-        });
-        const pk = normalizeHex(wallet.get_mss_pubkey(address));
-        await idbPut(`site_${address}`, wallet.export_mss_bytes(address));
-        cur = { generation, index, height: SITE_KEY_HEIGHT, address, pk, nextLeaf: 0 };
-        try {
-            const st = await rpc.getMssState(pk);
-            if (st && Number.isFinite(st.next_index)) cur.nextLeaf = Math.max(0, st.next_index);
-        } catch (_) { /* offline: a fresh key's record starts at 0 */ }
-        site.keys.push(cur);
-        await saveState();
-    }
-    return {
-        sitePk: cur.pk,
-        siteKeyLeft: siteKeyLeft(cur),
-        siteSigBytes: mssSigBytes(cur.height),
-        siteKeyGeneration: cur.generation,
-        sitePks: site.keys.map(k => ({ pk: k.pk, left: siteKeyLeft(k), sigBytes: mssSigBytes(k.height) })),
-    };
-}
-
-/**
- * Sign a commitment with one of a site's keys. The leaf is the higher of this
- * wallet's record and the network's, and is saved before the signature leaves.
- */
-async function signWithSiteKey(origin, pkHex, commitmentHex, prog) {
-    const site = (wState.siteKeys || {})[origin];
-    const k = site && site.keys.find(x => x.pk === normalizeHex(pkHex));
-    if (!k) throw new Error("This wallet has no signing key for this site with that public key. Connect again.");
-    await loadSiteTree(k, prog);
-    let leaf = k.nextLeaf || 0;
-    try {
-        const st = await rpc.getMssState(k.pk);
-        if (st && Number.isFinite(st.next_index)) leaf = Math.max(leaf, st.next_index);
-    } catch (_) { /* offline: the local record still guards reuse */ }
-    if (leaf >= (1 << k.height)) throw new Error("This site's signing key has no signatures left. Connect again for a new one.");
-    wallet.set_mss_leaf_index(k.address, leaf);
-    const sig = wallet.sign_mss_hex(k.pk, commitmentHex);
-    k.nextLeaf = leaf + 1;
-    await idbPut(`site_${k.address}`, wallet.export_mss_bytes(k.address));
-    await saveState();
-    return sig;
-}
-
-/**
- * Fill the site-key signature into every contract input's witness.
- *
- * The site builds the witness with a zero placeholder of exactly the
- * signature's length at `siteSig.item` (so the fee estimate already counts
- * it). The commitment covers inputs, outputs and salt but not witnesses, so it
- * is final here, before any witness is.
- */
-async function applySiteSignature(req, ctxStr, prog) {
-    const item = Number(req.siteSig.item);
-    const ctx = JSON.parse(ctxStr);
-    const site = (wState.siteKeys || {})[req.origin];
-    const k = site && site.keys.find(x => x.pk === normalizeHex(req.siteSig.pk));
-    if (!k) throw new Error("This wallet has no signing key for this site with that public key. Connect again.");
-    const want = mssSigBytes(k.height) * 2;
-    if (!(ctx.contract_inputs || []).length) throw new Error("A site signature needs a contract input.");
-    for (const ci of ctx.contract_inputs) {
-        const w = String(ci.witness || '').split(',');
-        if (!Number.isInteger(item) || item < 0 || item >= w.length) throw new Error("The site's signature slot is outside the witness.");
-        if (w[item].length !== want || /[^0]/.test(w[item])) {
-            throw new Error(`The site must leave ${want / 2} zero bytes where its signature goes.`);
-        }
-    }
-    prog("Signing with your key for this site…");
-    const sig = await signWithSiteKey(req.origin, k.pk, ctx.commitment, prog);
-    for (const ci of ctx.contract_inputs) {
-        const w = ci.witness.split(',');
-        w[item] = normalizeHex(sig);
-        ci.witness = w.join(',');
-    }
-    return JSON.stringify(ctx);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
 //  Contract Funding & Execution (MidstateConnect)
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -6495,8 +6347,7 @@ async function performContractTx(req) {
     let ctxStr;
     try {
         if (req.kind === 'fund' && Array.isArray(req.fundings) && req.fundings.length) {
-            // Several outputs, optional salts, and DataBurns in one funding tx
-            // (a launch: its seed coin, the registry mark and its announcement).
+            // Several outputs, optional salts, and DataBurns in one funding tx.
             const fundings = req.fundings.map(f => {
                 const address = normalizeHex(f.address), amount = Number(f.amount);
                 if (!/^[0-9a-f]{64}$/.test(address)) throw new Error("A funding address is not 32 bytes of hex.");
@@ -6516,7 +6367,7 @@ async function performContractTx(req) {
             ctxStr = wallet.prepare_fund_many(JSON.stringify(utxoArray), JSON.stringify(fundings), wState.nextWotsIndex,
                 burns.length ? JSON.stringify(burns) : null);
             // An older WASM build drops burns and per-funding salts silently; a
-            // launch published that way could never be found or spent.
+            // contract funded that way could never be found or spent.
             const c = JSON.parse(ctxStr), outs = c.outputs || [];
             for (const b of burns) {
                 if (!outs.some(o => o.type === 'data_burn' && normalizeHex(o.payload) === b.payload)) throw new Error("This wallet build cannot attach data to a funding. Update the wallet and try again.");
@@ -6550,9 +6401,6 @@ async function performContractTx(req) {
     } catch (e) {
         throw new Error(`Failed to prepare transaction: ${e.toString()}`);
     }
-
-    // A site-key signature goes in now: the commitment is final, the witnesses are not.
-    if (req.kind === 'spend' && req.siteSig) ctxStr = await applySiteSignature(req, ctxStr, prog);
 
     const ctx = JSON.parse(ctxStr);
 

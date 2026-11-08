@@ -19,18 +19,8 @@ export { PoolClient, verifyPoolProof, libp2pPoolTransport, POOL_PROTOCOL, POOL_P
 // On-chain DEX: order announcements, fragmentation, covenant derivation.
 export * as Dex from './dex.js';
 
-// Token / AMM / bonding-curve contract state and exact-integer curve math.
-export * as Launcher from './launcher.js';
-
-// Bonding-curve token launcher (pump-style): contract, ledger, trade builder.
-export * as Pump from './pump.js';
-
-// Launches that work on chain (v6): a curve that graduates into a pool, with
-// the contract's state in its address and a ledger readable from stripped blocks.
-export * as Launchpad from './launchpad.js';
-
-// Contract compiler and headless VM — compile a contract per token launch and
-// simulate the spend before funding an address you cannot recover from.
+// Contract compiler and headless VM — compile a contract and simulate the
+// spend before funding an address you cannot recover from.
 export { compile, MAX_SCRIPT_SIZE, OPS, STD_LIB } from './compiler.js';
 export { execute as executeContract, simulate as simulateContract,
          STATE_THREAD_ACTIVATION_HEIGHT, MAX_SIGOPS_PER_SCRIPT } from './vm.js';

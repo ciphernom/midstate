@@ -5,9 +5,8 @@
 // Ported from the IDE's step emulator with the DOM lookups replaced by an
 // explicit context, so a contract can be executed from code instead of by hand.
 //
-// This exists because a launcher funds a *fresh* contract address for every
-// token, and a contract that is wrong locks its funds at an address nobody can
-// spend from. There is no second chance and no upgrade path. Being able to run a
+// This exists because funding a *fresh* contract address is final: a contract
+// that is wrong locks its funds at an address nobody can spend from. There is no second chance and no upgrade path. Being able to run a
 // candidate transaction against the script before paying for a commit turns that
 // class of mistake from "funds gone" into "assertion failed on line 12".
 //
@@ -55,7 +54,7 @@ export const COVENANT_SUM_ACTIVATION_HEIGHT = 300_000n;
  *
  * MERKLE_ROOT is the reason this bank exists. A Merkle proof written with
  * `repeat(D) { merkle_step(); }` costs a flat 60 bytes per level, which is
- * what caps the pump ledger at depth 9 and 512 holders — a script-size
+ * what capped a script-written Merkle ledger at depth 9 — a script-size
  * artifact, not a protocol limit. Verifying a proof in one opcode makes depth
  * a function of witness size instead.
  */
@@ -426,7 +425,7 @@ export function execute(asm, ctx = {}) {
  * Compile and execute in one call.
  *
  * The convenience form for "does this transaction satisfy this contract",
- * which is the question a launcher needs answered before it funds anything.
+ * which is the question to answer before funding anything.
  */
 export function simulate(compileFn, source, ctx) {
     const compiled = compileFn(source);

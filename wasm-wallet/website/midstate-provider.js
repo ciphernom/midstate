@@ -242,24 +242,12 @@
     /**
      * Request the user's public MSS address.
      *
-     * With `{ siteKey: true }` the wallet also makes (once) a signing key for
-     * this site's origin: an MSS key derived from the user's recovery phrase,
-     * used only to sign transactions the wallet builds for this site. A
-     * contract that names an owner per position (the launchpad's ledger) uses
-     * its public key. The first connect takes about 20 seconds; progress
-     * arrives through `onProgress`.
-     *
-     * @param {{siteKey?:boolean, onProgress?:Function, resultTimeoutMs?:number}} [opts]
-     * @returns {Promise<{address:string, sitePk?:string, siteKeyLeft?:number,
-     *   siteSigBytes?:number, siteKeyGeneration?:number,
-     *   sitePks?:Array<{pk:string,left:number,sigBytes:number}>}>}
-     *   `sitePks` lists every key this site has had, newest last, so positions
-     *   held by an older one can be moved while it still has signatures.
+     * @param {{onProgress?:Function, resultTimeoutMs?:number}} [opts]
+     * @returns {Promise<{address:string}>}
      */
     connect: function (opts) {
       opts = opts || {};
-      return invoke("connect", { siteKey: !!opts.siteKey },
-        Object.assign({ resultTimeoutMs: opts.siteKey ? 10 * 60_000 : 120_000 }, opts));
+      return invoke("connect", {}, Object.assign({ resultTimeoutMs: 120_000 }, opts));
     },
 
     /**
@@ -309,12 +297,8 @@
      *     outputs: [{ address, value, state? }] }
      * Advanced dApps may pass explicit { inputs: [{ coinId, witness, inputState }] }.
      *
-     * A signature over THIS transaction's commitment comes from the site key
-     * (see connect({siteKey: true})): pass `siteSig: { item, pk }` and leave,
-     * at witness position `item` of every contract input, a placeholder of
-     * `siteSigBytes` zero bytes. The wallet builds the transaction, signs its
-     * commitment with that key and puts the signature in. Without `siteSig`,
-     * preimage / timelock / routing / state-covenant paths work as before.
+     * The wallet signs nothing for a contract: preimage, timelock, routing and
+     * state-covenant paths are what a page can use.
      *
      * Explicit inputs: `inputs: [{ coinId, value, salt, witness }]`, the witness
      * comma-separated hex, pushed left to right. Outputs:
