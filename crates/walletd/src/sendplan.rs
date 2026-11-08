@@ -15,7 +15,7 @@ const BYTES_PER_INPUT: u64 = 1636;
 const BYTES_PER_OUTPUT: u64 = 100;
 const BYTES_BASE: u64 = 100;
 /// Mempool fee floor: 10 units per KiB, +10 units safety padding.
-fn required_fee(inputs: usize, outputs: usize) -> u64 {
+pub(crate) fn required_fee(inputs: usize, outputs: usize) -> u64 {
     let est = BYTES_BASE + inputs as u64 * BYTES_PER_INPUT + outputs as u64 * BYTES_PER_OUTPUT;
     (est * 10) / 1024 + 10
 }

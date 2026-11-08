@@ -344,6 +344,90 @@ pub struct BondView {
     /// The wallet can register it (locked, large enough, lock long enough).
     #[serde(default)]
     pub can_register: bool,
+    /// "" | "rented" (someone else's coin, mining for this wallet) |
+    /// "rented_out" (this wallet's coin, mining for someone else).
+    #[serde(default)]
+    pub rental: String,
+}
+
+/// Bonds for rent (see walletd `rental`): the market, this wallet's offers,
+/// and the bonds it rented.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RentalsView {
+    /// Offers on the market whose coin is still there, cheapest a day first.
+    pub listings: Vec<RentalListingView>,
+    pub offers: Vec<RentalOfferView>,
+    pub rentals: Vec<RentedBondView>,
+    /// How much of the market's window the wallet has read, in blocks.
+    pub scanned: u64,
+    pub window: u64,
+    /// What an offer posted now locks: the bond midwimble registers now.
+    pub bond: u64,
+    /// The rental terms the wallet offers, in days of mining.
+    pub min_days: u64,
+    pub max_days: u64,
+    /// This wallet's mining key, which a rented bond names.
+    pub mining_key: String,
+}
+
+/// An offer on the market.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RentalListingView {
+    /// The offer coin's id (hex).
+    pub id: String,
+    pub bond: u64,
+    /// For the whole rental, in base units.
+    pub rent: u64,
+    pub bonded_until: u64,
+    /// Days it would mine for a renter taking it now.
+    pub mining_days: u64,
+    /// Days the owner's coin stays locked.
+    pub locked_days: u64,
+    pub rent_per_day: u64,
+    /// Where it was announced.
+    pub height: u64,
+    /// One of this wallet's own offers.
+    pub yours: bool,
+    pub takeable: bool,
+    /// Why it cannot be taken, when it cannot.
+    pub why_not: String,
+}
+
+/// An offer this wallet made.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RentalOfferView {
+    /// The offer coin's id (hex).
+    pub id: String,
+    /// "funding" | "listed" | "taken" | "cancelling" | "cancelled" | "failed"
+    pub status: String,
+    pub note: String,
+    pub bond: u64,
+    pub rent: u64,
+    pub bonded_until: u64,
+    /// Days it would mine for a renter taking it now.
+    pub mining_days: u64,
+    /// The renter's mining key (hex), once taken.
+    pub taken_by: String,
+    pub rent_paid: u64,
+    pub can_cancel: bool,
+}
+
+/// A bond this wallet rented.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RentedBondView {
+    /// The bond coin's id (hex), as in the bond list.
+    pub id: String,
+    /// "taking" | "rented" | "lost"
+    pub status: String,
+    pub note: String,
+    pub bond: u64,
+    pub rent: u64,
+    pub bonded_until: u64,
+    /// Days of mining left, counting registration's day.
+    pub mining_days: u64,
+    /// Its registration with midwimble (as `BondView::reg_phase`).
+    pub reg_phase: String,
+    pub reg_note: String,
 }
 
 /// Midwimble's bond rules as they stand, and this wallet's mining key.

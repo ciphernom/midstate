@@ -263,6 +263,21 @@ pub struct App {
     /// 1: on another key (a pool's, for a co-bond, or one of midwimble's).
     pub bond_key_mode: usize,
 
+    // Bonds for rent (Bonds tab)
+    /// 0: this wallet's bonds; 1: bonds for rent.
+    pub bonds_view: usize,
+    pub rentals: Option<RentalsView>,
+    /// Days of mining an offer gives, as typed.
+    pub rent_days: String,
+    /// The rent asked, as typed, in `rent_unit`.
+    pub rent_price: String,
+    pub rent_unit: usize,
+    /// "Offer" was pressed once; the next press offers.
+    pub rent_confirm: bool,
+    /// The listing whose "Rent" was pressed once; the next press rents it.
+    pub rent_pick: Option<String>,
+    pub rental_notice: String,
+
     // MDW: midwimble, beside midstate in every tab
     /// Which coin the Send, Receive and History tabs show: 0 MDS, 1 MDW.
     pub send_asset: usize,
@@ -480,6 +495,14 @@ impl App {
             bonds_last_poll: 0.0,
             bond_rules: None,
             bond_key_mode: 0,
+            bonds_view: 0,
+            rentals: None,
+            rent_days: "30".into(),
+            rent_price: String::new(),
+            rent_unit: 3,
+            rent_confirm: false,
+            rent_pick: None,
+            rental_notice: String::new(),
             send_asset: 0,
             recv_asset: 0,
             hist_asset: 0,
@@ -747,6 +770,9 @@ impl App {
                 self.book = None;
                 self.bonds.clear();
                 self.bond_confirm = false;
+                self.rentals = None;
+                self.rent_confirm = false;
+                self.rent_pick = None;
                 self.mwb_history.clear();
                 self.mwb_coins.clear();
                 self.mwb_send_to.clear();
@@ -934,6 +960,20 @@ impl App {
                 self.dex_cfg = Some(v);
             }
             Msg::Bonds(b) => self.bonds = b,
+            Msg::Rentals(r) => self.rentals = Some(r),
+            Msg::RentalDone(text) => {
+                self.busy = false;
+                self.rental_notice = text;
+                self.rent_confirm = false;
+                self.rent_pick = None;
+                if self.rental_notice.starts_with("Offered") {
+                    self.rent_price.clear();
+                }
+                self.go(ctx, Action::LoadRentals);
+                self.go(ctx, Action::LoadBonds);
+                self.go(ctx, Action::LoadSends);
+                self.go(ctx, Action::LoadBalance);
+            }
             Msg::BondDone(text) => {
                 self.busy = false;
                 self.bond_notice = text;
@@ -1055,7 +1095,7 @@ impl App {
                 // Background loads fail benignly while locked; don't banner those.
                 let background = matches!(
                     what,
-                    "status" | "balance" | "coins" | "addresses" | "history" | "sends" | "node info" | "chat" | "channels" | "channel identity" | "invoices" | "hub" | "order book" | "base account" | "dex settings" | "swap quote" | "my orders" | "swaps" | "my bids" | "hubs" | "bonds" | "mdw account" | "mdw book" | "mdw orders" | "mdw swaps" | "mdw node" | "mdw history" | "mdw coins" | "bond rules"
+                    "status" | "balance" | "coins" | "addresses" | "history" | "sends" | "node info" | "chat" | "channels" | "channel identity" | "invoices" | "hub" | "order book" | "base account" | "dex settings" | "swap quote" | "my orders" | "swaps" | "my bids" | "hubs" | "bonds" | "mdw account" | "mdw book" | "mdw orders" | "mdw swaps" | "mdw node" | "mdw history" | "mdw coins" | "bond rules" | "rentals"
                 );
                 if background {
                     tracing::debug!("{what}: {err}");
@@ -1248,6 +1288,7 @@ impl eframe::App for App {
                 self.bonds_last_poll = t;
                 self.go(ctx, Action::LoadBonds);
                 self.go(ctx, Action::LoadBondRules);
+                self.go(ctx, Action::LoadRentals);
                 if self.balance.is_none() {
                     self.go(ctx, Action::LoadBalance);
                 }

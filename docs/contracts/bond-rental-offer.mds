@@ -1,0 +1,60 @@
+// Bond rental offer: rent out a midwimble mining bond, trustlessly.
+//
+// The owner parks one 2^37 coin here. Anyone takes the offer by naming a
+// midwimble mining key. The taking transaction must lock this coin as a
+// mining bond for that key, with OWNER_PK still the bond's owner key, so
+// the coin comes back to the owner at UNTIL. It must also pay RENT to
+// PAY_TO. Until someone takes it, the owner can cancel.
+//
+//   take:   [mining_key, 01]
+//   cancel: [owner_sig, 00]
+//
+// Fill in the four values below. Use a fresh OWNER_PK and PAY_TO for
+// every offer: two offers that share either would take one bond, or one
+// rent payment, for both.
+//
+// The desktop wallet builds this contract itself (Bonds tab, "Bonds for
+// rent"), with PAY_TO the owner key's own address; core::script's
+// compile_bond_rental_offer is its compilation, op for op. Paste it into
+// the IDE to step through it.
+//
+// The bond mines until about five weeks before UNTIL: midwimble retires it
+// once 30 days of lock are left, by a clock that runs 7 days ahead.
+
+let OWNER_PK = "abababababababababababababababababababababababababababababababab";
+let PAY_TO   = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+let UNTIL    = 600000;          // midstate height the bond unlocks at
+let RENT     = 8589934592;      // rent per bond, in base units
+let BOND     = 137438953472;    // 2^37: one bond
+
+route {
+  case 1: {
+    var key = pop_hex();
+    // Exactly 32 bytes. Anything longer would run as opcodes inside the
+    // bond script: enough to brick the coin, or against some owner keys
+    // to make it the taker's.
+    assert(size(key) == 32);
+
+    // The bond script midwimble recognises, byte for byte:
+    //   PUSH_DATA <key> DROP  PUSH_INT <UNTIL> CHECKTIMEVERIFY
+    //   PUSH_DATA <OWNER_PK> CHECKSIGVERIFY  PUSH_INT 1
+    // A push is 01, a 2-byte length, then the data. Pushing UNTIL gives
+    // its minimal little-endian bytes, the encoding midwimble requires.
+    var until = UNTIL;
+    var script = concat(concat(concat(concat(concat(
+        concat("012000", key), "1001"),
+        concat(size(until), "00")), until),
+        "33012000"), concat(OWNER_PK, "3201010001"));
+    var bond = hash(script);
+
+    // Every coin of this offer the transaction spends goes into the bond...
+    assert(sum_to_addr(bond) >= sum_input_value());
+    // ...and the owner is paid RENT for each bond's worth of them.
+    assert(sum_to_addr(PAY_TO) >= sum_input_value() / BOND * RENT);
+  }
+  case 0: {
+    require_sig(OWNER_PK);
+  }
+  default: { fail(); }
+}
+true;

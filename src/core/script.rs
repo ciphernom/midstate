@@ -813,6 +813,117 @@ pub fn compile_mining_bond(mining_key: &[u8; 32], bonded_until: u64, owner_pk: &
     bc
 }
 
+/// A bond rental offer (`core::rental`): one coin that anyone may lock as a
+/// mining bond for a mining key of their choosing, by paying the rent.
+///
+/// ```text
+/// IF (selector 1)    take: [mining_key, 01]
+///     SIZE(key) == 32                       anything longer would run as code
+///                                           inside the bond script
+///     bond = HASH( 01 2000 <key> 10 01 <len(until)> 00 <until> 33
+///                  01 2000 <owner_pk> 32 01 0100 01 )
+///                                           compile_mining_bond, byte for byte
+///     SUM_TO_ADDR(bond)   >= SUM_INPUT_VALUE                every offer coin spent
+///                                                           becomes bond
+///     SUM_TO_ADDR(pay_to) >= SUM_INPUT_VALUE / bond * rent  and is paid for
+/// ELSE IF (selector 0)   cancel: [owner_sig, 00]
+///     <owner_pk> CHECKSIGVERIFY
+/// ELSE fail
+/// ```
+///
+/// The bond's owner key is the offer's, so the coin goes back to the owner
+/// at `bonded_until` whoever takes it; the taker gets only what midwimble
+/// grants the mining key. The rules are written against
+/// `OP_SUM_INPUT_VALUE`, so sweeping several coins of one offer into one
+/// bond fails (`compile_limit_order_covenant` explains the trap). Two offers
+/// sharing `owner_pk` or `pay_to` would accept one bond or one payment for
+/// both, so every offer needs its own owner key; `core::rental` pays the
+/// rent to that key's own address.
+///
+/// The bond script is rebuilt in the VM rather than passed in, so the taker
+/// chooses only the key. Pushing `bonded_until` gives its minimal
+/// little-endian bytes, the encoding midwimble requires, and their length
+/// (under 256) is the push's two length bytes `<len> 00`.
+///
+/// Uses no opcode newer than `OP_SUM_INPUT_VALUE`
+/// (`COVENANT_SUM_ACTIVATION_HEIGHT`). It is the IDE language's compilation
+/// of `docs/contracts/bond-rental-offer.mds`, op for op.
+pub fn compile_bond_rental_offer(
+    owner_pk: &[u8; 32],
+    bonded_until: u64,
+    rent: u64,
+    bond: u64,
+    pay_to: &[u8; 32],
+) -> Vec<u8> {
+    let mut bc = Vec::with_capacity(240);
+    bc.push(OP_DUP);
+    push_int(&mut bc, 1);
+    bc.push(OP_EQUAL);
+    bc.push(OP_IF);
+        bc.push(OP_DROP);
+        // The key is exactly 32 bytes.
+        bc.extend_from_slice(&[OP_DUP, OP_SIZE, OP_SWAP, OP_DROP]);
+        push_int(&mut bc, 32);
+        bc.push(OP_EQUAL);
+        bc.push(OP_VERIFY);
+        // The bond script around it: [key, until, script].
+        push_int(&mut bc, bonded_until);
+        push_data(&mut bc, &[OP_PUSH_DATA, 32, 0]);
+        push_int(&mut bc, 2);
+        bc.push(OP_PICK);
+        bc.push(OP_CONCAT);
+        push_data(&mut bc, &[OP_DROP, OP_PUSH_DATA]);
+        bc.push(OP_CONCAT);
+        bc.extend_from_slice(&[OP_OVER, OP_SIZE, OP_SWAP, OP_DROP]);
+        push_data(&mut bc, &[0]);
+        bc.push(OP_CONCAT);
+        bc.push(OP_CONCAT);
+        bc.push(OP_OVER);
+        bc.push(OP_CONCAT);
+        push_data(&mut bc, &[OP_CHECKTIMEVERIFY, OP_PUSH_DATA, 32, 0]);
+        bc.push(OP_CONCAT);
+        push_data(&mut bc, owner_pk);
+        push_data(&mut bc, &[OP_CHECKSIGVERIFY, OP_PUSH_DATA, 1, 0, 1]);
+        bc.push(OP_CONCAT);
+        bc.push(OP_CONCAT);
+        // [key, until, script, bond address]
+        bc.push(OP_DUP);
+        bc.push(OP_HASH);
+        // Every coin of this offer the transaction spends goes into the bond...
+        bc.push(OP_DUP);
+        bc.push(OP_SUM_TO_ADDR);
+        bc.push(OP_SUM_INPUT_VALUE);
+        bc.push(OP_GREATER_OR_EQUAL);
+        bc.push(OP_VERIFY);
+        // ...and is paid for.
+        push_data(&mut bc, pay_to);
+        bc.push(OP_SUM_TO_ADDR);
+        bc.push(OP_SUM_INPUT_VALUE);
+        push_int(&mut bc, bond);
+        bc.push(OP_DIV);
+        push_int(&mut bc, rent);
+        bc.push(OP_MUL);
+        bc.push(OP_GREATER_OR_EQUAL);
+        bc.push(OP_VERIFY);
+        bc.extend_from_slice(&[OP_DROP, OP_DROP, OP_DROP, OP_DROP]);
+    bc.push(OP_ELSE);
+        bc.push(OP_DUP);
+        push_int(&mut bc, 0);
+        bc.push(OP_EQUAL);
+        bc.push(OP_IF);
+            bc.push(OP_DROP);
+            push_data(&mut bc, owner_pk);
+            bc.push(OP_CHECKSIGVERIFY);
+        bc.push(OP_ELSE);
+            bc.push(OP_DROP);
+            push_int(&mut bc, 0);
+            bc.push(OP_VERIFY);
+        bc.push(OP_ENDIF);
+    bc.push(OP_ENDIF);
+    push_int(&mut bc, 1);
+    bc
+}
+
 pub fn compile_htlc(
     secret_hash: &[u8; 32],
     receiver_pk: &[u8; 32],

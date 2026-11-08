@@ -99,6 +99,10 @@ pub enum Action {
     RegisterBond { id: String },
     LoadBondRules,
     CopyCoBondFile { id: String },
+    LoadRentals,
+    PostOffer { days: u64, rent: u64 },
+    CancelOffer { id: String },
+    TakeOffer { id: String },
 }
 
 pub enum Msg {
@@ -179,6 +183,10 @@ pub enum Msg {
     MwbCoins(Vec<MwbCoinView>),
     MwbRescanOk,
     BondRules(BondRulesView),
+    /// The bond rental market, this wallet's offers and rented bonds.
+    Rentals(RentalsView),
+    /// A rental action finished; the text says what happened.
+    RentalDone(String),
     /// A bond file for a pool operator, to put on the clipboard.
     CoBondFile(String),
 }
@@ -392,6 +400,24 @@ pub fn dispatch(
             Action::MwbRescan { from } => run!("rescan MDW", h.mwb_rescan(from), |_| Msg::MwbRescanOk),
             Action::RegisterBond { id } => run!("register bond", h.register_bond(id), Msg::BondDone),
             Action::LoadBondRules => run!("bond rules", h.bond_rules(), Msg::BondRules),
+            Action::LoadRentals => run!("rentals", h.rentals(), Msg::Rentals),
+            Action::PostOffer { days, rent } => run!("offer a bond", h.post_offer(days, rent), |_| {
+                Msg::RentalDone(
+                    "Offered: the send that locks the coin is on the Send tab. Once it confirms, the offer is \
+                     listed, and anyone can rent it while this wallet is closed."
+                        .into(),
+                )
+            }),
+            Action::CancelOffer { id } => run!("cancel offer", h.cancel_offer(id), |_| {
+                Msg::RentalDone("Cancelling: the coin comes back once the send on the Send tab confirms.".into())
+            }),
+            Action::TakeOffer { id } => run!("rent bond", h.take_offer(id), |_| {
+                Msg::RentalDone(
+                    "Renting: the send is on the Send tab. Once it confirms, the wallet registers the bond, and \
+                     about a day later your miner signs with it."
+                        .into(),
+                )
+            }),
             Action::CopyCoBondFile { id } => run!("co-bond file", h.co_bond_file(id), Msg::CoBondFile),
         }
     });

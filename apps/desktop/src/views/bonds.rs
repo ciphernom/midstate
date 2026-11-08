@@ -24,11 +24,18 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         .map(|s| s.is_syncing || s.restore_pass > 0)
         .unwrap_or(true);
 
-    lock_form(app, ui, &ctx, height, blocked);
-    ui.add_space(10.0);
-    bond_list(app, ui, &ctx, blocked);
-    ui.add_space(10.0);
-    import_form(app, ui, &ctx);
+    let views = ["Your bonds", "Bonds for rent"];
+    theme::segmented(ui, &views, &mut app.bonds_view);
+    ui.add_space(8.0);
+    if app.bonds_view == 1 {
+        super::rent::show(app, ui, &ctx, height, blocked);
+    } else {
+        lock_form(app, ui, &ctx, height, blocked);
+        ui.add_space(10.0);
+        bond_list(app, ui, &ctx, blocked);
+        ui.add_space(10.0);
+        import_form(app, ui, &ctx);
+    }
 
     if app.busy {
         ui.add_space(6.0);
@@ -283,6 +290,11 @@ fn bond_list(app: &mut App, ui: &mut Ui, ctx: &egui::Context, blocked: bool) {
                 ui.label(RichText::new(title).font(theme::font_medium(14.0)));
                 ui.label(theme::mono(compact_units(b.value)).color(theme::ink()));
                 theme::badge(ui, &b.status.replace('_', " "), theme::ink());
+                match b.rental.as_str() {
+                    "rented" => theme::badge(ui, "rented", theme::muted()),
+                    "rented_out" => theme::badge(ui, "rented out", theme::muted()),
+                    _ => {}
+                }
             });
             theme::hint(ui, &b.status_text);
             ui.add_space(4.0);
