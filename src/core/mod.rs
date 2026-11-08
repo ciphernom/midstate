@@ -28,3 +28,6 @@ pub mod dex;
 
 // Midwimble mining bonds for rent: offers, announcements, takes.
 pub mod rental;
+
+// Inheritance plans and payment streams: covenants on existing opcodes.
+pub mod plans;

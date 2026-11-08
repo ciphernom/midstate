@@ -7,6 +7,7 @@ pub mod history;
 pub mod mdw;
 pub mod node;
 pub mod onboarding;
+pub mod plans;
 pub mod receive;
 pub mod rent;
 pub mod send;

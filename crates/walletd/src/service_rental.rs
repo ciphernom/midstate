@@ -647,7 +647,7 @@ impl Service {
     /// Confirms a send by one of its outputs appearing, for a spend of a
     /// coin someone else could spend first. Gives up once that coin has been
     /// gone a while without ours appearing.
-    fn spawn_output_monitor(&self, commitment: [u8; 32], ours: [u8; 32], contested: [u8; 32]) {
+    pub(super) fn spawn_output_monitor(&self, commitment: [u8; 32], ours: [u8; 32], contested: [u8; 32]) {
         let node = self.node.clone();
         let tx = self.self_tx.clone();
         tokio::spawn(async move {

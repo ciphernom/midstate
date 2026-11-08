@@ -430,6 +430,111 @@ pub struct RentedBondView {
     pub reg_note: String,
 }
 
+/// Inheritance plans and payment streams (`crate::plans`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PlansView {
+    /// Why plans cannot be used yet; empty when they can.
+    pub blocked: String,
+    pub tip: u64,
+    pub owned: Vec<OwnedPlanView>,
+    pub held: Vec<HeldPlanView>,
+    pub sent: Vec<SentStreamView>,
+    pub received: Vec<HeldStreamView>,
+    /// Whether this wallet has made a payee code yet, and how many sweeps
+    /// its newest payee key has left.
+    pub payee_ready: bool,
+    pub payee_left: u64,
+    /// Payouts to this wallet waiting to be swept into ordinary coins, and
+    /// those being swept now.
+    pub payouts_waiting: u64,
+    pub payouts_sweeping: u64,
+}
+
+/// A plan this wallet owns.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct OwnedPlanView {
+    pub id: String,
+    pub label: String,
+    /// Each heir's name and share in hundredths of a percent.
+    pub heirs: Vec<(String, u32)>,
+    pub balance: u64,
+    pub period_days: u64,
+    /// The earliest deadline any of its coins has (a midstate height), and
+    /// the same in words.
+    pub deadline: u64,
+    pub deadline_text: String,
+    /// Past the deadline: the heirs may claim now, until you check in.
+    pub overdue: bool,
+    /// Within a tenth of a period of the deadline.
+    pub due_soon: bool,
+    /// "active" | "moving" | "empty" | "closed"
+    pub status: String,
+    pub note: String,
+    /// The code to give each heir (and to keep: it restores the plan).
+    pub code: String,
+    pub can_check_in: bool,
+    pub can_close: bool,
+    pub owner_signatures_left: u64,
+}
+
+/// A plan naming this wallet as an heir.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct HeldPlanView {
+    pub id: String,
+    pub label: String,
+    /// Each heir's name, and whether it is this wallet.
+    pub heirs: Vec<(String, bool)>,
+    pub my_share_bps: u32,
+    pub balance: u64,
+    pub deadline: u64,
+    pub deadline_text: String,
+    /// Coins past their deadline: anyone may pay the heirs now.
+    pub claimable: bool,
+    pub period_days: u64,
+    pub note: String,
+}
+
+/// A stream this wallet pays.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SentStreamView {
+    pub id: String,
+    pub label: String,
+    pub recipient: String,
+    pub amount: u64,
+    pub count: u32,
+    pub period_days: f64,
+    pub cancellable: bool,
+    /// Payments still on chain, and how many of them are not yet due.
+    pub waiting: u32,
+    pub not_yet_due: u32,
+    pub next_due_text: String,
+    pub last_due_text: String,
+    /// "funding" | "active" | "ended"
+    pub status: String,
+    pub note: String,
+    /// The code to give the recipient.
+    pub code: String,
+    pub can_cancel: bool,
+}
+
+/// A stream paying this wallet.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct HeldStreamView {
+    pub id: String,
+    pub label: String,
+    pub amount: u64,
+    pub count: u32,
+    pub period_days: f64,
+    pub cancellable: bool,
+    pub waiting: u32,
+    /// Due and not yet collected.
+    pub due_now: u32,
+    pub next_due_text: String,
+    pub last_due_text: String,
+    pub auto_collect: bool,
+    pub note: String,
+}
+
 /// Midwimble's bond rules as they stand, and this wallet's mining key.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct BondRulesView {
