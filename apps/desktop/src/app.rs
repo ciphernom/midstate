@@ -20,12 +20,13 @@ pub enum Tab {
     Channels,
     Trade,
     Bonds,
+    Plans,
     Node,
     Settings,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 11] = [
+    pub const ALL: [Tab; 12] = [
         Tab::Dashboard,
         Tab::Send,
         Tab::Receive,
@@ -35,6 +36,7 @@ impl Tab {
         Tab::Channels,
         Tab::Trade,
         Tab::Bonds,
+        Tab::Plans,
         Tab::Node,
         Tab::Settings,
     ];
@@ -49,6 +51,7 @@ impl Tab {
             Tab::Channels => "Channels",
             Tab::Trade => "Trade",
             Tab::Bonds => "Bonds",
+            Tab::Plans => "Plans",
             Tab::Node => "Node",
             Tab::Settings => "Settings",
         }
@@ -278,6 +281,34 @@ pub struct App {
     pub rent_pick: Option<String>,
     pub rental_notice: String,
 
+    // Plans tab: inheritance plans and payment streams
+    pub plans: Option<midstate_walletd::api::PlansView>,
+    pub plans_last_poll: f64,
+    /// 0: inheritance; 1: streams; 2: codes.
+    pub plans_tab: usize,
+    pub plans_notice: String,
+    /// The action whose first press armed it; the next press does it.
+    pub plans_confirm: Option<String>,
+    pub payee_name: String,
+    pub payee_code_out: String,
+    pub plan_import_code: String,
+    pub plan_import_label: String,
+    pub plan_label: String,
+    pub plan_amount: String,
+    pub plan_unit: usize,
+    pub plan_days: String,
+    /// (payee code, share in percent) per heir.
+    pub plan_heirs: Vec<(String, String)>,
+    pub stream_label: String,
+    pub stream_payee: String,
+    pub stream_amount: String,
+    pub stream_unit: usize,
+    pub stream_every: String,
+    pub stream_count: String,
+    pub stream_delay: String,
+    pub stream_cancellable: bool,
+    pub stream_code_out: String,
+
     // MDW: midwimble, beside midstate in every tab
     /// Which coin the Send, Receive and History tabs show: 0 MDS, 1 MDW.
     pub send_asset: usize,
@@ -503,6 +534,29 @@ impl App {
             rent_confirm: false,
             rent_pick: None,
             rental_notice: String::new(),
+            plans: None,
+            plans_last_poll: 0.0,
+            plans_tab: 0,
+            plans_notice: String::new(),
+            plans_confirm: None,
+            payee_name: String::new(),
+            payee_code_out: String::new(),
+            plan_import_code: String::new(),
+            plan_import_label: String::new(),
+            plan_label: String::new(),
+            plan_amount: String::new(),
+            plan_unit: 3,
+            plan_days: "365".into(),
+            plan_heirs: vec![(String::new(), String::new())],
+            stream_label: String::new(),
+            stream_payee: String::new(),
+            stream_amount: String::new(),
+            stream_unit: 3,
+            stream_every: "30".into(),
+            stream_count: "12".into(),
+            stream_delay: "0".into(),
+            stream_cancellable: true,
+            stream_code_out: String::new(),
             send_asset: 0,
             recv_asset: 0,
             hist_asset: 0,
@@ -773,6 +827,11 @@ impl App {
                 self.rentals = None;
                 self.rent_confirm = false;
                 self.rent_pick = None;
+                self.plans = None;
+                self.plans_confirm = None;
+                self.plans_notice.clear();
+                self.payee_code_out.clear();
+                self.stream_code_out.clear();
                 self.mwb_history.clear();
                 self.mwb_coins.clear();
                 self.mwb_send_to.clear();
@@ -961,6 +1020,38 @@ impl App {
             }
             Msg::Bonds(b) => self.bonds = b,
             Msg::Rentals(r) => self.rentals = Some(r),
+            Msg::Plans(p) => self.plans = Some(p),
+            Msg::PlansDone(text) => {
+                self.busy = false;
+                self.plans_notice = text;
+                self.plans_confirm = None;
+                if self.plans_notice.starts_with("Plan made") {
+                    self.plan_amount.clear();
+                    self.plan_heirs = vec![(String::new(), String::new())];
+                }
+                if self.plans_notice.starts_with("Following") {
+                    self.plan_import_code.clear();
+                    self.plan_import_label.clear();
+                }
+                self.go(ctx, Action::LoadPlans);
+                self.go(ctx, Action::LoadSends);
+                self.go(ctx, Action::LoadBalance);
+            }
+            Msg::PayeeCode(code) => {
+                self.busy = false;
+                self.payee_code_out = code;
+                self.plans_notice = "A new payee code: copy it and give it to the person naming or paying you.".into();
+            }
+            Msg::StreamCode(code) => {
+                self.busy = false;
+                self.plans_confirm = None;
+                self.stream_code_out = code;
+                self.stream_amount.clear();
+                self.plans_notice = "Stream started: the funding send is on the Send tab.".into();
+                self.go(ctx, Action::LoadPlans);
+                self.go(ctx, Action::LoadSends);
+                self.go(ctx, Action::LoadBalance);
+            }
             Msg::RentalDone(text) => {
                 self.busy = false;
                 self.rental_notice = text;
@@ -1095,7 +1186,7 @@ impl App {
                 // Background loads fail benignly while locked; don't banner those.
                 let background = matches!(
                     what,
-                    "status" | "balance" | "coins" | "addresses" | "history" | "sends" | "node info" | "chat" | "channels" | "channel identity" | "invoices" | "hub" | "order book" | "base account" | "dex settings" | "swap quote" | "my orders" | "swaps" | "my bids" | "hubs" | "bonds" | "mdw account" | "mdw book" | "mdw orders" | "mdw swaps" | "mdw node" | "mdw history" | "mdw coins" | "bond rules" | "rentals"
+                    "status" | "balance" | "coins" | "addresses" | "history" | "sends" | "node info" | "chat" | "channels" | "channel identity" | "invoices" | "hub" | "order book" | "base account" | "dex settings" | "swap quote" | "my orders" | "swaps" | "my bids" | "hubs" | "bonds" | "mdw account" | "mdw book" | "mdw orders" | "mdw swaps" | "mdw node" | "mdw history" | "mdw coins" | "bond rules" | "rentals" | "plans"
                 );
                 if background {
                     tracing::debug!("{what}: {err}");
@@ -1294,6 +1385,13 @@ impl eframe::App for App {
                 }
             }
         }
+        if self.tab == Tab::Plans && self.handle.is_some() {
+            let t = self.t0.elapsed().as_secs_f64();
+            if t - self.plans_last_poll > 5.0 {
+                self.plans_last_poll = t;
+                self.go(ctx, Action::LoadPlans);
+            }
+        }
         if self.tab == Tab::Channels && self.handle.is_some() {
             let t = self.t0.elapsed().as_secs_f64();
             if t - self.chan_last_poll > 2.0 {
@@ -1406,6 +1504,7 @@ impl eframe::App for App {
                                 Tab::Channels => views::channels::show(self, ui),
                                 Tab::Trade => views::trade::show(self, ui),
                                 Tab::Bonds => views::bonds::show(self, ui),
+                                Tab::Plans => views::plans::show(self, ui),
                                 Tab::Node => views::node::show(self, ui),
                                 Tab::Settings => views::settings::show(self, ui, &status),
                             }

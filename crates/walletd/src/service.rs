@@ -29,6 +29,8 @@ use mwb_glue::MwbLive;
 mod mining_glue;
 #[path = "service_rental.rs"]
 mod rental_glue;
+#[path = "service_plans.rs"]
+mod plans_glue;
 
 const TICK: Duration = Duration::from_secs(2);
 /// How long a commit monitor waits for the commitment to enter chain state
@@ -162,6 +164,18 @@ enum Cmd {
     PostOffer { days: u64, rent: u64, resp: oneshot::Sender<Result<String>> },
     CancelOffer { id: String, resp: oneshot::Sender<Result<String>> },
     TakeOffer { id: String, resp: oneshot::Sender<Result<String>> },
+    Plans(oneshot::Sender<Result<crate::api::PlansView>>),
+    PayeeCode { name: String, resp: oneshot::Sender<Result<String>> },
+    CreatePlan { label: String, heirs: Vec<(String, u32)>, period_days: u64, amount: u64, resp: oneshot::Sender<Result<String>> },
+    CheckIn { id: String, resp: oneshot::Sender<Result<String>> },
+    ClosePlan { id: String, resp: oneshot::Sender<Result<String>> },
+    ClaimPlan { id: String, resp: oneshot::Sender<Result<String>> },
+    ImportPlanCode { code: String, label: String, resp: oneshot::Sender<Result<String>> },
+    CreateStream { label: String, payee: String, amount: u64, period_blocks: u64, count: u32, delay_blocks: u64, cancellable: bool, resp: oneshot::Sender<Result<String>> },
+    CancelStream { id: String, resp: oneshot::Sender<Result<String>> },
+    CollectStream { id: String, resp: oneshot::Sender<Result<String>> },
+    AutoCollect { id: String, on: bool, resp: oneshot::Sender<Result<()>> },
+    SweepPayouts(oneshot::Sender<Result<String>>),
     Internal(Internal),
 }
 
@@ -556,6 +570,52 @@ impl WalletdHandle {
     pub async fn take_offer(&self, id: String) -> Result<String> {
         ask!(self, TakeOffer { id: id })
     }
+
+    // ── Inheritance plans and payment streams ───────────────────────────
+
+    pub async fn plans(&self) -> Result<crate::api::PlansView> {
+        ask!(self, Plans)
+    }
+    /// A code naming a new key of this wallet's, for an owner to name it as
+    /// an heir or a payer to pay it.
+    pub async fn payee_code(&self, name: String) -> Result<String> {
+        ask!(self, PayeeCode { name: name })
+    }
+    /// Locks `amount` in a plan for heirs given as (payee code, share in
+    /// hundredths of a percent). Returns the plan's id.
+    pub async fn create_plan(&self, label: String, heirs: Vec<(String, u32)>, period_days: u64, amount: u64) -> Result<String> {
+        ask!(self, CreatePlan { label: label, heirs: heirs, period_days: period_days, amount: amount })
+    }
+    pub async fn check_in(&self, id: String) -> Result<String> {
+        ask!(self, CheckIn { id: id })
+    }
+    pub async fn close_plan(&self, id: String) -> Result<String> {
+        ask!(self, ClosePlan { id: id })
+    }
+    pub async fn claim_plan(&self, id: String) -> Result<String> {
+        ask!(self, ClaimPlan { id: id })
+    }
+    /// Takes in a plan or stream code naming one of this wallet's keys.
+    pub async fn import_plan_code(&self, code: String, label: String) -> Result<String> {
+        ask!(self, ImportPlanCode { code: code, label: label })
+    }
+    /// Starts a stream. Returns the code to give the recipient.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_stream(&self, label: String, payee: String, amount: u64, period_blocks: u64, count: u32, delay_blocks: u64, cancellable: bool) -> Result<String> {
+        ask!(self, CreateStream { label: label, payee: payee, amount: amount, period_blocks: period_blocks, count: count, delay_blocks: delay_blocks, cancellable: cancellable })
+    }
+    pub async fn cancel_stream(&self, id: String) -> Result<String> {
+        ask!(self, CancelStream { id: id })
+    }
+    pub async fn collect_stream(&self, id: String) -> Result<String> {
+        ask!(self, CollectStream { id: id })
+    }
+    pub async fn set_auto_collect(&self, id: String, on: bool) -> Result<()> {
+        ask!(self, AutoCollect { id: id, on: on })
+    }
+    pub async fn sweep_payouts(&self) -> Result<String> {
+        ask!(self, SweepPayouts)
+    }
 }
 
 /// Spawn the actor. `wallet_path` is the single managed wallet file
@@ -607,6 +667,7 @@ pub fn spawn(
         bonds: BondBook::default(),
         rentals: Default::default(),
         market: Default::default(),
+        plans: Default::default(),
         mining,
         events,
         self_tx: tx,
@@ -670,6 +731,9 @@ struct Service {
     rentals: crate::rental::RentalBook,
     /// The bond rental market as read off the chain; rebuilt every run.
     market: crate::rental::Market,
+    /// Inheritance plans and payment streams (see `crate::plans`). Persisted:
+    /// a plan's parameters may exist nowhere else.
+    plans: crate::plans::PlanBook,
     /// Supervises the local Stratum pool and hasher child processes. Mining is
     /// deliberately out-of-process; see `crate::mining` for the payout and
     /// working-directory reasons.
@@ -748,6 +812,7 @@ impl Service {
                 // Reloaded from the sidecars on unlock.
                 self.restore = None;
                 self.bonds = BondBook::default();
+                self.plans_unload();
                 self.mwb_unload();
                 // The bond's secret leaves with the wallet: the local pool
                 // mines midstate alone until it is unlocked again.
@@ -1106,6 +1171,42 @@ impl Service {
             Cmd::TakeOffer { id, resp } => {
                 let _ = resp.send(self.take_offer(&id).await);
             }
+            Cmd::Plans(resp) => {
+                let _ = resp.send(self.plans_view().await);
+            }
+            Cmd::PayeeCode { name, resp } => {
+                let _ = resp.send(self.payee_code(&name));
+            }
+            Cmd::CreatePlan { label, heirs, period_days, amount, resp } => {
+                let _ = resp.send(self.create_plan(label, heirs, period_days, amount).await);
+            }
+            Cmd::CheckIn { id, resp } => {
+                let _ = resp.send(self.check_in(&id).await);
+            }
+            Cmd::ClosePlan { id, resp } => {
+                let _ = resp.send(self.close_plan(&id).await);
+            }
+            Cmd::ClaimPlan { id, resp } => {
+                let _ = resp.send(self.claim_plan(&id).await);
+            }
+            Cmd::ImportPlanCode { code, label, resp } => {
+                let _ = resp.send(self.import_code(&code, &label).await);
+            }
+            Cmd::CreateStream { label, payee, amount, period_blocks, count, delay_blocks, cancellable, resp } => {
+                let _ = resp.send(self.create_stream(label, payee, amount, period_blocks, count, delay_blocks, cancellable).await);
+            }
+            Cmd::CancelStream { id, resp } => {
+                let _ = resp.send(self.cancel_stream(&id).await);
+            }
+            Cmd::CollectStream { id, resp } => {
+                let _ = resp.send(self.collect_stream(&id).await);
+            }
+            Cmd::AutoCollect { id, on, resp } => {
+                let _ = resp.send(self.set_auto_collect(&id, on));
+            }
+            Cmd::SweepPayouts(resp) => {
+                let _ = resp.send(self.sweep_payouts().await);
+            }
             Cmd::CoBondFile { id, resp } => {
                 let r = crate::mwb_mining::parse_bond_id(&id).and_then(|raw| {
                     let b = self.bonds.find(&raw).ok_or_else(|| anyhow!("no such bond"))?;
@@ -1159,7 +1260,12 @@ impl Service {
         if old_bonds.exists() {
             let _ = std::fs::rename(&old_bonds, old_bonds.with_extension(format!("bonds.previous-{}", now_secs())));
         }
+        let old_plans = crate::plans::PlanBook::path(&self.wallet_path);
+        if old_plans.exists() {
+            let _ = std::fs::rename(&old_plans, old_plans.with_extension(format!("plans.previous-{}", now_secs())));
+        }
         self.bonds = BondBook::default();
+        self.plans_unload();
         self.wallet = Some(wallet);
         self.mwb_load();
         // Fresh wallet: nothing historical can belong to it — start scanning
@@ -1241,6 +1347,7 @@ impl Service {
         self.sync_wots_hold();
         self.bonds = BondBook::load(&self.wallet_path).0;
         self.rentals_load();
+        self.plans_load();
         self.scan_pos = 0;
         self.persist_scan_pos();
         Ok(())
@@ -1275,6 +1382,7 @@ impl Service {
             let _ = self.events.send(WalletEvent::Warning { text });
         }
         self.rentals_load();
+        self.plans_load();
         self.mwb_load();
         // Mining that ran through the lock signs MDW blocks again.
         self.refresh_merge_bond();
@@ -2525,6 +2633,7 @@ impl Service {
                 None if self.rentals.by_take(&commitment).is_some() => {
                     (self.rentals.by_take(&commitment).map_or(0, |r| r.offer.rent), 0)
                 }
+                None if self.is_plan_send(&commitment) => self.plans_meta(&commitment).unwrap_or((0, 0)),
                 None => self
                     .wallet
                     .as_ref()
@@ -2577,7 +2686,8 @@ impl Service {
                     .bonds
                     .by_unbond(&c)
                     .map(|b| b.value)
-                    .or_else(|| self.rentals.by_cancel(&c).map(|o| o.offer.bond));
+                    .or_else(|| self.rentals.by_cancel(&c).map(|o| o.offer.bond))
+                    .or_else(|| self.plans_returned(&c));
                 if let Some(w) = self.wallet.as_mut() {
                     let spent: Vec<[u8; 32]> = w
                         .find_pending(&c)
@@ -2619,6 +2729,7 @@ impl Service {
                             }
                             self.set_stage(c, SendStage::Confirmed, "spend confirmed on-chain");
                             self.rental_confirmed(c);
+                            self.plans_confirmed(c);
                             let _ = self.events.send(WalletEvent::WalletChanged);
                         }
                         Err(e) => {
@@ -2646,6 +2757,10 @@ impl Service {
         }
         if self.rentals.by_cancel(&commitment).is_some() {
             self.reveal_cancel(commitment, pending).await;
+            return;
+        }
+        if self.is_plan_send(&commitment) {
+            self.reveal_plan(commitment, pending).await;
             return;
         }
 
@@ -7005,6 +7120,7 @@ impl Service {
         self.refresh_bonds_live().await;
         self.advance_registrations().await;
         self.tick_rentals(tip).await;
+        self.tick_plans(tip).await;
 
         // A restore pass records the window it starts with at height 0; one
         // whose start was never recorded (interrupted between passes) restarts.

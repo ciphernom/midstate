@@ -103,6 +103,18 @@ pub enum Action {
     PostOffer { days: u64, rent: u64 },
     CancelOffer { id: String },
     TakeOffer { id: String },
+    LoadPlans,
+    MakePayeeCode { name: String },
+    CreatePlan { label: String, heirs: Vec<(String, u32)>, period_days: u64, amount: u64 },
+    CheckIn { id: String },
+    ClosePlan { id: String },
+    ClaimPlan { id: String },
+    ImportPlanCode { code: String, label: String },
+    CreateStream { label: String, payee: String, amount: u64, period_blocks: u64, count: u32, delay_blocks: u64, cancellable: bool },
+    CancelStream { id: String },
+    CollectStream { id: String },
+    AutoCollect { id: String, on: bool },
+    SweepPayouts,
 }
 
 pub enum Msg {
@@ -189,6 +201,12 @@ pub enum Msg {
     RentalDone(String),
     /// A bond file for a pool operator, to put on the clipboard.
     CoBondFile(String),
+    Plans(midstate_walletd::api::PlansView),
+    /// A plan or stream action finished; the text says what happened.
+    PlansDone(String),
+    PayeeCode(String),
+    /// A stream started: the code for its recipient.
+    StreamCode(String),
 }
 
 pub fn dispatch(
@@ -419,6 +437,48 @@ pub fn dispatch(
                 )
             }),
             Action::CopyCoBondFile { id } => run!("co-bond file", h.co_bond_file(id), Msg::CoBondFile),
+            Action::LoadPlans => run!("plans", h.plans(), Msg::Plans),
+            Action::MakePayeeCode { name } => run!("make payee code", h.payee_code(name), Msg::PayeeCode),
+            Action::CreatePlan { label, heirs, period_days, amount } => {
+                run!("make plan", h.create_plan(label, heirs, period_days, amount), |_| {
+                    Msg::PlansDone(
+                        "Plan made: the send that funds it is on the Send tab. Once it confirms, give each heir the \
+                         plan's code."
+                            .into(),
+                    )
+                })
+            }
+            Action::CheckIn { id } => run!("check in", h.check_in(id), |_| {
+                Msg::PlansDone("Checking in: follow it on the Send tab.".into())
+            }),
+            Action::ClosePlan { id } => run!("close plan", h.close_plan(id), |_| {
+                Msg::PlansDone("Closing: the coins come back once the send on the Send tab confirms.".into())
+            }),
+            Action::ClaimPlan { id } => run!("claim plan", h.claim_plan(id), |_| {
+                Msg::PlansDone("Paying the heirs: follow it on the Send tab. Your share comes in by itself.".into())
+            }),
+            Action::ImportPlanCode { code, label } => run!("follow code", h.import_plan_code(code, label), |_| {
+                Msg::PlansDone("Following it: the wallet finds its coins on chain.".into())
+            }),
+            Action::CreateStream { label, payee, amount, period_blocks, count, delay_blocks, cancellable } => {
+                run!(
+                    "start stream",
+                    h.create_stream(label, payee, amount, period_blocks, count, delay_blocks, cancellable),
+                    Msg::StreamCode
+                )
+            }
+            Action::CancelStream { id } => run!("cancel stream", h.cancel_stream(id), |_| {
+                Msg::PlansDone("Taking back the payments not yet due: follow it on the Send tab.".into())
+            }),
+            Action::CollectStream { id } => run!("collect", h.collect_stream(id), |_| {
+                Msg::PlansDone("Collecting: follow it on the Send tab.".into())
+            }),
+            Action::AutoCollect { id, on } => run!("auto collect", h.set_auto_collect(id, on), move |_| {
+                Msg::PlansDone(if on { "Collecting payments as they fall due." } else { "Not collecting payments by itself." }.into())
+            }),
+            Action::SweepPayouts => run!("sweep", h.sweep_payouts(), |_| {
+                Msg::PlansDone("Moving what you were paid into your balance: follow it on the Send tab.".into())
+            }),
         }
     });
 }
