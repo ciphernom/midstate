@@ -614,6 +614,174 @@ fn golden_many<const K: usize>(pads: &mut [Box<Pad>; K]) -> bool {
     })
 }
 
+// ── Where a step's time goes ────────────────────────────────────────────────
+
+/// A step exactly as [`step`] computes it, written so that no register goes
+/// through memory: the register written (`S`) is known when it compiles, `k`
+/// is picked with two selects instead of an index, and AES's high half is
+/// XORed in under masks. `step` indexes the registers with `t`, so all eight
+/// live in memory, and it XORs into `r[t]` on every step. The
+/// XOR into `out` is also grouped so the loads' half is ready before the
+/// operation ends. Not yet what mines: `cpu-probe` times it against `step`.
+#[inline(always)]
+fn step_unindexed<A: AesRound, const S: usize>(op: u8, r: &mut [u64; 8], c: &mut u64, pad: &mut Pad) {
+    const MASK: u64 = WALK_LINES as u64 - 1;
+    let x = r[S] ^ *c;
+    let a = (x & MASK) as usize;
+    let off = (x >> 12) & 3;
+    let j = ((x >> 14) & 7) as usize;
+    let e = ((x >> 17) & MASK) as usize;
+    let b = ((x >> 32) & MASK) as usize;
+    let f = ((x >> 44) & MASK) as usize;
+    let m0 = pad[a][j];
+    let m1 = pad[b][j ^ 4];
+    let m2 = pad[e][j ^ 2];
+    let m3 = pad[f][j ^ 6];
+    let (r1, r2, r3, r4) = (r[(S + 1) & 7], r[(S + 2) & 7], r[(S + 3) & 7], r[(S + 4) & 7]);
+    let low_pair = if off & 1 == 0 { r1 } else { r2 };
+    let high_pair = if off & 1 == 0 { r3 } else { r4 };
+    let k = if off & 2 == 0 { low_pair } else { high_pair };
+    let v = x ^ m0 ^ m2;
+    let m13 = m1 ^ m3;
+    let y = match op {
+        0 => v.wrapping_mul(k | 1),
+        1 => v ^ mulhi(v, k),
+        2 => v.wrapping_add(k / ((v as u32 as u64) | 0x8000_0001)),
+        3 => {
+            let (lo, h) = A::round_pair(v, k);
+            let pick = |d: u64| h & 0u64.wrapping_sub((off == d) as u64);
+            r[(S + 1) & 7] ^= pick(0);
+            r[(S + 2) & 7] ^= pick(1);
+            r[(S + 3) & 7] ^= pick(2);
+            r[(S + 4) & 7] ^= pick(3);
+            lo
+        }
+        4 => v.rotate_right((k & 63) as u32),
+        5 => v.wrapping_add(k),
+        6 => v.wrapping_sub(k),
+        _ => v ^ k,
+    };
+    let out = y ^ m13;
+    r[S] = out;
+    *c = out;
+    pad[a][j] = m0 ^ y;
+    pad[b][j ^ 4] = m1.wrapping_add(x);
+    pad[e][j ^ 2] = m2.wrapping_add(y);
+    pad[f][j ^ 6] = m3 ^ x;
+}
+
+/// Eight steps (a round) of [`step_unindexed`].
+#[inline(always)]
+fn round_unindexed<A: AesRound>(prog: &[u8; 8], r: &mut [u64; 8], c: &mut u64, pad: &mut Pad) {
+    step_unindexed::<A, 0>(prog[0], r, c, pad);
+    step_unindexed::<A, 1>(prog[1], r, c, pad);
+    step_unindexed::<A, 2>(prog[2], r, c, pad);
+    step_unindexed::<A, 3>(prog[3], r, c, pad);
+    step_unindexed::<A, 4>(prog[4], r, c, pad);
+    step_unindexed::<A, 5>(prog[5], r, c, pad);
+    step_unindexed::<A, 6>(prog[6], r, c, pad);
+    step_unindexed::<A, 7>(prog[7], r, c, pad);
+}
+
+/// The walk with [`step_unindexed`]: the same hash as [`walk_hash`].
+#[inline(always)]
+fn walk_unindexed_generic<A: AesRound>(mining_hash: &[u8; 32], nonce: u64, pad: &mut Pad) -> [u8; 32] {
+    let (mut r, mut prog) = start_generic::<A>(mining_hash, nonce, pad);
+    let mut c = 0u64;
+    for round in 0..WALK_STEPS / 8 {
+        round_unindexed::<A>(&prog, &mut r, &mut c, pad);
+        if (round + 1) % (WALK_REMIX / 8) == 0 {
+            remix(&mut r, &mut prog);
+        }
+    }
+    finish(mining_hash, nonce, &r)
+}
+
+/// [`walk_hash`] computed with [`step_unindexed`], with the fastest AES this
+/// CPU has: for checking it, and timing it whole.
+pub fn walk_hash_unindexed(mining_hash: &[u8; 32], nonce: u64, pad: &mut Pad) -> [u8; 32] {
+    match backend() {
+        #[cfg(target_arch = "x86_64")]
+        Backend::AesNi => unsafe { x86::walk_unindexed(mining_hash, nonce, pad) },
+        #[cfg(target_arch = "aarch64")]
+        Backend::Armv8 => unsafe { arm::walk_unindexed(mining_hash, nonce, pad) },
+        _ => walk_unindexed_generic::<SoftAes>(mining_hash, nonce, pad),
+    }
+}
+
+/// `n` steps (a multiple of 8) of a walk on this thread, with the walk's own
+/// program or (`op`) every operation the same, unrolled as [`walk_generic`]
+/// runs them; no re-mix. Nanoseconds a step.
+#[inline(always)]
+fn time_steps_generic<A: AesRound>(op: Option<u8>, n: usize, unindexed: bool) -> f64 {
+    let m = *blake3::hash(b"midstate walk step timing").as_bytes();
+    let mut pad = new_pad();
+    let (mut r, mut prog) = start_generic::<A>(&m, 1, &mut pad);
+    if let Some(o) = op {
+        prog = [o & 7; 8];
+    }
+    let mut c = 0u64;
+    let begun = std::time::Instant::now();
+    if unindexed {
+        for _ in 0..n / 8 {
+            round_unindexed::<A>(&prog, &mut r, &mut c, &mut pad);
+        }
+    } else {
+        for _ in 0..n / 8 {
+            step::<A>(0, prog[0], &mut r, &mut c, &mut pad);
+            step::<A>(1, prog[1], &mut r, &mut c, &mut pad);
+            step::<A>(2, prog[2], &mut r, &mut c, &mut pad);
+            step::<A>(3, prog[3], &mut r, &mut c, &mut pad);
+            step::<A>(4, prog[4], &mut r, &mut c, &mut pad);
+            step::<A>(5, prog[5], &mut r, &mut c, &mut pad);
+            step::<A>(6, prog[6], &mut r, &mut c, &mut pad);
+            step::<A>(7, prog[7], &mut r, &mut c, &mut pad);
+        }
+    }
+    let took = begun.elapsed();
+    std::hint::black_box((&r, c, &pad[0]));
+    took.as_nanos() as f64 / (n / 8 * 8).max(1) as f64
+}
+
+/// Nanoseconds a step of the walk takes on this thread, with the fastest AES
+/// this CPU has, over `n` steps: with the walk's own program (`None`), or
+/// with every operation `op`. The steps are the walk's own code ([`step`],
+/// or with `unindexed` [`step_unindexed`]); setting one operation against
+/// another shows what each costs, and the XOR (the cheapest) shows what the
+/// rest of a step costs.
+pub fn time_steps(op: Option<u8>, n: usize, unindexed: bool) -> f64 {
+    match backend() {
+        #[cfg(target_arch = "x86_64")]
+        Backend::AesNi => unsafe { x86::time_steps(op, n, unindexed) },
+        #[cfg(target_arch = "aarch64")]
+        Backend::Armv8 => unsafe { arm::time_steps(op, n, unindexed) },
+        _ => time_steps_generic::<SoftAes>(op, n, unindexed),
+    }
+}
+
+/// Nanoseconds seeding a walk and growing its pad takes (once an attempt),
+/// over `n` of them.
+pub fn time_start(n: usize) -> f64 {
+    let m = *blake3::hash(b"midstate walk step timing").as_bytes();
+    let mut pad = new_pad();
+    let begun = std::time::Instant::now();
+    for i in 0..n {
+        std::hint::black_box(walk_start(&m, i as u64, &mut pad));
+    }
+    begun.elapsed().as_nanos() as f64 / n.max(1) as f64
+}
+
+/// Nanoseconds a re-mix takes (64 an attempt), over `n` of them.
+pub fn time_remix(n: usize) -> f64 {
+    let mut r = [1u64, 2, 3, 4, 5, 6, 7, 8];
+    let begun = std::time::Instant::now();
+    for _ in 0..n {
+        r = remix_of(std::hint::black_box(&r)).0;
+    }
+    std::hint::black_box(r);
+    begun.elapsed().as_nanos() as f64 / n.max(1) as f64
+}
+
 // ── The walk in three parts, for GPUs ───────────────────────────────────────
 //
 // A GPU runs the steps (`core::wgpu_walk`); the CPU seeds each walk and grows
@@ -886,6 +1054,20 @@ mod x86 {
     /// # Safety
     /// The CPU must support AES-NI and SSE2.
     #[target_feature(enable = "aes,sse2")]
+    pub(super) unsafe fn time_steps(op: Option<u8>, n: usize, unindexed: bool) -> f64 {
+        super::time_steps_generic::<AesNi>(op, n, unindexed)
+    }
+
+    /// # Safety
+    /// As [`time_steps`].
+    #[target_feature(enable = "aes,sse2")]
+    pub(super) unsafe fn walk_unindexed(m: &[u8; 32], nonce: u64, pad: &mut super::Pad) -> [u8; 32] {
+        super::walk_unindexed_generic::<AesNi>(m, nonce, pad)
+    }
+
+    /// # Safety
+    /// The CPU must support AES-NI and SSE2.
+    #[target_feature(enable = "aes,sse2")]
     pub(super) unsafe fn walk_many<const K: usize>(m: &[u8; 32], nonces: &[u64; K], pads: &mut [Box<super::Pad>; K]) -> [[u8; 32]; K] {
         super::walk_many_generic::<AesNi, K>(m, nonces, pads)
     }
@@ -944,6 +1126,20 @@ mod arm {
     #[target_feature(enable = "aes,neon")]
     pub(super) unsafe fn start(m: &[u8; 32], nonce: u64, pad: &mut super::Pad) -> ([u64; 8], [u8; 8]) {
         super::start_generic::<Armv8>(m, nonce, pad)
+    }
+
+    /// # Safety
+    /// The CPU must support the ARMv8 AES extension.
+    #[target_feature(enable = "aes,neon")]
+    pub(super) unsafe fn time_steps(op: Option<u8>, n: usize, unindexed: bool) -> f64 {
+        super::time_steps_generic::<Armv8>(op, n, unindexed)
+    }
+
+    /// # Safety
+    /// As [`time_steps`].
+    #[target_feature(enable = "aes,neon")]
+    pub(super) unsafe fn walk_unindexed(m: &[u8; 32], nonce: u64, pad: &mut super::Pad) -> [u8; 32] {
+        super::walk_unindexed_generic::<Armv8>(m, nonce, pad)
     }
 
     /// # Safety
@@ -1117,6 +1313,29 @@ mod tests {
         let r = [1u64, 2, 3, 4, 5, 6, 7, 8];
         let (r2, p2) = remix_of(&r);
         assert!(r2 != r && p2.iter().map(|o| 1u8 << o).fold(0, |a, b| a | b) == 0xff);
+    }
+
+    #[test]
+    fn step_timings_are_positive_for_every_operation() {
+        for op in [None, Some(0), Some(2), Some(3), Some(7)] {
+            assert!(time_steps(op, 64, false) > 0.0 && time_steps(op, 64, true) > 0.0, "{op:?}");
+        }
+        assert!(time_start(1) > 0.0 && time_remix(4) > 0.0);
+    }
+
+    /// The step written without indexing computes the walk: the known
+    /// answers, with the fastest AES here and the portable one.
+    #[test]
+    fn the_unindexed_step_is_the_walk() {
+        for (m, nonce, want) in GOLDEN {
+            let m = hex32(m);
+            assert_eq!(walk_hash_unindexed(&m, nonce, &mut new_pad()), hex32(want), "nonce {nonce}");
+            assert_eq!(walk_unindexed_generic::<SoftAes>(&m, nonce, &mut new_pad()), hex32(want), "nonce {nonce}, portable");
+        }
+        let m = hex32(GOLDEN[0].0);
+        for nonce in 100..104 {
+            assert_eq!(walk_hash_unindexed(&m, nonce, &mut new_pad()), walk_hash(&m, nonce));
+        }
     }
 
     /// Walks stepped in turn on one thread are each the walk of its nonce.

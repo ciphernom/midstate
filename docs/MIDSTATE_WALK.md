@@ -268,10 +268,47 @@ tried on a GPU without compiling anything.
    GPU's result is what the step gives with one of its words as it was
    before an earlier step wrote it (a stale read).
 
-The first Pi 5 run came out right for known answer 0 and wrong for known
-answer 1, on Mesa 25.0.7's v3dv. A software Vulkan driver computes all three
-right, so the fault lies in how the Pi's driver runs the kernel. The search
-above is how it will be found.
+The search found it on a Pi 5 with Mesa 25.0.7's v3dv. Every operation and
+the re-mix were right, but the walk went wrong at its first step. After one
+step, every register and the program were those of an earlier run's end. So
+the kernel had read the state as it last wrote it, not as just uploaded.
+Uploads by the copy engine into memory a kernel has written are not seen by
+the next kernel, while data the kernel only reads is. So nothing is uploaded
+there any more. Uploads go into a buffer the kernel only reads, and a copy
+kernel (`copy_in`) puts them in place, so the GPU's own writes are the only
+ones to that memory. The bench checks both ways at the start, four times each,
+and reports how many times the kernel saw the upload. Uploads also go in
+batches of 8 MiB: 1,024 pads in one go (256 MiB) was more than the Pi's driver
+could stage.
+
+The same run measured the Pi 5's GPU: 7.3 attempts/s at best (workgroup 64,
+64 walks). The four cores do about 1,500, so the GPU would add 0.5%, less
+than its heat would cost the CPU. The Pi mines on its CPU.
+
+### Where a CPU's step goes
+
+`midstate-walk-bench cpu-probe` measures, on one thread:
+
+- the latency of a load whose address is the last load's result, for working
+  sets from 16 KiB to 16 MiB: each cache level, and the pad's 256 KiB;
+- a step of the walk with its own mix of operations, and with every
+  operation each of the eight in turn: what each costs over the XOR, the
+  cheapest;
+- seeding and growing the pad, and the re-mixes, per attempt.
+
+It gives cycles at the clock the CPU runs at, and splits a step into the
+load, the rest of the step around the operation, and the operation. The
+attempts per second it predicts from these match the ones it measures, so
+nothing is left out: here, 403.2 predicted and 403.4 measured. The steps are
+everything. Seeding, the pad and the re-mixes take under 1% of an attempt.
+
+It also times `step_unindexed`, the same step written so that no register
+goes through memory. `step` indexes the registers with `t`, so all eight live
+in memory, and it XORs AES's high half into `r[t]` on every step. The
+unindexed step picks `k` with two selects, applies the high half under masks
+for AES only, and groups the last XOR so the loads' half is ready before the
+operation ends. It computes the known answers. On an x86 here it is 3.8%
+faster. Whether the miner should use it is the Pi's measurement to say.
 
 ## What changed in consensus
 

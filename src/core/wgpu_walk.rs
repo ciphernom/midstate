@@ -123,6 +123,7 @@ struct Params {
 @group(0) @binding(2) var<storage, read_write> pads: array<vec2<u32>>;
 @group(0) @binding(3) var<storage, read> consts: array<u32>;   // TE0..TE3 (1024), then the remix key (8)
 @group(0) @binding(4) var<storage, read> order: array<u32>;    // the walk each invocation runs, when grouped
+@group(0) @binding(5) var<storage, read> upload: array<vec2<u32>>;  // what the host sends, for copy_in
 
 fn add64(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
     let lo = a.x + b.x;
@@ -386,6 +387,16 @@ fn walk_steps(@builtin(global_invocation_id) gid: vec3<u32>) {{
     st[sb + 9u] = vec2<u32>(prog, 0u);
 }}
 
+// Copies P.walks words of upload to st (P.limit == 0) or pads (otherwise),
+// from word P.start on. The host never writes st or pads itself: on some
+// drivers (the Pi 5's v3dv) a kernel then reads what it wrote there before.
+@compute @workgroup_size(64)
+fn copy_in(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    let i = gid.x;
+    if (i >= P.walks) {{ return; }}
+    if (P.limit == 0u) {{ st[P.start + i] = upload[i]; }} else {{ pads[P.start + i] = upload[i]; }}
+}}
+
 // Each operation on input pairs st[2i], st[2i+1], written from st[2 * walks + 12i].
 @compute @workgroup_size(64)
 fn test_ops(@builtin(global_invocation_id) gid: vec3<u32>) {{
@@ -478,6 +489,14 @@ fn unpack_program(p: u32) -> [u8; 8] {
     std::array::from_fn(|s| ((p >> (3 * s)) & 7) as u8)
 }
 
+/// A walk's state as the kernel holds it: r0..r7, c, (program, 0).
+fn state_words(st: &WalkState) -> Vec<u32> {
+    let mut words: Vec<u32> = st.r.iter().flat_map(|r| word(*r)).collect();
+    words.extend(word(st.c));
+    words.extend([pack_program(&st.prog), 0]);
+    words
+}
+
 fn word(v: u64) -> [u32; 2] {
     [v as u32, (v >> 32) as u32]
 }
@@ -540,8 +559,23 @@ pub struct GpuWalker {
     pads: wgpu::Buffer,
     readback: wgpu::Buffer,
     order: wgpu::Buffer,
+    upload: wgpu::Buffer,
+    /// Uploads written straight into the state and pads, as before the copy
+    /// kernel: only to show a driver's fault in [`check_uploads`].
+    pub direct: bool,
     bind: wgpu::BindGroup,
 }
+
+/// Where an upload goes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Target {
+    State,
+    Pads,
+}
+
+/// 8-byte words an upload sends at a time (8 MiB): a whole load of 1,024
+/// pads (256 MiB) at once was more than the Pi's driver could stage.
+const UPLOAD_WORDS: u64 = 1 << 20;
 
 fn entry(binding: u32, ty: wgpu::BufferBindingType) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
@@ -608,6 +642,7 @@ impl GpuWalker {
                 entry(2, wgpu::BufferBindingType::Storage { read_only: false }),
                 entry(3, wgpu::BufferBindingType::Storage { read_only: true }),
                 entry(4, wgpu::BufferBindingType::Storage { read_only: true }),
+                entry(5, wgpu::BufferBindingType::Storage { read_only: true }),
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -627,6 +662,7 @@ impl GpuWalker {
         let readback = buffer("readback", state_words * 8, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST);
         let order = buffer("order", capacity as u64 * 4, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
         queue.write_buffer(&order, 0, &words_bytes(&(0..capacity).collect::<Vec<u32>>()));
+        let upload = buffer("upload", UPLOAD_WORDS * 8, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("walk"),
             layout: &layout,
@@ -636,6 +672,7 @@ impl GpuWalker {
                 wgpu::BindGroupEntry { binding: 2, resource: pads.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: consts_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: order.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: upload.as_entire_binding() },
             ],
         });
         Ok(GpuWalker {
@@ -653,6 +690,8 @@ impl GpuWalker {
             pads,
             readback,
             order,
+            upload,
+            direct: false,
             bind,
         })
     }
@@ -748,38 +787,58 @@ impl GpuWalker {
         Ok(out)
     }
 
+    /// Puts `words` (32-bit halves, two to a word) into the state or the
+    /// pads from 8-byte word `at`: through the upload buffer and the copy
+    /// kernel, a batch at a time, so the host never writes memory a kernel
+    /// writes. Waits until it is there.
+    fn put(&mut self, into: Target, at: u64, words: &[u32]) -> Result<(), String> {
+        if self.direct {
+            let buf = if into == Target::State { &self.state } else { &self.pads };
+            self.queue.write_buffer(buf, at * 8, &words_bytes(words));
+            return self.wait();
+        }
+        for (k, batch) in words.chunks(2 * UPLOAD_WORDS as usize).enumerate() {
+            self.queue.write_buffer(&self.upload, 0, &words_bytes(batch));
+            let start = at + k as u64 * UPLOAD_WORDS;
+            let n = (batch.len() / 2) as u32;
+            self.launch(Variant::walk(64), "copy_in", n, 0, start as u32, (into == Target::Pads) as u32)?;
+        }
+        Ok(())
+    }
+
     /// Seeds the walks of `nonces` on the CPU and loads them: their pads and
     /// states.
     pub fn load(&mut self, mining_hash: &[u8; 32], nonces: &[u64]) -> Result<Vec<WalkState>, String> {
         if nonces.len() > self.capacity as usize {
             return Err(format!("{} walks, room for {}", nonces.len(), self.capacity));
         }
+        let per_batch = (UPLOAD_WORDS / PAD_WORDS).max(1) as usize;
         let mut pad = walk::new_pad();
         let mut states = Vec::with_capacity(nonces.len());
         let mut words = Vec::with_capacity(nonces.len() * STATE_WORDS as usize * 2);
-        for (i, nonce) in nonces.iter().enumerate() {
-            let st = walk::walk_start(mining_hash, *nonce, &mut pad);
-            let flat: Vec<u32> = pad.iter().flat_map(|line| line.iter().flat_map(|w| word(*w))).collect();
-            self.queue.write_buffer(&self.pads, i as u64 * PAD_WORDS * 8, &words_bytes(&flat));
-            for r in st.r {
-                words.extend(word(r));
+        for (b, batch) in nonces.chunks(per_batch).enumerate() {
+            let mut flat: Vec<u32> = Vec::with_capacity(batch.len() * PAD_WORDS as usize * 2);
+            for nonce in batch {
+                let st = walk::walk_start(mining_hash, *nonce, &mut pad);
+                flat.extend(pad.iter().flat_map(|line| line.iter().flat_map(|w| word(*w))));
+                for r in st.r {
+                    words.extend(word(r));
+                }
+                words.extend(word(st.c));
+                words.extend([pack_program(&st.prog), 0]);
+                states.push(st);
             }
-            words.extend(word(st.c));
-            words.extend([pack_program(&st.prog), 0]);
-            states.push(st);
+            self.put(Target::Pads, (b * per_batch) as u64 * PAD_WORDS, &flat)?;
         }
-        self.queue.write_buffer(&self.state, 0, &words_bytes(&words));
+        self.put(Target::State, 0, &words)?;
         Ok(states)
     }
 
     /// Loads one walk part-way: `st` and its `pad`, as walk 0.
-    pub fn load_state(&mut self, st: &WalkState, pad: &walk::Pad) {
+    pub fn load_state(&mut self, st: &WalkState, pad: &walk::Pad) -> Result<(), String> {
         let flat: Vec<u32> = pad.iter().flat_map(|line| line.iter().flat_map(|w| word(*w))).collect();
-        self.queue.write_buffer(&self.pads, 0, &words_bytes(&flat));
-        let mut words: Vec<u32> = st.r.iter().flat_map(|r| word(*r)).collect();
-        words.extend(word(st.c));
-        words.extend([pack_program(&st.prog), 0]);
-        self.queue.write_buffer(&self.state, 0, &words_bytes(&words));
+        self.put(Target::Pads, 0, &flat)?;
+        self.put(Target::State, 0, &state_words(st))
     }
 
     /// Walk 0's pad, as it is now.
@@ -834,7 +893,7 @@ impl GpuWalker {
     /// what lies past it: for the search for where a GPU goes wrong.
     fn run_one_to(&mut self, v: Variant, st: &WalkState, pad: &walk::Pad, to: usize) -> Result<(), String> {
         let lim = Variant { limit: true, grouped: false, ..v };
-        self.load_state(st, pad);
+        self.load_state(st, pad)?;
         let rounds = (to - st.steps).div_ceil(8) as u32 * 8;
         self.run_span_to(lim, 1, st.steps as u32, rounds, 64, to as u32).map(|_| ())
     }
@@ -865,7 +924,7 @@ impl GpuWalker {
     pub fn test_ops(&mut self, pairs: &[(u64, u64)]) -> Result<Vec<[u64; 12]>, String> {
         let n = pairs.len() as u32;
         let words: Vec<u32> = pairs.iter().flat_map(|(a, b)| word(*a).into_iter().chain(word(*b))).collect();
-        self.queue.write_buffer(&self.state, 0, &words_bytes(&words));
+        self.put(Target::State, 0, &words)?;
         self.launch(Variant::walk(64), "test_ops", n, 0, 0, 0)?;
         let w = self.read_words(14 * n as u64)?;
         let base = 4 * n as usize;
@@ -882,7 +941,7 @@ impl GpuWalker {
     pub fn test_remix(&mut self, regs: &[[u64; 8]]) -> Result<Vec<([u64; 8], [u8; 8])>, String> {
         let n = regs.len() as u32;
         let words: Vec<u32> = regs.iter().flat_map(|r| r.iter().flat_map(|x| word(*x)).chain([0, 0, 0, 0])).collect();
-        self.queue.write_buffer(&self.state, 0, &words_bytes(&words));
+        self.put(Target::State, 0, &words)?;
         self.launch(Variant::walk(64), "test_remix", n, 0, 0, 0)?;
         Ok(self.states(n)?.into_iter().map(|s| (s.r, s.prog)).collect())
     }
@@ -987,6 +1046,37 @@ pub fn check_remix(g: &mut GpuWalker, total: usize) -> Result<Option<String>, St
     Ok(first.map(|f| format!("{wrong} of {total} wrong, first of registers {f}")))
 }
 
+/// Whether a kernel sees what was just uploaded into memory it has written:
+/// four times, a walk's state is put in place, run through zero steps (the
+/// kernel reads it and writes it back) and read back. With uploads written
+/// straight into the state (`direct`) and through the copy kernel: how many
+/// of the four each got right.
+pub fn check_uploads(g: &mut GpuWalker) -> Result<(usize, usize), String> {
+    let v = Variant::walk(64.min(g.max_workgroup));
+    let mut right = [0usize; 2];
+    for (m, direct) in [true, false].into_iter().enumerate() {
+        g.direct = direct;
+        // The kernel writes the state once first, as any earlier run has.
+        g.run(v, 1, 0, 0)?;
+        for k in 0..4u64 {
+            let st = WalkState {
+                r: std::array::from_fn(|i| (k * 8 + i as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15)),
+                prog: walk::program_of(k * 77 + 3),
+                c: k.wrapping_mul(0xdead_beef),
+                steps: 0,
+            };
+            g.put(Target::State, 0, &state_words(&st))?;
+            g.run(v, 1, 0, 0)?;
+            let back = g.states(1)?[0];
+            if (back.r, back.prog, back.c) == (st.r, st.prog, st.c) {
+                right[m] += 1;
+            }
+        }
+    }
+    g.direct = false;
+    Ok((right[0], right[1]))
+}
+
 /// Whether walk 0 on the GPU is `st` with `pad`; if not, what differs.
 fn differences(g: &GpuWalker, st: &WalkState, pad: &walk::Pad) -> Result<Vec<String>, String> {
     let gpu = g.states(1)?[0];
@@ -1038,7 +1128,7 @@ pub fn find_divergence(g: &mut GpuWalker, v: Variant, mining_hash: &[u8; 32], no
         report.push(format!("The walk is right up to step {a} and wrong by step {}.", a + WALK_REMIX));
 
         // The same stretch again, from the CPU's state at its start.
-        g.load_state(&start, &start_pad);
+        g.load_state(&start, &start_pad)?;
         g.run_span(v, 1, a as u32, WALK_REMIX as u32, 64)?;
         if differences(g, &cpu, &pad)?.is_empty() {
             report.push("Run again from the same state, the GPU got that stretch right: it does not repeat itself.".into());
@@ -1253,9 +1343,25 @@ pub fn bench(o: &BenchOptions) {
     }
     let wg0 = 64.min(g.max_workgroup);
 
-    // 1. The kernel's parts, then the known answers as whole walks.
+    // 1. Uploads, the kernel's parts, then the known answers as whole walks.
     println!("\nChecking the kernel on this GPU, part by part:");
     let mut right = true;
+    match check_uploads(&mut g) {
+        Ok((direct, copied)) => {
+            println!(
+                "  Uploads into memory the kernel has written: seen {direct} times of 4 when written straight in, {copied} of 4 through the copy kernel{}.",
+                if direct < 4 { " (this driver's fault, worked around)" } else { "" }
+            );
+            if copied < 4 {
+                right = false;
+                println!("  WRONG: even through the copy kernel, the kernel did not see what was uploaded.");
+            }
+        }
+        Err(e) => {
+            println!("  The upload check failed to run: {e}");
+            return;
+        }
+    }
     match check_ops(&mut g, 1 << 20) {
         Ok(p) if p.is_empty() => println!("  Operations: right on {} operand pairs.", 1 << 20),
         Ok(p) => {
@@ -1525,6 +1631,10 @@ mod tests {
         };
         eprintln!("testing the kernel on {} ({}, {})", g.info.name, g.info.backend, g.info.kind);
 
+        // Uploads reach the kernel (straight in, too, on a driver without
+        // the Pi's fault).
+        assert_eq!(check_uploads(&mut g).unwrap(), (4, 4));
+
         // Every operation, and the re-mix, against the CPU. The re-mix is
         // the CPU's own (walk::remix_of), a second BLAKE3 not written here.
         assert_eq!(check_ops(&mut g, 8192).unwrap(), Vec::<String>::new());
@@ -1560,6 +1670,16 @@ mod tests {
         for (nonce, h) in nonces.iter().zip(&grouped) {
             assert_eq!(*h, walk::walk_hash(&m[1], *nonce), "grouped, nonce {nonce}");
         }
+
+        // A load in two upload batches: walks past the first batch are right.
+        let per_batch = (UPLOAD_WORDS / PAD_WORDS) as u64;
+        let mut big = GpuWalker::open(name.as_deref(), per_batch as u32 + 2).unwrap();
+        let nonces: Vec<u64> = (0..per_batch + 2).collect();
+        let hashes = big.hash(v, &m[2], &nonces).unwrap();
+        for k in [per_batch - 1, per_batch, per_batch + 1] {
+            assert_eq!(hashes[k as usize], walk::walk_hash(&m[2], k), "walk {k}, across upload batches");
+        }
+        drop(big);
 
         // From any state to any step, as the search for a fault runs it.
         let mut pad = walk::new_pad();
