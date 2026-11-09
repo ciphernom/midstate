@@ -548,6 +548,24 @@ fn read_trim(path: &str) -> Option<String> {
     std::fs::read_to_string(path).ok().map(|s| s.trim().trim_end_matches('\0').to_string())
 }
 
+/// The board's temperature and power in words ("61.2 °C, 7.10 W"), as far
+/// as it reports them: for benchmarks to note before and after.
+pub fn board_summary() -> String {
+    let temp = temp_c().map(|t| format!("{t:.1} °C"));
+    let watts = std::process::Command::new("vcgencmd")
+        .arg("pmic_read_adc")
+        .output()
+        .ok()
+        .and_then(|o| parse_pmic(&String::from_utf8_lossy(&o.stdout)))
+        .map(|p| format!("{:.2} W", p.watts));
+    match (temp, watts) {
+        (Some(t), Some(w)) => format!("{t}, {w}"),
+        (Some(t), None) => t,
+        (None, Some(w)) => w,
+        (None, None) => "no sensors".into(),
+    }
+}
+
 /// The CPU's temperature, °C.
 pub fn temp_c() -> Option<f32> {
     read_trim("/sys/class/thermal/thermal_zone0/temp")?.parse::<f32>().ok().map(|m| m / 1000.0).filter(|t| *t > 0.0)
