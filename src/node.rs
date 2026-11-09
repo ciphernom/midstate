@@ -7115,8 +7115,16 @@ async fn try_apply_orphans(&mut self) {
                         
                         let dummy_stats = Arc::new(std::sync::RwLock::new(crate::mining::StratumStats::default()));
                         
+                        let pool = crate::mining::PoolSettings {
+                            pool_url: url,
+                            fallback_url: None,
+                            payout_address: addr,
+                            worker,
+                            midwimble_address: midwimble,
+                        };
+                        let control = Arc::new(crate::mining::MinerControl::new(pool, threads, None));
                         tokio::spawn(async move {
-                            crate::mining::run_stratum_client(url, addr, worker, midwimble, threads, hc, dummy_stats).await;
+                            crate::mining::run_stratum_client(control, hc, dummy_stats).await;
                         });
                         return Ok(());
                     } else {

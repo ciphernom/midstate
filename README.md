@@ -49,7 +49,7 @@ Circulating supply equals total supply: there is no premine, treasury or team al
 For hardware nodes (or local testing), access the web dashboard at `http://127.0.0.1:8545/axe` to configure Wi-Fi, view live telemetry, set up pool mining, and overclock and test the board. The MidstateAxe is a Raspberry Pi 5: see MANUAL.md, section 5.
 
 **Mining without a node, and on GPUs**
-`midstate miner --pool-url … --payout-address …` hashes for a pool with no node behind it, and serves a read-only dashboard at `http://127.0.0.1:8546/axe`, laid out as a Bitaxe's AxeOS is: hashrate, efficiency, shares, best difficulty, a chart, power, heat, the pool and its logs. From block 371,500 it mines Midstate Walk on the CPU and on NVIDIA GPUs through CUDA (only the driver is needed), as `midstate node --mine` does. `--backend auto|gpu|cpu`, `--cuda-devices`, `MINER_DISABLE_GPU=1` and running it under systemd: MANUAL.md, section 6.
+`midstate miner --pool-url … --payout-address …` hashes for a pool with no node behind it, and serves a dashboard at `http://127.0.0.1:8546/axe`, laid out as a Bitaxe's AxeOS is: hashrate, efficiency, shares, best difficulty, a chart, power, heat, the pool and its logs, and settings for the pool and a fallback, the threads, a heat limit, and a Pi's clock and fan. From block 371,500 it mines Midstate Walk on the CPU and on NVIDIA GPUs through CUDA (only the driver is needed), as `midstate node --mine` does. `--backend auto|gpu|cpu`, `--cuda-devices`, `MINER_DISABLE_GPU=1` and running it under systemd: MANUAL.md, section 6.
 
 ## 3. Wallet Operations
 

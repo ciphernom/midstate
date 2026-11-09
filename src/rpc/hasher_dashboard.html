@@ -97,13 +97,53 @@ dd .note { display: block; font-family: 'Inter', sans-serif; font-size: 12px; co
 #log .warn, #log .error { font-weight: 700; }
 #log .warn .lv, #log .error .lv { color: var(--text-main); }
 
+/* Settings */
+[hidden] { display: none !important; }
+.notice { border: 1px solid var(--border-bright); padding: 10px 14px; margin-top: 16px; font-size: 13.5px; }
+.notice[hidden] { display: none; }
+.section { padding: 22px 0 26px; border-bottom: 1px solid var(--border); }
+.section > h2 { font-size: 14px; font-weight: 600; margin: 0 0 4px; }
+.lead { font-size: 13px; color: var(--text-muted); margin: 0 0 18px; max-width: 68ch; line-height: 1.55; }
+.cols { display: grid; grid-template-columns: 1fr 1fr; column-gap: 44px; row-gap: 26px; }
+fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
+fieldset:disabled { opacity: 0.55; }
+.field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 18px; }
+.field > label, .field > .label { font-size: 12.5px; color: var(--text-muted); }
+.field input:not([type=range]), .field select { background: var(--bg); color: var(--text-main); border: 1px solid var(--border-bright); border-radius: 0; padding: 8px 10px; font: 13.5px 'Inter', system-ui, sans-serif; width: 100%; box-sizing: border-box; }
+.field input.mono { font: 12.5px 'JetBrains Mono', ui-monospace, monospace; }
+.field input:focus, .field select:focus { border-color: var(--text-main); outline: none; }
+.field input[aria-invalid="true"] { border-color: var(--text-main); border-width: 2px; padding: 7px 9px; }
+.hint { font-size: 12px; color: var(--text-faint); line-height: 1.45; }
+.was { font-size: 12px; color: var(--text-muted); overflow-wrap: anywhere; }
+.was:empty { display: none; }
+.inline { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.said { font-size: 13px; color: var(--text-muted); line-height: 1.45; }
+.said.err { color: var(--text-main); font-weight: 600; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chips button { background: transparent; border: 1px solid var(--border-bright); color: var(--text-main); padding: 7px 11px; text-align: left; cursor: pointer; font: 500 13px 'Inter', system-ui, sans-serif; }
+.chips button small { display: block; font: 11.5px 'JetBrains Mono', monospace; color: var(--text-muted); margin-top: 3px; font-weight: 400; }
+.chips button[aria-pressed="true"] { background: var(--text-main); border-color: var(--text-main); color: var(--bg); }
+.chips button[aria-pressed="true"] small { color: var(--bg); }
+.chips button:disabled { cursor: not-allowed; }
+.now { font-size: 12.5px; color: var(--text-muted); line-height: 1.5; }
+.now .fig { color: var(--text-bright); }
+.range { display: flex; align-items: center; gap: 12px; font: 13px 'JetBrains Mono', monospace; }
+.range input { flex: 1; accent-color: var(--text-main); }
+.setup { border: 1px solid var(--border-bright); padding: 14px 16px; margin-bottom: 20px; font-size: 13.5px; line-height: 1.5; }
+.setup[hidden] { display: none; }
+.setup code { display: block; font: 12.5px 'JetBrains Mono', monospace; background: var(--code-bg); padding: 9px 11px; margin: 10px 0 8px; overflow-wrap: anywhere; user-select: all; }
+.btn-plain:disabled { color: var(--text-faint); cursor: not-allowed; }
+.foot a { color: inherit; }
+.sub-h { font-size: 14px; font-weight: 600; margin: 0 0 4px; }
+
 @media (max-width: 860px) {
   .hero { grid-template-columns: 1fr 1fr; }
   .hero > div:first-child { grid-column: 1 / -1; }
   .hero > div:nth-child(2) { padding-left: 0; border-left: 0; }
   .hero > div:nth-child(n+2) { border-top: 1px solid var(--border); }
   .hero > div:nth-child(4) { padding-left: 0; border-left: 0; }
-  .grid3, .grid2 { grid-template-columns: 1fr; }
+  .grid3, .grid2, .cols { grid-template-columns: 1fr; }
   .panel + .panel { padding-left: 0; border-left: 0; border-top: 1px solid var(--border); }
   .big { font-size: 46px; }
 }
@@ -128,6 +168,7 @@ dd .note { display: block; font-family: 'Inter', sans-serif; font-size: 12px; co
     <span class="state" id="state">connecting</span>
     <div class="tabs" role="tablist">
       <button role="tab" id="tab-dash" aria-selected="true" aria-controls="view-dash">Dashboard</button>
+      <button role="tab" id="tab-settings" aria-selected="false" aria-controls="view-settings">Settings</button>
       <button role="tab" id="tab-logs" aria-selected="false" aria-controls="view-logs">Logs</button>
     </div>
     <button class="theme-toggle" onclick="toggleTheme()" title="Light or dark" aria-label="Toggle light or dark"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg></button>
@@ -212,7 +253,126 @@ dd .note { display: block; font-family: 'Inter', sans-serif; font-size: 12px; co
         <dl id="system"></dl>
       </div>
     </section>
-    <p class="foot">Read-only. The miner's settings are the ones it was started with.</p>
+    <p class="foot" id="foot"></p>
+  </main>
+
+  <main id="view-settings" role="tabpanel" aria-labelledby="tab-settings" hidden>
+    <p class="notice" id="set-notice" role="status" hidden></p>
+
+    <form class="section" id="mining-form" autocomplete="off" novalidate>
+      <h2>Mining</h2>
+      <p class="lead" id="mining-source">Reading the settings…</p>
+      <fieldset id="mining-fields">
+        <div class="cols">
+          <div>
+            <div class="field">
+              <label for="f-pool">Pool</label>
+              <input id="f-pool" class="mono" spellcheck="false" placeholder="stratum+tcp://pool.example:3333">
+              <span class="was" data-for="pool_url"></span>
+            </div>
+            <div class="field">
+              <label for="f-fallback">Fallback pool</label>
+              <input id="f-fallback" class="mono" spellcheck="false" placeholder="None">
+              <span class="hint">Mined on after three failed tries to reach the pool. The miner knocks on the pool every two minutes and goes back once it answers.</span>
+              <span class="was" data-for="fallback_url"></span>
+            </div>
+            <div class="field">
+              <label for="f-payout">Payout address</label>
+              <input id="f-payout" class="mono" spellcheck="false">
+              <span class="hint">Use an MSS address: the pool pays to it again and again.</span>
+              <span class="was" data-for="payout_address"></span>
+            </div>
+            <div class="field">
+              <label for="f-worker">Worker name</label>
+              <input id="f-worker" spellcheck="false" placeholder="default">
+              <span class="hint">How this rig shows in the pool’s list of miners.</span>
+              <span class="was" data-for="worker"></span>
+            </div>
+            <div class="field">
+              <label for="f-mw">Midwimble address</label>
+              <input id="f-mw" class="mono" spellcheck="false" placeholder="None: the pool keeps your midwimble share">
+              <span class="was" data-for="midwimble_address"></span>
+            </div>
+          </div>
+          <div>
+            <div class="field">
+              <label for="f-threads">Hashing threads</label>
+              <select id="f-threads"></select>
+              <span class="hint">One per core. More threads than cores don’t mine faster.</span>
+              <span class="was" data-for="threads"></span>
+            </div>
+            <div class="field">
+              <label for="f-heat">Heat limit</label>
+              <select id="f-heat"></select>
+              <span class="hint">At the limit the miner drops a thread every 30 seconds, down to none, and adds them back once the board is 5 °C under it. The Pi slows itself down at 85 °C whatever this says.</span>
+              <span class="was" data-for="heat_limit_c"></span>
+            </div>
+          </div>
+        </div>
+        <div class="actions">
+          <button type="submit" class="btn btn-primary" id="mining-save">Save settings</button>
+          <button type="button" class="btn-plain" id="mining-reset" hidden>Use the command line’s</button>
+          <span class="said" id="mining-said" role="status"></span>
+        </div>
+      </fieldset>
+    </form>
+
+    <section class="section" id="board-section" hidden>
+      <h2>Board</h2>
+      <p class="lead">The clock and the fan curve are kept in the Pi’s boot config, and take effect when it restarts. Test the unit after changing the clock.</p>
+      <div class="setup" id="setup" hidden>
+        <b>Board settings need a one-time setup.</b> On the Pi, run this, then reload the page:
+        <code id="setup-cmd"></code>
+        <span class="hint" id="setup-why"></span>
+      </div>
+      <fieldset id="board-fields">
+        <div class="cols">
+          <div class="field">
+            <span class="label" id="clock-label">Clock</span>
+            <div class="chips" id="clock-chips" role="group" aria-labelledby="clock-label"></div>
+            <div class="inline">
+              <div class="field"><label for="f-mhz">MHz</label><input id="f-mhz" type="number" inputmode="numeric"></div>
+              <div class="field"><label for="f-volt" id="volt-label">Extra voltage</label><select id="f-volt"></select></div>
+            </div>
+            <div class="now" id="clock-now"></div>
+          </div>
+          <div class="field" id="fan-field">
+            <span class="label" id="fan-label">Fan</span>
+            <div class="chips" id="fan-chips" role="group" aria-labelledby="fan-label">
+              <button type="button" data-fan="default">Pi’s own<small>on at 50 °C</small></button>
+              <button type="button" data-fan="cool">Cooler<small>on at 40 °C</small></button>
+              <button type="button" data-fan="full">Full<small>always</small></button>
+              <button type="button" data-fan="fixed">Fixed<small id="fixed-chip">50%</small></button>
+            </div>
+            <div class="range" id="fan-fixed" hidden>
+              <input type="range" id="fan-pct" min="20" max="100" step="5" aria-label="Fixed fan speed">
+              <span id="fan-pct-out">50%</span>
+            </div>
+            <div class="now" id="fan-now"></div>
+          </div>
+        </div>
+        <div class="actions">
+          <button type="button" class="btn btn-primary" id="board-save">Save and restart</button>
+          <button type="button" class="btn-plain" id="board-later">Save, restart later</button>
+          <span class="said" id="board-said" role="status"></span>
+        </div>
+      </fieldset>
+    </section>
+
+    <section class="section">
+      <div class="cols">
+        <div>
+          <h2 class="sub-h">Test this unit</h2>
+          <p class="lead">Mining pauses for five seconds while every core runs Midstate Walk and checks it gets the known answers, cold and hot. A core that gets one wrong loses shares.</p>
+          <div class="actions"><button type="button" class="btn-plain" id="bench">Test this unit</button><span class="said" id="bench-said" role="status"></span></div>
+        </div>
+        <div id="reboot-col">
+          <h2 class="sub-h">Restart the Pi</h2>
+          <p class="lead">Mining stops for about a minute. The miner starts again with the Pi if it runs as a service.</p>
+          <div class="actions"><button type="button" class="btn-plain" id="reboot">Restart the Pi</button><span class="said" id="reboot-said" role="status"></span></div>
+        </div>
+      </div>
+    </section>
   </main>
 
   <main id="view-logs" role="tabpanel" aria-labelledby="tab-logs" hidden>
@@ -290,7 +450,7 @@ async function pollStats() {
   } catch (e) {
     $('state').textContent = 'no answer';
     $('state').className = 'state';
-    showAlert('The miner is not answering. Is it still running?');
+    showAlert(restarting ? 'The Pi is restarting. This page reconnects by itself.' : 'The miner is not answering. Is it still running?');
   }
 }
 
@@ -317,9 +477,13 @@ function render(s) {
   const quiet = m.last_job_s != null && m.last_job_s > 180;
   const under = (s.throttle || []).find((w) => w.endsWith(' now'));
   showAlert(
-    !m.connected ? 'Not connected to the pool. The miner tries again every few seconds.'
+    restarting ? 'The Pi is restarting. This page reconnects by itself.'
+    : m.paused ? 'Mining is paused while the unit test runs.'
+    : !m.connected ? 'Not connected to the pool. The miner tries again every few seconds.'
     : quiet ? 'No new job from the pool for ' + dur(m.last_job_s) + '. Shares on an old job can be stale.'
     : under ? 'The board reports ' + under + '. Hashrate drops while it lasts.'
+    : m.heat_holding_back ? (m.cpu_threads ? 'Heat limit: hashing on ' + m.cpu_threads + ' of ' + m.threads_wanted + ' threads until the board cools.'
+                                           : 'Heat limit: hashing is paused until the board cools to ' + (m.heat_limit_c - 5) + ' °C.')
     : ''
   );
 
@@ -367,6 +531,7 @@ function render(s) {
     s.fan_rpm != null && ['Fan', s.fan_rpm.toLocaleString('en-US') + ' rpm'],
     s.fan_pct != null && ['Fan duty', s.fan_pct + '%'],
     ['Limits', limits.length ? '<span class="flag">' + esc(limits.join(', ')) + '</span>' : 'none hit'],
+    ['Heat limit', m.heat_limit_c != null ? m.heat_limit_c + ' °C' : 'off', m.heat_holding_back ? 'holding threads back' : ''],
   ]);
 
   // Performance
@@ -376,7 +541,8 @@ function render(s) {
   const total = (s.backends || []).reduce((a, b) => a + (b.hashes || 0), 0);
   rows('perf', [
     ['Proof of work', s.pow === 'walk' ? 'Midstate Walk' : 'BLAKE3 chain'],
-    ['Threads', String(m.cpu_threads || '--'), m.backend && m.backend !== 'auto' ? 'backend: ' + m.backend : ''],
+    ['Threads', m.paused ? 'paused' : m.heat_holding_back ? m.cpu_threads + ' of ' + m.threads_wanted : String(m.cpu_threads ?? '--'),
+      m.paused ? 'for the unit test' : m.heat_holding_back ? 'held back by the heat limit' : m.backend && m.backend !== 'auto' ? 'backend: ' + m.backend : ''],
     ...(s.backends || []).map((b) => [b.label, total ? pct(b.hashes / total) : '--', 'of the attempts']),
     ['Attempts', si(s.total_nonces), 'this run'],
   ]);
@@ -387,7 +553,7 @@ function render(s) {
   const blockEvery = m.network_difficulty && now ? m.network_difficulty / now : null;
   rows('pool-a', [
     ['Status', m.connected ? 'connected' : '<span class="flag">not connected</span>', m.connected ? 'for ' + dur(m.connected_s) : ''],
-    ['Pool', esc(String(m.pool_url || '').replace('stratum+tcp://', ''))],
+    ['Pool', esc(String(m.pool_in_use || m.pool_url || '').replace('stratum+tcp://', '')), m.on_fallback ? 'the fallback: the main pool is not answering' : ''],
     ['Worker', esc(m.worker || '--')],
     ['Payout', '<span title="' + esc(m.payout_address || '') + '">' + esc(short(m.payout_address)) + '</span>'],
     m.midwimble_address && ['MDW payout', '<span title="' + esc(m.midwimble_address) + '">' + esc(short(m.midwimble_address)) + '</span>'],
@@ -417,6 +583,8 @@ function render(s) {
     sys.load && sys.load.length && ['Load', sys.load.map((x) => x.toFixed(2)).join(' '), (sys.cores || '?') + ' cores'],
     memUsed != null && ['Memory', pct(memUsed) + ' used', Math.round(sys.mem_total_kb / 1024).toLocaleString('en-US') + ' MB in all'],
   ]);
+  $('foot').innerHTML = (m.saved ? 'Mining with the settings saved on this dashboard.' : 'Mining with the command line’s settings.') +
+    ' <a href="#settings" id="foot-settings">Change them</a>';
 }
 
 // ── Chart ───────────────────────────────────────────────────────────────
@@ -563,21 +731,297 @@ $('only-warn').addEventListener('change', () => {
 });
 $('clear').addEventListener('click', () => { $('log').innerHTML = ''; $('log-count').textContent = ''; });
 
+// ── Settings ────────────────────────────────────────────────────────────
+let cfg = null;            // the last /axe/config
+let boardNow = null;       // what the boot config says now
+const clockSel = { mhz: 0, voltage: 0 };
+const fanSel = { mode: 'default', percent: 50 };
+let restarting = false;
+
+async function post(path, body) {
+  const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+  let v = null;
+  try { v = await r.json(); } catch (_) {}
+  if (!r.ok || !v || v.ok === false) throw new Error((v && v.error) || 'The miner answered ' + r.status + '.');
+  return v;
+}
+function say(id, text, err) {
+  const el = $(id);
+  el.textContent = text || '';
+  el.className = 'said' + (err ? ' err' : '');
+}
+// A second click within six seconds does it; the first only asks.
+function confirmStep(btn, ask, ready, action) {
+  const label = btn.textContent;
+  let timer = null;
+  const disarm = () => { clearTimeout(timer); timer = null; btn.textContent = label; };
+  btn.addEventListener('click', async () => {
+    if (!timer) {
+      if (ready && !ready()) return;
+      btn.textContent = ask;
+      timer = setTimeout(disarm, 6000);
+      return;
+    }
+    disarm();
+    await action();
+  });
+}
+
+async function loadConfig() {
+  try {
+    const r = await fetch('/axe/config', { cache: 'no-store' });
+    if (!r.ok) return;
+    cfg = await r.json();
+  } catch (_) { return; }
+  fillMining(cfg);
+  fillBoard(cfg);
+  const n = $('set-notice');
+  n.hidden = !!cfg.can_change;
+  n.textContent = cfg.can_change ? '' : 'Viewing only. ' + (cfg.why_not || '');
+  $('bench').disabled = !cfg.can_change;
+}
+
+const FIELDS = { pool_url: 'f-pool', fallback_url: 'f-fallback', payout_address: 'f-payout', worker: 'f-worker', midwimble_address: 'f-mw', threads: 'f-threads', heat_limit_c: 'f-heat' };
+const ERRORS = { 'Pool:': 'f-pool', 'Fallback pool:': 'f-fallback', 'Payout address:': 'f-payout', 'Worker name:': 'f-worker', 'Midwimble address:': 'f-mw', 'Threads:': 'f-threads', 'Heat limit:': 'f-heat' };
+
+function fillMining(c) {
+  const s = c.settings, cl = c.command_line;
+  $('f-pool').value = s.pool_url || '';
+  $('f-fallback').value = s.fallback_url || '';
+  $('f-payout').value = s.payout_address || '';
+  $('f-worker').value = s.worker || '';
+  $('f-mw').value = s.midwimble_address || '';
+  const th = $('f-threads');
+  th.innerHTML = '<option value="0">Every core (' + c.cores + ')</option>' +
+    Array.from({ length: c.cores }, (_, i) => '<option value="' + (i + 1) + '">' + (i + 1) + '</option>').join('');
+  th.value = String(s.threads || 0);
+  const heat = $('f-heat');
+  const [lo, hi] = c.heat_limit_range || [50, 85];
+  let opts = '<option value="">Off</option>';
+  for (let t = lo; t <= hi; t += 5) opts += '<option value="' + t + '">' + t + ' °C</option>';
+  heat.innerHTML = opts;
+  if (s.heat_limit_c != null && ![...heat.options].some((o) => Number(o.value) === s.heat_limit_c)) {
+    heat.insertAdjacentHTML('beforeend', '<option value="' + s.heat_limit_c + '">' + s.heat_limit_c + ' °C</option>');
+  }
+  heat.value = s.heat_limit_c == null ? '' : String(s.heat_limit_c);
+  $('mining-source').textContent = c.saved
+    ? 'Saved on this dashboard, in miner-settings.toml beside the miner. They replace the command line’s, at every start too, until you go back to the command line’s.'
+    : 'The command line’s, which the miner was started with. Saving here keeps your settings in miner-settings.toml, which then replaces the command line’s at every start.';
+  $('mining-reset').hidden = !c.saved;
+  const shown = (k, v) => v == null || v === '' ? 'none' : k === 'threads' && Number(v) === 0 ? 'every core' : k === 'heat_limit_c' ? v + ' °C' : String(v);
+  document.querySelectorAll('.was').forEach((el) => {
+    const k = el.dataset.for;
+    el.textContent = c.saved && String(s[k] ?? '') !== String(cl[k] ?? '') ? 'Command line: ' + shown(k, cl[k]) : '';
+  });
+  markInvalid(null);
+  $('mining-fields').disabled = !c.can_change;
+}
+
+function markInvalid(msg) {
+  Object.values(FIELDS).forEach((id) => $(id).removeAttribute('aria-invalid'));
+  const k = msg && Object.keys(ERRORS).find((k) => msg.startsWith(k));
+  if (k) { $(ERRORS[k]).setAttribute('aria-invalid', 'true'); $(ERRORS[k]).focus(); }
+}
+
+$('mining-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const body = {
+    pool_url: $('f-pool').value,
+    fallback_url: $('f-fallback').value || null,
+    payout_address: $('f-payout').value,
+    worker: $('f-worker').value,
+    midwimble_address: $('f-mw').value || null,
+    threads: Number($('f-threads').value),
+    heat_limit_c: $('f-heat').value === '' ? null : Number($('f-heat').value),
+  };
+  markInvalid(null);
+  $('mining-save').disabled = true;
+  say('mining-said', 'Saving…');
+  try {
+    const v = await post('/axe/settings', body);
+    await loadConfig();
+    say('mining-said', v.message);
+    pollStats();
+  } catch (err) {
+    say('mining-said', err.message, true);
+    markInvalid(err.message);
+  } finally {
+    $('mining-save').disabled = false;
+  }
+});
+
+confirmStep($('mining-reset'), 'Forget the saved ones? Click again', null, async () => {
+  try {
+    const v = await post('/axe/settings/reset', {});
+    await loadConfig();
+    say('mining-said', v.message);
+    pollStats();
+  } catch (err) { say('mining-said', err.message, true); }
+});
+
+// Board
+function voltText(v) {
+  const p = cfg.board.clock;
+  if (!v) return 'no extra';
+  return p.voltage === 'delta_microvolts' ? '+' + v / 1000 + ' mV' : 'over_voltage ' + v;
+}
+function fillBoard(c) {
+  const b = c.board || {}, p = b.clock;
+  $('board-section').hidden = !p;
+  $('reboot-col').hidden = !p;
+  if (!p) return;
+  const helper = b.helper || {};
+  $('setup').hidden = !!helper.ready;
+  $('setup-cmd').textContent = b.setup_command || '';
+  $('setup-why').textContent = helper.problem && !/one-time setup/.test(helper.problem) ? 'Asked now, the Pi says: ' + helper.problem : '';
+  $('board-fields').disabled = !c.can_change || !helper.ready;
+  $('reboot').disabled = !c.can_change || !helper.ready;
+  say('reboot-said', helper.ready ? '' : 'Needs the board setup above.');
+
+  boardNow = { mhz: b.configured_mhz || p.stock_mhz, voltage: b.configured_voltage || 0, fan: b.fan || { mode: 'default' } };
+  clockSel.mhz = boardNow.mhz;
+  clockSel.voltage = boardNow.voltage;
+  $('clock-chips').innerHTML = p.presets.map((x, i) => {
+    const short = x.label.replace(/\s*\(.*\)$/, '');
+    const why = (x.label.match(/\((.*)\)$/) || [])[1];
+    return '<button type="button" data-i="' + i + '"' + (why ? ' title="' + esc(why) + '"' : '') + '>' + esc(short) +
+      '<small>' + x.mhz + ' MHz' + (x.voltage ? ', ' + esc(voltText(x.voltage)) : '') + '</small></button>';
+  }).join('');
+  const mhz = $('f-mhz');
+  mhz.min = p.min_mhz; mhz.max = p.max_mhz; mhz.step = 50;
+  $('volt-label').textContent = p.voltage === 'delta_microvolts' ? 'Extra voltage' : 'over_voltage';
+  let vo = '';
+  for (let v = 0; v <= p.voltage_max; v += p.voltage_step) vo += '<option value="' + v + '">' + esc(voltText(v)) + '</option>';
+  $('f-volt').innerHTML = vo;
+  $('f-mhz').value = clockSel.mhz;
+  $('f-volt').value = String(clockSel.voltage);
+  syncClockChips();
+  const stock = boardNow.mhz === p.stock_mhz && !boardNow.voltage;
+  $('clock-now').innerHTML = 'Boot config: <span class="fig">' + boardNow.mhz.toLocaleString('en-US') + ' MHz</span>, ' + esc(voltText(boardNow.voltage)) +
+    (stock ? ' (stock)' : '') + '. This board takes ' + p.min_mhz.toLocaleString('en-US') + '–' + p.max_mhz.toLocaleString('en-US') + ' MHz; past 2,800 it wants an active cooler.';
+
+  $('fan-field').hidden = !b.fan;
+  fanSel.mode = boardNow.fan.mode;
+  fanSel.percent = boardNow.fan.percent || 50;
+  $('fan-pct').min = b.fan_min_percent || 20;
+  syncFan();
+  $('fan-now').textContent = 'Boot config: ' + (b.fan_text || 'the Pi’s own curve') + '.';
+}
+function syncClockChips() {
+  const presets = cfg.board.clock.presets;
+  document.querySelectorAll('#clock-chips button').forEach((btn) => {
+    const x = presets[Number(btn.dataset.i)];
+    btn.setAttribute('aria-pressed', String(x.mhz === clockSel.mhz && x.voltage === clockSel.voltage));
+  });
+}
+$('clock-chips').addEventListener('click', (e) => {
+  const btn = e.target.closest('button');
+  if (!btn) return;
+  const x = cfg.board.clock.presets[Number(btn.dataset.i)];
+  clockSel.mhz = x.mhz;
+  clockSel.voltage = x.voltage;
+  $('f-mhz').value = x.mhz;
+  $('f-volt').value = String(x.voltage);
+  syncClockChips();
+  say('board-said', '');
+});
+$('f-mhz').addEventListener('input', () => { clockSel.mhz = Number($('f-mhz').value); syncClockChips(); say('board-said', ''); });
+$('f-volt').addEventListener('change', () => { clockSel.voltage = Number($('f-volt').value); syncClockChips(); say('board-said', ''); });
+
+function syncFan() {
+  document.querySelectorAll('#fan-chips button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.fan === fanSel.mode)));
+  $('fan-fixed').hidden = fanSel.mode !== 'fixed';
+  $('fan-pct').value = fanSel.percent;
+  $('fan-pct-out').textContent = fanSel.percent + '%';
+  $('fixed-chip').textContent = fanSel.percent + '%';
+}
+$('fan-chips').addEventListener('click', (e) => {
+  const btn = e.target.closest('button');
+  if (!btn) return;
+  fanSel.mode = btn.dataset.fan;
+  syncFan();
+  say('board-said', '');
+});
+$('fan-pct').addEventListener('input', () => { fanSel.percent = Number($('fan-pct').value); syncFan(); });
+
+function boardChange() {
+  const ch = {};
+  if (clockSel.mhz !== boardNow.mhz || clockSel.voltage !== boardNow.voltage) ch.clock = { mhz: clockSel.mhz, voltage: clockSel.voltage };
+  const f = fanSel.mode === 'fixed' ? { mode: 'fixed', percent: fanSel.percent } : { mode: fanSel.mode };
+  const now = boardNow.fan;
+  if (!$('fan-field').hidden && (f.mode !== now.mode || (f.mode === 'fixed' && f.percent !== now.percent))) ch.fan = f;
+  return ch;
+}
+function boardReady() {
+  const ch = boardChange();
+  if (ch.clock || ch.fan) return true;
+  say('board-said', 'Nothing to change: the boot config already says this.');
+  return false;
+}
+async function saveBoard(restart) {
+  const ch = boardChange();
+  ch.reboot = restart;
+  say('board-said', 'Saving…');
+  try {
+    const v = await post('/axe/board', ch);
+    say('board-said', v.message);
+    if (v.rebooting) awaitRestart(); else loadConfig();
+  } catch (err) { say('board-said', err.message, true); }
+}
+confirmStep($('board-save'), 'Restart the Pi now? Click again', boardReady, () => saveBoard(true));
+$('board-later').addEventListener('click', () => { if (boardReady()) saveBoard(false); });
+
+// Test and restart
+$('bench').addEventListener('click', async () => {
+  $('bench').disabled = true;
+  say('bench-said', 'Testing: about six seconds…');
+  try {
+    const v = await post('/axe/bench', {});
+    say('bench-said', v.message, !v.correct);
+  } catch (err) { say('bench-said', err.message, true); }
+  finally { $('bench').disabled = !cfg || !cfg.can_change; }
+});
+confirmStep($('reboot'), 'Restart now? Click again', null, async () => {
+  try {
+    const v = await post('/axe/reboot', {});
+    say('reboot-said', v.message);
+    awaitRestart();
+  } catch (err) { say('reboot-said', err.message, true); }
+});
+
+// Waits for the miner to go away and come back, then reloads.
+function awaitRestart() {
+  restarting = true;
+  showAlert('The Pi is restarting. This page reconnects by itself.');
+  let wentDown = false;
+  const t = setInterval(async () => {
+    try {
+      const r = await fetch('/axe/stats', { cache: 'no-store' });
+      if (r.ok && wentDown) { clearInterval(t); location.reload(); }
+    } catch (_) { wentDown = true; }
+  }, 3000);
+}
+
 // ── Tabs ────────────────────────────────────────────────────────────────
+const TABS = ['dash', 'settings', 'logs'];
 function show(tab) {
-  const logs = tab === 'logs';
-  $('tab-dash').setAttribute('aria-selected', String(!logs));
-  $('tab-logs').setAttribute('aria-selected', String(logs));
-  $('view-dash').hidden = logs;
-  $('view-logs').hidden = !logs;
+  if (!TABS.includes(tab)) tab = 'dash';
+  TABS.forEach((t) => {
+    $('tab-' + t).setAttribute('aria-selected', String(t === tab));
+    $('view-' + t).hidden = t !== tab;
+  });
   clearInterval(logTimer);
-  if (logs) { pollLogs(); logTimer = setInterval(pollLogs, 2000); }
-  else drawChart();
+  if (tab === 'logs') { pollLogs(); logTimer = setInterval(pollLogs, 2000); }
+  if (tab === 'settings') loadConfig();
+  if (tab === 'dash') drawChart();
   if (location.hash !== '#' + tab) history.replaceState(null, '', '#' + tab);
 }
-$('tab-dash').addEventListener('click', () => show('dash'));
-$('tab-logs').addEventListener('click', () => show('logs'));
-show(location.hash === '#logs' ? 'logs' : 'dash');
+TABS.forEach((t) => $('tab-' + t).addEventListener('click', () => show(t)));
+window.addEventListener('hashchange', () => show(location.hash.slice(1)));
+document.addEventListener('click', (e) => {
+  if (e.target.id === 'foot-settings') { e.preventDefault(); show('settings'); window.scrollTo(0, 0); }
+});
+show(location.hash.slice(1));
 
 pollStats();
 pollHistory();

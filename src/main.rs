@@ -409,10 +409,31 @@ enum Command {
         #[arg(long)]
         cuda_walks: Option<u32>,
         /// Where to serve the Axe dashboard: "127.0.0.1:8546" by default
-        /// (this machine only); "0.0.0.0:8546" to reach it from your network;
-        /// "off" for none. Or MINER_DASHBOARD.
+        /// (this machine only); "0.0.0.0:8546" to reach it from your network,
+        /// which can then change the miner's settings; "off" for none. Or
+        /// MINER_DASHBOARD.
         #[arg(long)]
         dashboard: Option<String>,
+        /// A second pool, mined on while the first can't be reached (three
+        /// failed tries in a row); the first is tried again every two minutes.
+        #[arg(long)]
+        fallback_pool_url: Option<String>,
+        /// Degrees Celsius above which the miner sheds a hashing thread every
+        /// 30 seconds, adding them back once 5 °C under it (50–85).
+        #[arg(long)]
+        heat_limit: Option<f32>,
+    },
+    /// On a Raspberry Pi, with sudo: let `midstate miner`'s dashboard set the
+    /// clock and fan curve and reboot, through a root-owned copy of midstate
+    /// that does nothing else (/usr/local/sbin/midstate-axe-board) and a
+    /// sudoers line for it. Run it again after installing a new midstate.
+    BoardSetup {
+        /// The user the miner runs as. Default: the one running sudo.
+        #[arg(long)]
+        user: Option<String>,
+        /// Remove the copy and the sudoers line instead.
+        #[arg(long)]
+        remove: bool,
     },
     /// Measure this machine's proof-of-work speed: Midstate Walk attempts per
     /// second on one thread and on all of them, and the BLAKE3 chain it
@@ -1147,6 +1168,11 @@ fn now_secs() -> u64 {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // The root-owned copy `board-setup` installs does its few things and
+    // nothing else, whatever it is given (rpc::axe_board).
+    if let Some(code) = midstate::rpc::axe_board::run_if_helper() {
+        std::process::exit(code);
+    }
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -1201,7 +1227,12 @@ async fn main() -> Result<()> {
             bench_pow(seconds, threads);
             Ok(())
         }
-        Command::Miner { pool_url, payout_address, worker, midwimble_address, threads, backend, cuda_devices, cuda_walks, dashboard } => {
+        Command::BoardSetup { user, remove } => {
+            let done = midstate::rpc::axe_board::setup(user, remove).map_err(|e| anyhow::anyhow!(e))?;
+            println!("{done}");
+            Ok(())
+        }
+        Command::Miner { pool_url, payout_address, worker, midwimble_address, threads, backend, cuda_devices, cuda_walks, dashboard, fallback_pool_url, heat_limit } => {
             #[cfg(not(target_arch = "wasm32"))]
             {
                 use midstate::core::{cuda_walk, gpu_mining};
@@ -1221,11 +1252,25 @@ async fn main() -> Result<()> {
                 }
                 cuda_walk::set_walks(cuda_walks);
                 // Checked here so a typo fails now, not as a refused login.
-                let midwimble_address = match midwimble_address {
-                    Some(a) => Some(midstate::pool::parse_midwimble_address(&a)
-                        .map_err(|e| anyhow::anyhow!("invalid --midwimble-address: {e}"))?),
-                    None => None,
-                };
+                use midstate::rpc::miner_settings::{MinerSettings, SETTINGS_FILE};
+                let command_line = MinerSettings {
+                    pool_url,
+                    fallback_url: fallback_pool_url,
+                    payout_address,
+                    worker,
+                    midwimble_address,
+                    threads,
+                    heat_limit_c: heat_limit,
+                }
+                .check()
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                // What the dashboard saved, if anything, replaces it.
+                let (settings, note) = MinerSettings::at_start(&command_line, std::path::Path::new(SETTINGS_FILE));
+                if let Some(note) = note {
+                    tracing::warn!("{note}");
+                }
+                let control = std::sync::Arc::new(midstate::mining::MinerControl::new(settings.pool(), settings.threads, settings.heat_limit_c));
+                let threads = settings.threads;
                 let hash_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
                 let stats = std::sync::Arc::new(std::sync::RwLock::new(midstate::mining::StratumStats::default()));
                 
@@ -1324,6 +1369,7 @@ async fn main() -> Result<()> {
                 });
 
                 tracing::info!("starting hasher (threads: {})", if threads == 0 { "max".to_string() } else { threads.to_string() });
+                tokio::spawn(midstate::mining::heat_guard(control.clone(), midstate::rpc::miner_mode::temp_c));
                 tracing::info!("press [ENTER] at any time to view dashboard");
 
                 // The Axe dashboard, read-only, beside the hasher (rpc::miner_mode).
@@ -1334,23 +1380,15 @@ async fn main() -> Result<()> {
                     let bind: std::net::SocketAddr = dashboard
                         .parse()
                         .map_err(|_| anyhow::anyhow!("--dashboard takes an ip:port, like 127.0.0.1:8546, or off"))?;
-                    let settings = midstate::rpc::miner_mode::MinerSettings {
-                        pool_url: pool_url.clone(),
-                        payout_address: payout_address.clone(),
-                        worker: worker.clone(),
-                        midwimble_address: midwimble_address.clone(),
-                        threads,
-                        backend: backend.to_ascii_lowercase(),
-                    };
-                    let (hc, st) = (hash_counter.clone(), stats.clone());
+                    let (hc, st, ctl, backend) = (hash_counter.clone(), stats.clone(), control.clone(), backend.to_ascii_lowercase());
                     tokio::spawn(async move {
-                        if let Err(e) = midstate::rpc::miner_mode::serve(bind, settings, hc, st).await {
+                        if let Err(e) = midstate::rpc::miner_mode::serve(bind, command_line, backend, ctl, hc, st).await {
                             tracing::warn!("miner dashboard not available on {bind}: {e}");
                         }
                     });
                 }
                 
-                midstate::mining::run_stratum_client(pool_url, payout_address, worker, midwimble_address, threads, hash_counter, stats).await;
+                midstate::mining::run_stratum_client(control, hash_counter, stats).await;
                 Ok(())
             }
             #[cfg(target_arch = "wasm32")]
