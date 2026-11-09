@@ -1,6 +1,8 @@
 #!/bin/sh
 # Rebuilds walk_miner.ptx from walk_miner.cu with clang (no CUDA toolkit
-# needed), and fails if a kernel would spill to local memory. Run it after
+# needed), and fails if a kernel would spill to local memory or has a 64-bit
+# rotate clang gets wrong. ptx_check.cpp then runs the PTX against the known
+# answers. Run it after
 # changing walk_miner.cu or anything it includes from
 # docs/walk-reference/cuda.
 #
@@ -25,6 +27,13 @@ local_lines=$(grep -cE '\.local|__local_depot' "$out" || true)
 echo "walk_miner: $kernels kernels, $local_lines lines of local memory"
 [ "$kernels" -eq 5 ] || { echo "expected 5 kernels"; exit 1; }
 [ "$local_lines" -eq 0 ] || { echo "a kernel uses local memory"; exit 1; }
+# clang compiles a 64-bit rotate by a variable amount to shifts that PTX
+# clamps to zero (walk_core.h's rotr64 says how), and every walk comes out
+# wrong. Its software rotate declares this register.
+if grep -q '\.reg \.b64 %lhs' "$out"; then
+  echo "a kernel has a 64-bit rotate by a variable amount, which clang compiles wrongly: use walk_core.h's rotr64"
+  exit 1
+fi
 if [ "${1:-}" = "--check" ]; then
   head -n 1 walk_miner.ptx | grep -qx "// sources sha256 $sources" || {
     echo "walk_miner.ptx was not built from these sources: run src/core/cuda/gen_ptx.sh"

@@ -2,8 +2,9 @@ name: Walk reference
 
 # The CUDA benchmark keeps its own copy of the walk. This checks that the copy
 # is still midstate's: its known answers are walk.rs's, its CPU self-test
-# passes, and its kernels compile without spilling to local memory. No GPU or
-# CUDA toolkit needed.
+# passes, and its kernels compile without spilling to local memory. It also
+# runs the miner's kernels on the CPU, from their source and from the PTX the
+# miner embeds. No GPU or CUDA toolkit needed.
 on:
   push:
     branches: [ "main" ]
@@ -52,3 +53,11 @@ jobs:
         run: |
           g++ -O2 -std=c++17 -Wall -fsanitize=address,undefined -fno-sanitize-recover=undefined host_check.cpp -o "$RUNNER_TEMP/host_check"
           "$RUNNER_TEMP/host_check"
+
+      - name: The miner's PTX itself, run on the CPU as PTX defines it, gives the known answers
+        working-directory: src/core/cuda
+        run: |
+          python3 ptx_to_c.py walk_miner.ptx > "$RUNNER_TEMP/walk_miner_ptx.c"
+          gcc -O1 -c "$RUNNER_TEMP/walk_miner_ptx.c" -o "$RUNNER_TEMP/walk_miner_ptx.o"
+          g++ -O2 -std=c++17 -Wall ptx_check.cpp "$RUNNER_TEMP/walk_miner_ptx.o" -o "$RUNNER_TEMP/ptx_check"
+          "$RUNNER_TEMP/ptx_check"

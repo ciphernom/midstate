@@ -14,7 +14,9 @@
 //! # Why a wrong GPU cannot cost a block
 //!
 //! - Every device runs the three known answers ([`walk::GOLDEN`]) when it
-//!   opens, and is not used if any is wrong.
+//!   opens, and is not used if any is wrong. (The first PTX failed this on
+//!   every GPU, through a clang bug in the 64-bit rotate. CI now runs the PTX
+//!   itself on the CPU against the known answers: `cuda/ptx_check.cpp`.)
 //! - Every hash a GPU reports below a target is recomputed on the CPU with
 //!   [`walk::walk_hash`] before it becomes a share or a block. A GPU that
 //!   goes wrong later (an overclock running hot, say) only loses work, and
@@ -1019,6 +1021,9 @@ mod tests {
         assert!(PTX.contains(".visible .const .align 4 .b8 ms_keys[96]"));
         assert!(!PTX.contains(".local"), "a kernel spills to local memory");
         assert!(PTX.starts_with("// sources sha256 "));
+        // clang's software 64-bit rotate, which shifts by the amount unreduced
+        // and gives 0 for most amounts (walk_core.h's rotr64 says why).
+        assert!(!PTX.contains(".reg .b64 %lhs"), "a 64-bit rotate clang compiles wrongly");
     }
 
     #[test]

@@ -63,6 +63,33 @@ WALK_HD uint64_t mulhi64(uint64_t a, uint64_t b) {
 #endif
 }
 
+// v rotated right by n, for n in 0..63.
+//
+// clang's NVPTX back end (18 at least) compiles a 64-bit rotate by a variable
+// amount to two 64-bit shifts, by n and by 64 - n, without first reducing n
+// mod 64 (it drops the `& 63` as redundant for a rotate), and PTX clamps a
+// shift of 64 or more to zero. Written as `(v >> n) | (v << ((64 - n) & 63))`
+// with n = k & 63, the rotate came out 0 whenever k's low 32 bits were 64 or
+// more: a miner's PTX built that way got every walk wrong, and the GPU
+// self-test refused the card. Built from 32-bit funnel shifts, which clang
+// compiles to shf.r.wrap (the amount taken mod 32, as a funnel shift wants),
+// it is right. nvcc compiles the plain form correctly, so it keeps it.
+WALK_HD uint64_t rotr64(uint64_t v, uint32_t n) {
+#if defined(__CUDA_ARCH__) && defined(__clang__)
+  uint32_t lo = (uint32_t)v, hi = (uint32_t)(v >> 32);
+  if (n & 32) {
+    const uint32_t t = lo;
+    lo = hi;
+    hi = t;
+  }
+  const uint32_t s = n & 31;
+  if (s == 0) return join(lo, hi);
+  return join((lo >> s) | (hi << (32 - s)), (hi >> s) | (lo << (32 - s)));
+#else
+  return (v >> n) | (v << ((64 - n) & 63));
+#endif
+}
+
 // ── AES ─────────────────────────────────────────────────────────────────────
 
 static const uint8_t SBOX[256] = {
@@ -180,11 +207,9 @@ WALK_HD void step(State& st, uint64_t* __restrict__ pad, const uint32_t* __restr
       hi = join(o[2], o[3]);
       break;
     }
-    case 4: {
-      const uint32_t n = (uint32_t)k & 63;
-      y = (v >> n) | (v << ((64 - n) & 63));
+    case 4:
+      y = rotr64(v, (uint32_t)k & 63);
       break;
-    }
     case 5:
       y = v + k;
       break;

@@ -16,4 +16,7 @@ for arch in sm_52 sm_89; do
   echo "$arch: $kernels kernels, $local_lines lines of local memory"
   [ "$kernels" -eq 5 ] || { echo "expected 5 kernels"; exit 1; }
   [ "$local_lines" -eq 0 ] || { echo "a kernel uses local memory"; exit 1; }
+  # A 64-bit rotate by a variable amount, which clang compiles wrongly
+  # (walk_core.h's rotr64).
+  if grep -q '\.reg \.b64 %lhs' "$out/$arch.ptx"; then echo "$arch: a 64-bit rotate clang gets wrong"; exit 1; fi
 done
