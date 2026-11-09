@@ -348,6 +348,9 @@ pub struct BondView {
     /// "rented_out" (this wallet's coin, mining for someone else).
     #[serde(default)]
     pub rental: String,
+    /// The pool a co-bond was handed to, by its address; empty for none.
+    #[serde(default)]
+    pub pool: String,
 }
 
 /// Bonds for rent (see walletd `rental`): the market, this wallet's offers,

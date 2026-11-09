@@ -80,7 +80,10 @@ pub enum Action {
     SetDexConfig { cfg: DexConfigView },
     LoadBonds,
     /// `register`: ask midwimble to count it as soon as the lock confirms.
-    CreateBond { mining_key: String, value: u64, until: u64, label: String, register: bool },
+    /// `pool`: a pool's address, to hand the bond in to once it confirms.
+    CreateBond { mining_key: String, value: u64, until: u64, label: String, register: bool, pool: Option<String> },
+    /// What co-bonding with the pool at `url` takes and gives.
+    PoolTerms { url: String },
     Unbond { id: String },
     ImportBond { text: String, label: String },
     RemoveBond { id: String },
@@ -203,6 +206,8 @@ pub enum Msg {
     /// A bond file for a pool operator, to put on the clipboard.
     /// A bond's id and its co-bond file.
     CoBondFile(String, String),
+    /// A pool's address, and its co-bond terms or why there are none.
+    PoolTerms(String, Result<midstate_walletd::co_bond::PoolTerms, String>),
     Plans(midstate_walletd::api::PlansView),
     /// A plan or stream action finished; the text says what happened.
     PlansDone(String),
@@ -385,8 +390,12 @@ pub fn dispatch(
                 run!("dex settings", h.set_dex_config(cfg), |_| Msg::DexConfigSaved)
             }
             Action::LoadBonds => run!("bonds", h.bonds(), Msg::Bonds),
-            Action::CreateBond { mining_key, value, until, label, register } => {
-                match h.create_bond(mining_key, value, until, label).await {
+            Action::PoolTerms { url } => {
+                let r = h.pool_terms(url.clone()).await.map_err(|e| format!("{e:#}"));
+                out(Msg::PoolTerms(url, r))
+            }
+            Action::CreateBond { mining_key, value, until, label, register, pool } => {
+                match h.create_bond(mining_key, value, until, label, pool).await {
                     Ok(id) => {
                         // Registration waits for the lock to confirm by
                         // itself. If asking fails, the bond's card offers

@@ -313,6 +313,103 @@ const MW_MAX_OUTPUTS: usize = 32;
 /// Payout weights sent to midwimble are fractions of this.
 const MW_PAYOUT_SCALE: u128 = 1 << 50;
 
+/// Co-bonds handed in through this pool, keyed by bond id (hex): JSON
+/// `{ address, value, bonded_until, added }`. `address` is the midwimble
+/// address the hand-in named for the bond's rewards, or empty. The first
+/// hand-in sets it, and the pool takes one only for a bond its midwimble node
+/// had never seen: until then only the bond's owner knows its script, so
+/// nobody else can claim it.
+const CO_BOND_CLAIMS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("co_bond_claims");
+
+/// How often the pool asks its midwimble node for its co-bonds (seconds).
+const CO_BOND_POLL_SECS: u64 = 60;
+
+/// What a pool gives the people who co-bond with it, in midwimble only
+/// (`midstate pool --co-bond-reward --co-bond-fee-cut`). A co-bond is a
+/// mining bond someone else locks on the pool's mining key: midwimble lets
+/// each bond sign an even share of full-weight blocks, so the pool's blocks
+/// count in full only while enough bonds stand behind its hashrate.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CoBondTerms {
+    /// Percent of the pool's midwimble fee shared among the co-bonds signing
+    /// for it, an even cut per bond, paid to the address each was handed in
+    /// with.
+    pub reward_percent: f64,
+    /// Percentage points off a miner's midwimble fee for each co-bond signing
+    /// for the pool that was handed in with its midwimble address. The fee
+    /// never goes below zero.
+    pub fee_cut: f64,
+}
+
+/// What a midwimble block's payouts take into account of the co-bonds: how
+/// many sign for the pool, by the address each was handed in with.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct CoBondPay {
+    terms: CoBondTerms,
+    bonds: Vec<(String, u64)>,
+}
+
+impl CoBondPay {
+    /// Whether co-bonds change what a block pays.
+    fn active(&self) -> bool {
+        !self.bonds.is_empty() && (self.terms.reward_percent > 0.0 || self.terms.fee_cut > 0.0)
+    }
+
+    fn bonds_of(&self, address: &str) -> u64 {
+        self.bonds.iter().find(|(a, _)| a == address).map_or(0, |(_, n)| *n)
+    }
+}
+
+/// A percentage as parts per million, within `0..=cap`.
+fn ppm(percent: f64, cap: u128) -> u128 {
+    if percent.is_finite() {
+        ((percent.clamp(0.0, 100.0) * 10_000.0).round() as u128).min(cap)
+    } else {
+        0
+    }
+}
+
+/// A miner's midwimble fee, in parts per million: the pool's, less the cut
+/// for each of its co-bonds that signs for the pool.
+fn own_fee_ppm(fee_percent: f64, co: &CoBondPay, address: &str) -> u128 {
+    let cut = ppm(co.terms.fee_cut, 1_000_000).saturating_mul(co.bonds_of(address) as u128);
+    ppm(fee_percent, 999_999).saturating_sub(cut)
+}
+
+/// Each address's part of a midwimble block before the draw, out of
+/// [`MW_PAYOUT_SCALE`], and what is left for the pool. A miner gets its share
+/// of the score less its own fee ([`own_fee_ppm`]). Of the fees, the share the
+/// pool gives co-bonders is cut evenly between the co-bonds signing for it,
+/// and paid to the address each was handed in with.
+fn payout_weights(fee_percent: f64, scores: &[(String, u64)], co: &CoBondPay) -> (Vec<(String, u64)>, u128) {
+    let total_score: u128 = scores.iter().map(|(_, s)| *s as u128).sum();
+    let mut weights: Vec<(String, u128)> = Vec::new();
+    let mut paid = 0u128;
+    if total_score > 0 {
+        for (address, score) in scores.iter().filter(|(_, s)| *s > 0) {
+            let share = MW_PAYOUT_SCALE * *score as u128 / total_score;
+            let w = share * (1_000_000 - own_fee_ppm(fee_percent, co, address)) / 1_000_000;
+            paid += w;
+            weights.push((address.clone(), w));
+        }
+    }
+    let fees = MW_PAYOUT_SCALE - paid;
+    let signing: u128 = co.bonds.iter().map(|(_, n)| *n as u128).sum();
+    if signing > 0 {
+        let per_bond = fees * ppm(co.terms.reward_percent, 1_000_000) / 1_000_000 / signing;
+        for (address, n) in &co.bonds {
+            let w = per_bond * *n as u128;
+            paid += w;
+            match weights.iter_mut().find(|(a, _)| a == address) {
+                Some((_, v)) => *v += w,
+                None => weights.push((address.clone(), w)),
+            }
+        }
+    }
+    let weights = weights.into_iter().filter(|(_, w)| *w > 0).map(|(a, w)| (a, w as u64)).collect();
+    (weights, MW_PAYOUT_SCALE - paid)
+}
+
 /// Checks a midwimble address the way midwimble decodes one (bech32m, `mw`,
 /// version 1, scan and spend keys that are valid, non-identity Ristretto
 /// points) and returns it in canonical lowercase.
@@ -572,14 +669,22 @@ fn allocate<'a>(
 /// [`MW_PAYOUT_SCALE`]: the pool's fee and any rounding to the pool's own
 /// address, and the rest by midwimble score (see [`allocate`]), at most
 /// [`MW_MAX_OUTPUTS`] in all. With no score yet, everything goes to the pool.
-fn merge_payouts(fee_percent: f64, pool: &str, scores: &[(String, u64)], seed: &[u8; 32]) -> Vec<(String, u64)> {
-    let fee_ppm = if fee_percent.is_finite() {
-        ((fee_percent.clamp(0.0, 100.0) * 10_000.0).round() as u128).min(999_999)
+/// Co-bonds signing for the pool cut their owners' fee and share in it
+/// ([`payout_weights`]), when the pool offers either.
+fn merge_payouts(
+    fee_percent: f64,
+    pool: &str,
+    scores: &[(String, u64)],
+    seed: &[u8; 32],
+    co: &CoBondPay,
+) -> Vec<(String, u64)> {
+    let (weights, kept) = if co.active() {
+        payout_weights(fee_percent, scores, co)
     } else {
-        0
+        let fee = MW_PAYOUT_SCALE * ppm(fee_percent, 999_999) / 1_000_000;
+        (scores.to_vec(), fee)
     };
-    let fee = MW_PAYOUT_SCALE * fee_ppm / 1_000_000;
-    let mut owners: Vec<(&str, u64)> = scores
+    let mut owners: Vec<(&str, u64)> = weights
         .iter()
         .filter(|(_, s)| *s > 0)
         .map(|(a, s)| (a.as_str(), *s))
@@ -587,9 +692,9 @@ fn merge_payouts(fee_percent: f64, pool: &str, scores: &[(String, u64)], seed: &
     owners.sort();
     let mut offset = [0u8; 16];
     offset.copy_from_slice(&seed[..16]);
-    let (miners, dust) = allocate(MW_PAYOUT_SCALE - fee, &owners, u128::from_be_bytes(offset), MW_MAX_OUTPUTS - 1);
+    let (miners, dust) = allocate(MW_PAYOUT_SCALE - kept, &owners, u128::from_be_bytes(offset), MW_MAX_OUTPUTS - 1);
     let mut payouts: Vec<(String, u64)> = miners.into_iter().map(|(a, w)| (a.to_string(), w as u64)).collect();
-    let to_pool = (fee + dust) as u64;
+    let to_pool = (kept + dust) as u64;
     if to_pool > 0 {
         match payouts.iter_mut().find(|(a, _)| a == pool) {
             Some((_, w)) => *w += to_pool,
@@ -725,9 +830,10 @@ async fn plan_merge(
     fee_percent: f64,
     seed: &[u8; 32],
     pow: crate::core::types::PowAlgo,
+    co: &CoBondPay,
 ) -> Result<(String, MergeCommit), String> {
     let scores = midwimble_scores(db);
-    let payouts = merge_payouts(fee_percent, pool, &scores, seed);
+    let payouts = merge_payouts(fee_percent, pool, &scores, seed, co);
     let pool_only = payouts.len() == 1 && payouts[0].0 == pool;
     let (reply, paid, payouts, note) = match request_merge_job(client, rpc, &payouts).await {
         Ok(reply) => (reply, scores, payouts, None),
@@ -1044,6 +1150,19 @@ async fn midwimble_stats(state: &PoolState) -> serde_json::Value {
     let mut scores = midwimble_scores(&state.db);
     scores.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     let total_score: u64 = scores.iter().map(|(_, s)| *s).sum();
+    // With co-bonds cutting fees or sharing them, what each address's part
+    // of the next block is before the draw, for the dashboard's estimate.
+    let co = {
+        let cache = state.co_bonds.read().await;
+        co_bond_pay(&state.db, state.co_bond_terms, cache.node.as_ref())
+    };
+    let next_weights = co.active().then(|| {
+        payout_weights(state.midwimble_fee_percent, &scores, &co)
+            .0
+            .into_iter()
+            .map(|(address, weight)| serde_json::json!({ "address": address, "weight": weight }))
+            .collect::<Vec<_>>()
+    });
     let (mut blocks_found, mut blocks_orphaned, mut recent) = (0usize, 0usize, Vec::new());
     if let Ok(txn) = state.db.begin_read() {
         if let Ok(table) = txn.open_table(MW_BLOCKS_TABLE) {
@@ -1073,6 +1192,10 @@ async fn midwimble_stats(state: &PoolState) -> serde_json::Value {
         "reward": reward,
         "target": target,
         "fee_percent": state.midwimble_fee_percent,
+        "co_bond_fee_cut": state.co_bond_terms.fee_cut,
+        "co_bond_reward_percent": state.co_bond_terms.reward_percent,
+        "co_bonds_paid": co.bonds.iter().map(|(_, n)| n).sum::<u64>(),
+        "next_weights": next_weights,
         "scores": scores
             .iter()
             .map(|(address, score)| serde_json::json!({ "address": address, "score": score }))
@@ -1083,6 +1206,255 @@ async fn midwimble_stats(state: &PoolState) -> serde_json::Value {
         "blocks_orphaned": blocks_orphaned,
         "recent_blocks": recent,
     })
+}
+
+// ── Co-bonds ────────────────────────────────────────────────────────────────
+
+/// The midwimble node's co-bonds and mining key, as the pool last read them.
+#[derive(Clone, Debug, Default)]
+struct CoBondCache {
+    /// The node's answer to `GET /co-bonds`, once it gave one.
+    node: Option<serde_json::Value>,
+    /// Why it gave none, when it did not.
+    error: Option<String>,
+}
+
+/// Asks the midwimble node for its mining key and co-bonds.
+async fn refresh_co_bonds(state: &PoolState, client: &reqwest::Client) {
+    let Some(rpc) = &state.midwimble_rpc else { return };
+    let cache = match client.get(format!("{rpc}/co-bonds")).send().await {
+        Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+            Ok(v) => CoBondCache { node: Some(v), error: None },
+            Err(e) => CoBondCache { node: None, error: Some(format!("the midwimble node's answer was unreadable: {e}")) },
+        },
+        Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => CoBondCache {
+            node: None,
+            error: Some("this pool's midwimble node predates co-bonds handed in while it runs".into()),
+        },
+        Ok(r) => {
+            let status = r.status();
+            let v: serde_json::Value = r.json().await.unwrap_or_default();
+            let why = v["error"].as_str().map(str::to_string).unwrap_or_else(|| format!("the midwimble node answered {status}"));
+            CoBondCache { node: None, error: Some(why) }
+        }
+        Err(e) => CoBondCache { node: None, error: Some(format!("the midwimble node did not answer: {e}")) },
+    };
+    *state.co_bonds.write().await = cache;
+}
+
+/// Every claim, by bond id (hex).
+fn co_bond_claims(db: &Database) -> HashMap<String, serde_json::Value> {
+    let Ok(txn) = db.begin_read() else { return HashMap::new() };
+    let Ok(table) = txn.open_table(CO_BOND_CLAIMS_TABLE) else { return HashMap::new() };
+    let Ok(rows) = table.iter() else { return HashMap::new() };
+    rows.flatten()
+        .filter_map(|(k, v)| Some((k.value().to_string(), serde_json::from_str(v.value()).ok()?)))
+        .collect()
+}
+
+/// What the co-bonds signing for the pool do to a block's payouts: those the
+/// node holds as registered, by the address each was handed in with.
+fn co_bond_pay(db: &Database, terms: CoBondTerms, node: Option<&serde_json::Value>) -> CoBondPay {
+    let Some(node) = node else { return CoBondPay { terms, bonds: Vec::new() } };
+    let claims = co_bond_claims(db);
+    let mut by: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for b in node["co_bonds"].as_array().into_iter().flatten() {
+        if b["phase"] != "registered" {
+            continue;
+        }
+        let address = b["bond_id"]
+            .as_str()
+            .and_then(|id| claims.get(id))
+            .and_then(|c| c["address"].as_str())
+            .filter(|a| !a.is_empty());
+        if let Some(address) = address {
+            *by.entry(address.to_string()).or_default() += 1;
+        }
+    }
+    CoBondPay { terms, bonds: by.into_iter().collect() }
+}
+
+#[derive(Deserialize)]
+struct CoBondQuery {
+    address: Option<String>,
+}
+
+/// `GET /pool/api/co-bonds`: what co-bonding with this pool takes (its
+/// mining key) and gives (the fee cut and the share of fees), and the
+/// co-bonds standing behind it. With `?address=`, that midwimble address's
+/// co-bonds and the midwimble fee it pays.
+async fn get_co_bonds(State(state): State<Arc<PoolState>>, Query(q): Query<CoBondQuery>) -> Json<serde_json::Value> {
+    Json(co_bonds_view(&state, q.address.as_deref()).await)
+}
+
+async fn co_bonds_view(state: &PoolState, address: Option<&str>) -> serde_json::Value {
+    let merging = state.midwimble_rpc.is_some() && state.midwimble_address.is_some();
+    let cache = state.co_bonds.read().await.clone();
+    let claims = co_bond_claims(&state.db);
+    let node = cache.node.as_ref();
+    let bonds: Vec<serde_json::Value> = node
+        .and_then(|n| n["co_bonds"].as_array())
+        .into_iter()
+        .flatten()
+        .map(|b| {
+            let claim = b["bond_id"].as_str().and_then(|id| claims.get(id));
+            serde_json::json!({
+                "bond_id": b["bond_id"],
+                "value": b["value"],
+                "bonded_until": b["bonded_until"],
+                "phase": b["phase"],
+                "progress": b["progress"],
+                "note": b["note"],
+                "added": b["added"],
+                "address": claim.and_then(|c| c["address"].as_str()).filter(|a| !a.is_empty()),
+            })
+        })
+        .collect();
+    let pay = co_bond_pay(&state.db, state.co_bond_terms, node);
+    let you = address.and_then(|a| parse_midwimble_address(a).ok()).map(|a| {
+        serde_json::json!({
+            "address": a,
+            "bonds": pay.bonds_of(&a),
+            "fee_percent": own_fee_ppm(state.midwimble_fee_percent, &pay, &a) as f64 / 10_000.0,
+        })
+    });
+    let note = if !merging {
+        Some("this pool does not merge-mine midwimble".to_string())
+    } else {
+        cache.error.clone()
+    };
+    serde_json::json!({
+        "merge_mining": merging,
+        "accepting": merging && node.is_some(),
+        "note": note,
+        "mining_key": node.and_then(|n| n["mining_key"].as_str()),
+        "fee_percent": state.midwimble_fee_percent,
+        "fee_cut": state.co_bond_terms.fee_cut,
+        "reward_percent": state.co_bond_terms.reward_percent,
+        "registered": bonds.iter().filter(|b| b["phase"] == "registered").count(),
+        "co_bonds": bonds,
+        "you": you,
+    })
+}
+
+#[derive(Deserialize)]
+struct CoBondHandIn {
+    /// The bond's script (hex), value and salt (hex): the coin, as the
+    /// wallet that locked it knows it.
+    script: String,
+    value: u64,
+    salt: String,
+    /// The midwimble address its rewards go to, if any.
+    #[serde(default)]
+    address: Option<String>,
+}
+
+/// `POST /pool/api/co-bonds`: hands in a co-bond, a bond its owner locked on
+/// this pool's mining key, so the pool's midwimble node registers it and
+/// signs with it. The address, if given, is where its rewards go, and whose
+/// midwimble fee it cuts. Only the first hand-in of a bond the node had never
+/// seen sets it.
+async fn post_co_bond(
+    State(state): State<Arc<PoolState>>,
+    Json(body): Json<CoBondHandIn>,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    use axum::http::StatusCode;
+    let refuse = |why: String| (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": why })));
+    let (Some(rpc), Some(_)) = (state.midwimble_rpc.clone(), state.midwimble_address.as_ref()) else {
+        return refuse("this pool does not merge-mine midwimble, so it takes no co-bonds".into());
+    };
+    if body.script.len() > 1024 || body.salt.len() > 128 {
+        return refuse("that is not a bond".into());
+    }
+    let address = match body.address.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
+        Some(a) => match parse_midwimble_address(a) {
+            Ok(a) => a,
+            Err(e) => return refuse(format!("not a midwimble address: {e}")),
+        },
+        None => String::new(),
+    };
+
+    let _one_at_a_time = state.co_bond_gate.lock().await;
+    let client = match reqwest::Client::builder().timeout(Duration::from_secs(90)).build() {
+        Ok(c) => c,
+        Err(e) => return refuse(e.to_string()),
+    };
+    let sent = client
+        .post(format!("{rpc}/co-bonds"))
+        .json(&serde_json::json!({ "script": body.script, "value": body.value, "salt": body.salt }))
+        .send()
+        .await;
+    let reply: serde_json::Value = match sent {
+        Ok(r) if r.status().is_success() => r.json().await.unwrap_or_default(),
+        Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
+            return refuse("this pool's midwimble node predates co-bonds handed in while it runs".into())
+        }
+        Ok(r) => {
+            let v: serde_json::Value = r.json().await.unwrap_or_default();
+            return refuse(v["error"].as_str().unwrap_or("the pool's midwimble node refused it").to_string());
+        }
+        Err(e) => return refuse(format!("the pool's midwimble node did not answer: {e}")),
+    };
+    let Some(id) = reply["co_bond"]["bond_id"].as_str().map(str::to_string) else {
+        return refuse("the pool's midwimble node gave no bond id".into());
+    };
+    let new = reply["new"].as_bool() == Some(true);
+    let held = co_bond_claims(&state.db).remove(&id);
+    let (recorded, note) = match held {
+        Some(c) => {
+            let first = c["address"].as_str().unwrap_or("").to_string();
+            let note = if first != address {
+                "Its rewards go to the address it was first handed in with."
+            } else {
+                ""
+            };
+            (first, note)
+        }
+        None if new => {
+            let row = serde_json::json!({
+                "address": address,
+                "value": reply["co_bond"]["value"],
+                "bonded_until": reply["co_bond"]["bonded_until"],
+                "added": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            })
+            .to_string();
+            let saved = (|| -> Result<(), String> {
+                let txn = state.db.begin_write().map_err(|e| e.to_string())?;
+                {
+                    let mut table = txn.open_table(CO_BOND_CLAIMS_TABLE).map_err(|e| e.to_string())?;
+                    table.insert(id.as_str(), row.as_str()).map_err(|e| e.to_string())?;
+                }
+                txn.commit().map_err(|e| e.to_string())
+            })();
+            match saved {
+                Ok(()) => (address.clone(), ""),
+                Err(e) => {
+                    tracing::warn!("recording co-bond {id}: {e}");
+                    (String::new(), "The pool could not record its reward address.")
+                }
+            }
+        }
+        None if address.is_empty() => (String::new(), ""),
+        None => (
+            String::new(),
+            "The pool's node knew this bond before it was handed in here, so it takes no reward address for it.",
+        ),
+    };
+    drop(_one_at_a_time);
+    let refresh = reqwest::Client::builder().timeout(Duration::from_secs(15)).build().unwrap_or_default();
+    refresh_co_bonds(&state, &refresh).await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "co_bond": reply["co_bond"],
+            "new": new,
+            "address": (!recorded.is_empty()).then_some(recorded),
+            "note": note,
+        })),
+    )
 }
 
 // ── App State ───────────────────────────────────────────────────────────────
@@ -1117,6 +1489,13 @@ struct PoolState {
     pool_fee_percent: f64,
     /// The percentage of midwimble rewards the pool keeps.
     midwimble_fee_percent: f64,
+    /// What co-bonders get, in midwimble.
+    co_bond_terms: CoBondTerms,
+    /// The midwimble node's co-bonds and mining key, as last read.
+    co_bonds: RwLock<CoBondCache>,
+    /// Hand-ins are taken one at a time: each asks the midwimble node, which
+    /// asks midstate's.
+    co_bond_gate: tokio::sync::Mutex<()>,
     /// The most recent network block reward seen from the node, relayed to the
     /// dashboard so it can estimate expected payouts / coins-per-day before the
     /// pool has found its first block. Lock-free; updated each polling cycle.
@@ -1501,6 +1880,7 @@ pub async fn run_stratum_pool(
     webrtc_port: Option<u16>,
     midwimble_rpc: Option<String>,
     midwimble_address: Option<String>,
+    co_bond_terms: CoBondTerms,
 ) {
     tracing::info!("starting stratum pool server");
     
@@ -1515,6 +1895,7 @@ pub async fn run_stratum_pool(
         let _ = write_txn.open_table(MW_SHARES_TABLE).unwrap();
         let _ = write_txn.open_table(MW_BLOCKS_TABLE).unwrap();
         let _ = write_txn.open_table(MW_PENDING_TABLE).unwrap();
+        let _ = write_txn.open_table(CO_BOND_CLAIMS_TABLE).unwrap();
         // ── One-off migration: purge stale zero-score rows ──
         // Databases written by affected versions accumulated permanent `score == 0`
         // rows (the deduction path used to write them back instead of removing them).
@@ -1597,6 +1978,9 @@ pub async fn run_stratum_pool(
         midwimble_address,
         pool_fee_percent,
         midwimble_fee_percent,
+        co_bond_terms,
+        co_bonds: RwLock::new(CoBondCache::default()),
+        co_bond_gate: tokio::sync::Mutex::new(()),
         current_block_reward: std::sync::atomic::AtomicU64::new(0),
         current_height: std::sync::atomic::AtomicU64::new(0),
         share_stats: RwLock::new(HashMap::new()),
@@ -1610,6 +1994,21 @@ pub async fn run_stratum_pool(
         http_throttle: RwLock::new(HashMap::new()),
         merge_status: RwLock::new(MergeStatus::default()),
     });
+
+    // The midwimble node's co-bonds, for the dashboard and the payouts.
+    if state.midwimble_rpc.is_some() {
+        let co_state = state.clone();
+        tokio::spawn(async move {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(15))
+                .build()
+                .unwrap_or_default();
+            loop {
+                refresh_co_bonds(&co_state, &client).await;
+                tokio::time::sleep(Duration::from_secs(CO_BOND_POLL_SECS)).await;
+            }
+        });
+    }
 
     let api_state = state.clone();
     let parts: Vec<&str> = bind_addr.split(':').collect();
@@ -1678,6 +2077,10 @@ pub async fn run_stratum_pool(
             .route("/pool/api/block_scores", get(get_block_scores))
             .route("/pool/api/template", get(get_http_template))
             .route("/pool/api/submit", post(post_http_submit))
+            // Co-bonds: what co-bonding with this pool takes and gives, and
+            // handing one in.
+            .route("/api/co-bonds", get(get_co_bonds).post(post_co_bond))
+            .route("/pool/api/co-bonds", get(get_co_bonds).post(post_co_bond))
             .layer(cors)
             .with_state(api_state);
         axum::serve(api_listener, app).await.unwrap();
@@ -1945,6 +2348,10 @@ pub async fn run_stratum_pool(
                 // root, none of which the pool can re-roll.
                 let merging = state_clone.midwimble_rpc.is_some() && state_clone.midwimble_address.is_some();
                 let mut merge_error: Option<String> = None;
+                let co_pay = {
+                    let cache = state_clone.co_bonds.read().await;
+                    co_bond_pay(&state_clone.db, state_clone.co_bond_terms, cache.node.as_ref())
+                };
                 let merge_plan = match (state_clone.midwimble_rpc.as_deref(), state_clone.midwimble_address.as_deref()) {
                     (Some(mw_rpc), Some(mw_pool)) => {
                         let mut seed_data = b"midstate.pool.midwimble-draw.v1".to_vec();
@@ -1959,6 +2366,7 @@ pub async fn run_stratum_pool(
                             state_clone.midwimble_fee_percent,
                             &hash(&seed_data),
                             crate::core::types::pow_algo_at(tip_height),
+                            &co_pay,
                         )
                         .await
                         .map_err(|e| merge_error = Some(e))
@@ -3899,14 +4307,14 @@ mod tests {
 
     #[test]
     fn with_no_midwimble_score_the_pool_is_paid_everything() {
-        let payouts = merge_payouts(1.0, &pool_mw(), &[], &[0; 32]);
+        let payouts = merge_payouts(1.0, &pool_mw(), &[], &[0; 32], &CoBondPay::default());
         assert_eq!(payouts, vec![(pool_mw(), MW_PAYOUT_SCALE as u64)]);
     }
 
     #[test]
     fn larger_miners_are_paid_exactly_and_the_fee_goes_to_the_pool() {
         let scores = vec![(ALICE.to_string(), 60), (BOB.to_string(), 40)];
-        let payouts = merge_payouts(1.0, &pool_mw(), &scores, &[9; 32]);
+        let payouts = merge_payouts(1.0, &pool_mw(), &scores, &[9; 32], &CoBondPay::default());
         assert_eq!(total(&payouts), MW_PAYOUT_SCALE, "every unit is paid to someone");
         let fee = MW_PAYOUT_SCALE / 100;
         let weight = |a: &str| payouts.iter().find(|(x, _)| x == a).map(|(_, w)| *w as u128).unwrap();
@@ -3919,7 +4327,7 @@ mod tests {
     fn the_pools_own_score_and_fee_share_one_output() {
         // Shares from miners who gave no midwimble address count for the pool.
         let scores = vec![(ALICE.to_string(), 50), (pool_mw(), 50)];
-        let payouts = merge_payouts(2.0, &pool_mw(), &scores, &[1; 32]);
+        let payouts = merge_payouts(2.0, &pool_mw(), &scores, &[1; 32], &CoBondPay::default());
         assert_eq!(payouts.len(), 2);
         assert_eq!(total(&payouts), MW_PAYOUT_SCALE);
     }
@@ -3933,7 +4341,7 @@ mod tests {
         let draws = 4000u32;
         for i in 0..draws {
             let seed = hash(&i.to_le_bytes());
-            let payouts = merge_payouts(0.0, "mw1pool", &scores, &seed);
+            let payouts = merge_payouts(0.0, "mw1pool", &scores, &seed, &CoBondPay::default());
             assert!(payouts.len() <= MW_MAX_OUTPUTS);
             assert_eq!(payouts.len(), MW_MAX_OUTPUTS, "31 miners and the pool's rounding");
             assert_eq!(total(&payouts), MW_PAYOUT_SCALE);
@@ -3947,6 +4355,77 @@ mod tests {
             let off = expected.abs_diff(average) as f64 / expected as f64;
             assert!(off < 0.08, "{address}: average {average}, expected {expected}");
         }
+    }
+
+    fn co(reward_percent: f64, fee_cut: f64, bonds: &[(&str, u64)]) -> CoBondPay {
+        CoBondPay {
+            terms: CoBondTerms { reward_percent, fee_cut },
+            bonds: bonds.iter().map(|(a, n)| (a.to_string(), *n)).collect(),
+        }
+    }
+
+    #[test]
+    fn without_co_bond_terms_payouts_are_as_before() {
+        let scores = vec![(ALICE.to_string(), 60), (BOB.to_string(), 40)];
+        let before = merge_payouts(1.0, &pool_mw(), &scores, &[9; 32], &CoBondPay::default());
+        // Terms with no bond signing, or bonds with no terms, change nothing.
+        assert_eq!(merge_payouts(1.0, &pool_mw(), &scores, &[9; 32], &co(50.0, 0.5, &[])), before);
+        assert_eq!(merge_payouts(1.0, &pool_mw(), &scores, &[9; 32], &co(0.0, 0.0, &[(ALICE, 2)])), before);
+    }
+
+    #[test]
+    fn each_co_bond_cuts_its_owners_midwimble_fee() {
+        let scores = vec![(ALICE.to_string(), 50), (BOB.to_string(), 50)];
+        let terms = co(0.0, 0.5, &[(ALICE, 1)]);
+        assert_eq!(own_fee_ppm(2.0, &terms, ALICE), 15_000, "2% less half a point");
+        assert_eq!(own_fee_ppm(2.0, &terms, BOB), 20_000);
+        assert_eq!(own_fee_ppm(2.0, &co(0.0, 0.5, &[(ALICE, 9)]), ALICE), 0, "never below zero");
+
+        let payouts = merge_payouts(2.0, &pool_mw(), &scores, &[3; 32], &terms);
+        assert_eq!(total(&payouts), MW_PAYOUT_SCALE, "every unit is paid to someone");
+        let weight = |a: &str| payouts.iter().find(|(x, _)| x == a).map(|(_, w)| *w as u128).unwrap();
+        let half = MW_PAYOUT_SCALE / 2;
+        assert_eq!(weight(ALICE), half * 985 / 1000);
+        assert_eq!(weight(BOB), half * 98 / 100);
+        let fees = MW_PAYOUT_SCALE - weight(ALICE) - weight(BOB);
+        assert_eq!(weight(&pool_mw()), fees);
+    }
+
+    #[test]
+    fn co_bonds_share_the_pools_fee_evenly_per_bond() {
+        let scores = vec![(ALICE.to_string(), 100)];
+        // Half the fee goes to co-bonders: Bob has two bonds, Carol one.
+        let carol = "mw1carol";
+        let terms = co(50.0, 0.0, &[(BOB, 2), (carol, 1)]);
+        let (weights, kept) = payout_weights(3.0, &scores, &terms);
+        let w = |a: &str| weights.iter().find(|(x, _)| x == a).map(|(_, w)| *w as u128).unwrap_or(0);
+        let fees = MW_PAYOUT_SCALE - w(ALICE);
+        assert_eq!(w(ALICE), MW_PAYOUT_SCALE * 97 / 100);
+        let per_bond = fees / 2 / 3;
+        assert_eq!(w(BOB), 2 * per_bond);
+        assert_eq!(w(carol), per_bond);
+        assert_eq!(kept, MW_PAYOUT_SCALE - w(ALICE) - w(BOB) - w(carol), "the pool keeps the rest");
+        assert!(kept >= fees / 2);
+
+        // With no score yet the fee is the whole block, and co-bonders share in it.
+        let (weights, kept) = payout_weights(3.0, &[], &terms);
+        let all: u128 = weights.iter().map(|(_, w)| *w as u128).sum();
+        assert_eq!(all + kept, MW_PAYOUT_SCALE);
+        assert!(all > 0 && all <= MW_PAYOUT_SCALE / 2);
+    }
+
+    #[test]
+    fn a_co_bonder_who_also_mines_is_paid_in_one_output() {
+        let scores = vec![(ALICE.to_string(), 70), (BOB.to_string(), 30)];
+        let payouts = merge_payouts(1.0, &pool_mw(), &scores, &[5; 32], &co(100.0, 1.0, &[(BOB, 1)]));
+        assert_eq!(payouts.iter().filter(|(a, _)| a == BOB).count(), 1);
+        assert_eq!(total(&payouts), MW_PAYOUT_SCALE);
+        // Bob's fee is cut to nothing, and all of Alice's fee goes to his bond.
+        let weight = |a: &str| payouts.iter().find(|(x, _)| x == a).map_or(0, |(_, w)| *w as u128);
+        assert_eq!(weight(ALICE), MW_PAYOUT_SCALE * 70 / 100 * 99 / 100);
+        assert!(weight(&pool_mw()) <= 1, "the pool keeps no more than rounding");
+        assert!(weight(BOB) > MW_PAYOUT_SCALE * 30 / 100);
+        assert_eq!(weight(ALICE) + weight(BOB) + weight(&pool_mw()), MW_PAYOUT_SCALE);
     }
 
     fn test_db() -> (tempfile::TempDir, Arc<Database>) {
@@ -4072,7 +4551,7 @@ mod tests {
         settle_midwimble_scores(&db, &[(ALICE.into(), 3), (BOB.into(), 1)], true).unwrap();
 
         let chain = crate::core::types::PowAlgo::Blake3Chain;
-        let (commitment, plan) = plan_merge(&db, &client, &rpc, &pool, 1.0, &[0; 32], chain).await.unwrap();
+        let (commitment, plan) = plan_merge(&db, &client, &rpc, &pool, 1.0, &[0; 32], chain, &CoBondPay::default()).await.unwrap();
         assert_eq!(commitment, "11".repeat(32));
         assert_eq!(sorted(plan.paid.to_vec()), sorted(vec![(ALICE.into(), 3), (BOB.into(), 1)]));
         let asked: Vec<String> = mock.lock().unwrap().jobs[0].iter().map(|(a, _)| a.clone()).collect();
@@ -4085,21 +4564,21 @@ mod tests {
         // The node refuses the miners' payouts: the job pays the pool alone,
         // as before per-miner payouts, and takes nobody's score.
         mock.lock().unwrap().refuse_miners = true;
-        let (_, plan) = plan_merge(&db, &client, &rpc, &pool, 1.0, &[0; 32], chain).await.unwrap();
+        let (_, plan) = plan_merge(&db, &client, &rpc, &pool, 1.0, &[0; 32], chain, &CoBondPay::default()).await.unwrap();
         assert!(plan.paid.is_empty());
         assert_eq!(mock.lock().unwrap().jobs.last().unwrap(), &vec![(pool.clone(), 1)]);
         assert_eq!(plan.payouts.to_vec(), vec![(pool.clone(), 1)]);
         assert!(plan.note.as_deref().is_some_and(|n| n.contains("invalid scan key")), "{:?}", plan.note);
 
         // No node at all: no merge-mining this job, and nothing breaks.
-        let refused = plan_merge(&db, &client, "http://127.0.0.1:9", &pool, 1.0, &[0; 32], chain).await;
+        let refused = plan_merge(&db, &client, "http://127.0.0.1:9", &pool, 1.0, &[0; 32], chain, &CoBondPay::default()).await;
         assert!(refused.as_ref().is_err_and(|e| e.contains("unreachable")), "{:?}", refused.map(|r| r.0));
 
         // A midwimble node that predates Midstate Walk wants the BLAKE3 chain:
         // a Walk job cannot carry its block, so the pool mines midstate alone.
         mock.lock().unwrap().refuse_miners = false;
         let walk = crate::core::types::PowAlgo::Walk;
-        let mismatched = plan_merge(&db, &client, &rpc, &pool, 1.0, &[0; 32], walk).await;
+        let mismatched = plan_merge(&db, &client, &rpc, &pool, 1.0, &[0; 32], walk, &CoBondPay::default()).await;
         assert!(mismatched.as_ref().is_err_and(|e| e.contains("same one")), "{:?}", mismatched.map(|r| r.0));
     }
 
@@ -4133,6 +4612,9 @@ mod tests {
             merge_status: RwLock::new(MergeStatus::default()),
             pool_fee_percent: 1.0,
             midwimble_fee_percent: 1.0,
+            co_bond_terms: CoBondTerms::default(),
+            co_bonds: RwLock::new(CoBondCache::default()),
+            co_bond_gate: tokio::sync::Mutex::new(()),
             current_block_reward: AtomicU64::new(0),
             current_height: AtomicU64::new(0),
             share_stats: RwLock::new(HashMap::new()),

@@ -324,6 +324,11 @@ pub struct BondRecord {
     /// it in a bond file (no secret: the mining secret is the phrase's).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bond_file: Option<::midwimble::core::bond::BondFile>,
+    /// The pool this bond was locked for, by its address (`co_bond::
+    /// pool_base`). The wallet hands the bond in there once its lock
+    /// confirms, and the pool's midwimble node registers it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
     /// Where that registration stands (`mwb_mining`).
     #[serde(default)]
     pub reg: RegStatus,
@@ -335,7 +340,9 @@ pub struct BondRecord {
 pub struct RegStatus {
     /// "" (not asked) | "waiting" (asked; the coin is not confirmed yet, or
     /// the first attempt is due) | "burying" | "ready" | "on_chain" |
-    /// "failed" (the last attempt failed; retried)
+    /// "failed" (the last attempt failed; retried) | "to_pool" (a co-bond
+    /// handed in to its pool once the lock confirms) | "pool" (handed in:
+    /// the pool registers it)
     #[serde(default)]
     pub phase: String,
     /// Burial progress: percent of the work a registration needs.
@@ -351,7 +358,7 @@ pub struct RegStatus {
 impl RegStatus {
     /// Asked to register, and not there yet.
     pub fn active(&self) -> bool {
-        matches!(self.phase.as_str(), "waiting" | "burying" | "ready" | "failed")
+        matches!(self.phase.as_str(), "waiting" | "burying" | "ready" | "failed" | "to_pool" | "pool")
     }
 }
 
@@ -715,6 +722,7 @@ mod tests {
             owner_next_leaf: 0,
             seen_live: true,
             bond_file: None,
+            pool: None,
             reg: Default::default(),
         };
         let (mut state, _) = midstate::core::types::State::genesis();
@@ -868,6 +876,7 @@ mod tests {
             owner_next_leaf: 0,
             seen_live: false,
             bond_file: None,
+            pool: None,
             reg: Default::default(),
         });
         book.save(&wp).unwrap();

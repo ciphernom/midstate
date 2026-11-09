@@ -18,6 +18,7 @@ pub mod api;
 pub mod base;
 pub mod bond;
 pub mod channels;
+pub mod co_bond;
 pub mod dex;
 pub mod evm;
 pub mod ledger;

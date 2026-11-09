@@ -72,6 +72,21 @@ Every accepted share earns a point of midwimble score for its miner's midwimble 
 
 Midwimble's nodes replace a run of blocks that went over their bond's cap with a block that counts in full (`docs/BONDED_POW.md` in midwimble), so a pool with too few bonds for its share of the work loses some of its midwimble blocks. A replaced block paid nobody, so the pool gives back the scores it took, once, for its next midwimble block to pay. It watches each block it finds until 10 blocks that counted in full bury it, or more than 100 blocks do: the dashboard marks a block settling until then, and orphaned once another block has settled in its place. The node replaces other bonds' over-cap blocks the same way (unless started with `--no-orphan-over-cap`), so a job can build past them, and the dashboard says when one does.
 
+### 5. Take Co-bonds (Optional)
+Midwimble lets each mining bond sign an even share of full-weight blocks, so the bonds behind a pool decide how many of its midwimble blocks count. A **co-bond** is a bond someone else locks on the pool's mining key: they keep the coin, which only their recovery phrase can spend, and the pool's midwimble node signs with it.
+
+A merge-mining pool publishes its mining key and takes co-bonds at `/pool/api/co-bonds`, and the dashboard shows both. A co-bonder's desktop wallet does the rest: Bonds, New bond, A pool, with the pool's address. The wallet locks the bond, and once the lock confirms it hands the bond's script, value and salt to the pool. The pool's midwimble node then registers the bond itself, through its `--midstate-rpc`, which takes about a day. The node must run a midwimble release that takes co-bonds while it runs (`GET`/`POST /co-bonds`); older nodes take them only as files, with `--co-bond`.
+
+The pool can pay co-bonders, in midwimble only:
+```bash
+midstate pool --pool-address <POOL_ADDRESS> --midwimble-rpc 127.0.0.1:9434 --midwimble-address <POOL_MW_ADDRESS> \
+  --midwimble-fee 2 --co-bond-reward 50 --co-bond-fee-cut 1
+```
+* `--co-bond-reward 50`: half of the pool's midwimble fee from each block goes to the co-bonds signing for it, an even cut per bond, paid in the block to the midwimble address each was handed in with.
+* `--co-bond-fee-cut 1`: each such co-bond takes 1 percentage point off its owner's own midwimble fee when they mine, down to zero. With `--midwimble-fee 2`, one co-bond means a 1% fee, and two mean none.
+
+Both default to 0. A bond's reward address is set by its first hand-in, and only for a bond the node had never seen: until then only its owner knows its script, so nobody else can claim it. Every payout is in the midwimble coinbase, as the miners' are, so it is as auditable.
+
 ---
 
 ## Part 2: Mining on a Pool

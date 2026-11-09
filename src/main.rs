@@ -352,6 +352,16 @@ enum Command {
         /// Midwimble address this pool's midwimble rewards are paid to.
         #[arg(long)]
         midwimble_address: Option<String>,
+        /// Percent of the pool's midwimble fee shared among the co-bonds
+        /// signing for it (bonds others locked on its mining key), an even cut
+        /// per bond, paid to the midwimble address each was handed in with.
+        #[arg(long, default_value = "0")]
+        co_bond_reward: f64,
+        /// Percentage points off a miner's midwimble fee for each co-bond
+        /// signing for the pool that was handed in with its midwimble
+        /// address (never below zero).
+        #[arg(long, default_value = "0")]
+        co_bond_fee_cut: f64,
         /// Share difficulty in leading zero bits (default 12 = one share per
         /// 2^12 nonces). Raise it for a pool fronting fast hardware to cut
         /// submission volume; lower it for small/mobile miners to cut variance.
@@ -1172,11 +1182,12 @@ async fn main() -> Result<()> {
         Command::Peers { rpc_port, rpc_host } => get_peers(rpc_port, rpc_host).await,
         Command::Keygen { rpc_port, rpc_host } => keygen(rpc_port, rpc_host).await,
         Command::Sync { data_dir, peer, port } => sync_from_genesis(data_dir, peer, port).await,
-        Command::Pool { pool_address, bind_addr, rpc_port, rpc_host, fee, midwimble_fee, share_bits, webrtc_port, midwimble_rpc, midwimble_address } => {
+        Command::Pool { pool_address, bind_addr, rpc_port, rpc_host, fee, midwimble_fee, share_bits, webrtc_port, midwimble_rpc, midwimble_address, co_bond_reward, co_bond_fee_cut } => {
             #[cfg(not(target_arch = "wasm32"))]
             {
                 let node_rpc_url = format!("http://{}:{}", rpc_host, rpc_port);
-                midstate::pool::run_stratum_pool(pool_address, bind_addr, node_rpc_url, fee, midwimble_fee.unwrap_or(fee), share_bits, webrtc_port, midwimble_rpc, midwimble_address).await;
+                let co_bonds = midstate::pool::CoBondTerms { reward_percent: co_bond_reward, fee_cut: co_bond_fee_cut };
+                midstate::pool::run_stratum_pool(pool_address, bind_addr, node_rpc_url, fee, midwimble_fee.unwrap_or(fee), share_bits, webrtc_port, midwimble_rpc, midwimble_address, co_bonds).await;
                 Ok(())
             }
             #[cfg(target_arch = "wasm32")]

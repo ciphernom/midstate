@@ -31,6 +31,8 @@ mod mining_glue;
 mod rental_glue;
 #[path = "service_plans.rs"]
 mod plans_glue;
+#[path = "service_co_bond.rs"]
+mod co_bond_glue;
 
 const TICK: Duration = Duration::from_secs(2);
 /// How long a commit monitor waits for the commitment to enter chain state
@@ -139,6 +141,7 @@ enum Cmd {
         value: u64,
         until: u64,
         label: String,
+        pool: Option<String>,
         resp: oneshot::Sender<Result<String>>,
     },
     Unbond { id: String, resp: oneshot::Sender<Result<String>> },
@@ -185,6 +188,8 @@ enum Internal {
     CommitStalled([u8; 32]),
     RevealConfirmed([u8; 32]),
     Tick,
+    /// A pool answered about a co-bond (`co_bond_glue`).
+    PoolReply { id: [u8; 32], reply: co_bond_glue::PoolReply },
 }
 
 // ── Public handle ───────────────────────────────────────────────────────────
@@ -467,9 +472,23 @@ impl WalletdHandle {
         ask!(self, Bonds)
     }
     /// Lock one coin of `value` (a power of two) as a midwimble mining bond on
-    /// `mining_key` until block `until`. Returns the bond's id.
-    pub async fn create_bond(&self, mining_key: String, value: u64, until: u64, label: String) -> Result<String> {
-        ask!(self, CreateBond { mining_key: mining_key, value: value, until: until, label: label })
+    /// `mining_key` until block `until`. Returns the bond's id. With `pool`
+    /// (a pool's address, whose mining key `mining_key` is), the wallet hands
+    /// the bond in to that pool once its lock confirms (`co_bond`).
+    pub async fn create_bond(
+        &self,
+        mining_key: String,
+        value: u64,
+        until: u64,
+        label: String,
+        pool: Option<String>,
+    ) -> Result<String> {
+        ask!(self, CreateBond { mining_key: mining_key, value: value, until: until, label: label, pool: pool })
+    }
+    /// What co-bonding with the pool at `address` takes and gives, as the
+    /// pool says (`co_bond::terms`). Asks the pool directly, not the actor.
+    pub async fn pool_terms(&self, address: String) -> Result<crate::co_bond::PoolTerms> {
+        crate::co_bond::terms(&crate::co_bond::pool_base(&address)?).await
     }
     /// Spend an unlocked bond back to this wallet. Returns the send's id.
     pub async fn unbond(&self, id: String) -> Result<String> {
@@ -668,6 +687,7 @@ pub fn spawn(
         rentals: Default::default(),
         market: Default::default(),
         plans: Default::default(),
+        co_bond_call: None,
         mining,
         events,
         self_tx: tx,
@@ -734,6 +754,8 @@ struct Service {
     /// Inheritance plans and payment streams (see `crate::plans`). Persisted:
     /// a plan's parameters may exist nowhere else.
     plans: crate::plans::PlanBook,
+    /// The co-bond a pool is being asked about now, if one is.
+    co_bond_call: Option<[u8; 32]>,
     /// Supervises the local Stratum pool and hasher child processes. Mining is
     /// deliberately out-of-process; see `crate::mining` for the payout and
     /// working-directory reasons.
@@ -1102,8 +1124,8 @@ impl Service {
             Cmd::Bonds(resp) => {
                 let _ = resp.send(self.bonds_view().await);
             }
-            Cmd::CreateBond { mining_key, value, until, label, resp } => {
-                let _ = resp.send(self.create_bond(&mining_key, value, until, label).await);
+            Cmd::CreateBond { mining_key, value, until, label, pool, resp } => {
+                let _ = resp.send(self.create_bond(&mining_key, value, until, label, pool).await);
             }
             Cmd::Unbond { id, resp } => {
                 let _ = resp.send(self.unbond(&id).await);
@@ -2006,10 +2028,13 @@ impl Service {
                     reg_progress: b.reg.progress,
                     reg_note: b.reg.note.clone(),
                     // A bond rented out is the renter's to register.
+                    // A co-bond handed to a pool is the pool's to register.
                     can_register: matches!(status, "locked" | "locking")
                         && counts_until.is_some()
                         && b.reg.phase != "on_chain"
+                        && b.pool.is_none()
                         && !rented_out.contains(&b.owner_pk),
+                    pool: b.pool.clone().unwrap_or_default(),
                     rental: if rented {
                         "rented".into()
                     } else if rented_out.contains(&b.owner_pk) {
@@ -2025,10 +2050,18 @@ impl Service {
     /// Lock one coin as a mining bond. The send runs through the ordinary
     /// send machine; the bond's record (with the salt nothing else keeps) is
     /// written before its commit is broadcast.
-    async fn create_bond(&mut self, mining_key: &str, value: u64, until: u64, label: String) -> Result<String> {
+    async fn create_bond(
+        &mut self,
+        mining_key: &str,
+        value: u64,
+        until: u64,
+        label: String,
+        pool: Option<String>,
+    ) -> Result<String> {
         if self.wallet.is_none() {
             bail!("wallet is locked");
         }
+        let pool = pool.as_deref().map(crate::co_bond::pool_base).transpose()?;
         if self.node.is_syncing() {
             bail!("node is still syncing — locking a bond against a stale coin set would fail");
         }
@@ -2102,7 +2135,18 @@ impl Service {
             owner_next_leaf: 0,
             seen_live: false,
             bond_file: None,
-            reg: Default::default(),
+            reg: match &pool {
+                Some(base) => bond::RegStatus {
+                    phase: "to_pool".into(),
+                    note: format!(
+                        "The wallet hands it in to {} once the lock confirms.",
+                        crate::co_bond::pool_host(base)
+                    ),
+                    ..bond::RegStatus::default()
+                },
+                None => Default::default(),
+            },
+            pool,
         };
         let id = rec.coin_id();
         self.bonds.bonds.push(rec);
@@ -2358,6 +2402,7 @@ impl Service {
             owner_next_leaf: 0,
             seen_live: false,
             bond_file: None,
+            pool: None,
             reg: Default::default(),
         };
         let id = rec.coin_id();
@@ -2672,6 +2717,7 @@ impl Service {
     async fn internal(&mut self, msg: Internal) {
         match msg {
             Internal::Tick => self.tick().await,
+            Internal::PoolReply { id, reply } => self.pool_reply(id, reply),
             Internal::CommitStalled(c) => {
                 self.set_stage(
                     c,
@@ -7119,6 +7165,7 @@ impl Service {
         self.check_new_mss_trees();
         self.refresh_bonds_live().await;
         self.advance_registrations().await;
+        self.tick_co_bonds().await;
         self.tick_rentals(tip).await;
         self.tick_plans(tip).await;
 

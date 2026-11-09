@@ -15,6 +15,7 @@ use crate::theme::{self, compact_units, short_hex};
 use eframe::egui::{self, CornerRadius, FontId, Frame, Margin, RichText, Sense, Stroke, TextEdit, Ui};
 use midstate_walletd::api::BondView;
 use midstate_walletd::bond::{midwimble, parse_mining_key};
+use midstate_walletd::co_bond;
 use midstate_walletd::rental;
 
 /// A test bond: the smallest coin, unlocking this many blocks out.
@@ -97,9 +98,35 @@ fn new_bond(app: &mut App, ui: &mut Ui, ctx: &egui::Context, height: u64, blocke
     let wallet_key = rules.as_ref().map(|r| r.mining_key.clone()).unwrap_or_default();
     // A wallet made before recovery phrases has no mining key of its own.
     let wallet_can_mine = !wallet_key.is_empty() || rules.is_none();
-    if !wallet_can_mine {
+    if !wallet_can_mine && app.bond_key_mode != 1 {
         app.bond_key_mode = 1;
+        if app.bond_key.trim().is_empty() {
+            app.bond_key = co_bond::DEFAULT_POOL.into();
+        }
     }
+
+    // A co-bond names a pool by its address, which the wallet asks for the
+    // pool's mining key and terms (and hands the bond in to), or by a bare
+    // mining key, for a pool that takes co-bond files.
+    let pool_text = app.bond_key.trim().to_string();
+    let by_key = parse_mining_key(&pool_text).is_ok();
+    let base = (app.bond_key_mode == 1 && !by_key).then(|| co_bond::pool_base(&pool_text).ok()).flatten();
+    if let Some(b) = &base {
+        // Once the address has stood still for a moment.
+        let t = app.t0.elapsed().as_secs_f64();
+        if app.pool_asked != *b && t - app.pool_edit_at > 0.7 {
+            app.pool_asked = b.clone();
+            app.go(ctx, Action::PoolTerms { url: b.clone() });
+        }
+    }
+    let terms = base
+        .as_ref()
+        .and_then(|b| app.pool_terms.as_ref().filter(|(u, _)| u == b).map(|(_, r)| r.clone()));
+    let pool_key = match &terms {
+        Some(Ok(t)) if t.accepting => t.mining_key.clone().filter(|k| parse_mining_key(k).is_ok()),
+        _ => None,
+    };
+    let host = base.as_deref().map(co_bond::pool_host).unwrap_or_default();
 
     // The sizes: what midwimble registers now, doubling up to the most its
     // price can ever ask. A bigger bond mines no more than the smallest.
@@ -145,7 +172,10 @@ fn new_bond(app: &mut App, ui: &mut Ui, ctx: &egui::Context, height: u64, blocke
                 app.bond_key_mode = 0;
                 app.bond_confirm = false;
             }
-            if choice(ui, "who_pool", w, app.bond_key_mode == 1, true, "A pool (co-bond)", "Back your pool's mining key") {
+            if choice(ui, "who_pool", w, app.bond_key_mode == 1, true, "A pool (co-bond)", "Back a pool's mining") {
+                if app.bond_key_mode != 1 && app.bond_key.trim().is_empty() {
+                    app.bond_key = co_bond::DEFAULT_POOL.into();
+                }
                 app.bond_key_mode = 1;
                 app.bond_confirm = false;
             }
@@ -155,12 +185,13 @@ fn new_bond(app: &mut App, ui: &mut Ui, ctx: &egui::Context, height: u64, blocke
             ui.horizontal(|ui| {
                 let r = ui.add(
                     TextEdit::singleline(&mut app.bond_key)
-                        .hint_text("pool's mining key")
+                        .hint_text("the pool's address, or its mining key")
                         .font(egui::TextStyle::Monospace)
                         .desired_width((ui.available_width() - 10.0) * 0.7),
                 );
                 if r.changed() {
                     app.bond_confirm = false;
+                    app.pool_edit_at = app.t0.elapsed().as_secs_f64();
                 }
                 ui.add(
                     TextEdit::singleline(&mut app.bond_label)
@@ -168,14 +199,7 @@ fn new_bond(app: &mut App, ui: &mut Ui, ctx: &egui::Context, height: u64, blocke
                         .desired_width(ui.available_width()),
                 );
             });
-            if !app.bond_key.trim().is_empty() {
-                if let Err(e) = parse_mining_key(&app.bond_key) {
-                    let why = format!("{e:#}");
-                    let mut c = why.chars();
-                    let why = c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default();
-                    theme::hint(ui, &format!("{why}."));
-                }
-            }
+            pool_line(app, ui, &pool_text, by_key, base.as_deref(), terms.as_ref());
         }
 
         // 2. How much.
@@ -234,7 +258,14 @@ fn new_bond(app: &mut App, ui: &mut Ui, ctx: &egui::Context, height: u64, blocke
         let value = 1u64 << if app.bond_test { TEST_EXP } else { app.bond_exp };
         let until = if app.bond_test { height + TEST_BLOCKS } else { midwimble::until_for_days(now, app.bond_days) };
         let back = back_at(until, height, now);
-        let key = if app.bond_key_mode == 0 { wallet_key.clone() } else { app.bond_key.trim().to_string() };
+        let key = match app.bond_key_mode {
+            0 => wallet_key.clone(),
+            _ if by_key => pool_text.clone(),
+            _ => pool_key.clone().unwrap_or_default(),
+        };
+        // Handed in to the pool by the wallet: not a test bond, which no
+        // pool registers.
+        let hand_in = (app.bond_key_mode == 1 && !by_key && !app.bond_test).then(|| base.clone()).flatten();
         let key_ok = parse_mining_key(&key).is_ok();
         let affordable = value < spendable;
         let ready = !app.busy && !blocked && key_ok && affordable && (app.bond_test || !days.is_empty());
@@ -262,15 +293,19 @@ fn new_bond(app: &mut App, ui: &mut Ui, ctx: &egui::Context, height: u64, blocke
                             String::new()
                         };
                         // Midwimble can count it: have the wallet register it
-                        // as soon as the lock confirms.
+                        // as soon as the lock confirms, unless a pool does.
                         let register = !app.bond_test
+                            && hand_in.is_none()
                             && value >= midwimble::min_bond(now)
                             && rules.as_ref().is_some_and(|r| r.rpc_on);
                         app.busy = true;
                         app.bond_confirm = false;
                         app.error.clear();
                         app.bond_notice.clear();
-                        app.go(ctx, Action::CreateBond { mining_key: key.clone(), value, until, label, register });
+                        app.go(
+                            ctx,
+                            Action::CreateBond { mining_key: key.clone(), value, until, label, register, pool: hand_in.clone() },
+                        );
                     }
                     if ui.button("Cancel").clicked() {
                         app.bond_confirm = false;
@@ -287,7 +322,9 @@ fn new_bond(app: &mut App, ui: &mut Ui, ctx: &egui::Context, height: u64, blocke
             } else {
                 format!("The coin can't move until ~{}.", theme::fmt_date(back))
             };
-            if app.bond_key_mode == 1 {
+            if hand_in.is_some() {
+                line.push_str(&format!(" It mines for {host}, and the wallet hands it in there once the lock confirms."));
+            } else if app.bond_key_mode == 1 {
                 line.push_str(&format!(" It mines for the pool key {}.", short_hex(&key, 8)));
             }
             ui.label(RichText::new(line).size(12.5).color(theme::ink()));
@@ -307,6 +344,65 @@ fn new_bond(app: &mut App, ui: &mut Ui, ctx: &egui::Context, height: u64, blocke
             });
         }
     });
+}
+
+/// Under the pool field: what the pool takes and gives, or why it can't be
+/// used.
+fn pool_line(
+    app: &mut App,
+    ui: &mut Ui,
+    text: &str,
+    by_key: bool,
+    base: Option<&str>,
+    terms: Option<&Result<co_bond::PoolTerms, String>>,
+) {
+    let pct = |v: f64| format!("{}%", format!("{v:.2}").trim_end_matches('0').trim_end_matches('.'));
+    match (base, terms) {
+        _ if by_key => theme::hint(ui, "A mining key: once the bond is ready, save its co-bond file and send it to the pool."),
+        (None, _) if text.is_empty() => {}
+        (None, _) => theme::hint(ui, "Give the pool's address, like rpc.cypherpunk.gold/pool, or its mining key."),
+        (Some(b), None) => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                theme::hint(ui, &format!("Asking {}…", co_bond::pool_host(b)));
+            });
+        }
+        (Some(b), Some(Err(e))) => {
+            ui.horizontal(|ui| {
+                theme::hint(ui, &format!("Couldn't use {}: {e}.", co_bond::pool_host(b)));
+                if ui.small_button("Try again").clicked() {
+                    app.pool_asked.clear();
+                }
+            });
+        }
+        (Some(b), Some(Ok(t))) if !t.accepting || t.mining_key.is_none() => {
+            let why = t.note.clone().unwrap_or_else(|| "it gives no mining key".into());
+            theme::hint(ui, &format!("{} isn't taking co-bonds: {why}.", co_bond::pool_host(b)));
+        }
+        (Some(b), Some(Ok(t))) => {
+            // The fee with this bond too, counting the co-bonds this wallet
+            // already has signing for the pool.
+            let signing = app.bonds.iter().filter(|x| x.pool == b && x.reg_phase == "on_chain" && x.status == "locked").count();
+            let with_this = (t.fee_percent - t.fee_cut * (signing as f64 + 1.0)).max(0.0);
+            let mut gives = format!("MDW fee {}", pct(t.fee_percent));
+            if t.fee_cut > 0.0 {
+                gives.push_str(&format!(", {} with this bond", pct(with_this)));
+            }
+            if t.reward_percent > 0.0 {
+                gives.push_str(&format!(" · co-bonders share {} of its fee", pct(t.reward_percent)));
+            }
+            ui.horizontal(|ui| {
+                theme::badge(ui, "takes co-bonds", theme::ink());
+                ui.label(RichText::new(co_bond::pool_host(b)).size(12.5).color(theme::ink()));
+                theme::hint(ui, &gives);
+            });
+            let pays = t.fee_cut > 0.0 || t.reward_percent > 0.0;
+            let mdw = app.mwb_account.as_ref().and_then(|a| a.address.clone());
+            if pays && mdw.is_none() {
+                theme::hint(ui, "Add an MDW account on the Receive tab to get these: the wallet hands the bond in with its address.");
+            }
+        }
+    }
 }
 
 /// The exponent of the smallest coin holding at least `v`.
@@ -377,6 +473,8 @@ fn stage(b: &BondView, now: u64) -> Stage {
     let counting = b.counts_until > now;
     let rented = b.rental == "rented";
     let co_bond = !b.wallet_key && b.rental.is_empty();
+    // A co-bond handed to a pool by its address: the pool registers it.
+    let pool = (!b.pool.is_empty()).then(|| co_bond::pool_host(&b.pool));
     let mut s = Stage { at: 0, skip_mining: b.below_min, badge: "", line: String::new(), next: None, progress: None };
     let set = |s: &mut Stage, at: usize, badge: &'static str, line: String| {
         s.at = at;
@@ -388,7 +486,13 @@ fn stage(b: &BondView, now: u64) -> Stage {
             set(&mut s, 0, "failed", "The lock never confirmed.".into());
             s.next = b.can_remove.then_some(Next::Forget);
         }
-        "locking" => set(&mut s, 0, "locking", "Waiting for the send to confirm.".into()),
+        "locking" => {
+            let line = match &pool {
+                Some(host) => format!("Waiting for the send to confirm. Then it goes to {host}."),
+                None => "Waiting for the send to confirm.".into(),
+            };
+            set(&mut s, 0, "locking", line);
+        }
         "unbonding" => set(&mut s, 3, "unbonding", "Coming back to your balance.".into()),
         "unbonded" => {
             let line = if rented { "Its owner has taken the coin back." } else { "Back in your balance." };
@@ -408,10 +512,19 @@ fn stage(b: &BondView, now: u64) -> Stage {
             set(&mut s, 3, "locked", format!("Too short to mine. It {unlock}."));
         }
         _ => match b.reg_phase.as_str() {
+            "to_pool" => set(&mut s, 1, "handing in", b.reg_note.clone()),
+            "pool" => {
+                set(&mut s, 1, "pool registering", b.reg_note.clone());
+                if (1..100).contains(&b.reg_progress) {
+                    s.progress = Some(b.reg_progress as f32 / 100.0);
+                }
+            }
             "on_chain" => {
                 let until = theme::fmt_date(b.counts_until);
                 let line = if rented {
                     format!("Mining for you until ~{until}.")
+                } else if let Some(host) = &pool {
+                    format!("Mining with {host} until ~{until}. It {unlock}.")
                 } else if co_bond {
                     format!("Mining with your pool until ~{until}. It {unlock}.")
                 } else {
@@ -419,7 +532,7 @@ fn stage(b: &BondView, now: u64) -> Stage {
                 };
                 set(&mut s, 2, "mining", line);
             }
-            "ready" if co_bond => {
+            "ready" if co_bond && pool.is_none() => {
                 set(&mut s, 1, "send to pool", "Save the co-bond file and send it to your pool.".into());
                 s.next = Some(Next::CoBondFile);
             }
@@ -539,6 +652,7 @@ fn who(b: &BondView) -> String {
         "rented" => "rented".to_string(),
         "rented_out" => "rented out".to_string(),
         _ if b.wallet_key => "this wallet".to_string(),
+        _ if !b.pool.is_empty() => format!("co-bond · {}", co_bond::pool_host(&b.pool)),
         _ => format!("co-bond · {}", short_hex(&b.mining_key, 6)),
     };
     if b.label.is_empty() || b.label == "test" {
@@ -581,13 +695,13 @@ fn details(app: &mut App, ui: &mut Ui, ctx: &egui::Context, b: &BondView) {
         if ui.small_button("Copy for another wallet").clicked() {
             ui.ctx().copy_text(b.export_line.clone());
         }
-        let co_bond = !b.wallet_key && b.rental.is_empty();
+        let co_bond = !b.wallet_key && b.rental.is_empty() && b.pool.is_empty();
         if co_bond && b.reg_phase == "on_chain" && ui.add_enabled(!app.busy, egui::Button::new("Save co-bond file").small()).clicked() {
             app.busy = true;
             app.error.clear();
             app.go(ctx, Action::CopyCoBondFile { id: b.id.clone() });
         }
-        if b.reg_phase != "on_chain" && !b.below_min && ui.small_button("Copy register command").clicked() {
+        if b.reg_phase != "on_chain" && !b.below_min && b.pool.is_empty() && ui.small_button("Copy register command").clicked() {
             ui.ctx().copy_text(b.register_cmd.clone());
         }
     });
@@ -826,5 +940,18 @@ mod tests {
         b.below_min = true;
         let s = stage(&b, now);
         assert!(s.skip_mining && s.badge == "test");
+
+        // A co-bond handed to a pool: the pool registers it, so there is no
+        // co-bond file to save.
+        let mut b = bond("locked", "pool");
+        b.pool = "https://rpc.cypherpunk.gold/pool".into();
+        b.reg_progress = 40;
+        let s = stage(&b, now);
+        assert_eq!((s.at, s.badge), (1, "pool registering"));
+        assert!(s.next.is_none() && s.progress.is_some());
+        let mut b = bond("locked", "ready");
+        b.pool = "https://rpc.cypherpunk.gold/pool".into();
+        assert!(stage(&b, now).next.is_none());
+        assert_eq!(who(&b), "co-bond · rpc.cypherpunk.gold");
     }
 }
