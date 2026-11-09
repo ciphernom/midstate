@@ -13,7 +13,9 @@
 //!
 //! `cpu-probe` shows where a step's time goes on this CPU: how long a load
 //! takes from each level of cache, and what a step costs with each of the
-//! walk's operations, in cycles at the clock it runs at.
+//! walk's operations, in cycles at the clock it runs at, for each way the
+//! step can be written (what mines, what mined before, a candidate, and the
+//! step without its writes to the pad).
 //!
 //! `dump-wgsl` writes the GPU kernel out, and `gpu --wgsl` runs an edited
 //! one: a change to the kernel tried on a GPU with nothing compiled.
@@ -155,39 +157,89 @@ fn cpu_probe() {
         println!("  {:>6} KiB {:>7.2} ns {}{}", kib, ns, cyc(ns, f0), if kib == 256 { "   <- the pad's size" } else { "" });
     }
 
-    walk::time_steps(None, 1 << 16, false);
-    let all = walk::time_steps(None, 1 << 20, false);
-    let over = |ns: f64, base: f64| match f0 {
-        Some(f) => format!("{:+.1} cycles", (ns - base) * f / 1000.0),
-        None => format!("{:+.2} ns", ns - base),
+    use walk::StepCode;
+    let codes = [
+        (StepCode::Indexed, "indexed"),
+        (StepCode::Unindexed, "unindexed"),
+        (StepCode::Ahead, "ahead"),
+        (StepCode::NoStores, "no writes"),
+    ];
+    let mine = codes.iter().position(|(c, _)| *c == walk::MINER_STEP).unwrap();
+    walk::time_steps(None, 1 << 16, walk::MINER_STEP);
+    let show = |ns: f64| match f0 {
+        Some(f) => format!("{:>9.1}", ns * f / 1000.0),
+        None => format!("{:>9.2}", ns),
     };
     let names = ["mul", "mulhi", "div", "aes", "rotr", "add", "sub", "xor"];
-    let mut xor = [0.0f64; 2];
-    let mut mix = [all, 0.0];
-    for (k, unindexed) in [false, true].into_iter().enumerate() {
-        if unindexed {
-            mix[1] = walk::time_steps(None, 1 << 20, true);
-            println!("\nThe same, with no register going through memory (step_unindexed, not yet mining):");
-        } else {
-            println!("\nA step of the walk, as the miner runs it:");
-        }
-        println!("  its own mix of operations {:>6.2} ns {}", mix[k], cyc(mix[k], f0));
-        let per: Vec<f64> = (0..8u8).map(|op| walk::time_steps(Some(op), 1 << 19, unindexed)).collect();
-        xor[k] = per[7];
-        for (op, ns) in per.iter().enumerate() {
-            println!("  every operation {:<6}    {:>6.2} ns {}   {} over xor", names[op], ns, cyc(*ns, f0), over(*ns, xor[k]));
+    // [code][0] the walk's own mix of operations, [code][1 + op] every step that operation.
+    let mut t = [[0.0f64; 9]; 4];
+    for (k, (code, _)) in codes.iter().enumerate() {
+        t[k][0] = walk::time_steps(None, 1 << 20, *code);
+        for op in 0..8u8 {
+            t[k][1 + op as usize] = walk::time_steps(Some(op), 1 << 19, *code);
         }
     }
-    println!(
-        "  so the unindexed step is {:+.1}% the miner's{}",
-        100.0 * (mix[1] / mix[0] - 1.0),
-        if mix[1] < mix[0] * 0.97 { ": faster" } else { "" }
-    );
+    println!("\nA step, in {}, by how it is written (* is what mines on this CPU):", if f0.is_some() { "cycles" } else { "ns" });
+    println!("  indexed    the reference, registers indexed through memory (mined before)");
+    println!("  unindexed  no register through memory");
+    println!("  ahead      unindexed, and the next step's address one XOR after the operation");
+    println!("  no writes  unindexed without its four writes to the pad: not the walk, a probe");
+    print!("  {:<22}", "");
+    for (k, (_, name)) in codes.iter().enumerate() {
+        print!("{:>10}", if k == mine { format!("{name}*") } else { name.to_string() });
+    }
+    println!();
+    for row in 0..9 {
+        let label = if row == 0 { "its own mix".to_string() } else { format!("every step {}", names[row - 1]) };
+        print!("  {label:<22}");
+        for k in 0..codes.len() {
+            print!(" {}", show(t[k][row]));
+        }
+        println!();
+    }
+    let pct = |a: f64, b: f64| 100.0 * (a / b - 1.0);
+    for k in 0..3 {
+        if k != mine {
+            println!("  {} against what mines: {:+.1}%", codes[k].1, pct(t[k][0], t[mine][0]));
+        }
+    }
+    println!("  the four writes to the pad are {:.1}% of the unindexed step", 100.0 * (1.0 - t[3][0] / t[1][0]));
+
+    // Whole walks: the measure that counts, as steps alone leave out the
+    // re-mixes and the loop around them.
     let mut pad = walk::new_pad();
     let m = *blake3::hash(b"cpu-probe").as_bytes();
-    let same = (0..4).all(|n| walk::walk_hash_unindexed(&m, n, &mut pad) == walk::walk_hash(&m, n));
-    println!("  and it computes the same hashes: {}", if same { "yes" } else { "NO" });
-    let xor = xor[0];
+    let mut whole = [0.0f64; 3];
+    for _ in 0..2 {
+        for (k, (code, _)) in codes[..3].iter().enumerate() {
+            let begun = std::time::Instant::now();
+            let mut n = 0u64;
+            while begun.elapsed() < Duration::from_millis(1500) {
+                std::hint::black_box(walk::walk_hash_written(*code, &m, n, &mut pad));
+                n += 1;
+            }
+            whole[k] = whole[k].max(n as f64 / begun.elapsed().as_secs_f64());
+        }
+    }
+    print!("\nWhole walks on one thread, attempts/s:");
+    for (k, (_, name)) in codes[..3].iter().enumerate() {
+        print!("  {}{} {:.1}", name, if k == mine { "*" } else { "" }, whole[k]);
+    }
+    println!();
+    let best = (0..3).max_by(|&a, &b| whole[a].total_cmp(&whole[b])).unwrap();
+    if best != mine && whole[best] > whole[mine] * 1.02 {
+        println!("  {} is {:.1}% faster here than what mines: worth telling us", codes[best].1, pct(whole[best], whole[mine]));
+    }
+    let same = (0..3).all(|n| {
+        let mut st = walk::walk_start(&m, n, &mut pad);
+        walk::walk_steps(&mut st, &mut pad, walk::WALK_STEPS);
+        let reference = walk::walk_finish(&m, n, &st.r);
+        walk::walk_hash(&m, n) == reference
+            && [StepCode::Indexed, StepCode::Unindexed, StepCode::Ahead].iter().all(|c| walk::walk_hash_written(*c, &m, n, &mut pad) == reference)
+    });
+    println!("  every way computes the same hashes as the reference: {}", if same { "yes" } else { "NO" });
+    let all = t[mine][0];
+    let xor = t[mine][8];
 
     let start = walk::time_start(32);
     let remix = walk::time_remix(20_000);

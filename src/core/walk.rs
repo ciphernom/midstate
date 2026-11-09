@@ -334,6 +334,11 @@ fn mulhi(a: u64, b: u64) -> u64 {
 /// One step of the walk on register `s` with operation `op`. `c` carries
 /// the previous step's output into this step's addresses, so that every
 /// step waits for the one before it.
+///
+/// This is the step as the walk defines it, and the reference the other ways
+/// of writing it are tested against. The CPU miner runs the same step written
+/// one of two faster ways, [`step_unindexed`] or [`step_ahead`]: see
+/// [`MINER_STEP`].
 #[inline(always)]
 fn step<A: AesRound>(s: usize, op: u8, r: &mut [u64; 8], c: &mut u64, pad: &mut Pad) {
     const MASK: u64 = WALK_LINES as u64 - 1;
@@ -427,26 +432,76 @@ fn finish(mining_hash: &[u8; 32], nonce: u64, r: &[u64; 8]) -> [u8; 32] {
 
 #[inline(always)]
 fn walk_generic<A: AesRound>(mining_hash: &[u8; 32], nonce: u64, pad: &mut Pad) -> [u8; 32] {
+    walk_written::<A>(MINER_STEP, mining_hash, nonce, pad)
+}
+
+/// How the miner writes the walk's step on this CPU: the fastest of the ways
+/// `cpu-probe` measures that has been measured here. Each computes the same
+/// hash (tested), so this is a choice of speed only. On a Pi 5 (Cortex-A76)
+/// [`step_unindexed`] takes 28.3 cycles to [`step`]'s 29.8 (5% less;
+/// [`step_ahead`] not yet measured there). On a Xeon, whole walks on one
+/// thread are 5% faster with `step_ahead` than with `step`, and 3% faster
+/// with `step_unindexed`.
+#[cfg(target_arch = "aarch64")]
+pub const MINER_STEP: StepCode = StepCode::Unindexed;
+/// How the miner writes the walk's step on this CPU: see the aarch64 one.
+#[cfg(not(target_arch = "aarch64"))]
+pub const MINER_STEP: StepCode = StepCode::Ahead;
+
+/// The walk with its step written as `code` says (not [`StepCode::NoStores`],
+/// which is not the walk). Eight steps a round, one per register, written out
+/// so that each step's operation is a branch whose target is fixed for the
+/// whole program: a CPU predicts all eight, while a GPU warp's threads (each
+/// with its own program) diverge.
+#[inline(always)]
+fn walk_written<A: AesRound>(code: StepCode, mining_hash: &[u8; 32], nonce: u64, pad: &mut Pad) -> [u8; 32] {
     let (mut r, mut prog) = start_generic::<A>(mining_hash, nonce, pad);
-    let mut c = 0u64;
-    for round in 0..WALK_STEPS / 8 {
-        // Eight steps, one per register, written out so that each step's
-        // operation is a branch whose target is fixed for the whole program:
-        // a CPU predicts all eight, while a GPU warp's threads (each with its
-        // own program) diverge.
-        step::<A>(0, prog[0], &mut r, &mut c, pad);
-        step::<A>(1, prog[1], &mut r, &mut c, pad);
-        step::<A>(2, prog[2], &mut r, &mut c, pad);
-        step::<A>(3, prog[3], &mut r, &mut c, pad);
-        step::<A>(4, prog[4], &mut r, &mut c, pad);
-        step::<A>(5, prog[5], &mut r, &mut c, pad);
-        step::<A>(6, prog[6], &mut r, &mut c, pad);
-        step::<A>(7, prog[7], &mut r, &mut c, pad);
-        if (round + 1) % (WALK_REMIX / 8) == 0 {
-            remix(&mut r, &mut prog);
+    match code {
+        StepCode::Ahead => {
+            let mut x = r[0];
+            for round in 0..WALK_STEPS / 8 {
+                let (next, out) = round_ahead::<A>(&prog, x, &mut r, pad);
+                x = next;
+                if (round + 1) % (WALK_REMIX / 8) == 0 {
+                    remix(&mut r, &mut prog);
+                    x = r[0] ^ out;
+                }
+            }
         }
+        StepCode::Unindexed => {
+            let mut c = 0u64;
+            for round in 0..WALK_STEPS / 8 {
+                round_unindexed::<A, true>(&prog, &mut r, &mut c, pad);
+                if (round + 1) % (WALK_REMIX / 8) == 0 {
+                    remix(&mut r, &mut prog);
+                }
+            }
+        }
+        StepCode::Indexed => {
+            let mut c = 0u64;
+            for round in 0..WALK_STEPS / 8 {
+                round_indexed::<A>(&prog, &mut r, &mut c, pad);
+                if (round + 1) % (WALK_REMIX / 8) == 0 {
+                    remix(&mut r, &mut prog);
+                }
+            }
+        }
+        StepCode::NoStores => panic!("a walk without its writes to the pad is not the walk"),
     }
     finish(mining_hash, nonce, &r)
+}
+
+/// Eight steps (a round) of [`step`].
+#[inline(always)]
+fn round_indexed<A: AesRound>(prog: &[u8; 8], r: &mut [u64; 8], c: &mut u64, pad: &mut Pad) {
+    step::<A>(0, prog[0], r, c, pad);
+    step::<A>(1, prog[1], r, c, pad);
+    step::<A>(2, prog[2], r, c, pad);
+    step::<A>(3, prog[3], r, c, pad);
+    step::<A>(4, prog[4], r, c, pad);
+    step::<A>(5, prog[5], r, c, pad);
+    step::<A>(6, prog[6], r, c, pad);
+    step::<A>(7, prog[7], r, c, pad);
 }
 
 // ── Several walks per thread ────────────────────────────────────────────────
@@ -614,17 +669,20 @@ fn golden_many<const K: usize>(pads: &mut [Box<Pad>; K]) -> bool {
     })
 }
 
-// ── Where a step's time goes ────────────────────────────────────────────────
+// ── Ways of writing a step, and where its time goes ─────────────────────────
 
 /// A step exactly as [`step`] computes it, written so that no register goes
-/// through memory: the register written (`S`) is known when it compiles, `k`
-/// is picked with two selects instead of an index, and AES's high half is
-/// XORed in under masks. `step` indexes the registers with `t`, so all eight
-/// live in memory, and it XORs into `r[t]` on every step. The
-/// XOR into `out` is also grouped so the loads' half is ready before the
-/// operation ends. Not yet what mines: `cpu-probe` times it against `step`.
+/// through memory: what the miner runs on aarch64. The register written (`S`) is
+/// known when it compiles, `k` is picked with two selects instead of an
+/// index, and AES's high half is XORed in under masks on AES steps only.
+/// `step` indexes the registers with `t`, so all eight live in memory, and
+/// it XORs into `r[t]` on every step. On a Pi 5 this takes 28.3 cycles a
+/// step to `step`'s 29.8.
+///
+/// `STORE` false leaves out the four writes to the pad: not the walk, only
+/// for `cpu-probe` to measure what the writes cost.
 #[inline(always)]
-fn step_unindexed<A: AesRound, const S: usize>(op: u8, r: &mut [u64; 8], c: &mut u64, pad: &mut Pad) {
+fn step_unindexed<A: AesRound, const S: usize, const STORE: bool>(op: u8, r: &mut [u64; 8], c: &mut u64, pad: &mut Pad) {
     const MASK: u64 = WALK_LINES as u64 - 1;
     let x = r[S] ^ *c;
     let a = (x & MASK) as usize;
@@ -664,56 +722,131 @@ fn step_unindexed<A: AesRound, const S: usize>(op: u8, r: &mut [u64; 8], c: &mut
     let out = y ^ m13;
     r[S] = out;
     *c = out;
-    pad[a][j] = m0 ^ y;
-    pad[b][j ^ 4] = m1.wrapping_add(x);
-    pad[e][j ^ 2] = m2.wrapping_add(y);
-    pad[f][j ^ 6] = m3 ^ x;
+    if STORE {
+        pad[a][j] = m0 ^ y;
+        pad[b][j ^ 4] = m1.wrapping_add(x);
+        pad[e][j ^ 2] = m2.wrapping_add(y);
+        pad[f][j ^ 6] = m3 ^ x;
+    }
 }
 
 /// Eight steps (a round) of [`step_unindexed`].
 #[inline(always)]
-fn round_unindexed<A: AesRound>(prog: &[u8; 8], r: &mut [u64; 8], c: &mut u64, pad: &mut Pad) {
-    step_unindexed::<A, 0>(prog[0], r, c, pad);
-    step_unindexed::<A, 1>(prog[1], r, c, pad);
-    step_unindexed::<A, 2>(prog[2], r, c, pad);
-    step_unindexed::<A, 3>(prog[3], r, c, pad);
-    step_unindexed::<A, 4>(prog[4], r, c, pad);
-    step_unindexed::<A, 5>(prog[5], r, c, pad);
-    step_unindexed::<A, 6>(prog[6], r, c, pad);
-    step_unindexed::<A, 7>(prog[7], r, c, pad);
+fn round_unindexed<A: AesRound, const STORE: bool>(prog: &[u8; 8], r: &mut [u64; 8], c: &mut u64, pad: &mut Pad) {
+    step_unindexed::<A, 0, STORE>(prog[0], r, c, pad);
+    step_unindexed::<A, 1, STORE>(prog[1], r, c, pad);
+    step_unindexed::<A, 2, STORE>(prog[2], r, c, pad);
+    step_unindexed::<A, 3, STORE>(prog[3], r, c, pad);
+    step_unindexed::<A, 4, STORE>(prog[4], r, c, pad);
+    step_unindexed::<A, 5, STORE>(prog[5], r, c, pad);
+    step_unindexed::<A, 6, STORE>(prog[6], r, c, pad);
+    step_unindexed::<A, 7, STORE>(prog[7], r, c, pad);
 }
 
-/// The walk with [`step_unindexed`]: the same hash as [`walk_hash`].
+/// [`step_unindexed`] handed its `x`, working out the next step's as
+/// `(r[S+1] ^ m1 ^ m3) ^ y`: one XOR after the operation, where the step as
+/// written has two (`out = y ^ m1 ^ m3`, then the next `x = r[S+1] ^ out`).
+/// On AES steps the high half that goes into `r[S+1]` is XORed in too.
+/// Returns the next step's `x` and this step's output. The same walk: what
+/// the miner runs on x86.
 #[inline(always)]
-fn walk_unindexed_generic<A: AesRound>(mining_hash: &[u8; 32], nonce: u64, pad: &mut Pad) -> [u8; 32] {
-    let (mut r, mut prog) = start_generic::<A>(mining_hash, nonce, pad);
-    let mut c = 0u64;
-    for round in 0..WALK_STEPS / 8 {
-        round_unindexed::<A>(&prog, &mut r, &mut c, pad);
-        if (round + 1) % (WALK_REMIX / 8) == 0 {
-            remix(&mut r, &mut prog);
+fn step_ahead<A: AesRound, const S: usize>(op: u8, x: u64, r: &mut [u64; 8], pad: &mut Pad) -> (u64, u64) {
+    const MASK: u64 = WALK_LINES as u64 - 1;
+    let a = (x & MASK) as usize;
+    let off = (x >> 12) & 3;
+    let j = ((x >> 14) & 7) as usize;
+    let e = ((x >> 17) & MASK) as usize;
+    let b = ((x >> 32) & MASK) as usize;
+    let f = ((x >> 44) & MASK) as usize;
+    let m0 = pad[a][j];
+    let m1 = pad[b][j ^ 4];
+    let m2 = pad[e][j ^ 2];
+    let m3 = pad[f][j ^ 6];
+    let (r1, r2, r3, r4) = (r[(S + 1) & 7], r[(S + 2) & 7], r[(S + 3) & 7], r[(S + 4) & 7]);
+    let low_pair = if off & 1 == 0 { r1 } else { r2 };
+    let high_pair = if off & 1 == 0 { r3 } else { r4 };
+    let k = if off & 2 == 0 { low_pair } else { high_pair };
+    let v = x ^ m0 ^ m2;
+    let m13 = m1 ^ m3;
+    let ahead = r1 ^ m13;
+    let (y, next) = match op {
+        3 => {
+            let (lo, h) = A::round_pair(v, k);
+            let pick = |d: u64| h & 0u64.wrapping_sub((off == d) as u64);
+            r[(S + 1) & 7] ^= pick(0);
+            r[(S + 2) & 7] ^= pick(1);
+            r[(S + 3) & 7] ^= pick(2);
+            r[(S + 4) & 7] ^= pick(3);
+            (lo, (ahead ^ lo) ^ pick(0))
         }
-    }
-    finish(mining_hash, nonce, &r)
+        _ => {
+            let y = match op {
+                0 => v.wrapping_mul(k | 1),
+                1 => v ^ mulhi(v, k),
+                2 => v.wrapping_add(k / ((v as u32 as u64) | 0x8000_0001)),
+                4 => v.rotate_right((k & 63) as u32),
+                5 => v.wrapping_add(k),
+                6 => v.wrapping_sub(k),
+                _ => v ^ k,
+            };
+            (y, ahead ^ y)
+        }
+    };
+    let out = y ^ m13;
+    r[S] = out;
+    pad[a][j] = m0 ^ y;
+    pad[b][j ^ 4] = m1.wrapping_add(x);
+    pad[e][j ^ 2] = m2.wrapping_add(y);
+    pad[f][j ^ 6] = m3 ^ x;
+    (next, out)
 }
 
-/// [`walk_hash`] computed with [`step_unindexed`], with the fastest AES this
-/// CPU has: for checking it, and timing it whole.
-pub fn walk_hash_unindexed(mining_hash: &[u8; 32], nonce: u64, pad: &mut Pad) -> [u8; 32] {
+/// Eight steps (a round) of [`step_ahead`]: the next round's `x`, and the
+/// last step's output.
+#[inline(always)]
+fn round_ahead<A: AesRound>(prog: &[u8; 8], x: u64, r: &mut [u64; 8], pad: &mut Pad) -> (u64, u64) {
+    let (x, _) = step_ahead::<A, 0>(prog[0], x, r, pad);
+    let (x, _) = step_ahead::<A, 1>(prog[1], x, r, pad);
+    let (x, _) = step_ahead::<A, 2>(prog[2], x, r, pad);
+    let (x, _) = step_ahead::<A, 3>(prog[3], x, r, pad);
+    let (x, _) = step_ahead::<A, 4>(prog[4], x, r, pad);
+    let (x, _) = step_ahead::<A, 5>(prog[5], x, r, pad);
+    let (x, _) = step_ahead::<A, 6>(prog[6], x, r, pad);
+    step_ahead::<A, 7>(prog[7], x, r, pad)
+}
+
+/// [`walk_hash`] with the step written as `code` says, with the fastest AES
+/// this CPU has: for checking each way against the others.
+pub fn walk_hash_written(code: StepCode, mining_hash: &[u8; 32], nonce: u64, pad: &mut Pad) -> [u8; 32] {
     match backend() {
         #[cfg(target_arch = "x86_64")]
-        Backend::AesNi => unsafe { x86::walk_unindexed(mining_hash, nonce, pad) },
+        Backend::AesNi => unsafe { x86::walk_written(code, mining_hash, nonce, pad) },
         #[cfg(target_arch = "aarch64")]
-        Backend::Armv8 => unsafe { arm::walk_unindexed(mining_hash, nonce, pad) },
-        _ => walk_unindexed_generic::<SoftAes>(mining_hash, nonce, pad),
+        Backend::Armv8 => unsafe { arm::walk_written(code, mining_hash, nonce, pad) },
+        _ => walk_written::<SoftAes>(code, mining_hash, nonce, pad),
     }
+}
+
+/// Ways of writing the walk's step: all the same walk but the last.
+/// [`MINER_STEP`] says which one mines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepCode {
+    /// [`step`], the reference: what mined everywhere before these.
+    Indexed,
+    /// [`step_unindexed`].
+    Unindexed,
+    /// [`step_ahead`].
+    Ahead,
+    /// [`step_unindexed`] without its writes to the pad. Not the walk: what
+    /// the writes cost.
+    NoStores,
 }
 
 /// `n` steps (a multiple of 8) of a walk on this thread, with the walk's own
 /// program or (`op`) every operation the same, unrolled as [`walk_generic`]
 /// runs them; no re-mix. Nanoseconds a step.
 #[inline(always)]
-fn time_steps_generic<A: AesRound>(op: Option<u8>, n: usize, unindexed: bool) -> f64 {
+fn time_steps_generic<A: AesRound>(op: Option<u8>, n: usize, code: StepCode) -> f64 {
     let m = *blake3::hash(b"midstate walk step timing").as_bytes();
     let mut pad = new_pad();
     let (mut r, mut prog) = start_generic::<A>(&m, 1, &mut pad);
@@ -722,20 +855,27 @@ fn time_steps_generic<A: AesRound>(op: Option<u8>, n: usize, unindexed: bool) ->
     }
     let mut c = 0u64;
     let begun = std::time::Instant::now();
-    if unindexed {
-        for _ in 0..n / 8 {
-            round_unindexed::<A>(&prog, &mut r, &mut c, &mut pad);
+    match code {
+        StepCode::Unindexed => {
+            for _ in 0..n / 8 {
+                round_unindexed::<A, true>(&prog, &mut r, &mut c, &mut pad);
+            }
         }
-    } else {
-        for _ in 0..n / 8 {
-            step::<A>(0, prog[0], &mut r, &mut c, &mut pad);
-            step::<A>(1, prog[1], &mut r, &mut c, &mut pad);
-            step::<A>(2, prog[2], &mut r, &mut c, &mut pad);
-            step::<A>(3, prog[3], &mut r, &mut c, &mut pad);
-            step::<A>(4, prog[4], &mut r, &mut c, &mut pad);
-            step::<A>(5, prog[5], &mut r, &mut c, &mut pad);
-            step::<A>(6, prog[6], &mut r, &mut c, &mut pad);
-            step::<A>(7, prog[7], &mut r, &mut c, &mut pad);
+        StepCode::NoStores => {
+            for _ in 0..n / 8 {
+                round_unindexed::<A, false>(&prog, &mut r, &mut c, &mut pad);
+            }
+        }
+        StepCode::Ahead => {
+            let mut x = r[0];
+            for _ in 0..n / 8 {
+                (x, c) = round_ahead::<A>(&prog, x, &mut r, &mut pad);
+            }
+        }
+        StepCode::Indexed => {
+            for _ in 0..n / 8 {
+                round_indexed::<A>(&prog, &mut r, &mut c, &mut pad);
+            }
         }
     }
     let took = begun.elapsed();
@@ -745,17 +885,16 @@ fn time_steps_generic<A: AesRound>(op: Option<u8>, n: usize, unindexed: bool) ->
 
 /// Nanoseconds a step of the walk takes on this thread, with the fastest AES
 /// this CPU has, over `n` steps: with the walk's own program (`None`), or
-/// with every operation `op`. The steps are the walk's own code ([`step`],
-/// or with `unindexed` [`step_unindexed`]); setting one operation against
-/// another shows what each costs, and the XOR (the cheapest) shows what the
-/// rest of a step costs.
-pub fn time_steps(op: Option<u8>, n: usize, unindexed: bool) -> f64 {
+/// with every operation `op`. The steps are written as `code` says; setting
+/// one operation against another shows what each costs, and the XOR (the
+/// cheapest) shows what the rest of a step costs.
+pub fn time_steps(op: Option<u8>, n: usize, code: StepCode) -> f64 {
     match backend() {
         #[cfg(target_arch = "x86_64")]
-        Backend::AesNi => unsafe { x86::time_steps(op, n, unindexed) },
+        Backend::AesNi => unsafe { x86::time_steps(op, n, code) },
         #[cfg(target_arch = "aarch64")]
-        Backend::Armv8 => unsafe { arm::time_steps(op, n, unindexed) },
-        _ => time_steps_generic::<SoftAes>(op, n, unindexed),
+        Backend::Armv8 => unsafe { arm::time_steps(op, n, code) },
+        _ => time_steps_generic::<SoftAes>(op, n, code),
     }
 }
 
@@ -1054,15 +1193,15 @@ mod x86 {
     /// # Safety
     /// The CPU must support AES-NI and SSE2.
     #[target_feature(enable = "aes,sse2")]
-    pub(super) unsafe fn time_steps(op: Option<u8>, n: usize, unindexed: bool) -> f64 {
-        super::time_steps_generic::<AesNi>(op, n, unindexed)
+    pub(super) unsafe fn time_steps(op: Option<u8>, n: usize, code: super::StepCode) -> f64 {
+        super::time_steps_generic::<AesNi>(op, n, code)
     }
 
     /// # Safety
     /// As [`time_steps`].
     #[target_feature(enable = "aes,sse2")]
-    pub(super) unsafe fn walk_unindexed(m: &[u8; 32], nonce: u64, pad: &mut super::Pad) -> [u8; 32] {
-        super::walk_unindexed_generic::<AesNi>(m, nonce, pad)
+    pub(super) unsafe fn walk_written(code: super::StepCode, m: &[u8; 32], nonce: u64, pad: &mut super::Pad) -> [u8; 32] {
+        super::walk_written::<AesNi>(code, m, nonce, pad)
     }
 
     /// # Safety
@@ -1131,15 +1270,15 @@ mod arm {
     /// # Safety
     /// The CPU must support the ARMv8 AES extension.
     #[target_feature(enable = "aes,neon")]
-    pub(super) unsafe fn time_steps(op: Option<u8>, n: usize, unindexed: bool) -> f64 {
-        super::time_steps_generic::<Armv8>(op, n, unindexed)
+    pub(super) unsafe fn time_steps(op: Option<u8>, n: usize, code: super::StepCode) -> f64 {
+        super::time_steps_generic::<Armv8>(op, n, code)
     }
 
     /// # Safety
     /// As [`time_steps`].
     #[target_feature(enable = "aes,neon")]
-    pub(super) unsafe fn walk_unindexed(m: &[u8; 32], nonce: u64, pad: &mut super::Pad) -> [u8; 32] {
-        super::walk_unindexed_generic::<Armv8>(m, nonce, pad)
+    pub(super) unsafe fn walk_written(code: super::StepCode, m: &[u8; 32], nonce: u64, pad: &mut super::Pad) -> [u8; 32] {
+        super::walk_written::<Armv8>(code, m, nonce, pad)
     }
 
     /// # Safety
@@ -1318,23 +1457,67 @@ mod tests {
     #[test]
     fn step_timings_are_positive_for_every_operation() {
         for op in [None, Some(0), Some(2), Some(3), Some(7)] {
-            assert!(time_steps(op, 64, false) > 0.0 && time_steps(op, 64, true) > 0.0, "{op:?}");
+            for code in [StepCode::Indexed, StepCode::Unindexed, StepCode::Ahead, StepCode::NoStores] {
+                assert!(time_steps(op, 64, code) > 0.0, "{op:?} {code:?}");
+            }
         }
         assert!(time_start(1) > 0.0 && time_remix(4) > 0.0);
     }
 
-    /// The step written without indexing computes the walk: the known
-    /// answers, with the fastest AES here and the portable one.
+    /// Every way of writing a step agrees with the reference, round by
+    /// round: from random registers, under random programs (every operation
+    /// at every register, every register offset), over one pad each that the
+    /// steps keep writing. The miner's step_unindexed, and step_ahead.
     #[test]
-    fn the_unindexed_step_is_the_walk() {
+    fn every_way_of_writing_a_step_agrees() {
+        let mut z = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            z ^= z << 13;
+            z ^= z >> 7;
+            z ^= z << 17;
+            z
+        };
+        let mut reference = new_pad();
+        for line in reference.iter_mut() {
+            for w in line.iter_mut() {
+                *w = next();
+            }
+        }
+        let (mut unindexed, mut ahead) = (reference.clone(), reference.clone());
+        let mut r: [u64; 8] = std::array::from_fn(|_| next());
+        let (mut r_u, mut r_a) = (r, r);
+        let mut c = next();
+        let mut c_u = c;
+        let mut x_a = r[0] ^ c;
+        for round in 0..6000 {
+            let prog = program_of(next());
+            for s in 0..8 {
+                step::<SoftAes>(s, prog[s], &mut r, &mut c, &mut reference);
+            }
+            round_unindexed::<SoftAes, true>(&prog, &mut r_u, &mut c_u, &mut unindexed);
+            let (nx, out) = round_ahead::<SoftAes>(&prog, x_a, &mut r_a, &mut ahead);
+            x_a = nx;
+            assert_eq!((r_u, c_u), (r, c), "unindexed, round {round}, program {prog:?}");
+            assert_eq!((r_a, out, x_a), (r, c, r[0] ^ c), "ahead, round {round}, program {prog:?}");
+        }
+        assert!(unindexed[..] == reference[..] && ahead[..] == reference[..], "the same pads");
+    }
+
+    /// The walks written those ways give the known answers, with the fastest
+    /// AES here and the portable one.
+    #[test]
+    fn the_walk_written_every_way_gives_the_known_answers() {
         for (m, nonce, want) in GOLDEN {
             let m = hex32(m);
-            assert_eq!(walk_hash_unindexed(&m, nonce, &mut new_pad()), hex32(want), "nonce {nonce}");
-            assert_eq!(walk_unindexed_generic::<SoftAes>(&m, nonce, &mut new_pad()), hex32(want), "nonce {nonce}, portable");
-        }
-        let m = hex32(GOLDEN[0].0);
-        for nonce in 100..104 {
-            assert_eq!(walk_hash_unindexed(&m, nonce, &mut new_pad()), walk_hash(&m, nonce));
+            assert_eq!(walk_hash(&m, nonce), hex32(want), "nonce {nonce}, the miner's");
+            for code in [StepCode::Indexed, StepCode::Unindexed, StepCode::Ahead] {
+                assert_eq!(walk_hash_written(code, &m, nonce, &mut new_pad()), hex32(want), "nonce {nonce}, {code:?}");
+                assert_eq!(walk_written::<SoftAes>(code, &m, nonce, &mut new_pad()), hex32(want), "nonce {nonce}, {code:?}, portable");
+            }
+            let mut pad = new_pad();
+            let mut st = walk_start(&m, nonce, &mut pad);
+            walk_steps(&mut st, &mut pad, WALK_STEPS);
+            assert_eq!(walk_finish(&m, nonce, &st.r), hex32(want), "nonce {nonce}, the reference step");
         }
     }
 
