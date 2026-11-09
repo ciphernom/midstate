@@ -1153,6 +1153,8 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| "midstate=info,tower_http=debug".into()),
         )
         .with(tracing_subscriber::fmt::layer())
+        // The last few hundred lines, for the miner dashboard's Logs tab.
+        .with(midstate::rpc::log_ring::LogLayer)
         .init();
 
     let cli = Cli::parse();

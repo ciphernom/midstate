@@ -180,20 +180,26 @@ CUDA needs only the NVIDIA driver: the kernels are built into midstate, and the 
 
 ### The dashboard
 
-The miner serves the Axe dashboard at `http://127.0.0.1:8546/axe`:
+The miner serves its own dashboard at `http://127.0.0.1:8546/axe`, laid out as a Bitaxe's AxeOS is:
 
-- the hashrate: in total, and for the CPU and for each GPU;
-- shares accepted and rejected, the last share, and the pool job;
-- uptime;
-- the board's temperature, clock and throttling;
-- whether the pool is merge-mining midwimble now. Merged mining pauses while the two chains are on different proofs of work: between midwimble's switch at its block 37,300 and midstate's at block 371,500.
+- **Along the top:** the hashrate over the last minute, ten minutes and an hour; efficiency, in attempts per joule; shares accepted and rejected; and the best share's difficulty, this run and ever. The best ever is kept in `miner-best.json`, beside the miner.
+- **The chart:** hashrate and temperature over 15 minutes, an hour, 6 hours or a day. The miner keeps a day of history, so the chart survives a reload.
+- **Power:** what the board's rails draw, the input and core voltages, and under-voltage. These come from a Raspberry Pi 5's power monitor (`vcgencmd pmic_read_adc`). That is the SoC's side, a little under what the wall supplies.
+- **Heat:** temperature against the Pi's 80 °C and 85 °C limits, the fan's speed and duty, and any limits hit.
+- **Performance:** the clock, the threads, each backend's part of the attempts (the CPU and each GPU), and the proof of work.
+- **Pool:**
+  - the connection and how long it has held, the last job and how long the pool takes to answer a share, and reconnects;
+  - the share and network difficulty, with how often a share comes at this hashrate, and a block alone;
+  - this miner's part of the round, what a pool block would pay it, the pool's fee and miners, and merged mining. Merged mining pauses while the two chains are on different proofs of work: between midwimble's switch at its block 37,300 and midstate's at block 371,500.
+- **System:** the board, host name, versions, uptimes, load and memory.
+- **Logs:** a tab with the miner's last 500 lines, following new ones, or warnings alone.
 
-What only a node knows (peers, the chain, the mempool, blocks won) shows as unavailable.
+A line across the top says when something needs you: no pool connection, no new job from the pool for over three minutes, or under-voltage now.
 
 The miner's dashboard is read-only. Its settings are the miner's flags, and the node's settings panels (Wi-Fi, clocks, mining mode, the bench) are not served.
 
 - **Access.** It answers this machine only. To open it to your network, give `--dashboard 0.0.0.0:8546`, or `MINER_DASHBOARD`. `--dashboard off` turns it off.
-- **Cost.** The hashing threads only bump counters they already had. The board is read when the page asks, every few seconds, and the pool's stats at most every 30 seconds.
+- **Cost.** The hashing threads only bump counters they already had. A sampler reads them and the board every 5 seconds and keeps a day of it, a few hundred kilobytes. `vcgencmd` runs at most every 10 seconds. The pool's stats are asked for at most every 30 seconds, and only while the page is open.
 
 ### As a service
 

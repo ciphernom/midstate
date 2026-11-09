@@ -32,6 +32,20 @@ pub struct StratumStats {
     pub jobs: u64,
     /// Unix time of the last accepted share (0: none yet).
     pub last_share_unix: u64,
+    /// Unix time this connection to the pool opened (0: not connected).
+    pub connected_since: u64,
+    /// Times the connection was lost and opened again.
+    pub reconnects: u64,
+    /// Unix time of the last job from the pool (0: none yet).
+    pub last_job_unix: u64,
+    /// The pool's share target for the current job.
+    pub share_target: [u8; 32],
+    /// Shares this miner found and sent, accepted or not.
+    pub shares_found: u64,
+    /// The lowest hash among them: the best share, by difficulty.
+    pub best_share: Option<[u8; 32]>,
+    /// How long the pool took to answer the last share (milliseconds).
+    pub latency_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -202,6 +216,11 @@ impl MiningCoordinator {
     }
 }
 
+/// Unix seconds now.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |t| t.as_secs())
+}
+
 pub async fn run_stratum_client(
     pool_url: String,
     payout_address: String,
@@ -233,7 +252,14 @@ pub async fn run_stratum_client(
         
         tracing::info!("stratum client connecting to {} (api: {})", host, api_host);
         if let Ok(mut stream) = TcpStream::connect(&host).await {
-            stats.write().unwrap().connected = true;
+            {
+                let mut s = stats.write().unwrap();
+                if s.connected_since != 0 || s.jobs > 0 {
+                    s.reconnects += 1;
+                }
+                s.connected = true;
+                s.connected_since = unix_now();
+            }
             let (read_half, mut write_half) = stream.split();
             // A line at a time, through `Lines`: its `next_line` keeps a
             // half-read line between calls, so it can wait in the select!
@@ -259,8 +285,12 @@ pub async fn run_stratum_client(
 
             let current_job_id = Arc::new(std::sync::RwLock::new(0u64));
             
-            // Create a fresh channel for shares on each successful connection
-            let (share_tx, mut share_rx) = tokio::sync::mpsc::channel::<(u64, u64)>(100);
+            // Create a fresh channel for shares on each successful connection:
+            // the job, the nonce, and the share's hash (for the best share).
+            let (share_tx, mut share_rx) = tokio::sync::mpsc::channel::<(u64, u64, [u8; 32])>(100);
+            // When each share in flight was sent, oldest first: the pool
+            // answers them in order.
+            let mut in_flight: std::collections::VecDeque<std::time::Instant> = std::collections::VecDeque::new();
 
             let mut s_target = [0xff; 32];
             s_target[0] = 0x00; s_target[1] = 0x0f;
@@ -307,8 +337,10 @@ pub async fn run_stratum_client(
                             {
                                 let mut s = stats.write().unwrap();
                                 s.network_target = n_target;
+                                s.share_target = s_target;
                                 s.job_height = job_height;
                                 s.jobs += 1;
+                                s.last_job_unix = unix_now();
                             }
                             let calculated_hash = crate::core::types::compute_header_hash(&header);
                             
@@ -392,11 +424,11 @@ pub async fn run_stratum_client(
                                     if let Some(res) = crate::core::gpu_mining::mine(
                                         job_height, m_hash, n_target, Some(s_target), threads, nc.clone(), hc.clone()
                                     ) {
-                                        let nonce = match res {
-                                            crate::core::extension::MiningResult::Block(ext) => ext.nonce,
-                                            crate::core::extension::MiningResult::Share(ext) => ext.nonce,
+                                        let ext = match res {
+                                            crate::core::extension::MiningResult::Block(ext) => ext,
+                                            crate::core::extension::MiningResult::Share(ext) => ext,
                                         };
-                                        let _ = share_tx_clone.blocking_send((j_id, nonce));
+                                        let _ = share_tx_clone.blocking_send((j_id, ext.nonce, ext.final_hash));
                                     } else {
                                         break; 
                                     }
@@ -415,6 +447,9 @@ pub async fn run_stratum_client(
                             tracing::info!("share accepted");
                             {
                                 let mut s = stats.write().unwrap();
+                                if let Some(sent) = in_flight.pop_front() {
+                                    s.latency_ms = Some(sent.elapsed().as_millis() as u64);
+                                }
                                 s.accepted_shares += 1;
                                 s.last_share_unix = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
@@ -422,10 +457,25 @@ pub async fn run_stratum_client(
                             }
                         } else if let Some(err) = msg["error"].as_str() {
                             tracing::warn!("share rejected: {}", err);
-                            stats.write().unwrap().rejected_shares += 1; 
+                            let mut s = stats.write().unwrap();
+                            s.rejected_shares += 1;
+                            if let Some(sent) = in_flight.pop_front() {
+                                s.latency_ms = Some(sent.elapsed().as_millis() as u64);
+                            }
                         }
                     }
-                    Some((job_id, nonce)) = share_rx.recv() => {
+                    Some((job_id, nonce, share_hash)) = share_rx.recv() => {
+                        {
+                            let mut s = stats.write().unwrap();
+                            s.shares_found += 1;
+                            if s.best_share.is_none_or(|best| share_hash < best) {
+                                s.best_share = Some(share_hash);
+                            }
+                        }
+                        in_flight.push_back(std::time::Instant::now());
+                        if in_flight.len() > 100 {
+                            in_flight.pop_front();
+                        }
                         let submit_req = serde_json::json!({
                             "id": 2, "method": "mining.submit", "params": [payout_address.clone(), job_id, nonce]
                         });
@@ -434,7 +484,11 @@ pub async fn run_stratum_client(
                 }
             }
         }
-        stats.write().unwrap().connected = false;
+        {
+            let mut s = stats.write().unwrap();
+            s.connected = false;
+            s.connected_since = 0;
+        }
         tracing::warn!("disconnected from stratum pool. reconnecting in 5s...");
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
