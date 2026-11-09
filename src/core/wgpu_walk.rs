@@ -78,12 +78,16 @@ pub struct Variant {
     /// Walks regrouped at every re-mix so that lanes running together have
     /// their costly operations at the same steps ([`group_order`]).
     pub grouped: bool,
+    /// Steps from the launch's `limit` on are skipped: for running a walk
+    /// to any step, not only to the end of a round of eight, when looking
+    /// for where a GPU goes wrong.
+    pub limit: bool,
 }
 
 impl Variant {
     /// The walk itself.
     pub fn walk(workgroup: u32) -> Self {
-        Variant { workgroup, real_ops: true, lines: WALK_LINES as u32, grouped: false }
+        Variant { workgroup, real_ops: true, lines: WALK_LINES as u32, grouped: false, limit: false }
     }
 
     /// Whether this computes the walk (not a probe).
@@ -99,7 +103,7 @@ struct Params {
     walks: u32,
     steps: u32,   // steps in this launch, a multiple of 8
     start: u32,   // steps every walk has run before it
-    pad0: u32,
+    limit: u32,   // with the limit variant: no step from this one on
 };
 
 @group(0) @binding(0) var<uniform> P: Params;
@@ -286,8 +290,13 @@ fn step_source(s: usize, v: &Variant) -> String {
     } else {
         "y = v ^ k;".to_string()
     };
+    let (open, close) = if v.limit {
+        (format!("\n    if (P.start + n * 8u + {s}u < P.limit) {{"), "\n    }".to_string())
+    } else {
+        (String::new(), String::new())
+    };
     format!(
-        r#"
+        r#"{open}
     {{
         let x = r{s} ^ c;
         let a = x.x & LMASK;
@@ -320,7 +329,7 @@ fn step_source(s: usize, v: &Variant) -> String {
         pads[ib] = add64(m1, x);
         pads[ie] = add64(m2, y);
         pads[if_] = m3 ^ x;
-    }}"#,
+    }}{close}"#,
         t0 = t(0),
         t1 = t(1),
         t2 = t(2),
@@ -353,7 +362,7 @@ fn walk_steps(@builtin(global_invocation_id) gid: vec3<u32>) {{
     var prog = st[sb + 9u].x;
     for (var n = 0u; n < P.steps / 8u; n = n + 1u) {{
 {steps}
-        if (((P.start + (n + 1u) * 8u) & (REMIX - 1u)) == 0u) {{
+        if (((P.start + (n + 1u) * 8u) & (REMIX - 1u)) == 0u{remix_limit}) {{
             let m = array<u32, 16>({regs_m});
             let o = blake3_out(m, 0u);
 {regs_set}            let o1 = blake3_out(m, 1u);
@@ -415,6 +424,7 @@ fn test_remix(@builtin(global_invocation_id) gid: vec3<u32>) {{
         common = COMMON,
         state_words = STATE_WORDS,
         walk_index = if v.grouped { "order[gid.x]" } else { "gid.x" },
+        remix_limit = if v.limit { " && P.start + (n + 1u) * 8u <= P.limit" } else { "" },
         pad_base = if v.lines < WALK_LINES as u32 { "0u" } else { "w * PAD_WORDS" },
     )
 }
@@ -665,10 +675,11 @@ impl GpuWalker {
             .map_err(|e| format!("the GPU stopped answering: {e}"))
     }
 
-    /// Runs `entry` over `n` invocations with `steps` from `start`, and waits.
-    fn launch(&mut self, v: Variant, entry: &'static str, n: u32, steps: u32, start: u32) -> Result<Duration, String> {
+    /// Runs `entry` over `n` invocations with `steps` from `start` (and, for
+    /// the limit variant, none from `limit` on), and waits.
+    fn launch(&mut self, v: Variant, entry: &'static str, n: u32, steps: u32, start: u32, limit: u32) -> Result<Duration, String> {
         let groups = n.div_ceil(if entry == "walk_steps" { v.workgroup } else { 64 });
-        self.queue.write_buffer(&self.params, 0, &words_bytes(&[n, steps, start, 0]));
+        self.queue.write_buffer(&self.params, 0, &words_bytes(&[n, steps, start, limit]));
         let pipe = self.pipeline(v, entry)?.clone();
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(entry) });
         {
@@ -684,9 +695,14 @@ impl GpuWalker {
     }
 
     fn read_words(&self, words: u64) -> Result<Vec<u32>, String> {
+        self.read_from(&self.state, 0, words)
+    }
+
+    /// `words` 8-byte words of `buf` from word `at`, as 32-bit halves.
+    fn read_from(&self, buf: &wgpu::Buffer, at: u64, words: u64) -> Result<Vec<u32>, String> {
         let bytes = words * 8;
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("read") });
-        enc.copy_buffer_to_buffer(&self.state, 0, &self.readback, 0, bytes);
+        enc.copy_buffer_to_buffer(buf, at * 8, &self.readback, 0, bytes);
         self.queue.submit([enc.finish()]);
         let slice = self.readback.slice(0..bytes);
         let (tx, rx) = std::sync::mpsc::channel();
@@ -724,11 +740,33 @@ impl GpuWalker {
         Ok(states)
     }
 
+    /// Loads one walk part-way: `st` and its `pad`, as walk 0.
+    pub fn load_state(&mut self, st: &WalkState, pad: &walk::Pad) {
+        let flat: Vec<u32> = pad.iter().flat_map(|line| line.iter().flat_map(|w| word(*w))).collect();
+        self.queue.write_buffer(&self.pads, 0, &words_bytes(&flat));
+        let mut words: Vec<u32> = st.r.iter().flat_map(|r| word(*r)).collect();
+        words.extend(word(st.c));
+        words.extend([pack_program(&st.prog), 0]);
+        self.queue.write_buffer(&self.state, 0, &words_bytes(&words));
+    }
+
+    /// Walk 0's pad, as it is now.
+    pub fn pad0(&self) -> Result<Vec<u64>, String> {
+        let w = self.read_from(&self.pads, 0, PAD_WORDS)?;
+        Ok(w.chunks(2).map(|p| p[0] as u64 | (p[1] as u64) << 32).collect())
+    }
+
     /// Runs `steps` more steps (a multiple of 8) of the `n` loaded walks,
     /// which have run `start` so far. How long the GPU took.
     pub fn run(&mut self, v: Variant, n: u32, start: u32, steps: u32) -> Result<Duration, String> {
+        self.run_to(v, n, start, steps, u32::MAX)
+    }
+
+    /// As [`GpuWalker::run`], skipping every step from `limit` on (the
+    /// limit variant).
+    fn run_to(&mut self, v: Variant, n: u32, start: u32, steps: u32, limit: u32) -> Result<Duration, String> {
         assert!(steps % 8 == 0 && start % 8 == 0, "whole rounds of eight");
-        self.launch(v, "walk_steps", n, steps, start)
+        self.launch(v, "walk_steps", n, steps, start, limit)
     }
 
     /// Regroups the `n` loaded walks by their programs now ([`group_order`]).
@@ -741,18 +779,32 @@ impl GpuWalker {
     /// Runs `steps` steps from `start` in launches sized to
     /// [`LAUNCH_TARGET`], regrouping at every re-mix for a grouped variant,
     /// beginning with launches of `chunk` steps. The chunk to go on with.
-    fn run_span(&mut self, v: Variant, n: u32, start: u32, steps: u32, mut chunk: u32) -> Result<u32, String> {
+    fn run_span(&mut self, v: Variant, n: u32, start: u32, steps: u32, chunk: u32) -> Result<u32, String> {
+        self.run_span_to(v, n, start, steps, chunk, u32::MAX)
+    }
+
+    /// As `run_span`, skipping every step from `limit` on (the limit variant).
+    fn run_span_to(&mut self, v: Variant, n: u32, start: u32, steps: u32, mut chunk: u32, limit: u32) -> Result<u32, String> {
         let mut done = start;
         while done < start + steps {
             if v.grouped && done % WALK_REMIX as u32 == 0 {
                 self.regroup(n)?;
             }
             let c = chunk.min(start + steps - done);
-            let took = self.run(v, n, done, c)?;
+            let took = self.run_to(v, n, done, c, limit)?;
             done += c;
             chunk = next_chunk(chunk, took);
         }
         Ok(chunk)
+    }
+
+    /// Runs walk 0 from `st` and `pad` to step `to` (any step), skipping
+    /// what lies past it: for the search for where a GPU goes wrong.
+    fn run_one_to(&mut self, v: Variant, st: &WalkState, pad: &walk::Pad, to: usize) -> Result<(), String> {
+        let lim = Variant { limit: true, grouped: false, ..v };
+        self.load_state(st, pad);
+        let rounds = (to - st.steps).div_ceil(8) as u32 * 8;
+        self.run_span_to(lim, 1, st.steps as u32, rounds, 64, to as u32).map(|_| ())
     }
 
     /// The `n` loaded walks' states, as they are now.
@@ -782,7 +834,7 @@ impl GpuWalker {
         let n = pairs.len() as u32;
         let words: Vec<u32> = pairs.iter().flat_map(|(a, b)| word(*a).into_iter().chain(word(*b))).collect();
         self.queue.write_buffer(&self.state, 0, &words_bytes(&words));
-        self.launch(Variant::walk(64), "test_ops", n, 0, 0)?;
+        self.launch(Variant::walk(64), "test_ops", n, 0, 0, 0)?;
         let w = self.read_words(14 * n as u64)?;
         let base = 4 * n as usize;
         Ok((0..n as usize)
@@ -799,7 +851,7 @@ impl GpuWalker {
         let n = regs.len() as u32;
         let words: Vec<u32> = regs.iter().flat_map(|r| r.iter().flat_map(|x| word(*x)).chain([0, 0, 0, 0])).collect();
         self.queue.write_buffer(&self.state, 0, &words_bytes(&words));
-        self.launch(Variant::walk(64), "test_remix", n, 0, 0)?;
+        self.launch(Variant::walk(64), "test_remix", n, 0, 0, 0)?;
         Ok(self.states(n)?.into_iter().map(|s| (s.r, s.prog)).collect())
     }
 }
@@ -815,6 +867,261 @@ pub fn next_chunk(chunk: u32, took: Duration) -> u32 {
         c *= 2;
     }
     c
+}
+
+// ── Checking a GPU ──────────────────────────────────────────────────────────
+
+/// What `test_ops` computes for each pair, by name.
+pub const TEST_OPS: [&str; 12] = ["mul", "mulhi", "div", "aes (low half)", "aes (high half)", "rotr", "add", "sub", "xor", "program", "32x32 multiply", "64/32 division"];
+
+/// What `test_ops` should give for (a, b), from the CPU.
+pub fn ops_reference(a: u64, b: u64) -> [u64; 12] {
+    let d = (a as u32 | 0x8000_0001) as u64;
+    let (aes_lo, aes_hi) = walk::aes_round_pair(a, b);
+    [
+        a.wrapping_mul(b | 1),
+        a ^ ((a as u128 * b as u128) >> 64) as u64,
+        a.wrapping_add(b / d),
+        aes_lo,
+        aes_hi,
+        a.rotate_right((b & 63) as u32),
+        a.wrapping_add(b),
+        a.wrapping_sub(b),
+        a ^ b,
+        pack_program(&walk::program_of(a)) as u64,
+        (a as u32 as u64) * (b as u32 as u64),
+        b / d,
+    ]
+}
+
+/// Operand pairs for checking: every pair of edge values, then `total`
+/// in all from a fixed generator, every seventh with its division's
+/// quotient near a digit boundary.
+pub fn op_pairs(total: usize) -> Vec<(u64, u64)> {
+    let edges = [0u64, 1, 2, 0x7fff_ffff, 0x8000_0000, 0x8000_0001, 0xffff_ffff, 1 << 32, (1 << 32) + 1, u64::MAX, u64::MAX - 1, 1 << 63, 0xffff_0000_ffff_0000, 0x0000_ffff_0000_ffff];
+    let mut pairs: Vec<(u64, u64)> = edges.iter().flat_map(|a| edges.iter().map(move |b| (*a, *b))).collect();
+    let mut x = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    while pairs.len() < total {
+        let a = next();
+        let r = next();
+        let b = if pairs.len() % 7 == 0 { ((a as u32 | 0x8000_0001) as u64).wrapping_mul(r >> 33) } else { r };
+        pairs.push((a, b));
+    }
+    pairs
+}
+
+/// Runs every operation on `total` operand pairs on the GPU against the
+/// CPU: a line for each that came out wrong, with its first case.
+pub fn check_ops(g: &mut GpuWalker, total: usize) -> Result<Vec<String>, String> {
+    let mut wrong = [0usize; 12];
+    let mut first: [Option<String>; 12] = Default::default();
+    for batch in op_pairs(total).chunks(4096) {
+        for (&(a, b), got) in batch.iter().zip(g.test_ops(batch)?) {
+            let want = ops_reference(a, b);
+            for k in 0..12 {
+                if got[k] != want[k] {
+                    wrong[k] += 1;
+                    first[k].get_or_insert_with(|| format!("a={a:#018x} b={b:#018x}: the GPU gave {:#018x}, the CPU {:#018x}", got[k], want[k]));
+                }
+            }
+        }
+    }
+    Ok((0..12)
+        .filter(|&k| wrong[k] > 0)
+        .map(|k| format!("{} wrong {} times, first {}", TEST_OPS[k], wrong[k], first[k].as_deref().unwrap_or("")))
+        .collect())
+}
+
+/// Runs the re-mix on `total` register sets on the GPU against the CPU: how
+/// many came out wrong, and the first.
+pub fn check_remix(g: &mut GpuWalker, total: usize) -> Result<Option<String>, String> {
+    let mut wrong = 0;
+    let mut first = None;
+    let sets: Vec<[u64; 8]> = (0..total as u64).map(|i| std::array::from_fn(|k| (i ^ (k as u64) << 56).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(k as u32 * 7))).collect();
+    for batch in sets.chunks(4096) {
+        for (r, got) in batch.iter().zip(g.test_remix(batch)?) {
+            if got != walk::remix_of(r) {
+                wrong += 1;
+                first.get_or_insert_with(|| format!("{r:x?}"));
+            }
+        }
+    }
+    Ok(first.map(|f| format!("{wrong} of {total} wrong, first of registers {f}")))
+}
+
+/// Whether walk 0 on the GPU is `st` with `pad`; if not, what differs.
+fn differences(g: &GpuWalker, st: &WalkState, pad: &walk::Pad) -> Result<Vec<String>, String> {
+    let gpu = g.states(1)?[0];
+    let mut out = Vec::new();
+    for k in 0..8 {
+        if gpu.r[k] != st.r[k] {
+            out.push(format!("r{k}: GPU {:#018x}, CPU {:#018x}", gpu.r[k], st.r[k]));
+        }
+    }
+    if gpu.c != st.c {
+        out.push(format!("c: GPU {:#018x}, CPU {:#018x}", gpu.c, st.c));
+    }
+    if gpu.prog != st.prog {
+        out.push(format!("program: GPU {:?}, CPU {:?}", gpu.prog, st.prog));
+    }
+    let gp = g.pad0()?;
+    let flat = pad.iter().flat_map(|l| l.iter().copied());
+    let bad: Vec<String> = gp
+        .iter()
+        .zip(flat)
+        .enumerate()
+        .filter(|(_, (a, b))| *a != b)
+        .map(|(i, (a, b))| format!("pad word {i} (line {}, word {}): GPU {a:#018x}, CPU {b:#018x}", i / 8, i % 8))
+        .collect();
+    if !bad.is_empty() {
+        out.push(format!("{} pad word{} differ", bad.len(), if bad.len() == 1 { "" } else { "s" }));
+        out.extend(bad.into_iter().take(6));
+    }
+    Ok(out)
+}
+
+/// Finds the first step at which the GPU's walk of `nonce` leaves the CPU's,
+/// and what is wrong about it: runs the walk in stretches of one re-mix,
+/// checking each, runs a wrong stretch again to see whether the GPU repeats
+/// itself, then narrows it to one step. A report to print.
+pub fn find_divergence(g: &mut GpuWalker, v: Variant, mining_hash: &[u8; 32], nonce: u64) -> Result<String, String> {
+    let mut pad = walk::new_pad();
+    let mut cpu = walk::walk_start(mining_hash, nonce, &mut pad);
+    g.load(mining_hash, &[nonce])?;
+    let mut chunk = 64;
+    let mut report = Vec::new();
+    while cpu.steps < WALK_STEPS {
+        let (a, start, start_pad) = (cpu.steps, cpu, pad.clone());
+        chunk = g.run_span(v, 1, a as u32, WALK_REMIX as u32, chunk)?;
+        walk::walk_steps(&mut cpu, &mut pad, WALK_REMIX);
+        if differences(g, &cpu, &pad)?.is_empty() {
+            continue;
+        }
+        report.push(format!("The walk is right up to step {a} and wrong by step {}.", a + WALK_REMIX));
+
+        // The same stretch again, from the CPU's state at its start.
+        g.load_state(&start, &start_pad);
+        g.run_span(v, 1, a as u32, WALK_REMIX as u32, 64)?;
+        if differences(g, &cpu, &pad)?.is_empty() {
+            report.push("Run again from the same state, the GPU got that stretch right: it does not repeat itself.".into());
+            report.push("So the fault comes and goes: a GPU reset (look for v3d in: sudo dmesg | tail -50), or a race in reading back what a step wrote.".into());
+            return Ok(report.join("\n"));
+        }
+        report.push("Run again from the same state, the GPU got it wrong again.".into());
+
+        // The first step after which the GPU differs: (lo] right, [hi wrong.
+        let (mut lo, mut hi) = (0usize, WALK_REMIX);
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2;
+            g.run_one_to(v, &start, &start_pad, a + mid)?;
+            let (mut st, mut p) = (start, start_pad.clone());
+            walk::walk_steps(&mut st, &mut p, mid);
+            if differences(g, &st, &p)?.is_empty() {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+
+        // The step itself, from the CPU's state just before it, and what
+        // the stretch's steps wrote before it.
+        let (mut before, mut before_pad) = (start, start_pad.clone());
+        let mut written: std::collections::HashMap<usize, (usize, u64)> = Default::default();
+        for _ in 0..hi - 1 {
+            let i = walk::step_inputs(&before, &before_pad);
+            for (w, m) in i.words.iter().zip(i.m) {
+                written.insert(*w, (before.steps, m));
+            }
+            walk::walk_steps(&mut before, &mut before_pad, 1);
+        }
+        let i = walk::step_inputs(&before, &before_pad);
+        let (mut after, mut after_pad) = (before, before_pad.clone());
+        walk::walk_steps(&mut after, &mut after_pad, 1);
+        g.run_one_to(v, &start, &start_pad, a + hi)?;
+        let gpu = g.states(1)?[0];
+        report.push(format!(
+            "The first wrong step is step {} of the walk (register r{}, operation {}).",
+            before.steps,
+            i.s,
+            walk::OP_NAMES[i.op as usize]
+        ));
+        if hi == WALK_REMIX {
+            report.push("It is the stretch's last step, so the re-mix follows it.".into());
+            let (gr, gp) = g.test_remix(&[after_regs_before_remix(&before, &before_pad)])?[0];
+            if (gr, gp) != walk::remix_of(&after_regs_before_remix(&before, &before_pad)) {
+                report.push("The GPU's re-mix of these registers alone is wrong.".into());
+            }
+        }
+        report.push(format!("  x={:#018x} k=r{}={:#018x} v={:#018x}", i.x, i.t, i.k, i.v));
+        for (n, (w, m)) in i.words.iter().zip(i.m).enumerate() {
+            let when = match written.get(w) {
+                Some((at, _)) => format!("written by step {at}, {} step(s) before", before.steps - at),
+                None => "not written since step ".to_string() + &a.to_string(),
+            };
+            report.push(format!("  m{n} = pad word {w} = {m:#018x}, {when}"));
+        }
+        for d in differences(g, &after, &after_pad)? {
+            report.push(format!("  after it: {d}"));
+        }
+
+        // The operation alone, on the same inputs.
+        let alone = g.test_ops(&[(i.v, i.k)])?[0];
+        let want = ops_reference(i.v, i.k);
+        let slot = [0usize, 1, 2, 3, 5, 6, 7, 8][i.op as usize];
+        report.push(if alone[slot] == want[slot] && (i.op != 3 || alone[4] == want[4]) {
+            format!("Alone, on these inputs, the GPU's {} is right: the fault is in the step around it.", walk::OP_NAMES[i.op as usize])
+        } else {
+            format!("Alone, on these inputs, the GPU's {} is wrong: {:#018x}, not {:#018x}.", walk::OP_NAMES[i.op as usize], alone[slot], want[slot])
+        });
+
+        // Did it read a word as it was before an earlier step wrote it?
+        for n in 0..4 {
+            if let Some((at, old)) = written.get(&i.words[n]) {
+                let mut m = i.m;
+                m[n] = *old;
+                let (y, _) = walk::apply_op(i.op, i.x ^ m[0] ^ m[2], i.k);
+                if y ^ m[1] ^ m[3] == gpu.c {
+                    report.push(format!(
+                        "The GPU's result is what the step gives with m{n} as it was before step {at} wrote it, {} step(s) earlier: the GPU read a stale value.",
+                        before.steps - at
+                    ));
+                }
+            }
+        }
+        return Ok(report.join("\n"));
+    }
+    Ok("Run again, the whole walk came out right: the fault comes and goes (a GPU reset, or a race). Look for v3d in: sudo dmesg | tail -50".into())
+}
+
+/// The registers after `st`'s next step, before the re-mix that follows it.
+fn after_regs_before_remix(st: &WalkState, pad: &walk::Pad) -> [u64; 8] {
+    let i = walk::step_inputs(st, pad);
+    let (y, h) = walk::apply_op(i.op, i.v, i.k);
+    let mut r = st.r;
+    r[i.s] = y ^ i.m[1] ^ i.m[3];
+    r[i.t] ^= h;
+    r
+}
+
+/// Cores' worth of CPU time something else is using, sampled over a second.
+fn busy_cores() -> Option<f64> {
+    let read = || -> Option<(u64, u64)> {
+        let stat = std::fs::read_to_string("/proc/stat").ok()?;
+        let v: Vec<u64> = stat.lines().next()?.split_whitespace().skip(1).filter_map(|x| x.parse().ok()).collect();
+        let idle = v.get(3)? + v.get(4).unwrap_or(&0);
+        Some((v.iter().sum(), idle))
+    };
+    let (t0, i0) = read()?;
+    std::thread::sleep(Duration::from_secs(1));
+    let (t1, i1) = read()?;
+    let total = (t1 - t0).max(1) as f64;
+    Some((1.0 - (i1 - i0) as f64 / total) * super::super::mining::cores() as f64)
 }
 
 // ── The benchmark ───────────────────────────────────────────────────────────
@@ -913,34 +1220,67 @@ pub fn bench(o: &BenchOptions) {
         "\nMeasuring {} ({}, {}). Room for {} walks of 256 KiB; workgroups up to {}.",
         g.info.name, g.info.backend, g.info.kind, g.capacity, g.max_workgroup
     );
-    let load = std::fs::read_to_string("/proc/loadavg").ok().and_then(|l| l.split_whitespace().next()?.parse::<f64>().ok());
-    if let Some(l) = load.filter(|l| *l > 1.0) {
-        println!("Something else is keeping the CPU busy (load {l:.1}). Stop the miner first for clean numbers: sudo systemctl stop midstate-hasher");
+    if let Some(busy) = busy_cores().filter(|b| *b > 0.5) {
+        println!("Something else is using {busy:.1} cores' worth of CPU now. Stop it for clean numbers (the miner: sudo systemctl stop midstate-hasher).");
     }
     let wg0 = 64.min(g.max_workgroup);
 
-    // 1. The known answers, whole walks: a kernel that computes another walk
-    //    is not measured.
-    let started = Instant::now();
+    // 1. The kernel's parts, then the known answers as whole walks.
+    println!("\nChecking the kernel on this GPU, part by part:");
+    let mut right = true;
+    match check_ops(&mut g, 1 << 20) {
+        Ok(p) if p.is_empty() => println!("  Operations: right on {} operand pairs.", 1 << 20),
+        Ok(p) => {
+            right = false;
+            for line in p {
+                println!("  WRONG {line}");
+            }
+        }
+        Err(e) => {
+            println!("  The operations test failed to run: {e}");
+            return;
+        }
+    }
+    match check_remix(&mut g, 1 << 16) {
+        Ok(None) => println!("  Re-mix: right on {} register sets.", 1 << 16),
+        Ok(Some(p)) => {
+            right = false;
+            println!("  WRONG re-mix: {p}");
+        }
+        Err(e) => println!("  The re-mix test failed to run: {e}"),
+    }
+    println!("Known answers, as whole walks, one at a time:");
     for (k, (m, nonce, want)) in walk::GOLDEN.iter().enumerate() {
         let mut mh = [0u8; 32];
         if hex::decode_to_slice(m, &mut mh).is_err() {
             continue;
         }
+        let started = Instant::now();
         match g.hash(Variant::walk(wg0), &mh, &[*nonce]) {
-            Ok(h) if hex::encode(h[0]) == *want => {}
+            Ok(h) if hex::encode(h[0]) == *want => println!("  answer {k}: right ({:.1}s)", started.elapsed().as_secs_f64()),
             Ok(h) => {
-                println!("\nWRONG: known answer {k} came out {} on this GPU, not {want}.", hex::encode(h[0]));
-                println!("The kernel computes another walk here, so nothing is measured. Please send this output.");
-                return;
+                right = false;
+                println!("  answer {k}: WRONG, {} not {want} ({:.1}s)", hex::encode(h[0]), started.elapsed().as_secs_f64());
+                println!("Finding the first step where the GPU leaves the CPU (a walk and a few reruns of part of it)...");
+                match find_divergence(&mut g, Variant::walk(wg0), &mh, *nonce) {
+                    Ok(r) => {
+                        for line in r.lines() {
+                            println!("  {line}");
+                        }
+                    }
+                    Err(e) => println!("  The search failed: {e}"),
+                }
             }
             Err(e) => {
-                println!("\nThe GPU failed the known answers: {e}");
+                println!("  answer {k}: the GPU failed: {e}");
                 return;
             }
         }
     }
-    println!("Known answers: all three right, as whole walks ({:.1}s).", started.elapsed().as_secs_f64());
+    if !right {
+        println!("\nTHE KERNEL IS WRONG ON THIS GPU. Please send this whole output.");
+        println!("The rates below are of a kernel that does the work but gets some of it wrong: what it costs, not yet what it earns.");
+    }
 
     // 2. Workgroup size and walks at once.
     let per = (o.seconds as f64 / 5.0).max(1.0);
@@ -1084,7 +1424,8 @@ pub fn bench(o: &BenchOptions) {
         }
     }
     println!(
-        "\nSummary: {} | best wg {} × {} walks{} = {:.2} att/s | mem-only {} | alu-only {} | CPU {:.1} att/s",
+        "\nSummary{}: {} | best wg {} × {} walks{} = {:.2} att/s | mem-only {} | alu-only {} | CPU {:.1} att/s",
+        if right { "" } else { " (KERNEL WRONG HERE)" },
         g.info.name,
         best.variant.workgroup,
         best.walks,
@@ -1119,7 +1460,8 @@ mod tests {
         assert_eq!(next_chunk(64, Duration::from_secs(5)), 8);
         let src = shader(&Variant::walk(64));
         assert!(src.contains("fn walk_steps") && src.contains("r7 = vec2<u32>(o[14], o[15]);"));
-        let probe = shader(&Variant { workgroup: 64, real_ops: false, lines: 8, grouped: false });
+        let probe = shader(&Variant { workgroup: 64, real_ops: false, lines: 8, grouped: false, limit: false });
+        assert!(shader(&Variant { limit: true, ..Variant::walk(64) }).contains("if (P.start + n * 8u + 7u < P.limit) {"));
         assert!(!probe.contains("mulhi64(v, k)") && probe.contains("let base = 0u;"));
         assert!(shader(&Variant { grouped: true, ..Variant::walk(64) }).contains("let w = order[gid.x];"));
 
@@ -1152,58 +1494,10 @@ mod tests {
         };
         eprintln!("testing the kernel on {} ({}, {})", g.info.name, g.info.backend, g.info.kind);
 
-        // Every operation on edge cases and random pairs.
-        let mut pairs: Vec<(u64, u64)> = Vec::new();
-        let edges = [0u64, 1, 2, 0x7fff_ffff, 0x8000_0000, 0x8000_0001, 0xffff_ffff, 1 << 32, (1 << 32) + 1, u64::MAX, u64::MAX - 1, 1 << 63, 0xffff_0000_ffff_0000, 0x0000_ffff_0000_ffff];
-        for a in edges {
-            for b in edges {
-                pairs.push((a, b));
-            }
-        }
-        let mut x = 0x9e37_79b9_7f4a_7c15u64;
-        while pairs.len() < 4096 {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            let a = x;
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            // Some with the divisor's quotient near a digit boundary.
-            let b = if pairs.len() % 7 == 0 { ((a as u32 | 0x8000_0001) as u64).wrapping_mul(x >> 33) } else { x };
-            pairs.push((a, b));
-        }
-        let got = g.test_ops(&pairs).expect("test_ops runs");
-        for (&(a, b), o) in pairs.iter().zip(&got) {
-            let d = (a as u32 | 0x8000_0001) as u64;
-            let (aes_lo, aes_hi) = walk::aes_round_pair(a, b);
-            let want = [
-                a.wrapping_mul(b | 1),
-                a ^ ((a as u128 * b as u128) >> 64) as u64,
-                a.wrapping_add(b / d),
-                aes_lo,
-                aes_hi,
-                a.rotate_right((b & 63) as u32),
-                a.wrapping_add(b),
-                a.wrapping_sub(b),
-                a ^ b,
-                pack_program(&walk::program_of(a)) as u64,
-                (a as u32 as u64) * (b as u32 as u64),
-                b / d,
-            ];
-            let names = ["mul", "mulhi", "div", "aes lo", "aes hi", "rotr", "add", "sub", "xor", "program", "wide", "div64n"];
-            for k in 0..12 {
-                assert_eq!(o[k], want[k], "{} of a={a:#x} b={b:#x}", names[k]);
-            }
-        }
-
-        // The re-mix.
-        let regs: Vec<[u64; 8]> = (0..64u64).map(|i| std::array::from_fn(|k| i.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (k as u64) << 40)).collect();
-        for (r, (gr, gp)) in regs.iter().zip(g.test_remix(&regs).expect("test_remix runs")) {
-            let (mut r2, mut p2) = (*r, [0u8; 8]);
-            walk_remix_reference(&mut r2, &mut p2);
-            assert_eq!((gr, gp), (r2, p2), "the re-mix of {r:x?}");
-        }
+        // Every operation, and the re-mix, against the CPU. The re-mix is
+        // the CPU's own (walk::remix_of), a second BLAKE3 not written here.
+        assert_eq!(check_ops(&mut g, 8192).unwrap(), Vec::<String>::new());
+        assert_eq!(check_remix(&mut g, 256).unwrap(), None);
 
         // Steps against the CPU, across the first re-mix, then whole walks.
         let m = walk::GOLDEN.map(|(m, _, _)| {
@@ -1235,19 +1529,36 @@ mod tests {
         for (nonce, h) in nonces.iter().zip(&grouped) {
             assert_eq!(*h, walk::walk_hash(&m[1], *nonce), "grouped, nonce {nonce}");
         }
-    }
 
-    /// The CPU's re-mix, as `walk_steps` does it at a boundary.
-    fn walk_remix_reference(r: &mut [u64; 8], prog: &mut [u8; 8]) {
-        let mut regs = [0u8; 64];
-        for (k, w) in r.iter().enumerate() {
-            regs[8 * k..8 * k + 8].copy_from_slice(&w.to_le_bytes());
+        // From any state to any step, as the search for a fault runs it.
+        let mut pad = walk::new_pad();
+        let mut start = walk::walk_start(&m[0], 5, &mut pad);
+        walk::walk_steps(&mut start, &mut pad, WALK_REMIX);
+        for n in [1usize, 5, 8, 13, WALK_REMIX - 1, WALK_REMIX] {
+            g.run_one_to(v, &start, &pad, start.steps + n).unwrap();
+            let (mut st, mut p) = (start, pad.clone());
+            walk::walk_steps(&mut st, &mut p, n);
+            assert_eq!(differences(&g, &st, &p).unwrap(), Vec::<String>::new(), "{n} steps on");
         }
-        let mut out = [0u8; 72];
-        blake3::Hasher::new_derive_key("midstate walk v1 remix").update(&regs).finalize_xof().fill(&mut out);
-        for (k, w) in r.iter_mut().enumerate() {
-            *w = u64::from_le_bytes(out[8 * k..8 * k + 8].try_into().unwrap());
-        }
-        *prog = walk::program_of(u64::from_le_bytes(out[64..72].try_into().unwrap()));
+
+        // The search: the right kernel is right throughout, and a wrong one
+        // (every operation an XOR) is caught at its first step whose
+        // operation is not one.
+        let right = find_divergence(&mut g, v, &m[0], 5).unwrap();
+        assert!(right.contains("came out right"), "{right}");
+        let xor_only = Variant { real_ops: false, ..v };
+        let mut probe = walk::new_pad();
+        let mut st = walk::walk_start(&m[0], 5, &mut probe);
+        let first = loop {
+            let i = walk::step_inputs(&st, &probe);
+            let (y, h) = walk::apply_op(i.op, i.v, i.k);
+            if (y, h) != (i.v ^ i.k, 0) {
+                break st.steps;
+            }
+            walk::walk_steps(&mut st, &mut probe, 1);
+        };
+        let report = find_divergence(&mut g, xor_only, &m[0], 5).unwrap();
+        assert!(report.contains(&format!("The first wrong step is step {first} of the walk")), "{report}");
+        assert!(report.contains("got it wrong again") && report.contains("the fault is in the step around it"), "{report}");
     }
 }

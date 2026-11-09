@@ -544,11 +544,15 @@ pub fn bench_many<const K: usize>(threads: usize, duration: std::time::Duration,
                 let mut pads: [Box<Pad>; K] = std::array::from_fn(|_| new_pad());
                 let mut good = golden_many::<K>(&mut pads);
                 let mut nonce = (t as u64) << 40;
-                while !stop.load(Ordering::Relaxed) {
+                // At least one batch each, however short the run.
+                loop {
                     let nonces: [u64; K] = std::array::from_fn(|k| nonce + k as u64);
                     std::hint::black_box(walk_hash_many::<K>(&mining_hash, &nonces, &mut pads));
                     nonce += K as u64;
                     done.fetch_add(K as u64, Ordering::Relaxed);
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
                 }
                 good &= golden_many::<K>(&mut pads);
                 good
@@ -609,19 +613,77 @@ pub fn walk_start(mining_hash: &[u8; 32], nonce: u64, pad: &mut Pad) -> WalkStat
 }
 
 /// Runs `n` more steps of a walk on the CPU (the portable path), re-mixing
-/// where the walk does. `n` and the steps already run are multiples of 8.
-/// The reference a GPU's partial runs are checked against.
+/// where the walk does. The reference a GPU's partial runs are checked
+/// against, a step at a time if need be.
 pub fn walk_steps(st: &mut WalkState, pad: &mut Pad, n: usize) {
-    assert!(st.steps % 8 == 0 && n % 8 == 0 && st.steps + n <= WALK_STEPS, "whole rounds of eight, within the walk");
-    for _ in 0..n / 8 {
-        for s in 0..8 {
-            step::<SoftAes>(s, st.prog[s], &mut st.r, &mut st.c, pad);
-        }
-        st.steps += 8;
+    assert!(st.steps + n <= WALK_STEPS, "within the walk");
+    for _ in 0..n {
+        let s = st.steps % 8;
+        step::<SoftAes>(s, st.prog[s], &mut st.r, &mut st.c, pad);
+        st.steps += 1;
         if st.steps % WALK_REMIX == 0 {
             remix(&mut st.r, &mut st.prog);
         }
     }
+}
+
+/// The operations by number, as a program names them.
+pub const OP_NAMES: [&str; 8] = ["mul", "mulhi", "div", "aes", "rotr", "add", "sub", "xor"];
+
+/// What a walk's next step works on: for finding where a GPU's walk goes
+/// wrong. `words` are the four pad words' places (line * 8 + word), for
+/// `m[0..4]` in that order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StepInputs {
+    /// The register the step writes.
+    pub s: usize,
+    pub op: u8,
+    /// The register `k` comes from, which AES's high half is XORed into.
+    pub t: usize,
+    pub x: u64,
+    pub k: u64,
+    pub v: u64,
+    pub m: [u64; 4],
+    pub words: [usize; 4],
+}
+
+/// Operation `op` of the walk on `v` and `k`, the portable way: its result,
+/// and the half AES XORs into register `t` (0 for the others).
+pub fn apply_op(op: u8, v: u64, k: u64) -> (u64, u64) {
+    match op {
+        0 => (v.wrapping_mul(k | 1), 0),
+        1 => (v ^ mulhi(v, k), 0),
+        2 => (v.wrapping_add(k / ((v as u32 as u64) | 0x8000_0001)), 0),
+        3 => SoftAes::round_pair(v, k),
+        4 => (v.rotate_right((k & 63) as u32), 0),
+        5 => (v.wrapping_add(k), 0),
+        6 => (v.wrapping_sub(k), 0),
+        _ => (v ^ k, 0),
+    }
+}
+
+/// The inputs of `st`'s next step over `pad`, as [`step`] works them out.
+pub fn step_inputs(st: &WalkState, pad: &Pad) -> StepInputs {
+    const MASK: u64 = WALK_LINES as u64 - 1;
+    let s = st.steps % 8;
+    let x = st.r[s] ^ st.c;
+    let a = (x & MASK) as usize;
+    let t = (s + 1 + ((x >> 12) & 3) as usize) & 7;
+    let j = ((x >> 14) & 7) as usize;
+    let e = ((x >> 17) & MASK) as usize;
+    let b = ((x >> 32) & MASK) as usize;
+    let f = ((x >> 44) & MASK) as usize;
+    let words = [a * 8 + j, b * 8 + (j ^ 4), e * 8 + (j ^ 2), f * 8 + (j ^ 6)];
+    let m = words.map(|w| pad[w / 8][w % 8]);
+    StepInputs { s, op: st.prog[s], t, x, k: st.r[t], v: x ^ m[0] ^ m[2], m, words }
+}
+
+/// The re-mix of registers `r`: the new registers and program, as the walk
+/// makes them every [`WALK_REMIX`] steps.
+pub fn remix_of(r: &[u64; 8]) -> ([u64; 8], [u8; 8]) {
+    let (mut r, mut prog) = (*r, [0u8; 8]);
+    remix(&mut r, &mut prog);
+    (r, prog)
 }
 
 /// The proof-of-work hash of a walk whose steps have all run.
@@ -995,6 +1057,35 @@ mod tests {
             assert_eq!((fast.r, fast.prog), (r, prog));
             assert!(other[..] == again[..], "the same pad");
         }
+    }
+
+    /// Steps one at a time are the walk, and the inputs worked out for a
+    /// step are the ones it uses.
+    #[test]
+    fn single_steps_and_their_inputs() {
+        let m = hex32(GOLDEN[1].0);
+        let mut pad = new_pad();
+        let mut st = walk_start(&m, GOLDEN[1].1, &mut pad);
+        let (mut whole, mut whole_pad) = (st, pad.clone());
+        walk_steps(&mut whole, &mut whole_pad, WALK_REMIX + 24);
+        for _ in 0..WALK_REMIX + 24 {
+            let i = step_inputs(&st, &pad);
+            let (y, aes_hi) = apply_op(i.op, i.v, i.k);
+            let crossing = (st.steps + 1) % WALK_REMIX == 0;
+            walk_steps(&mut st, &mut pad, 1);
+            if !crossing {
+                assert_eq!(st.c, y ^ i.m[1] ^ i.m[3], "step {}", st.steps);
+                if i.op == 3 && i.t != i.s {
+                    assert_eq!(st.r[i.t], i.k ^ aes_hi);
+                }
+            }
+            assert_eq!(pad[i.words[0] / 8][i.words[0] % 8], i.m[0] ^ y);
+            assert_eq!(pad[i.words[3] / 8][i.words[3] % 8], i.m[3] ^ i.x);
+        }
+        assert_eq!((st, &pad[..]), (whole, &whole_pad[..]));
+        let r = [1u64, 2, 3, 4, 5, 6, 7, 8];
+        let (r2, p2) = remix_of(&r);
+        assert!(r2 != r && p2.iter().map(|o| 1u8 << o).fold(0, |a, b| a | b) == 0xff);
     }
 
     /// Walks stepped in turn on one thread are each the walk of its nonce.
