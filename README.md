@@ -188,9 +188,4 @@ midstate wallet import-rewards --path wallet.dat --coinbase-file ./data/coinbase
 
 ---
 
-# MidstateLabs
-
-
-MidstateLabs will be the software company that continues to develop midstate. In addition to the ongoing development, it will be the company responsible for running the bootstraps, formal messaging the community, and selling the up-and-comping MidtateAxe hardware.  
-
 ----
