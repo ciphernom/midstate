@@ -178,6 +178,12 @@ CUDA needs only the NVIDIA driver: the kernels are built into midstate, and the 
 
 `midstate node --mine --backend …` uses the same backends.
 
+### Pools and heat
+
+- `--fallback-pool-url host:port`: a second pool. After three failed tries in a row to reach the first (or a connection that never brings a job), the miner mines on the fallback. Meanwhile it knocks on the first pool every two minutes, a connection opened and closed at once, and goes back as soon as it answers.
+- A pool that stops talking without closing the connection is left after five minutes of silence, and a pool that doesn't accept a connection within ten seconds counts as a failed try. A pool that refuses the login (a bad payout or midwimble address) is not tried again until the settings change.
+- `--heat-limit 80`: at or above this many degrees Celsius (50–85), the miner drops a hashing thread every 30 seconds, down to none, and adds them back one at a time once the board is 5 °C under the limit. The Pi itself slows its clock at 85 °C whatever this says.
+
 ### The dashboard
 
 The miner serves its own dashboard at `http://127.0.0.1:8546/axe`, laid out as a Bitaxe's AxeOS is:
@@ -194,11 +200,26 @@ The miner serves its own dashboard at `http://127.0.0.1:8546/axe`, laid out as a
 - **System:** the board, host name, versions, uptimes, load and memory.
 - **Logs:** a tab with the miner's last 500 lines, following new ones, or warnings alone.
 
-A line across the top says when something needs you: no pool connection, no new job from the pool for over three minutes, or under-voltage now.
+A line across the top says when something needs you: no pool connection, no new job from the pool for over three minutes, under-voltage now, or the heat limit holding threads back.
 
-The miner's dashboard is read-only. Its settings are the miner's flags, and the node's settings panels (Wi-Fi, clocks, mining mode, the bench) are not served.
+### Settings
 
-- **Access.** It answers this machine only. To open it to your network, give `--dashboard 0.0.0.0:8546`, or `MINER_DASHBOARD`. `--dashboard off` turns it off.
+The Settings tab changes the miner while it runs:
+
+- **Mining:** the pool and the fallback pool, the payout address, the worker name, the midwimble address, the threads and the heat limit. Each is checked before it is used. New pool settings reconnect at once; new threads restart the job's threads. Saved settings are kept in `miner-settings.toml` in the miner's working directory and replace the command line's whole, at every start too, until **Use the command line's** removes the file. The log says at start which it uses, and the tab shows where the command line differs.
+- **Board** (a Raspberry Pi): the clock and the extra voltage, with presets and limits for the board's family as on the node's page (section 5), and on a Pi 5 the fan curve: the Pi's own (on at 50 °C), cooler (on at 40 °C, full at 68 °C), full all the time, or a fixed speed of 20–100% with full speed above 75 °C. Both go into marked `[all]` blocks at the end of `config.txt` and take effect when the Pi restarts; the file as it was is kept in `config.txt.midstate-bak`. **Fit an active cooler before going past the stock clock.**
+- **Test this unit:** mining pauses for five seconds while every core checks it computes Midstate Walk's known answers, cold and hot, and counts attempts. Run it after changing the clock: a core that gets an answer wrong loses shares.
+- **Restart the Pi.**
+
+The board settings and the restart need root, and the miner should not run as root. Set them up once, on the Pi, as the user the miner runs as:
+
+```bash
+sudo /path/to/midstate board-setup
+```
+
+This installs a copy of midstate owned by root at `/usr/local/sbin/midstate-axe-board`, and a line in `/etc/sudoers.d/midstate-axe-board` that lets that user run it, and only it, without a password. The copy knows it is the helper by its name and does three things: report itself, write a clock and fan curve it checks against the board's limits itself, and restart the Pi. Run the setup again after installing a new midstate; `sudo midstate board-setup --remove` takes it all away. A service with `NoNewPrivileges=yes` can't use sudo: the tab says so.
+
+- **Access.** It answers this machine only. To open it to your network, give `--dashboard 0.0.0.0:8546`, or `MINER_DASHBOARD`. `--dashboard off` turns it off. On the network, anyone may look; a change is taken only from this machine or the local network, addressed by an IP address or a local name (`midstate5axe`, `midstate5axe.local`) and not a public one, and not sent by another site's page. Anyone on your network can change the settings, as on a Bitaxe.
 - **Cost.** The hashing threads only bump counters they already had. A sampler reads them and the board every 5 seconds and keeps a day of it, a few hundred kilobytes. `vcgencmd` runs at most every 10 seconds. The pool's stats are asked for at most every 30 seconds, and only while the page is open.
 
 ### As a service
@@ -211,6 +232,9 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+User=midstate
+# Where miner-settings.toml and miner-best.json are kept.
+WorkingDirectory=/home/midstate
 ExecStart=/usr/local/bin/midstate miner --pool-url pool.example:3333 \
     --payout-address <mss address> --worker rig1 --midwimble-address mw1…
 # Uncomment to keep GPUs out (a shared desktop, say):
@@ -224,4 +248,4 @@ Nice=10
 WantedBy=multi-user.target
 ```
 
-`sudo systemctl enable --now midstate-miner`, then `journalctl -u midstate-miner -f` for the log. A pool's `--payout-address` and `--midwimble-address` are only ever read from the command line, so a restart keeps them.
+`sudo systemctl enable --now midstate-miner`, then `journalctl -u midstate-miner -f` for the log. Settings saved on the dashboard replace these flags at every start until you go back to the command line's; delete `miner-settings.toml` from the working directory to do that from a shell.

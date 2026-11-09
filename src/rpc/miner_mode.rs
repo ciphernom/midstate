@@ -27,27 +27,45 @@
 //! `vcgencmd` at most every ten. The pool's stats are asked for at most every
 //! thirty seconds, and only while someone is looking.
 //!
+//! # Settings
+//!
+//! The Settings tab changes what the miner mines with, while it runs: the
+//! pool and a fallback pool, who is paid, the threads and a heat limit
+//! (`rpc::miner_settings`, kept in `miner-settings.toml`). New pool settings
+//! reconnect the stratum client at once; a thread count restarts the job's
+//! threads. The Pi's clock and fan curve, and a reboot, go through a small
+//! root-owned helper set up once with `sudo midstate board-setup`
+//! (`rpc::axe_board`), and take effect at the next boot. "Test this unit"
+//! pauses mining for five seconds to measure the board alone.
+//!
 //! # Access
 //!
 //! It listens on 127.0.0.1 unless told otherwise (`--dashboard`), and then
 //! answers only requests addressed to localhost, so a web page cannot reach it
-//! by pointing a name at 127.0.0.1. It changes nothing: every route is a GET,
-//! and the node's settings routes (Wi-Fi, clocks, mining mode, the bench) are
-//! not served at all, so there is nothing on it to protect.
-
-use crate::mining::StratumStats;
-use axum::extract::{Query, Request, State};
-use axum::http::{header, StatusCode};
+//! by pointing a name at 127.0.0.1. On the network, anyone may look; a change
+//! is taken only ([`may_change`]) from this machine or the local network,
+//! addressed by an IP address or a local name (never a public name, which a
+//! page could point at the Pi: DNS rebinding), sent as JSON (which a page on
+//! another site cannot send without asking first) and not by another site's
+//! page (its `Origin`). A node's routes (Wi-Fi among them) are not served.
+use super::axe_board::{self, Change, Fan};
+use super::miner_settings::MinerSettings;
+use crate::mining::{MinerControl, StratumStats};
+use axum::extract::{ConnectInfo, Query, Request, State};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
+
+pub use crate::mining::pool_api;
 
 /// Where `midstate miner` serves its dashboard unless told otherwise.
 pub const DEFAULT_BIND: &str = "127.0.0.1:8546";
@@ -61,19 +79,6 @@ const KEEP_SAMPLES: usize = 24 * 3600 / 5;
 const CHART_POINTS: usize = 360;
 /// Where the best share ever is kept, beside the miner.
 const BEST_FILE: &str = "miner-best.json";
-
-/// What the miner was started with.
-#[derive(Clone, Debug, Serialize)]
-pub struct MinerSettings {
-    pub pool_url: String,
-    pub payout_address: String,
-    pub worker: String,
-    pub midwimble_address: Option<String>,
-    /// CPU threads asked for (0: every core).
-    pub threads: usize,
-    /// "auto", "gpu" or "cpu".
-    pub backend: String,
-}
 
 /// One reading of the miner and its board.
 #[derive(Clone, Copy, Debug, Serialize, PartialEq)]
@@ -97,50 +102,51 @@ struct Best {
 
 #[derive(Clone)]
 struct Dash {
-    settings: Arc<MinerSettings>,
+    /// What the command line said, for "Use the command line's".
+    command_line: Arc<MinerSettings>,
+    /// "auto", "gpu" or "cpu", from the command line.
+    backend: String,
+    control: Arc<MinerControl>,
+    /// Where saved settings are kept.
+    settings_path: PathBuf,
     hash_counter: Arc<AtomicU64>,
     stats: Arc<RwLock<StratumStats>>,
     started: Instant,
-    /// The pool's HTTP API (`host:8081` for a stratum port of 3333).
-    pool_api: String,
     http: reqwest::Client,
-    /// The pool's view of this miner, and when it was asked.
-    pool: Arc<tokio::sync::Mutex<(Option<Instant>, Option<serde_json::Value>)>>,
+    /// The pool's view of this miner: when it was asked, of which API, and
+    /// what it said.
+    pool: Arc<tokio::sync::Mutex<(Option<Instant>, String, Option<serde_json::Value>)>>,
     history: Arc<RwLock<VecDeque<Sample>>>,
     best_ever: Arc<RwLock<Option<Best>>>,
     loopback_only: bool,
+    /// A unit test is running.
+    testing: Arc<AtomicBool>,
 }
-
-/// The pool's API address, as the stratum client works it out.
-pub fn pool_api(pool_url: &str) -> String {
-    let host = pool_url.replace("stratum+tcp://", "");
-    if let Some((ip, port)) = host.rsplit_once(':') {
-        if let Ok(port) = port.parse::<u16>() {
-            return format!("{}:{}", ip, 8081 + port.saturating_sub(3333));
-        }
-    }
-    host
-}
-
-/// Serves the dashboard on `bind` until the process ends.
+/// Serves the dashboard on `bind` until the process ends. `command_line`:
+/// the settings the command line gave; `control`: the miner's live ones.
 pub async fn serve(
     bind: SocketAddr,
-    settings: MinerSettings,
+    command_line: MinerSettings,
+    backend: String,
+    control: Arc<MinerControl>,
     hash_counter: Arc<AtomicU64>,
     stats: Arc<RwLock<StratumStats>>,
 ) -> anyhow::Result<()> {
     let best = std::fs::read(BEST_FILE).ok().and_then(|b| serde_json::from_slice::<Best>(&b).ok());
     let dash = Dash {
-        pool_api: pool_api(&settings.pool_url),
-        settings: Arc::new(settings),
+        command_line: Arc::new(command_line),
+        backend,
+        control,
+        settings_path: PathBuf::from(super::miner_settings::SETTINGS_FILE),
         hash_counter,
         stats,
         started: Instant::now(),
         http: reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?,
-        pool: Arc::new(tokio::sync::Mutex::new((None, None))),
+        pool: Arc::new(tokio::sync::Mutex::new((None, String::new(), None))),
         history: Arc::new(RwLock::new(VecDeque::new())),
         best_ever: Arc::new(RwLock::new(best)),
         loopback_only: bind.ip().is_loopback(),
+        testing: Arc::new(AtomicBool::new(false)),
     };
     tokio::spawn(sampler(dash.clone()));
     let app = router(dash);
@@ -148,14 +154,28 @@ pub async fn serve(
     if bind.ip().is_loopback() {
         tracing::info!("miner dashboard: http://{bind}/axe (this machine only; --dashboard <ip:port> to change)");
     } else {
-        tracing::warn!("miner dashboard: http://{bind}/axe, reachable from your network. It is read-only.");
+        tracing::warn!("miner dashboard: http://{bind}/axe, reachable from your network, which can change its settings.");
     }
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
 }
 
 fn router(dash: Dash) -> Router {
     let loopback_only = dash.loopback_only;
+    let changes = Router::new()
+        .route("/axe/settings", post(save_settings))
+        .route("/axe/settings/reset", post(reset_settings))
+        .route("/axe/board", post(board))
+        .route("/axe/reboot", post(reboot))
+        .route("/axe/bench", post(bench))
+        .route_layer(middleware::from_fn(|req: Request, next: Next| async move {
+            let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip());
+            match peer.map(|p| may_change(p, req.headers())) {
+                Some(Ok(())) => next.run(req).await,
+                Some(Err(why)) => refuse(StatusCode::FORBIDDEN, why),
+                None => refuse(StatusCode::FORBIDDEN, "Who sent this is not known.".into()),
+            }
+        }));
     Router::new()
         .route("/", get(page))
         .route("/axe", get(page))
@@ -164,6 +184,7 @@ fn router(dash: Dash) -> Router {
         .route("/axe/logs", get(logs))
         .route("/axe/config", get(config))
         .route("/midstate.css", get(super::handlers::midstate_css))
+        .merge(changes)
         .with_state(dash)
         .layer(middleware::from_fn(move |req: Request, next: Next| async move {
             if loopback_only && !addressed_to_localhost(&req) {
@@ -173,6 +194,69 @@ fn router(dash: Dash) -> Router {
         }))
 }
 
+fn refuse(status: StatusCode, error: String) -> Response {
+    (status, Json(serde_json::json!({ "ok": false, "error": error }))).into_response()
+}
+
+/// Whether `ip` is this machine or on the local network.
+fn peer_is_local(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => peer_is_local(IpAddr::V4(v4)),
+            // Loopback, unique local (fc00::/7) and link-local (fe80::/10).
+            None => v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00 || (v6.segments()[0] & 0xffc0) == 0xfe80,
+        },
+    }
+}
+
+/// The name in a Host header, without its port.
+fn host_name(host: &str) -> &str {
+    match host.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(""),
+        None => host.rsplit_once(':').map_or(host, |(n, _)| n),
+    }
+}
+
+/// Whether `host` (a Host header) names this machine the way only the local
+/// network can: an IP address, `localhost`, a bare host name, or a name under
+/// a suffix no public DNS serves. A page on the web can point a name of its
+/// own at the Pi's address (DNS rebinding), but not one of these.
+fn host_is_local_name(host: &str) -> bool {
+    let name = host_name(host).trim_end_matches('.').to_ascii_lowercase();
+    if name.parse::<IpAddr>().is_ok() || name == "localhost" {
+        return true;
+    }
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.') {
+        return false;
+    }
+    !name.contains('.')
+        || [".local", ".lan", ".home", ".home.arpa", ".internal", ".localdomain"].iter().any(|s| name.ends_with(s))
+}
+
+/// Whether a request from `peer` with `headers` may change the miner's
+/// settings, and if not, why (the text to show).
+pub(crate) fn may_change(peer: IpAddr, headers: &HeaderMap) -> Result<(), String> {
+    if !peer_is_local(peer) {
+        return Err("Settings can be changed only from this machine or your local network.".into());
+    }
+    let host = headers.get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("");
+    if !host_is_local_name(host) {
+        return Err(format!(
+            "Settings can't be changed through the name {}. Open the dashboard by the Pi's IP address or its .local name.",
+            host_name(host)
+        ));
+    }
+    if let Some(origin) = headers.get(header::ORIGIN).and_then(|o| o.to_str().ok()) {
+        if origin.split("://").nth(1).unwrap_or(origin) != host {
+            return Err("Refused: this came from another site's page.".into());
+        }
+    }
+    if headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) == Some("cross-site") {
+        return Err("Refused: this came from another site's page.".into());
+    }
+    Ok(())
+}
 /// Whether a request names this machine in its Host header: what a browser
 /// on it sends, and what a page that points another name at 127.0.0.1
 /// (DNS rebinding) does not.
@@ -192,9 +276,25 @@ async fn page() -> Html<&'static str> {
     Html(include_str!("hasher_dashboard.html"))
 }
 
-/// The mining settings, read-only.
-async fn config(State(d): State<Dash>) -> Response {
-    let s = &d.settings;
+/// The settings, the command line's beside them, and the board's: what the
+/// Settings tab fills its forms with. `can_change` says whether this browser
+/// may change them, and `why_not` why when it may not.
+async fn config(State(d): State<Dash>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap) -> Json<serde_json::Value> {
+    let s = MinerSettings::current(&d.control);
+    let model = axe_board::board_model();
+    let profile = model.as_deref().and_then(super::axe::profile);
+    let boot = axe_board::boot_config_path().and_then(|p| std::fs::read_to_string(p).ok());
+    let (mhz, voltage) = boot
+        .as_deref()
+        .map(|c| super::axe::configured(c, profile.as_ref()))
+        .unwrap_or((None, None));
+    let pi5 = profile.as_ref().is_some_and(|p| p.family == super::axe::Family::Pi5);
+    let fan = boot.as_deref().map(axe_board::configured_fan).filter(|_| pi5);
+    let helper = match profile {
+        Some(_) => Some(axe_board::helper_status().await),
+        None => None,
+    };
+    let change = may_change(peer.ip(), &headers);
     Json(serde_json::json!({
         "mode": "pool",
         "pool_url": s.pool_url,
@@ -202,10 +302,150 @@ async fn config(State(d): State<Dash>) -> Response {
         "worker": s.worker,
         "midwimble_address": s.midwimble_address,
         "threads": s.threads,
-        "backend": s.backend,
-        "read_only": true,
+        "backend": d.backend,
+        "settings": s,
+        "command_line": *d.command_line,
+        "saved": d.settings_path.exists(),
+        "cores": crate::mining::cores(),
+        "heat_limit_range": [super::miner_settings::HEAT_LIMIT_RANGE.start(), super::miner_settings::HEAT_LIMIT_RANGE.end()],
+        "can_change": change.is_ok(),
+        "why_not": change.err(),
+        "board": {
+            "model": model,
+            "clock": profile,
+            "configured_mhz": mhz,
+            "configured_voltage": voltage,
+            "fan": fan,
+            "fan_text": fan.map(|f| f.describe()),
+            "fan_min_percent": axe_board::FAN_MIN_PERCENT,
+            "helper": helper,
+            "setup_command": axe_board::setup_command(),
+        },
     }))
-    .into_response()
+}
+
+/// POST /axe/settings: checks, keeps and applies new settings.
+async fn save_settings(State(d): State<Dash>, Json(next): Json<MinerSettings>) -> Response {
+    let next = match next.check() {
+        Ok(s) => s,
+        Err(e) => return refuse(StatusCode::BAD_REQUEST, e),
+    };
+    if let Err(e) = next.save(&d.settings_path) {
+        return refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not keep the settings: {e}"));
+    }
+    let before = MinerSettings::current(&d.control);
+    next.apply(&d.control);
+    tracing::info!("settings saved from the dashboard ({})", d.settings_path.display());
+    let message = if before.pool() != next.pool() {
+        "Saved. Reconnecting to the pool with them."
+    } else if before == next {
+        "Saved. Nothing changed."
+    } else {
+        "Saved and in use."
+    };
+    Json(serde_json::json!({ "ok": true, "message": message, "settings": next })).into_response()
+}
+
+/// POST /axe/settings/reset: back to the command line's settings.
+async fn reset_settings(State(d): State<Dash>, Json(_): Json<serde_json::Value>) -> Response {
+    if let Err(e) = MinerSettings::forget(&d.settings_path) {
+        return refuse(StatusCode::INTERNAL_SERVER_ERROR, e);
+    }
+    d.command_line.apply(&d.control);
+    tracing::info!("back to the command line's settings");
+    Json(serde_json::json!({ "ok": true, "message": "Using the command line's settings again.", "settings": *d.command_line })).into_response()
+}
+
+#[derive(Deserialize)]
+struct ClockBody {
+    mhz: u32,
+    /// In the board's unit (microvolts on a Pi 5).
+    voltage: u32,
+}
+
+#[derive(Deserialize)]
+struct BoardBody {
+    clock: Option<ClockBody>,
+    fan: Option<Fan>,
+    #[serde(default)]
+    reboot: bool,
+}
+
+/// POST /axe/board: the clock and fan curve, written to the boot config by
+/// the helper, and a reboot to bring them in if asked.
+async fn board(Json(body): Json<BoardBody>) -> Response {
+    let change = Change { clock: body.clock.map(|c| (c.mhz, c.voltage)), fan: body.fan };
+    if change == Change::default() {
+        return refuse(StatusCode::BAD_REQUEST, "Nothing to set: give a clock, a fan curve or both.".into());
+    }
+    // Checked here for a quick answer; the helper checks again, as root.
+    if let (Some(model), Some(boot)) = (axe_board::board_model(), axe_board::boot_config_path().and_then(|p| std::fs::read_to_string(p).ok())) {
+        if let Err(e) = change.rewrite(&model, &boot) {
+            return refuse(StatusCode::BAD_REQUEST, e);
+        }
+    }
+    let message = match axe_board::helper_apply(change).await {
+        Ok(m) => m,
+        Err(e) => return refuse(StatusCode::CONFLICT, e),
+    };
+    tracing::info!(
+        "board settings written{}{}",
+        change.clock.map(|(m, v)| format!(": {m} MHz, +{v}")).unwrap_or_default(),
+        change.fan.map(|f| format!(", fan {}", f.describe())).unwrap_or_default()
+    );
+    if body.reboot {
+        schedule_reboot();
+        return Json(serde_json::json!({ "ok": true, "rebooting": true, "message": format!("{message} Restarting now: the dashboard is back in about a minute.") })).into_response();
+    }
+    Json(serde_json::json!({ "ok": true, "rebooting": false, "message": message })).into_response()
+}
+
+/// Reboots through the helper in two seconds, once the answer has gone.
+fn schedule_reboot() {
+    tokio::spawn(async {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        tracing::warn!("restarting the Pi, as asked from the dashboard");
+        if let Err(e) = axe_board::helper_reboot().await {
+            tracing::error!("could not restart the Pi: {e}");
+        }
+    });
+}
+
+/// POST /axe/reboot.
+async fn reboot(Json(_): Json<serde_json::Value>) -> Response {
+    let status = axe_board::helper_status().await;
+    if !status.ready {
+        return refuse(StatusCode::CONFLICT, status.problem.unwrap_or_else(|| "The board helper is not set up.".into()));
+    }
+    schedule_reboot();
+    Json(serde_json::json!({ "ok": true, "message": "Restarting now: the dashboard is back in about a minute." })).into_response()
+}
+
+/// POST /axe/bench, "Test this unit": mining pauses, then every core checks
+/// it computes Midstate Walk's known answers, counts attempts for five
+/// seconds, and checks them again while hot. After an overclock, the way to
+/// find out whether it holds: a core that gets one wrong loses shares.
+async fn bench(State(d): State<Dash>, Json(_): Json<serde_json::Value>) -> Response {
+    if d.testing.swap(true, Ordering::SeqCst) {
+        return refuse(StatusCode::CONFLICT, "A test is already running.".into());
+    }
+    d.control.set_paused(true);
+    // The hashing threads stop at their next check.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let threads = crate::mining::cores();
+    let result = tokio::task::spawn_blocking(move || crate::core::walk::bench(threads, Duration::from_secs(5))).await;
+    d.control.set_paused(false);
+    d.testing.store(false, Ordering::SeqCst);
+    let Ok((rate, correct)) = result else {
+        return refuse(StatusCode::INTERNAL_SERVER_ERROR, "The test could not run.".into());
+    };
+    let message = if correct {
+        format!("Every core computed the known answers: {rate:.0} attempts a second on {threads} threads.")
+    } else {
+        "A core computed a wrong answer: this clock is unstable. Lower it or add voltage, then test again.".to_string()
+    };
+    tracing::info!("unit test: {message}");
+    Json(serde_json::json!({ "ok": true, "threads": threads, "attempts_per_second": rate, "correct": correct, "message": message })).into_response()
 }
 
 // ── Sampling ────────────────────────────────────────────────────────────────
@@ -308,7 +548,8 @@ fn read_trim(path: &str) -> Option<String> {
     std::fs::read_to_string(path).ok().map(|s| s.trim().trim_end_matches('\0').to_string())
 }
 
-fn temp_c() -> Option<f32> {
+/// The CPU's temperature, °C.
+pub fn temp_c() -> Option<f32> {
     read_trim("/sys/class/thermal/thermal_zone0/temp")?.parse::<f32>().ok().map(|m| m / 1000.0).filter(|t| *t > 0.0)
 }
 
@@ -442,15 +683,18 @@ async fn stats(State(d): State<Dash>) -> Json<serde_json::Value> {
     let throttled = super::handlers::throttled_flags().await;
     let power = pmic().await;
     let fan = fan();
-    let cpu_threads = match d.settings.threads {
-        0 => std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
-        n => n,
-    };
+    let threads = d.control.threads();
+    let settings = MinerSettings::current(&d.control);
     let ago = |unix: u64| (unix > 0).then(|| now.saturating_sub(unix));
     let best_ever = d.best_ever.read().unwrap_or_else(|e| e.into_inner()).clone();
     let known = |t: &[u8; 32]| (*t != [0u8; 32]).then(|| difficulty(t));
-    let mut miner = serde_json::to_value(&*d.settings).unwrap_or_default();
+    let pool_in_use = if s.pool_url.is_empty() { settings.pool_url.clone() } else { s.pool_url.clone() };
+    let mut miner = serde_json::to_value(&settings).unwrap_or_default();
     let extra = serde_json::json!({
+        "backend": d.backend,
+        "pool_in_use": pool_in_use,
+        "on_fallback": s.on_fallback,
+        "saved": d.settings_path.exists(),
         "connected": s.connected,
         "accepted": s.accepted_shares,
         "rejected": s.rejected_shares,
@@ -462,13 +706,18 @@ async fn stats(State(d): State<Dash>) -> Json<serde_json::Value> {
         "connected_s": ago(s.connected_since),
         "reconnects": s.reconnects,
         "latency_ms": s.latency_ms,
-        "cpu_threads": cpu_threads,
+        // Hashing now; fewer than asked while the heat limit holds some
+        // back, none while paused (the unit test).
+        "cpu_threads": threads.running(),
+        "threads_wanted": threads.wanted(),
+        "heat_holding_back": threads.heat_cap.is_some_and(|c| c < threads.wanted()),
+        "paused": threads.paused,
         "share_difficulty": known(&s.share_target),
         "network_difficulty": known(&s.network_target),
         "best_difficulty": s.best_share.as_ref().map(difficulty),
         "best_ever_difficulty": best_ever.as_ref().and_then(|b| hex32(&b.hash)).map(|h| difficulty(&h)),
         "best_ever_unix": best_ever.as_ref().map(|b| b.unix),
-        "pool": pool_view(&d).await,
+        "pool": pool_view(&d, &pool_in_use, &settings.payout_address).await,
     });
     if let (Some(m), Some(e)) = (miner.as_object_mut(), extra.as_object()) {
         m.extend(e.clone());
@@ -500,16 +749,17 @@ async fn stats(State(d): State<Dash>) -> Json<serde_json::Value> {
     }))
 }
 
-/// What the pool says about this miner, asked for at most every thirty
-/// seconds: its part of the round, the pool's fee, what a block pays, and
-/// merged mining.
-async fn pool_view(d: &Dash) -> Option<serde_json::Value> {
+/// What the pool at `pool_url` says about `payout`, asked for at most every
+/// thirty seconds: its part of the round, the pool's fee, what a block pays,
+/// and merged mining.
+async fn pool_view(d: &Dash, pool_url: &str, payout: &str) -> Option<serde_json::Value> {
+    let api = pool_api(pool_url);
     let mut cache = d.pool.lock().await;
-    if cache.0.is_some_and(|at| at.elapsed() < POOL_STATS_EVERY) {
-        return cache.1.clone();
+    if cache.1 == api && cache.0.is_some_and(|at| at.elapsed() < POOL_STATS_EVERY) {
+        return cache.2.clone();
     }
-    let url = format!("http://{}/pool/stats", d.pool_api);
-    let me = crate::core::types::parse_address_flexible(&d.settings.payout_address).ok();
+    let url = format!("http://{api}/pool/stats");
+    let me = crate::core::types::parse_address_flexible(payout).ok();
     let fresh = async {
         let v: serde_json::Value = d.http.get(&url).send().await.ok()?.json().await.ok()?;
         let mine = v["miners"].as_array().into_iter().flatten().find(|m| {
@@ -533,8 +783,8 @@ async fn pool_view(d: &Dash) -> Option<serde_json::Value> {
         }))
     }
     .await;
-    *cache = (Some(Instant::now()), fresh);
-    cache.1.clone()
+    *cache = (Some(Instant::now()), api, fresh);
+    cache.2.clone()
 }
 
 #[derive(Deserialize)]
@@ -552,16 +802,26 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    fn settings() -> MinerSettings {
+        MinerSettings {
+            pool_url: "127.0.0.1:1".into(),
+            fallback_url: None,
+            payout_address: "07".repeat(32),
+            worker: "rig".into(),
+            midwimble_address: None,
+            threads: 2,
+            heat_limit_c: None,
+        }
+    }
+
     fn dash(loopback_only: bool) -> Dash {
+        let dir = std::env::temp_dir().join(format!("midstate-dash-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
         Dash {
-            settings: Arc::new(MinerSettings {
-                pool_url: "127.0.0.1:1".into(),
-                payout_address: "payout".into(),
-                worker: "rig".into(),
-                midwimble_address: None,
-                threads: 2,
-                backend: "auto".into(),
-            }),
+            command_line: Arc::new(settings()),
+            backend: "auto".into(),
+            control: Arc::new(MinerControl::new(settings().pool(), 2, None)),
+            settings_path: dir.join(super::super::miner_settings::SETTINGS_FILE),
             hash_counter: Arc::new(AtomicU64::new(1234)),
             stats: Arc::new(RwLock::new(StratumStats {
                 accepted_shares: 5,
@@ -572,22 +832,29 @@ mod tests {
                 ..Default::default()
             })),
             started: Instant::now(),
-            pool_api: "127.0.0.1:1".into(),
             http: reqwest::Client::new(),
-            pool: Arc::new(tokio::sync::Mutex::new((None, None))),
+            pool: Arc::new(tokio::sync::Mutex::new((None, String::new(), None))),
             history: Arc::new(RwLock::new(VecDeque::new())),
             best_ever: Arc::new(RwLock::new(None)),
             loopback_only,
+            testing: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// One request over a real socket, with the Host header given.
-    async fn call(d: Dash, method: &str, path: &str, host: &str) -> (StatusCode, String) {
+    /// One request over a real socket, with the Host header and any other
+    /// headers and body given.
+    async fn send(d: Dash, method: &str, path: &str, host: &str, headers: &[(&str, &str)], body: &str) -> (StatusCode, String) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, router(d)).await.unwrap() });
+        tokio::spawn(async move {
+            axum::serve(listener, router(d).into_make_service_with_connect_info::<SocketAddr>()).await.unwrap()
+        });
         let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let req = format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let extra: String = headers.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect();
+        let req = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {host}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
         conn.write_all(req.as_bytes()).await.unwrap();
         let mut raw = Vec::new();
         conn.read_to_end(&mut raw).await.unwrap();
@@ -595,6 +862,16 @@ mod tests {
         let code: u16 = text.split_whitespace().nth(1).unwrap().parse().unwrap();
         let body = text.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
         (StatusCode::from_u16(code).unwrap(), body)
+    }
+
+    async fn call(d: Dash, method: &str, path: &str, host: &str) -> (StatusCode, String) {
+        send(d, method, path, host, &[], "").await
+    }
+
+    async fn post_json(d: Dash, path: &str, host: &str, body: &serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let (s, b) = send(d, "POST", path, host, &[("Content-Type", "application/json")], &body.to_string()).await;
+        let v = if b.contains('{') { json_of(&b) } else { serde_json::Value::Null };
+        (s, v)
     }
 
     fn json_of(body: &str) -> serde_json::Value {
@@ -621,6 +898,8 @@ mod tests {
         assert_eq!(v["miner"]["connected"], true);
         assert_eq!(v["miner"]["worker"], "rig");
         assert_eq!(v["miner"]["cpu_threads"], 2);
+        assert_eq!(v["miner"]["threads_wanted"], 2);
+        assert_eq!(v["miner"]["pool_in_use"], "127.0.0.1:1");
         assert_eq!(v["miner"]["best_difficulty"], 2f64.powi(20), "0x000010… is 2^236, so 2^20 attempts");
         assert!(v["miner"]["network_difficulty"].is_null(), "no job yet");
         assert!(v["miner"]["pool"].is_null(), "no pool API to ask");
@@ -632,12 +911,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn it_changes_nothing_and_answers_only_this_machine() {
-        for (method, path) in [("POST", "/axe/config"), ("POST", "/axe/overclock"), ("POST", "/axe/wifi"), ("POST", "/axe/bench")] {
-            let (s, _) = call(dash(true), method, path, "127.0.0.1").await;
-            assert!(s == StatusCode::METHOD_NOT_ALLOWED || s == StatusCode::NOT_FOUND, "{method} {path}: {s}");
-        }
-        for path in ["/state", "/peers", "/mempool", "/metrics"] {
+    async fn it_answers_only_this_machine_unless_told_and_serves_no_node_routes() {
+        for path in ["/state", "/peers", "/mempool", "/metrics", "/axe/wifi", "/axe/overclock"] {
             let (s, _) = call(dash(true), "GET", path, "127.0.0.1").await;
             assert_eq!(s, StatusCode::NOT_FOUND, "{path} is the node's");
         }
@@ -647,6 +922,114 @@ mod tests {
         assert_eq!(s, StatusCode::OK);
         let (s, _) = call(dash(false), "GET", "/axe/stats", "axe.local:8546").await;
         assert_eq!(s, StatusCode::OK, "on the network, when asked for");
+    }
+
+    #[test]
+    fn changes_come_only_from_the_local_network_by_a_local_name() {
+        let headers = |pairs: &[(&'static str, &str)]| {
+            let mut h = HeaderMap::new();
+            for (k, v) in pairs {
+                h.insert(*k, v.parse().unwrap());
+            }
+            h
+        };
+        let lan: IpAddr = "192.168.50.20".parse().unwrap();
+        for host in ["192.168.50.17:8546", "midstate5axe:8546", "midstate5axe.local:8546", "localhost:8546", "[fe80::1]:8546", "axe.home.arpa"] {
+            assert!(may_change(lan, &headers(&[("host", host)])).is_ok(), "{host}");
+        }
+        // A page on the web pointing its own name at the Pi.
+        let rebound = may_change(lan, &headers(&[("host", "pi.attacker.example:8546")])).unwrap_err();
+        assert!(rebound.contains("pi.attacker.example") && rebound.contains("IP address"), "{rebound}");
+        assert!(may_change(lan, &headers(&[])).is_err(), "no Host");
+        // Another site's page, by its Origin or the browser's own word.
+        let h = headers(&[("host", "192.168.50.17:8546"), ("origin", "http://evil.example")]);
+        assert!(may_change(lan, &h).unwrap_err().contains("another site"));
+        let h = headers(&[("host", "192.168.50.17:8546"), ("origin", "http://192.168.50.17:8546")]);
+        assert!(may_change(lan, &h).is_ok(), "the dashboard's own page");
+        let h = headers(&[("host", "192.168.50.17:8546"), ("sec-fetch-site", "cross-site")]);
+        assert!(may_change(lan, &h).is_err());
+        // From outside the network (a forwarded port).
+        let wan: IpAddr = "203.0.113.9".parse().unwrap();
+        assert!(may_change(wan, &headers(&[("host", "192.168.50.17:8546")])).unwrap_err().contains("local network"));
+        assert!(peer_is_local("::ffff:10.0.0.2".parse().unwrap()) && peer_is_local("fd12::1".parse().unwrap()));
+        assert!(!peer_is_local("2001:db8::1".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn settings_are_checked_kept_and_applied_while_it_runs() {
+        let d = dash(false);
+        let (control, path) = (d.control.clone(), d.settings_path.clone());
+
+        // Only JSON: a form posted by another site's page is not taken.
+        let (s, _) = send(d.clone(), "POST", "/axe/settings", "192.168.1.5", &[("Content-Type", "application/x-www-form-urlencoded")], "pool_url=x").await;
+        assert_eq!(s, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        let mut next = settings();
+        next.payout_address = "nope".into();
+        let (s, v) = post_json(d.clone(), "/axe/settings", "192.168.1.5", &serde_json::to_value(&next).unwrap()).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(v["error"].as_str().unwrap().starts_with("Payout address"), "{v}");
+        assert!(!path.exists(), "nothing kept");
+
+        let mut next = settings();
+        next.pool_url = "stratum+tcp://other.example:3334".into();
+        next.fallback_url = Some("127.0.0.1:1".into());
+        next.threads = 1;
+        next.heat_limit_c = Some(75.0);
+        let (s, v) = post_json(d.clone(), "/axe/settings", "192.168.1.5", &serde_json::to_value(&next).unwrap()).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert!(v["message"].as_str().unwrap().contains("Reconnecting"), "{v}");
+        assert_eq!(MinerSettings::current(&control), next, "in use at once");
+        assert_eq!(MinerSettings::load(&path).unwrap(), Some(next.clone()), "and kept");
+
+        let (s, body) = call(d.clone(), "GET", "/axe/config", "192.168.1.5").await;
+        assert_eq!(s, StatusCode::OK);
+        let v = json_of(&body);
+        assert_eq!(v["saved"], true);
+        assert_eq!(v["settings"]["pool_url"], "stratum+tcp://other.example:3334");
+        assert_eq!(v["command_line"]["pool_url"], "127.0.0.1:1");
+        assert_eq!(v["can_change"], true);
+        let (_, body) = call(d.clone(), "GET", "/axe/config", "pi.attacker.example").await;
+        assert_eq!(json_of(&body)["can_change"], false);
+
+        // Refused from a rebinding name.
+        let (s, v) = post_json(d.clone(), "/axe/settings/reset", "pi.attacker.example", &serde_json::json!({})).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{v}");
+        assert!(path.exists());
+
+        let (s, v) = post_json(d.clone(), "/axe/settings/reset", "192.168.1.5", &serde_json::json!({})).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert!(!path.exists());
+        assert_eq!(MinerSettings::current(&control), settings(), "the command line's again");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn board_changes_are_checked_and_need_the_helper() {
+        let d = dash(true);
+        let (s, v) = post_json(d.clone(), "/axe/board", "localhost", &serde_json::json!({})).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        let (s, v) = post_json(d.clone(), "/axe/board", "localhost", &serde_json::json!({ "fan": { "mode": "loud" } })).await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
+        // Off a Pi with the helper set up, it says what is missing.
+        if !std::path::Path::new(axe_board::HELPER_PATH).exists() {
+            let (s, v) = post_json(d.clone(), "/axe/board", "localhost", &serde_json::json!({ "fan": { "mode": "cool" } })).await;
+            assert!(s == StatusCode::CONFLICT || s == StatusCode::BAD_REQUEST, "{s} {v}");
+            let (s, v) = post_json(d, "/axe/reboot", "localhost", &serde_json::json!({})).await;
+            assert_eq!(s, StatusCode::CONFLICT, "{v}");
+            assert!(v["error"].as_str().unwrap().contains("setup"), "{v}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_unit_test_pauses_mining_and_gives_it_back() {
+        let d = dash(true);
+        let control = d.control.clone();
+        let (s, v) = post_json(d, "/axe/bench", "localhost", &serde_json::json!({})).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["correct"], true, "{v}");
+        assert!(v["attempts_per_second"].as_f64().unwrap() > 0.0);
+        assert!(!control.threads().paused, "mining resumes");
     }
 
     #[test]

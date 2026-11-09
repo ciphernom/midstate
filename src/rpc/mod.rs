@@ -3,7 +3,9 @@ pub mod handlers;
 pub mod types;
 pub mod pow_governor;
 pub mod axe;
+pub mod axe_board;
 pub mod miner_mode;
+pub mod miner_settings;
 pub mod log_ring;
 
 pub use server::RpcServer;
