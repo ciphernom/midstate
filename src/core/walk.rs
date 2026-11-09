@@ -380,8 +380,10 @@ fn step<A: AesRound>(s: usize, op: u8, r: &mut [u64; 8], c: &mut u64, pad: &mut 
     pad[f][j ^ 6] = m3 ^ x;
 }
 
+/// Seeds a walk: its registers and first program from BLAKE3, and `pad`
+/// grown from its four AES lanes.
 #[inline(always)]
-fn walk_generic<A: AesRound>(mining_hash: &[u8; 32], nonce: u64, pad: &mut Pad) -> [u8; 32] {
+fn start_generic<A: AesRound>(mining_hash: &[u8; 32], nonce: u64, pad: &mut Pad) -> ([u64; 8], [u8; 8]) {
     let mut seed = [0u8; 200];
     blake3::Hasher::new_derive_key(CTX_INIT)
         .update(mining_hash)
@@ -393,7 +395,7 @@ fn walk_generic<A: AesRound>(mining_hash: &[u8; 32], nonce: u64, pad: &mut Pad) 
     for (k, w) in r.iter_mut().enumerate() {
         *w = le64(&seed[8 * k..]);
     }
-    let mut prog = program(le64(&seed[192..]));
+    let prog = program(le64(&seed[192..]));
 
     // Grow the pad from four AES lanes, one round per 16 bytes.
     let mut lanes = [[0u8; 16]; 4];
@@ -409,7 +411,23 @@ fn walk_generic<A: AesRound>(mining_hash: &[u8; 32], nonce: u64, pad: &mut Pad) 
             line[2 * q + 1] = le64(&lanes[q][8..]);
         }
     }
+    (r, prog)
+}
 
+/// The proof-of-work hash of a walk's last registers.
+#[inline(always)]
+fn finish(mining_hash: &[u8; 32], nonce: u64, r: &[u64; 8]) -> [u8; 32] {
+    *blake3::Hasher::new_derive_key(CTX_FINAL)
+        .update(mining_hash)
+        .update(&nonce.to_le_bytes())
+        .update(&regs_bytes(r))
+        .finalize()
+        .as_bytes()
+}
+
+#[inline(always)]
+fn walk_generic<A: AesRound>(mining_hash: &[u8; 32], nonce: u64, pad: &mut Pad) -> [u8; 32] {
+    let (mut r, mut prog) = start_generic::<A>(mining_hash, nonce, pad);
     let mut c = 0u64;
     for round in 0..WALK_STEPS / 8 {
         // Eight steps, one per register, written out so that each step's
@@ -428,13 +446,200 @@ fn walk_generic<A: AesRound>(mining_hash: &[u8; 32], nonce: u64, pad: &mut Pad) 
             remix(&mut r, &mut prog);
         }
     }
+    finish(mining_hash, nonce, &r)
+}
 
-    *blake3::Hasher::new_derive_key(CTX_FINAL)
-        .update(mining_hash)
-        .update(&nonce.to_le_bytes())
-        .update(&regs_bytes(&r))
-        .finalize()
-        .as_bytes()
+// ── Several walks per thread ────────────────────────────────────────────────
+//
+// One walk keeps a core waiting: every step's loads depend on the step
+// before, so an out-of-order core that could issue four instructions a cycle
+// averages about one. Walks of other nonces are independent, so a thread
+// can step several in turn (A0, B0, A1, B1, ...) and the core overlaps
+// their waits, as SMT does on CPUs that have it. Their pads share the core's
+// L2, which two of them fill on a Cortex-A76: whether it pays is measured
+// (`midstate bench-pow --interleave`), not assumed. Each hash is its walk's.
+
+/// The walks of `nonces`, `K` of them stepped in turn on this thread, with a
+/// scratchpad each.
+#[inline(always)]
+fn walk_many_generic<A: AesRound, const K: usize>(mining_hash: &[u8; 32], nonces: &[u64; K], pads: &mut [Box<Pad>; K]) -> [[u8; 32]; K] {
+    let mut r = [[0u64; 8]; K];
+    let mut prog = [[0u8; 8]; K];
+    let mut c = [0u64; K];
+    for k in 0..K {
+        (r[k], prog[k]) = start_generic::<A>(mining_hash, nonces[k], &mut pads[k]);
+    }
+    for round in 0..WALK_STEPS / 8 {
+        macro_rules! steps {
+            ($($s:literal)*) => {$(
+                for k in 0..K {
+                    step::<A>($s, prog[k][$s], &mut r[k], &mut c[k], &mut pads[k]);
+                }
+            )*};
+        }
+        steps!(0 1 2 3 4 5 6 7);
+        if (round + 1) % (WALK_REMIX / 8) == 0 {
+            for k in 0..K {
+                remix(&mut r[k], &mut prog[k]);
+            }
+        }
+    }
+    std::array::from_fn(|k| finish(mining_hash, nonces[k], &r[k]))
+}
+
+/// The proof-of-work hashes of `K` nonces, their walks stepped in turn on
+/// this thread (`pads`: one scratchpad each), with the fastest AES this CPU
+/// has. Each is exactly [`walk_hash`] of its nonce.
+pub fn walk_hash_many<const K: usize>(mining_hash: &[u8; 32], nonces: &[u64; K], pads: &mut [Box<Pad>; K]) -> [[u8; 32]; K] {
+    match backend() {
+        #[cfg(target_arch = "x86_64")]
+        Backend::AesNi => unsafe { x86::walk_many(mining_hash, nonces, pads) },
+        #[cfg(target_arch = "aarch64")]
+        Backend::Armv8 => unsafe { arm::walk_many(mining_hash, nonces, pads) },
+        _ => walk_many_generic::<SoftAes, K>(mining_hash, nonces, pads),
+    }
+}
+
+/// Pins this thread to CPU `cpu`, where the system allows (Linux). Whether
+/// it did.
+pub fn pin_to_cpu(cpu: usize) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        extern "C" {
+            fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u64) -> i32;
+        }
+        let mut set = [0u64; 16]; // a cpu_set_t: 1024 CPUs
+        if cpu >= 1024 {
+            return false;
+        }
+        set[cpu / 64] |= 1 << (cpu % 64);
+        // SAFETY: pid 0 is this thread; the mask is a whole cpu_set_t.
+        unsafe { sched_setaffinity(0, std::mem::size_of_val(&set), set.as_ptr()) == 0 }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = cpu;
+        false
+    }
+}
+
+/// Attempts a second with `K` walks stepped in turn per thread, over
+/// `threads` threads for `duration`, pinned to a core each if `pin`; and
+/// whether every thread computed [`GOLDEN`] right that way before and after.
+pub fn bench_many<const K: usize>(threads: usize, duration: std::time::Duration, pin: bool) -> (f64, bool) {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    let mining_hash = crate::core::types::hash(b"midstate walk bench");
+    let stop = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicU64::new(0));
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let start = std::time::Instant::now();
+    let workers: Vec<_> = (0..threads.max(1))
+        .map(|t| {
+            let (stop, done) = (stop.clone(), done.clone());
+            std::thread::spawn(move || {
+                if pin {
+                    pin_to_cpu(t % cores);
+                }
+                let mut pads: [Box<Pad>; K] = std::array::from_fn(|_| new_pad());
+                let mut good = golden_many::<K>(&mut pads);
+                let mut nonce = (t as u64) << 40;
+                while !stop.load(Ordering::Relaxed) {
+                    let nonces: [u64; K] = std::array::from_fn(|k| nonce + k as u64);
+                    std::hint::black_box(walk_hash_many::<K>(&mining_hash, &nonces, &mut pads));
+                    nonce += K as u64;
+                    done.fetch_add(K as u64, Ordering::Relaxed);
+                }
+                good &= golden_many::<K>(&mut pads);
+                good
+            })
+        })
+        .collect();
+    std::thread::sleep(duration);
+    stop.store(true, Ordering::Relaxed);
+    let good = workers.into_iter().all(|w| w.join().unwrap_or(false));
+    (done.load(Ordering::Relaxed) as f64 / start.elapsed().as_secs_f64(), good)
+}
+
+/// Whether [`walk_hash_many`] computes [`GOLDEN`], the known answers spread
+/// over its `K` walks (each walk's own mining hash and nonce).
+fn golden_many<const K: usize>(pads: &mut [Box<Pad>; K]) -> bool {
+    let decode = |h: &str| {
+        let mut b = [0u8; 32];
+        hex::decode_to_slice(h, &mut b).map(|_| b)
+    };
+    // Walks in one call share a mining hash, so each known answer is run
+    // in every slot, with the other slots running other nonces beside it.
+    (0..K).all(|slot| {
+        GOLDEN.iter().all(|(m, nonce, want)| {
+            let (Ok(m), Ok(want)) = (decode(m), decode(want)) else { return false };
+            let nonces: [u64; K] = std::array::from_fn(|k| if k == slot { *nonce } else { nonce.wrapping_add(1 + k as u64) });
+            walk_hash_many::<K>(&m, &nonces, pads)[slot] == want
+        })
+    })
+}
+
+// ── The walk in three parts, for GPUs ───────────────────────────────────────
+//
+// A GPU runs the steps (`core::wgpu_walk`); the CPU seeds each walk and grows
+// its pad, which is BLAKE3 and AES and a few microseconds, and hashes what
+// the steps leave. Together they are exactly `walk_hash`.
+
+/// A walk's state after `steps` of its steps: its registers, its program,
+/// and the previous step's output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WalkState {
+    pub r: [u64; 8],
+    pub prog: [u8; 8],
+    pub c: u64,
+    pub steps: usize,
+}
+
+/// Seeds the walk of `nonce` and grows `pad`, with the fastest AES this CPU
+/// has: the state before its first step.
+pub fn walk_start(mining_hash: &[u8; 32], nonce: u64, pad: &mut Pad) -> WalkState {
+    let (r, prog) = match backend() {
+        #[cfg(target_arch = "x86_64")]
+        Backend::AesNi => unsafe { x86::start(mining_hash, nonce, pad) },
+        #[cfg(target_arch = "aarch64")]
+        Backend::Armv8 => unsafe { arm::start(mining_hash, nonce, pad) },
+        _ => start_generic::<SoftAes>(mining_hash, nonce, pad),
+    };
+    WalkState { r, prog, c: 0, steps: 0 }
+}
+
+/// Runs `n` more steps of a walk on the CPU (the portable path), re-mixing
+/// where the walk does. `n` and the steps already run are multiples of 8.
+/// The reference a GPU's partial runs are checked against.
+pub fn walk_steps(st: &mut WalkState, pad: &mut Pad, n: usize) {
+    assert!(st.steps % 8 == 0 && n % 8 == 0 && st.steps + n <= WALK_STEPS, "whole rounds of eight, within the walk");
+    for _ in 0..n / 8 {
+        for s in 0..8 {
+            step::<SoftAes>(s, st.prog[s], &mut st.r, &mut st.c, pad);
+        }
+        st.steps += 8;
+        if st.steps % WALK_REMIX == 0 {
+            remix(&mut st.r, &mut st.prog);
+        }
+    }
+}
+
+/// The proof-of-work hash of a walk whose steps have all run.
+pub fn walk_finish(mining_hash: &[u8; 32], nonce: u64, r: &[u64; 8]) -> [u8; 32] {
+    finish(mining_hash, nonce, r)
+}
+
+/// One AES round (`AESENC`) of `lo ‖ hi` under a zero key, as the walk's
+/// AES operation computes it, through the portable table: for checking a
+/// GPU's.
+pub fn aes_round_pair(lo: u64, hi: u64) -> (u64, u64) {
+    SoftAes::round_pair(lo, hi)
+}
+
+/// The program a 64-bit draw decodes to (which operation each register
+/// runs): for checking a GPU's.
+pub fn program_of(z: u64) -> [u8; 8] {
+    program(z)
 }
 
 // ── One AES round ───────────────────────────────────────────────────────────
@@ -578,6 +783,20 @@ mod x86 {
         super::walk_generic::<AesNi>(m, nonce, pad)
     }
 
+    /// # Safety
+    /// The CPU must support AES-NI and SSE2.
+    #[target_feature(enable = "aes,sse2")]
+    pub(super) unsafe fn start(m: &[u8; 32], nonce: u64, pad: &mut super::Pad) -> ([u64; 8], [u8; 8]) {
+        super::start_generic::<AesNi>(m, nonce, pad)
+    }
+
+    /// # Safety
+    /// The CPU must support AES-NI and SSE2.
+    #[target_feature(enable = "aes,sse2")]
+    pub(super) unsafe fn walk_many<const K: usize>(m: &[u8; 32], nonces: &[u64; K], pads: &mut [Box<super::Pad>; K]) -> [[u8; 32]; K] {
+        super::walk_many_generic::<AesNi, K>(m, nonces, pads)
+    }
+
     /// One AESENC round, for cross-checks.
     ///
     /// # Safety
@@ -625,6 +844,20 @@ mod arm {
     #[target_feature(enable = "aes,neon")]
     pub(super) unsafe fn walk(m: &[u8; 32], nonce: u64, pad: &mut super::Pad) -> [u8; 32] {
         super::walk_generic::<Armv8>(m, nonce, pad)
+    }
+
+    /// # Safety
+    /// The CPU must support the ARMv8 AES extension.
+    #[target_feature(enable = "aes,neon")]
+    pub(super) unsafe fn start(m: &[u8; 32], nonce: u64, pad: &mut super::Pad) -> ([u64; 8], [u8; 8]) {
+        super::start_generic::<Armv8>(m, nonce, pad)
+    }
+
+    /// # Safety
+    /// The CPU must support the ARMv8 AES extension.
+    #[target_feature(enable = "aes,neon")]
+    pub(super) unsafe fn walk_many<const K: usize>(m: &[u8; 32], nonces: &[u64; K], pads: &mut [Box<super::Pad>; K]) -> [[u8; 32]; K] {
+        super::walk_many_generic::<Armv8, K>(m, nonces, pads)
     }
 
     /// One AESENC round, for cross-checks.
@@ -739,6 +972,46 @@ mod tests {
             assert_eq!(walk_hash_portable(&m, nonce), hex32(want), "portable, nonce {nonce}");
         }
         assert!(check_golden());
+    }
+
+    /// Seeding, the steps in pieces, and the final hash are the walk.
+    #[test]
+    fn the_walk_in_three_parts_is_the_walk() {
+        for (m, nonce, want) in GOLDEN {
+            let m = hex32(m);
+            let mut pad = new_pad();
+            let mut st = walk_start(&m, nonce, &mut pad);
+            // Pieces that cross re-mixes and end on them.
+            for n in [8, WALK_REMIX - 8, WALK_REMIX, WALK_STEPS - 2 * WALK_REMIX] {
+                walk_steps(&mut st, &mut pad, n);
+            }
+            assert_eq!(st.steps, WALK_STEPS);
+            assert_eq!(walk_finish(&m, nonce, &st.r), hex32(want), "nonce {nonce}");
+            // The start with hardware AES is the portable one's.
+            let mut other = new_pad();
+            let (r, prog) = start_generic::<SoftAes>(&m, nonce, &mut other);
+            let mut again = new_pad();
+            let fast = walk_start(&m, nonce, &mut again);
+            assert_eq!((fast.r, fast.prog), (r, prog));
+            assert!(other[..] == again[..], "the same pad");
+        }
+    }
+
+    /// Walks stepped in turn on one thread are each the walk of its nonce.
+    #[test]
+    fn walks_stepped_in_turn_are_each_their_own() {
+        let m = hex32(GOLDEN[2].0);
+        let mut pads2: [Box<Pad>; 2] = std::array::from_fn(|_| new_pad());
+        let two = walk_hash_many::<2>(&m, &[42, 43], &mut pads2);
+        assert_eq!(two, [walk_hash_portable(&m, 42), walk_hash_portable(&m, 43)]);
+        assert_eq!(two[0], hex32(GOLDEN[2].2));
+        let mut pads3: [Box<Pad>; 3] = std::array::from_fn(|_| new_pad());
+        let three = walk_hash_many::<3>(&m, &[1, 42, 2], &mut pads3);
+        assert_eq!(three[1], hex32(GOLDEN[2].2));
+        assert_eq!(three[2], walk_hash(&m, 2));
+        assert!(golden_many::<2>(&mut pads2) && golden_many::<1>(&mut [new_pad()]));
+        let (rate, good) = bench_many::<2>(2, std::time::Duration::from_millis(300), true);
+        assert!(rate > 0.0 && good);
     }
 
     #[test]
