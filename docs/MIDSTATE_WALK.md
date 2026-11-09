@@ -208,8 +208,47 @@ midstate bench-pow --interleave [--seconds S] [--threads T]
 
 This measures 1, 2 and 3 walks per thread, with the threads pinned to their
 cores and not. Pinning matters because the L2 is per core, so a thread that
-migrates warms 256 KiB again. Each run checks the known answers. The miner
-still runs one walk per thread and changes only if the Pi's numbers say so.
+migrates warms 256 KiB again. Each run checks the known answers.
+
+On a Raspberry Pi 5 (4 threads, 10 s each) it does not pay:
+
+| Walks per thread | Attempts/s | Against one |
+|---|---|---|
+| 1 | 1,495.9 | |
+| 1, pinned | 1,490.5 | −0.4% |
+| 2 | 364.4 | −75.6% |
+| 2, pinned | 370.3 | −75.2% |
+| 3 | 194.6 | −87.0% |
+| 3, pinned | 193.7 | −87.0% |
+
+Two pads fill a core's 512 KiB L2, and four cores' eight pads (2 MiB) fill
+the shared L3, so the loads go out to DRAM. That is the scratchpad doing what
+it was sized for: one walk per core is the most a Pi 5 can run. Pinning
+changes nothing. The miner keeps one walk per thread, and on a Pi the lever
+left is the clock.
+
+### Checking a GPU
+
+`bench-pow --gpu` checks the kernel before it measures:
+
+1. Every operation on 2^20 operand pairs against the CPU, then the re-mix on
+   2^16 register sets.
+2. The three known answers, each as a whole walk.
+3. If one comes out wrong, it finds where. It runs the walk in stretches of
+   one re-mix, checking each against the CPU. It runs a wrong stretch again
+   from the CPU's state, which tells a fault that comes and goes (a GPU
+   reset, a race) from one that repeats. Then it narrows the fault to one
+   step, with a variant of the kernel that stops at any step.
+4. It reports that step: the register, the operation and its inputs, and
+   when each of its four pad words was last written. It also reports whether
+   the operation alone gives the right answer on the GPU, and whether the
+   GPU's result is what the step gives with one of its words as it was
+   before an earlier step wrote it (a stale read).
+
+The first Pi 5 run came out right for known answer 0 and wrong for known
+answer 1, on Mesa 25.0.7's v3dv. A software Vulkan driver computes all three
+right, so the fault lies in how the Pi's driver runs the kernel. The search
+above is how it will be found.
 
 ## What changed in consensus
 
