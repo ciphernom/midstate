@@ -694,6 +694,7 @@ mod tests {
             owner_next_leaf: 0,
             seen_live: true,
             bond_file: None,
+            pool: None,
             reg: RegStatus { phase: phase.into(), ..RegStatus::default() },
         };
         // Without a registration on file, nothing is usable, whatever the

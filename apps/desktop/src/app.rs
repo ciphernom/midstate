@@ -260,6 +260,11 @@ pub struct App {
     pub bond_form_open: bool,
     /// A co-bond's pool name, kept as the bond's label.
     pub bond_label: String,
+    /// A pool's co-bond terms, for the address they were asked of.
+    pub pool_terms: Option<(String, Result<midstate_walletd::co_bond::PoolTerms, String>)>,
+    /// The pool address last asked about, and when the field last changed.
+    pub pool_asked: String,
+    pub pool_edit_at: f64,
     /// "Lock bond" was pressed once; the next press locks.
     pub bond_confirm: bool,
     pub bond_import: String,
@@ -527,6 +532,9 @@ impl App {
             bond_test: false,
             bond_form_open: false,
             bond_label: String::new(),
+            pool_terms: None,
+            pool_asked: String::new(),
+            pool_edit_at: 0.0,
             bond_confirm: false,
             bond_import: String::new(),
             bond_import_label: String::new(),
@@ -1177,6 +1185,9 @@ impl App {
                     self.bond_exp = self.bond_exp.max(r.registration_min.trailing_zeros());
                 }
                 self.bond_rules = Some(r);
+            }
+            Msg::PoolTerms(url, r) => {
+                self.pool_terms = Some((url, r));
             }
             Msg::CoBondFile(id, text) => {
                 self.busy = false;

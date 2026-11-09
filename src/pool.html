@@ -386,6 +386,42 @@ tr.mine > td { background: var(--accent-bg); }
       <div class="ref-note">Every share also earns midwimble score for the address your miner gives with <span class="mono">--midwimble-address</span>; shares without one count for the pool. A midwimble block pays at most 31 addresses: anyone with 1/31 of the score is paid exactly, the rest by a draw that gives each its share on average. Midwimble amounts are confidential, so blocks show each address's share. A block midwimble replaces pays nobody, so the scores it took go back to the table for the next block.</div>
     </div>
 
+    <div class="pool-box" id="cb-box" hidden>
+      <h2>Co-bond With This Pool</h2>
+      <div class="mw-head">
+        <span class="badge" id="cb-badge"><span class="mark">&middot;</span><span id="cb-badge-text">checking&hellip;</span></span>
+        <span class="mw-note" id="cb-note"></span>
+      </div>
+      <div class="cards">
+        <div class="card">
+          <div class="card-k">Co-bonds Signing</div>
+          <div class="card-v" id="cb-signing">--</div>
+          <div class="card-sub" id="cb-signing-sub">bonds others locked on this pool's key</div>
+        </div>
+        <div class="card">
+          <div class="card-k">Midwimble Fee</div>
+          <div class="card-v" id="cb-fee">--</div>
+          <div class="card-sub" id="cb-fee-sub">--</div>
+        </div>
+        <div class="card">
+          <div class="card-k">Shared With Co-bonders</div>
+          <div class="card-v" id="cb-reward">--</div>
+          <div class="card-sub">of the pool's midwimble fee, evenly per bond</div>
+        </div>
+      </div>
+      <h3>This pool's mining key</h3>
+      <div class="code"><span id="cb-key">--</span></div>
+      <button type="button" class="btn-verify" id="cb-copy">copy key</button>
+      <h3>Co-bonds</h3>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Bond</th><th class="num">Size</th><th>Status</th><th>Rewards To</th></tr></thead>
+          <tbody id="cb-bonds"><tr class="empty-row"><td colspan="4">None yet.</td></tr></tbody>
+        </table>
+      </div>
+      <div class="ref-note">A co-bond is a mining bond you lock on this pool's key. Midwimble lets each bond sign an even share of full-weight blocks, so the bonds behind a pool decide how many of its midwimble blocks count. To co-bond, open Bonds in the Midstate desktop wallet, choose New bond, then A pool, and give it this page's address. The wallet locks the bond and hands it in here, and the pool registers it, which takes about a day. Only your wallet can ever spend the coin, and it comes back when the lock ends.</div>
+    </div>
+
     <div class="pool-box">
       <h2>How to Connect</h2>
       <p class="hint">Provably-fair SPV pool. Your miner mathematically audits the pool every block.</p>
@@ -1023,10 +1059,16 @@ function fmtMdw(units) {
 // one (or more) with a chance in proportion to its score. Amounts need the
 // block's reward, which an older pool doesn't send; chances don't.
 const MW_SLOTS = 31;
+const MW_PAYOUT_SCALE = 1125899906842624;   // 2^50, as pool.rs
 function mwNextBlock(mw, feePercent) {
-  const scores = (mw && mw.scores) || [];
+  // With co-bonds cutting fees or sharing them, the pool sends each
+  // address's part of the block before the draw; otherwise it is the score.
+  const weights = mw && mw.next_weights;
+  const scores = weights ? weights.map((w) => ({ address: w.address, score: Number(w.weight) || 0 })) : ((mw && mw.scores) || []);
   const total = scores.reduce((a, s) => a + (Number(s.score) || 0), 0);
-  const pot = (Number(mw && mw.reward) || 0) * (1 - (Number(feePercent) || 0) / 100);
+  const pot = weights
+    ? (Number(mw && mw.reward) || 0) * total / MW_PAYOUT_SCALE
+    : (Number(mw && mw.reward) || 0) * (1 - (Number(feePercent) || 0) / 100);
   const by = new Map();
   let exactPaid = 0, exactCount = 0, smallWeight = 0;
   scores.forEach((s) => {
@@ -1383,6 +1425,99 @@ function renderMinerEarnChart(events) {
     charts.mnearn.resize();
   }
 }
+
+// ---------------------------------------------------------------------------
+// Co-bonds: the pool's mining key, what co-bonding gives, and the bonds
+// standing behind the pool (`/pool/api/co-bonds`).
+// ---------------------------------------------------------------------------
+let coBonds = null;                     // the last answer, for address pages
+
+// A bond's size in midstate units, as the wallet shows it ("128 gMDS").
+function fmtBond(units) {
+  const v = Number(units) || 0;
+  const g = 1073741824, m = 1048576, k = 1024;
+  const [div, name] = v >= g ? [g, 'gMDS'] : v >= m ? [m, 'mMDS'] : v >= k ? [k, 'kMDS'] : [1, 'MDS'];
+  return (v / div).toLocaleString('en-US', { maximumFractionDigits: 4 }) + ' ' + name;
+}
+
+const CB_PHASES = {
+  waiting: 'proving the lock',
+  burying: 'registering',
+  ready: 'ready to register',
+  registered: 'signing',
+  expired: 'expired',
+  failed: 'retrying',
+};
+
+// How many co-bonds sign for the pool under `address`, and its midwimble fee.
+function coBondFee(address) {
+  const cb = coBonds;
+  if (!cb) return null;
+  const bonds = (cb.co_bonds || []).filter((b) => b.phase === 'registered' && b.address === address).length;
+  const fee = Math.max(0, (Number(cb.fee_percent) || 0) - (Number(cb.fee_cut) || 0) * bonds);
+  return { bonds, fee };
+}
+
+function renderCoBonds(cb) {
+  coBonds = cb;
+  const show = !!(cb && cb.merge_mining);
+  $('cb-box').hidden = !show;
+  if (!show) return;
+  const accepting = !!cb.accepting;
+  $('cb-badge').className = 'badge ' + (accepting ? 'ok' : 'bad');
+  $('cb-badge-text').textContent = accepting ? 'taking co-bonds' : 'not taking co-bonds';
+  $('cb-note').textContent = cb.note || '';
+  $('cb-key').textContent = cb.mining_key || '--';
+  $('cb-copy').hidden = !cb.mining_key;
+
+  const bonds = cb.co_bonds || [];
+  $('cb-signing').textContent = fmtInt(Number(cb.registered) || 0);
+  const coming = bonds.filter((b) => ['waiting', 'burying', 'ready', 'failed'].includes(b.phase)).length;
+  $('cb-signing-sub').textContent = coming ? (fmtInt(coming) + ' more registering') : 'bonds others locked on this pool’s key';
+  const fee = Number(cb.fee_percent) || 0, cut = Number(cb.fee_cut) || 0;
+  $('cb-fee').textContent = fee.toFixed(2).replace(/\.?0+$/, '') + '%';
+  $('cb-fee-sub').textContent = cut > 0
+    ? (cut.toFixed(2).replace(/\.?0+$/, '') + ' points less per co-bond you hand in')
+    : 'the same with or without a co-bond';
+  const reward = Number(cb.reward_percent) || 0;
+  $('cb-reward').textContent = reward > 0 ? (reward.toFixed(2).replace(/\.?0+$/, '') + '%') : 'none';
+
+  const label = (addr) => addr
+    ? '<a class="addr" href="' + mwHref(addr) + '" title="' + esc(addr) + '">' + esc(shortAddr(addr)) + '</a>' + (isMyMw(addr) ? youTag : '')
+    : '<span class="mw-note">no address</span>';
+  renderPaged('cb-bonds', bonds, {
+    cols: 4, size: 10, noun: 'co-bonds',
+    placeholder: 'Search a bond id or an address',
+    empty: '<tr class="empty-row"><td colspan="4">None yet.</td></tr>',
+    text: (b) => (String(b.bond_id) + ' ' + (b.address || '')).toLowerCase(),
+    mine: (b) => !!b.address && isMyMw(b.address),
+    row: (b) => {
+      const phase = CB_PHASES[b.phase] || String(b.phase || '');
+      const pct = b.phase === 'burying' ? (' · ' + fmtInt(b.progress) + '%') : '';
+      return '<tr' + (b.address && isMyMw(b.address) ? ' class="mine"' : '') + '>' +
+        '<td><span class="addr" title="' + esc(b.bond_id) + '">' + esc(shortAddr(String(b.bond_id))) + '</span></td>' +
+        '<td class="num">' + (Number(b.value) ? fmtBond(b.value) : '--') + '</td>' +
+        '<td title="' + esc(b.note || '') + '">' + esc(phase + pct) + '</td>' +
+        '<td>' + label(b.address) + '</td></tr>';
+    },
+  });
+}
+
+async function fetchCoBonds() {
+  try {
+    const res = await fetch('/pool/api/co-bonds');
+    if (!res.ok) return;
+    renderCoBonds(await res.json());
+  } catch (_) { /* an older pool has no co-bonds */ }
+}
+
+$('cb-copy').addEventListener('click', () => {
+  const key = coBonds && coBonds.mining_key;
+  if (key && navigator.clipboard) navigator.clipboard.writeText(key).then(() => {
+    $('cb-copy').textContent = 'copied';
+    setTimeout(() => { $('cb-copy').textContent = 'copy key'; }, 1500);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // Polling + client-side BigInt math
@@ -1924,6 +2059,12 @@ function renderMwAddress(data, address) {
     ? ((total > 0 ? (score / total * 100).toFixed(2) + '% of the next block · ' : '') +
        '#' + fmtInt(at + 1) + ' of ' + fmtInt(scores.length))
     : 'none toward the next block yet';
+  // Its co-bonds signing for the pool, and the midwimble fee they leave it.
+  const cbf = coBondFee(address);
+  if (cbf && cbf.bonds > 0) {
+    $('mwa-rank').textContent += ' · ' + fmtInt(cbf.bonds) + ' co-bond' + (cbf.bonds === 1 ? '' : 's') +
+      ', fee ' + cbf.fee.toFixed(2).replace(/\.?0+$/, '') + '%';
+  }
 
   // Paid exactly, or drawn: see mwNextBlock.
   if (!nb) {
@@ -2149,6 +2290,8 @@ new MutationObserver((muts) => {
 renderRoute();                          // set the correct view immediately
 fetchStats();                           // first load
 setInterval(fetchStats, POLL_MS);       // then every 5s
+fetchCoBonds();
+setInterval(fetchCoBonds, 30000);
 </script>
 </body>
 </html>

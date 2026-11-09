@@ -477,6 +477,7 @@ impl Service {
             owner_next_leaf: 0,
             seen_live: false,
             bond_file: None,
+            pool: None,
             reg: RegStatus {
                 phase: "waiting".into(),
                 note: "Registering: the wallet takes a proof once the bond confirms on midstate.".into(),
@@ -838,6 +839,7 @@ impl Service {
                             owner_next_leaf: 0,
                             seen_live: false,
                             bond_file: None,
+                            pool: None,
                             reg: RegStatus::default(),
                         };
                         if self.bonds.find(&rec.coin_id()).is_none() {
