@@ -94,6 +94,18 @@ impl Variant {
     pub fn is_walk(&self) -> bool {
         self.real_ops && self.lines == WALK_LINES as u32
     }
+
+    /// Its pipeline constants, as [`kernel_source`] declares them.
+    pub fn constants(&self) -> [(&'static str, f64); 5] {
+        let b = |x: bool| if x { 1.0 } else { 0.0 };
+        [
+            ("WG", self.workgroup as f64),
+            ("LINES", self.lines as f64),
+            ("REAL_OPS", b(self.real_ops)),
+            ("GROUPED", b(self.grouped)),
+            ("LIMITED", b(self.limit)),
+        ]
+    }
 }
 
 // ── The kernel ──────────────────────────────────────────────────────────────
@@ -270,41 +282,21 @@ fn blake3_out(m_in: array<u32, 16>, counter: u32) -> array<u32, 16> {
 }
 "#;
 
-/// One step on register `s`, written out for the kernel.
-fn step_source(s: usize, v: &Variant) -> String {
+/// One step on register `s`, written out for the kernel. The pipeline
+/// constants pick what it does: the walk's operation or (`REAL_OPS` false)
+/// an XOR, and with `LIMITED`, nothing from `P.limit` on.
+fn step_source(s: usize) -> String {
     let t = |d: usize| (s + 1 + d) % 8;
-    let op = if v.real_ops {
-        format!(
-            r#"switch ((prog >> {shift}u) & 7u) {{
-            case 0u: {{ y = mul64(v, k | vec2<u32>(1u, 0u)); }}
-            case 1u: {{ y = v ^ mulhi64(v, k); }}
-            case 2u: {{ y = add64(v, div64n(k, v.x | 0x80000001u)); }}
-            case 3u: {{ let o = aes(v, k); y = o.xy; h = o.zw; }}
-            case 4u: {{ y = rotr64(v, k.x & 63u); }}
-            case 5u: {{ y = add64(v, k); }}
-            case 6u: {{ y = sub64(v, k); }}
-            default: {{ y = v ^ k; }}
-        }}"#,
-            shift = 3 * s
-        )
-    } else {
-        "y = v ^ k;".to_string()
-    };
-    let (open, close) = if v.limit {
-        (format!("\n    if (P.start + n * 8u + {s}u < P.limit) {{"), "\n    }".to_string())
-    } else {
-        (String::new(), String::new())
-    };
     format!(
-        r#"{open}
-    {{
+        r#"
+    if (!LIMITED || P.start + n * 8u + {s}u < P.limit) {{
         let x = r{s} ^ c;
-        let a = x.x & LMASK;
+        let a = x.x & (LINES - 1u);
         let toff = (x.x >> 12u) & 3u;
         let j = (x.x >> 14u) & 7u;
-        let e = (x.x >> 17u) & LMASK;
-        let b = x.y & LMASK;
-        let f = (x.y >> 12u) & LMASK;
+        let e = (x.x >> 17u) & (LINES - 1u);
+        let b = x.y & (LINES - 1u);
+        let f = (x.y >> 12u) & (LINES - 1u);
         let ia = base + a * 8u + j;
         let ib = base + b * 8u + (j ^ 4u);
         let ie = base + e * 8u + (j ^ 2u);
@@ -315,9 +307,20 @@ fn step_source(s: usize, v: &Variant) -> String {
         let m3 = pads[if_];
         let k = select(select(r{t0}, r{t1}, toff == 1u), select(r{t2}, r{t3}, toff == 3u), toff >= 2u);
         let v = x ^ m0 ^ m2;
-        var y = vec2<u32>(0u, 0u);
+        var y = v ^ k;
         var h = vec2<u32>(0u, 0u);
-        {op}
+        if (REAL_OPS) {{
+            switch ((prog >> {shift}u) & 7u) {{
+                case 0u: {{ y = mul64(v, k | vec2<u32>(1u, 0u)); }}
+                case 1u: {{ y = v ^ mulhi64(v, k); }}
+                case 2u: {{ y = add64(v, div64n(k, v.x | 0x80000001u)); }}
+                case 3u: {{ let o = aes(v, k); y = o.xy; h = o.zw; }}
+                case 4u: {{ y = rotr64(v, k.x & 63u); }}
+                case 5u: {{ y = add64(v, k); }}
+                case 6u: {{ y = sub64(v, k); }}
+                default: {{}}
+            }}
+        }}
         let out = y ^ m1 ^ m3;
         r{s} = out;
         r{t0} = r{t0} ^ select(vec2<u32>(0u, 0u), h, toff == 0u);
@@ -329,7 +332,8 @@ fn step_source(s: usize, v: &Variant) -> String {
         pads[ib] = add64(m1, x);
         pads[ie] = add64(m2, y);
         pads[if_] = m3 ^ x;
-    }}{close}"#,
+    }}"#,
+        shift = 3 * s,
         t0 = t(0),
         t1 = t(1),
         t2 = t(2),
@@ -337,32 +341,41 @@ fn step_source(s: usize, v: &Variant) -> String {
     )
 }
 
-/// The WGSL for `v`: the common functions, the walk's steps kernel
-/// (`walk_steps`), and two test kernels (`test_ops`, `test_remix`).
-pub fn shader(v: &Variant) -> String {
-    let steps: String = (0..8).map(|s| step_source(s, v)).collect();
+/// The kernel's WGSL: the common functions, the walk's steps kernel
+/// (`walk_steps`), and two test kernels (`test_ops`, `test_remix`). One
+/// source for every [`Variant`]: its fields are pipeline constants
+/// ([`Variant::constants`]). `bench --dump-wgsl` writes it out and `--wgsl`
+/// runs an edited one, with nothing compiled.
+pub fn kernel_source() -> String {
+    let steps: String = (0..8).map(step_source).collect();
     let regs_in: String = (0..8).map(|i| format!("    var r{i} = st[sb + {i}u];\n")).collect();
     let regs_out: String = (0..8).map(|i| format!("    st[sb + {i}u] = r{i};\n")).collect();
     let regs_m = (0..8).map(|i| format!("r{i}.x, r{i}.y")).collect::<Vec<_>>().join(", ");
     let regs_set: String = (0..8).map(|i| format!("            r{i} = vec2<u32>(o[{}], o[{}]);\n", 2 * i, 2 * i + 1)).collect();
     format!(
-        r#"// Midstate Walk, generated by core::wgpu_walk for workgroup {wg}, {lines} lines, {ops}.
-const LMASK: u32 = {lmask}u;
+        r#"// Midstate Walk for GPUs, written out by core::wgpu_walk (midstate {version}).
+// The pipeline constants below are set for each variant the bench runs.
+override WG: u32 = 64u;           // invocations per workgroup
+override LINES: u32 = {lines}u;      // pad lines used: the walk's own, or 8 (a probe)
+override REAL_OPS: bool = true;   // the walk's operations, or an XOR for each (a probe)
+override GROUPED: bool = false;   // lanes run walks in the order the host sorts them
+override LIMITED: bool = false;   // no step from P.limit on
 const PAD_WORDS: u32 = {pad_words}u;
 const REMIX: u32 = {remix}u;
 {common}
 
-@compute @workgroup_size({wg})
+@compute @workgroup_size(WG)
 fn walk_steps(@builtin(global_invocation_id) gid: vec3<u32>) {{
     if (gid.x >= P.walks) {{ return; }}
-    let w = {walk_index};
+    let w = select(gid.x, order[gid.x], GROUPED);
     let sb = w * {state_words}u;
-    let base = {pad_base};
+    // A probe's few lines are shared by every walk, so they stay cached.
+    let base = select(w * PAD_WORDS, 0u, LINES < {lines}u);
 {regs_in}    var c = st[sb + 8u];
     var prog = st[sb + 9u].x;
     for (var n = 0u; n < P.steps / 8u; n = n + 1u) {{
 {steps}
-        if (((P.start + (n + 1u) * 8u) & (REMIX - 1u)) == 0u{remix_limit}) {{
+        if (((P.start + (n + 1u) * 8u) & (REMIX - 1u)) == 0u && (!LIMITED || P.start + (n + 1u) * 8u <= P.limit)) {{
             let m = array<u32, 16>({regs_m});
             let o = blake3_out(m, 0u);
 {regs_set}            let o1 = blake3_out(m, 1u);
@@ -415,17 +428,12 @@ fn test_remix(@builtin(global_invocation_id) gid: vec3<u32>) {{
     st[sb + 9u] = vec2<u32>(program(vec2<u32>(o1[0], o1[1])), 0u);
 }}
 "#,
-        wg = v.workgroup,
-        lines = v.lines,
-        ops = if v.real_ops { "the walk's operations" } else { "XOR for every operation" },
-        lmask = v.lines - 1,
+        version = env!("CARGO_PKG_VERSION"),
+        lines = WALK_LINES,
         pad_words = PAD_WORDS,
         remix = WALK_REMIX,
         common = COMMON,
         state_words = STATE_WORDS,
-        walk_index = if v.grouped { "order[gid.x]" } else { "gid.x" },
-        remix_limit = if v.limit { " && P.start + (n + 1u) * 8u <= P.limit" } else { "" },
-        pad_base = if v.lines < WALK_LINES as u32 { "0u" } else { "w * PAD_WORDS" },
     )
 }
 
@@ -524,6 +532,9 @@ pub struct GpuWalker {
     queue: wgpu::Queue,
     pipeline_layout: wgpu::PipelineLayout,
     pipelines: std::collections::HashMap<(Variant, &'static str), wgpu::ComputePipeline>,
+    /// The kernel run instead of [`kernel_source`], if any.
+    source: Option<String>,
+    module: Option<wgpu::ShaderModule>,
     params: wgpu::Buffer,
     state: wgpu::Buffer,
     pads: wgpu::Buffer,
@@ -635,6 +646,8 @@ impl GpuWalker {
             queue,
             pipeline_layout,
             pipelines: Default::default(),
+            source: None,
+            module: None,
             params,
             state,
             pads,
@@ -645,19 +658,38 @@ impl GpuWalker {
     }
 
     /// The pipeline for `entry` of variant `v`, compiled once.
+    /// Runs the kernel from `source` instead of [`kernel_source`]: an edited
+    /// copy, to try a change on a GPU with nothing compiled. Before any run.
+    pub fn use_source(&mut self, source: String) {
+        self.source = Some(source);
+        self.module = None;
+        self.pipelines.clear();
+    }
+
     fn pipeline(&mut self, v: Variant, entry: &'static str) -> Result<&wgpu::ComputePipeline, String> {
         if !self.pipelines.contains_key(&(v, entry)) {
             let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-            let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("walk"),
-                source: wgpu::ShaderSource::Wgsl(shader(&v).into()),
-            });
+            let source = self.source.clone().unwrap_or_else(kernel_source);
+            let module = self
+                .module
+                .get_or_insert_with(|| {
+                    self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some("walk"),
+                        source: wgpu::ShaderSource::Wgsl(source.into()),
+                    })
+                })
+                .clone();
+            let constants = v.constants();
             let pipe = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(entry),
                 layout: Some(&self.pipeline_layout),
                 module: &module,
                 entry_point: Some(entry),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    // The test kernels are the same whatever the variant.
+                    constants: if entry == "walk_steps" { &constants } else { &[] },
+                    ..Default::default()
+                },
                 cache: None,
             });
             if let Some(e) = pollster::block_on(scope.pop()) {
@@ -1121,7 +1153,7 @@ fn busy_cores() -> Option<f64> {
     std::thread::sleep(Duration::from_secs(1));
     let (t1, i1) = read()?;
     let total = (t1 - t0).max(1) as f64;
-    Some((1.0 - (i1 - i0) as f64 / total) * super::super::mining::cores() as f64)
+    Some((1.0 - (i1 - i0) as f64 / total) * cores() as f64)
 }
 
 // ── The benchmark ───────────────────────────────────────────────────────────
@@ -1139,6 +1171,10 @@ pub struct BenchOptions {
     pub threads: usize,
     /// Also run the CPU and the GPU together.
     pub with_cpu: bool,
+    /// The board's temperature and power, in words, for before and after.
+    pub board: fn() -> String,
+    /// A kernel to run instead of [`kernel_source`] (an edited copy).
+    pub wgsl: Option<String>,
 }
 
 /// One measurement: attempts a second, and the steps a second behind it.
@@ -1153,7 +1189,7 @@ struct Point {
 /// Runs `walks` walks of `v` for about `secs` from fresh seeds: attempts a
 /// second, from the steps done (seeding is the CPU's and not counted).
 fn measure(g: &mut GpuWalker, v: Variant, walks: u32, secs: f64, salt: u64) -> Result<Point, String> {
-    let mining_hash = super::types::hash(b"midstate bench-pow --gpu");
+    let mining_hash = *blake3::hash(b"midstate bench-pow --gpu").as_bytes();
     let (mut timed, mut chunk, mut busy, mut round) = (0f64, 8u32, 0f64, 0u64);
     while busy < secs {
         // Fresh walks whenever the last ran out of steps; seeding them is
@@ -1178,21 +1214,9 @@ fn measure(g: &mut GpuWalker, v: Variant, walks: u32, secs: f64, salt: u64) -> R
     Ok(Point { variant: v, walks, attempts: steps / WALK_STEPS as f64, steps })
 }
 
-/// The board's temperature and power, where it reports them.
-fn board_reading() -> String {
-    let temp = crate::rpc::miner_mode::temp_c().map(|t| format!("{t:.1} °C"));
-    let watts = std::process::Command::new("vcgencmd")
-        .arg("pmic_read_adc")
-        .output()
-        .ok()
-        .and_then(|o| crate::rpc::miner_mode::parse_pmic(&String::from_utf8_lossy(&o.stdout)))
-        .map(|p| format!("{:.2} W", p.watts));
-    match (temp, watts) {
-        (Some(t), Some(w)) => format!("{t}, {w}"),
-        (Some(t), None) => t,
-        (None, Some(w)) => w,
-        (None, None) => "no sensors".into(),
-    }
+/// This machine's cores.
+fn cores() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
 
 /// `midstate bench-pow --gpu`: checks the kernel against the known answers
@@ -1220,6 +1244,10 @@ pub fn bench(o: &BenchOptions) {
         "\nMeasuring {} ({}, {}). Room for {} walks of 256 KiB; workgroups up to {}.",
         g.info.name, g.info.backend, g.info.kind, g.capacity, g.max_workgroup
     );
+    if let Some(src) = &o.wgsl {
+        println!("Running the kernel given (--wgsl), not the built-in one.");
+        g.use_source(src.clone());
+    }
     if let Some(busy) = busy_cores().filter(|b| *b > 0.5) {
         println!("Something else is using {busy:.1} cores' worth of CPU now. Stop it for clean numbers (the miner: sudo systemctl stop midstate-hasher).");
     }
@@ -1392,7 +1420,7 @@ pub fn bench(o: &BenchOptions) {
     );
 
     // 4. The CPU, for scale.
-    let threads = if o.threads == 0 { super::super::mining::cores() } else { o.threads };
+    let threads = if o.threads == 0 { cores() } else { o.threads };
     let (cpu, good) = walk::bench(threads, Duration::from_secs(o.seconds.max(1)));
     println!(
         "\nThis CPU, {threads} threads: {cpu:.1} attempts/s{}. The GPU adds {:.1}% to it.",
@@ -1402,7 +1430,7 @@ pub fn bench(o: &BenchOptions) {
 
     // 5. Both at once: what the board does when both work, and how hot.
     if o.with_cpu {
-        println!("\nThe CPU and the GPU together, {}s (before: {}):", o.seconds, board_reading());
+        println!("\nThe CPU and the GPU together, {}s (before: {}):", o.seconds, (o.board)());
         let cpu_side = std::thread::spawn({
             let secs = o.seconds;
             move || walk::bench(threads, Duration::from_secs(secs.max(1))).0
@@ -1417,7 +1445,7 @@ pub fn bench(o: &BenchOptions) {
                     "  Together {:.1} attempts/s: {:+.2}% against the CPU alone. After: {}.",
                     cpu_with + p.attempts,
                     100.0 * ((cpu_with + p.attempts) / cpu - 1.0),
-                    board_reading()
+                    (o.board)()
                 );
             }
             Err(e) => println!("  the GPU failed: {e}"),
@@ -1458,12 +1486,15 @@ mod tests {
         assert_eq!(next_chunk(remix, Duration::from_millis(1)), remix, "at most a re-mix's worth");
         assert_eq!(next_chunk(1024, Duration::from_millis(240)), 256);
         assert_eq!(next_chunk(64, Duration::from_secs(5)), 8);
-        let src = shader(&Variant::walk(64));
+        // One source, every variant's differences in its pipeline constants.
+        let src = kernel_source();
         assert!(src.contains("fn walk_steps") && src.contains("r7 = vec2<u32>(o[14], o[15]);"));
-        let probe = shader(&Variant { workgroup: 64, real_ops: false, lines: 8, grouped: false, limit: false });
-        assert!(shader(&Variant { limit: true, ..Variant::walk(64) }).contains("if (P.start + n * 8u + 7u < P.limit) {"));
-        assert!(!probe.contains("mulhi64(v, k)") && probe.contains("let base = 0u;"));
-        assert!(shader(&Variant { grouped: true, ..Variant::walk(64) }).contains("let w = order[gid.x];"));
+        assert!(src.contains("if (!LIMITED || P.start + n * 8u + 7u < P.limit) {"));
+        for (name, _) in Variant::walk(64).constants() {
+            assert!(src.contains(&format!("override {name}:")), "{name} is declared");
+        }
+        let probe = Variant { workgroup: 16, real_ops: false, lines: 8, grouped: true, limit: true };
+        assert_eq!(probe.constants(), [("WG", 16.0), ("LINES", 8.0), ("REAL_OPS", 0.0), ("GROUPED", 1.0), ("LIMITED", 1.0)]);
 
         // Grouping sorts by the AES round's step first, and is a permutation.
         let progs: Vec<[u8; 8]> = (0..500u64).map(|i| walk::program_of(i.wrapping_mul(0x9e37_79b9_7f4a_7c15))).collect();

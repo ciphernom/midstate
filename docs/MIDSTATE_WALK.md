@@ -227,6 +227,29 @@ it was sized for: one walk per core is the most a Pi 5 can run. Pinning
 changes nothing. The miner keeps one walk per thread, and on a Pi the lever
 left is the clock.
 
+### The standalone bencher
+
+`tools/walk-bench` measures the Walk without the rest of midstate: no node,
+wallet or networking, and no fat LTO. It compiles in about a minute where
+midstate takes many. It builds the miner's own `src/core/walk.rs` and
+`src/core/wgpu_walk.rs`, not copies, so what it measures is what mines, and
+its own build of those files runs their tests.
+
+```bash
+cd tools/walk-bench
+cargo build --release --target aarch64-unknown-linux-gnu   # for a Pi 5, from another machine
+midstate-walk-bench cpu          # 1 thread and all threads, with the known answers
+midstate-walk-bench interleave   # as bench-pow --interleave
+midstate-walk-bench gpu [--with-cpu] [--adapter NAME] [--walks N] [--wgsl FILE]
+midstate-walk-bench dump-wgsl walk.wgsl
+```
+
+The GPU kernel is a single WGSL source. What tells one variant from another
+(the workgroup size, the probes, grouping, stopping at a step) is a pipeline
+constant, set when each pipeline is built. So `dump-wgsl` writes the whole
+kernel, and `gpu --wgsl` runs an edited one: a change to the kernel can be
+tried on a GPU without compiling anything.
+
 ### Checking a GPU
 
 `bench-pow --gpu` checks the kernel before it measures:

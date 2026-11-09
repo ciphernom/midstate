@@ -1,0 +1,24 @@
+[package]
+name = "midstate-walk-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Midstate Walk measured without the rest of midstate: on the CPU, several walks per thread, and on GPUs through wgpu."
+
+# Its own workspace, so it builds with nothing of midstate's but the Walk.
+[workspace]
+
+[dependencies]
+blake3 = "1.5"
+hex = "0.4"
+pollster = "0.3"
+wgpu = "29"
+
+# A plain release build: no fat LTO and no single codegen unit, which the
+# miner pays minutes for. The Walk's loop is in this one crate either way.
+[profile.release]
+opt-level = 3
+
+[features]
+# midstate's feature of the same name: the test-sized walk.
+fast-mining = []

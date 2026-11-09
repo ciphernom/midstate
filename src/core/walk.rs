@@ -253,7 +253,7 @@ pub fn check_golden() -> bool {
 pub fn bench(threads: usize, duration: std::time::Duration) -> (f64, bool) {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
-    let mining_hash = crate::core::types::hash(b"midstate walk bench");
+    let mining_hash = *blake3::hash(b"midstate walk bench").as_bytes();
     let stop = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicU64::new(0));
     let start = std::time::Instant::now();
@@ -529,7 +529,7 @@ pub fn pin_to_cpu(cpu: usize) -> bool {
 pub fn bench_many<const K: usize>(threads: usize, duration: std::time::Duration, pin: bool) -> (f64, bool) {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
-    let mining_hash = crate::core::types::hash(b"midstate walk bench");
+    let mining_hash = *blake3::hash(b"midstate walk bench").as_bytes();
     let stop = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicU64::new(0));
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
@@ -563,6 +563,37 @@ pub fn bench_many<const K: usize>(threads: usize, duration: std::time::Duration,
     stop.store(true, Ordering::Relaxed);
     let good = workers.into_iter().all(|w| w.join().unwrap_or(false));
     (done.load(Ordering::Relaxed) as f64 / start.elapsed().as_secs_f64(), good)
+}
+
+/// `bench-pow --interleave`: attempts a second with 1, 2 and 3 walks stepped
+/// in turn per thread, pinned to cores and not, each against 1 unpinned,
+/// with the temperature (`temp`, °C) after each. Prints as it goes.
+pub fn print_interleave(seconds: u64, threads: usize, temp: fn() -> Option<f32>) {
+    let threads = if threads == 0 { std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) } else { threads };
+    let d = std::time::Duration::from_secs(seconds.max(1));
+    println!(
+        "Midstate Walk, walks stepped in turn per thread: {threads} threads, {}s each, AES: {}",
+        d.as_secs(),
+        backend_name()
+    );
+    let mut first = None;
+    for (k, pin) in [(1, false), (1, true), (2, false), (2, true), (3, false), (3, true)] {
+        let (rate, good) = match k {
+            1 => bench_many::<1>(threads, d, pin),
+            2 => bench_many::<2>(threads, d, pin),
+            _ => bench_many::<3>(threads, d, pin),
+        };
+        let against = first.map(|f: f64| format!(" ({:+.1}%)", 100.0 * (rate / f - 1.0))).unwrap_or_default();
+        println!(
+            "  {k} walk{} per thread{:<8} {rate:>9.1} attempts/s{against}{}{}",
+            if k == 1 { " " } else { "s" },
+            if pin { ", pinned" } else { "" },
+            if good { "" } else { "  WRONG: a known answer came out wrong" },
+            temp().map(|t| format!(", {t:.1} °C after")).unwrap_or_default()
+        );
+        first.get_or_insert(rate);
+    }
+    println!("Each line runs after the last, so a board that heats up throttles the later ones: compare the temperatures.");
 }
 
 /// Whether [`walk_hash_many`] computes [`GOLDEN`], the known answers spread
