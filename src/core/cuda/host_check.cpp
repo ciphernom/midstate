@@ -4,8 +4,9 @@
 // result as little-endian words), and checks they reproduce the walk's known
 // answers (walk.rs's GOLDEN). Built with the address and undefined-behaviour
 // sanitizers, so a kernel reading or writing outside its walk's memory
-// fails it too. It cannot check the GPU's compiler or driver: each GPU runs
-// the same known answers when the miner opens it.
+// fails it too. It cannot check what clang makes of the source:
+// ptx_check.cpp runs the PTX itself. Nor the GPU's driver: each GPU runs the
+// same known answers when the miner opens it.
 //
 //   g++ -O2 -std=c++17 -fsanitize=address,undefined -fno-sanitize-recover=undefined host_check.cpp -o host_check
 //   ./host_check

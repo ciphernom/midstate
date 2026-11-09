@@ -387,6 +387,12 @@ pad. That is not the walk; it only shows what the writes cost.
   `--backend gpu` on them alone, and with no usable GPU both mine on the CPU,
   saying why once. Each GPU must reproduce the known answers before it
   mines, and the CPU re-checks every hash it reports. MANUAL.md, section 6.
+  The first PTX failed that check on every GPU (a Quadro M6000 was the first
+  to run it): clang 18 had compiled the walk's 64-bit rotate to two 64-bit
+  shifts without reducing the amount mod 64, and PTX clamps shifts of 64 or
+  more to zero, so the rotate gave 0. The kernels now build the rotate from
+  32-bit shifts (`walk_core.h`'s `rotr64`), and CI runs the PTX itself
+  (below).
 - **Merged mining with midwimble.**
   - The pool reads `pow` from midwimble's `/merge/job` (absent means
     BLAKE3 chain).
@@ -468,7 +474,11 @@ definition rather than from the Rust, and a GPU benchmark:
   `walk.rs`, runs its CPU self-test and compiles its kernels. The miner's
   kernels (`src/core/cuda/walk_miner.cu`) are these; CI checks the PTX the
   miner embeds is built from them, and runs them on the CPU as the miner
-  launches them, against the known answers.
+  launches them, against the known answers: compiled from their source
+  (`host_check.cpp`), and as the PTX itself, translated into C instruction
+  by instruction with PTX's rules (`ptx_to_c.py`, `ptx_check.cpp`). Only the
+  second sees what clang made of the source. The broken rotate passed the
+  first and fails the second, with the same wrong hash the M6000 gave.
 
 All three reproduce the golden vectors in `walk.rs`'s tests. So does the Rust code:
 

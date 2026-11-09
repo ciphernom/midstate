@@ -7,9 +7,11 @@
 //
 // walk_miner.ptx is this file compiled by gen_ptx.sh (clang, no toolkit). CI
 // rebuilds it and fails if the committed copy differs, so the PTX the miner
-// embeds is always this source. CI also runs these kernels on the CPU
-// (host_check.cpp, which defines WALK_MINER_HOST_CHECK), launched as the
-// miner launches them, against the known answers.
+// embeds is always this source. CI also runs these kernels on the CPU,
+// launched as the miner launches them, against the known answers: from this
+// source (host_check.cpp, which defines WALK_MINER_HOST_CHECK), and from the
+// PTX itself (ptx_check.cpp), which is what caught clang miscompiling the
+// walk's 64-bit rotate.
 //
 // One thread per walk, as in the benchmark. For walk w:
 //   init:   seed registers and scratchpad from (mining hash, nonces[w])
