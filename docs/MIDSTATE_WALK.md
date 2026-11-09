@@ -132,6 +132,85 @@ The knobs, if that margin needs widening:
   Pi 5's 512 KiB L2.
 - The operation mix.
 
+### Any GPU through wgpu, the Pi 5's first
+
+`src/core/wgpu_walk.rs` is a second GPU kernel, in WGSL, so the Walk runs on
+whatever wgpu reaches: Vulkan, Metal or DX12. That includes the Raspberry
+Pi 5's VideoCore VII (through Mesa's v3dv) and AMD, Intel and Apple GPUs.
+For now it is measured, not mined with:
+
+```bash
+midstate bench-pow --gpu [--with-cpu] [--gpu-adapter NAME] [--gpu-walks N] [--seconds S]
+```
+
+The CPU seeds each walk and grows its pad, with its AES instructions. That
+is microseconds per attempt. The GPU runs the 2^18 steps and the 64 BLAKE3
+re-mixes, and the CPU hashes the final registers. A WGSL kernel has 32-bit
+words only, and the Pi's GPU has a 24-bit multiplier. So the kernel works
+like this:
+
+- **64-bit words** are pairs of 32-bit words. Multiplies are built from
+  16-bit limbs; the 128-bit high product takes sixteen.
+- **The division** always has a divisor with its top bit set, so 64÷32 is two
+  base-2^16 digits of Knuth's algorithm D. Each digit is exact after at most
+  two corrections.
+- **The program draw** only needs `z mod 8!`, because Fisher–Yates reads its
+  digits in radices 8 to 2.
+- **The AES round** uses four rotated 1 KiB tables.
+- **Each launch** lasts about 60 ms. The Pi's kernel driver resets a GPU
+  whose job runs for half a second.
+
+Lanes in lockstep diverge on each walk's program, so there is a second
+version that **groups the walks by their programs**. At every re-mix the CPU
+sorts the walks by the step their AES round falls on, then the division, then
+the high multiply. Lanes side by side then take the costly paths at the
+same step: with a few hundred walks in flight, a group of 16 lanes has its
+AES at one step of eight instead of nearly all of them. The hashes don't
+change, because which lane runs which walk is free.
+
+The benchmark:
+
+1. Checks the GPU against the three known answers as whole walks, and stops
+   if any comes out wrong.
+2. Sweeps the workgroup size and the walks at once, then tries grouping at
+   the best size.
+3. Runs two probes. Every operation an XOR leaves only the memory traffic.
+   A shared pad of eight lines, which stays cached, leaves only the
+   arithmetic. Together they say which limits the GPU.
+4. Measures the CPU, and with `--with-cpu` both at once, with the board's
+   temperature and power before and after. The GPU's heat can slow the CPU.
+
+The kernel reproduces every operation, the re-mix, partial walks and the
+known answers on a software Vulkan driver (`the_gpu_walk_is_the_walk`, run
+with `VK_ICD_FILENAMES` pointing at SwiftShader or lavapipe and
+`MIDSTATE_TEST_GPU` naming it). It has not yet run on a Pi 5's GPU.
+
+The expectation from the measured GPUs above is modest. Take random traffic
+at 17–23% of the Pi's 17 GB/s, and 64 MiB an attempt (128 MiB if each access
+moves a 64-byte line rather than a 32-byte sector). That caps it at roughly
+25–50 attempts/s, 2–3% of the four cores, and the emulated arithmetic may hold
+it under that. The benchmark is how to find out.
+
+### Several walks per thread on a CPU
+
+One walk keeps a core waiting. At 3.1 GHz a Pi 5 core takes about 31 cycles a
+step, mostly the L2 load and the operation that the next step's addresses
+depend on. The core could issue four instructions a cycle and averages about
+one. Walks of other nonces are independent, so a thread can step two or three
+in turn and the core overlaps their waits, as SMT does on the CPUs that have
+it. The catch: two pads fill a Cortex-A76's 512 KiB L2, so some loads fall to
+the shared L3. `walk::walk_hash_many` steps K walks in turn, and each hash is
+exactly that nonce's walk.
+
+```bash
+midstate bench-pow --interleave [--seconds S] [--threads T]
+```
+
+This measures 1, 2 and 3 walks per thread, with the threads pinned to their
+cores and not. Pinning matters because the L2 is per core, so a thread that
+migrates warms 256 KiB again. Each run checks the known answers. The miner
+still runs one walk per thread and changes only if the Pi's numbers say so.
+
 ## What changed in consensus
 
 - **Proof of work by height.**
@@ -167,7 +246,9 @@ The knobs, if that margin needs widening:
   - `midstate miner` picks the algorithm from it.
   - A pool that sends four parameters is treated as a BLAKE3-chain pool.
 - **The pool's HTTP and WebRTC templates** carry `height` and `pow`.
-- **GPU backend.** The wgpu kernel is the BLAKE3 chain's. Walk runs on
+- **GPU backend.** The miner's wgpu kernel is the BLAKE3 chain's; a Walk
+  kernel for wgpu exists for measuring (`bench-pow --gpu`, see
+  [Any GPU through wgpu](#any-gpu-through-wgpu-the-pi-5s-first)). Walk mines on
   NVIDIA GPUs through CUDA (`src/core/cuda_walk.rs`, the benchmark's kernels
   loaded through the driver): `Auto` mines on them and the CPU threads,
   `--backend gpu` on them alone, and with no usable GPU both mine on the CPU,
@@ -185,7 +266,9 @@ The knobs, if that margin needs widening:
     Message rate does not.
   - Consider adding 4 to `--share-bits` at the switch.
 - **`midstate bench-pow [--seconds N] [--threads T]`** measures Walk (one
-  thread and all threads) and the BLAKE3 chain on this machine.
+  thread and all threads) and the BLAKE3 chain on this machine. With `--gpu`
+  it measures the Walk on a GPU instead, and with `--interleave` several walks
+  stepped in turn per thread.
 
 ## Browser wallet
 

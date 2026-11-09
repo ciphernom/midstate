@@ -445,6 +445,28 @@ enum Command {
         /// Threads for the all-cores measurement. 0 uses every detected core.
         #[arg(long, default_value = "0")]
         threads: usize,
+        /// Measure Midstate Walk on a GPU through wgpu (Vulkan, Metal, DX12):
+        /// a Raspberry Pi 5's VideoCore VII, or an AMD, Intel or Apple GPU.
+        /// Checks it computes the known answers first.
+        #[arg(long)]
+        gpu: bool,
+        /// With --gpu: part of the GPU's name (the first hardware GPU
+        /// otherwise; a software one such as llvmpipe only when named).
+        #[arg(long)]
+        gpu_adapter: Option<String>,
+        /// With --gpu: the most walks at once to try (each needs 256 KiB).
+        #[arg(long, default_value = "1024")]
+        gpu_walks: u32,
+        /// With --gpu: also run the CPU and the GPU together, and read the
+        /// board's temperature and power before and after.
+        #[arg(long)]
+        with_cpu: bool,
+        /// Measure walks stepped in turn on each thread (1, 2 and 3 per
+        /// thread, with the threads pinned to cores and not), each checked
+        /// against the known answers. A core waits on every step of one walk;
+        /// a second walk's steps can fill those waits.
+        #[arg(long)]
+        interleave: bool,
     },
 }
 
@@ -477,6 +499,38 @@ fn walk_rate(mining_hash: [u8; 32], threads: usize, duration: std::time::Duratio
 }
 
 /// `midstate bench-pow`.
+/// `bench-pow --interleave`: attempts a second with 1, 2 and 3 walks stepped
+/// in turn per thread, pinned to cores and not, each against 1 unpinned.
+fn bench_interleave(seconds: u64, threads: usize) {
+    use midstate::core::walk;
+    let threads = if threads == 0 { std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) } else { threads };
+    let d = std::time::Duration::from_secs(seconds.max(1));
+    let temp = || midstate::rpc::miner_mode::temp_c().map(|t| format!(", {t:.1} °C after")).unwrap_or_default();
+    println!(
+        "Midstate Walk, walks stepped in turn per thread: {threads} threads, {}s each, AES: {}",
+        d.as_secs(),
+        walk::backend_name()
+    );
+    let mut first = None;
+    for (k, pin) in [(1, false), (1, true), (2, false), (2, true), (3, false), (3, true)] {
+        let (rate, good) = match k {
+            1 => walk::bench_many::<1>(threads, d, pin),
+            2 => walk::bench_many::<2>(threads, d, pin),
+            _ => walk::bench_many::<3>(threads, d, pin),
+        };
+        let against = first.map(|f: f64| format!(" ({:+.1}%)", 100.0 * (rate / f - 1.0))).unwrap_or_default();
+        println!(
+            "  {k} walk{} per thread{:<8} {rate:>9.1} attempts/s{against}{}{}",
+            if k == 1 { " " } else { "s" },
+            if pin { ", pinned" } else { "" },
+            if good { "" } else { "  WRONG: a known answer came out wrong" },
+            temp()
+        );
+        first.get_or_insert(rate);
+    }
+    println!("Each line runs after the last, so a board that heats up throttles the later ones: compare the temperatures.");
+}
+
 fn bench_pow(seconds: u64, threads: usize) {
     use midstate::core::walk;
     let threads = if threads == 0 {
@@ -1223,7 +1277,23 @@ async fn main() -> Result<()> {
                 anyhow::bail!("Pool server cannot run in WebAssembly");
             }
         }
-        Command::BenchPow { seconds, threads } => {
+        Command::BenchPow { seconds, threads, gpu, gpu_adapter, gpu_walks, with_cpu, interleave } => {
+            if interleave {
+                bench_interleave(seconds, threads);
+                return Ok(());
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            if gpu {
+                midstate::core::wgpu_walk::bench(&midstate::core::wgpu_walk::BenchOptions {
+                    adapter: gpu_adapter,
+                    max_walks: gpu_walks,
+                    seconds,
+                    threads,
+                    with_cpu,
+                });
+                return Ok(());
+            }
+            let _ = (gpu, gpu_adapter, gpu_walks, with_cpu);
             bench_pow(seconds, threads);
             Ok(())
         }
