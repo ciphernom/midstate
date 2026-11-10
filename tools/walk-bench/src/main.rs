@@ -33,7 +33,7 @@ const USAGE: &str = "\
 usage: midstate-walk-bench <command> [options]
 
   cpu          the Walk on 1 thread and on all of them, and the known answers
-  interleave   1, 2 and 3 walks stepped in turn per thread, pinned and not
+  interleave   1 to 4 walks stepped in turn per thread, each way of writing the step
   gpu          the Walk on a GPU through wgpu (Vulkan, Metal, DX12), checked first
   dump-wgsl F  write the GPU kernel to file F, to edit and run with gpu --wgsl F
   cpu-probe    where a step's time goes: cache latencies and each operation's cost

@@ -9,6 +9,8 @@ description = "Midstate Walk measured without the rest of midstate: on the CPU, 
 [workspace]
 
 [dependencies]
+# walk.rs logs the miner's choice of walks per thread; nothing prints it here.
+tracing = "0.1"
 blake3 = "1.5"
 hex = "0.4"
 pollster = "0.3"

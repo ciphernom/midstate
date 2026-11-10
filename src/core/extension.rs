@@ -163,11 +163,13 @@ pub enum MiningResult {
     Share(Extension),
 }
 
-/// Nonces one worker tries per round: the SIMD width for the BLAKE3 chain,
-/// one for Midstate Walk (each attempt already has a core to itself).
-fn lanes_for(algo: PowAlgo) -> usize {
+/// Nonces one worker tries per round: the SIMD width for the BLAKE3 chain;
+/// for Midstate Walk, the walks each thread steps in turn
+/// ([`walk::walks_per_thread`](super::walk::walks_per_thread), chosen once
+/// per process for `threads` threads).
+fn lanes_for(algo: PowAlgo, threads: usize) -> usize {
     match algo {
-        PowAlgo::Walk => 1,
+        PowAlgo::Walk => super::walk::walks_per_thread(threads),
         PowAlgo::Blake3Chain => crate::core::simd_mining::detected_level().lanes(),
     }
 }
@@ -175,10 +177,7 @@ fn lanes_for(algo: PowAlgo) -> usize {
 /// `(nonce, final_hash)` for each of `nonces` under `algo`.
 fn attempt_batch(algo: PowAlgo, midstate: [u8; 32], nonces: &[u64]) -> Vec<(u64, [u8; 32])> {
     match algo {
-        PowAlgo::Walk => nonces
-            .iter()
-            .map(|&n| (n, super::walk::walk_hash(&midstate, n)))
-            .collect(),
+        PowAlgo::Walk => super::walk::walk_hash_batch(&midstate, nonces),
         PowAlgo::Blake3Chain => crate::core::simd_mining::mine_batch(midstate, nonces),
     }
 }
@@ -219,6 +218,8 @@ pub fn mine_extension(
 
     let found = Arc::new(AtomicBool::new(false));
     let (tx, rx) = std::sync::mpsc::channel::<(MiningResult, u64)>();
+    // Chosen (for the Walk, measured) before the workers start, not by each.
+    let lanes = lanes_for(algo, num_threads);
 
     let threads: Vec<_> = (0..num_threads)
         .map(|_| {
@@ -227,7 +228,6 @@ pub fn mine_extension(
             let tx = tx.clone();
             let hash_counter = Arc::clone(&hash_counter);
             std::thread::spawn(move || {
-                let lanes = lanes_for(algo);
                 let mut attempts = 0u64;
                 loop {
                     if cancel.load(Ordering::Relaxed) || found.load(Ordering::Relaxed) {
@@ -309,7 +309,7 @@ fn mine_extension_single(
     cancel: Arc<AtomicBool>,
     hash_counter: Arc<std::sync::atomic::AtomicU64>
 ) -> Option<MiningResult> {
-    let lanes = lanes_for(algo);
+    let lanes = lanes_for(algo, 1);
     let mut attempts = 0u64;
 
     loop {

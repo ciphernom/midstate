@@ -206,9 +206,12 @@ exactly that nonce's walk.
 midstate bench-pow --interleave [--seconds S] [--threads T]
 ```
 
-This measures 1, 2 and 3 walks per thread, with the threads pinned to their
-cores and not. Pinning matters because the L2 is per core, so a thread that
-migrates warms 256 KiB again. Each run checks the known answers.
+This measured 1, 2 and 3 walks per thread, with the threads pinned to their
+cores and not (pinning could matter because the L2 is per core, so a thread
+that migrates warms 256 KiB again). It now measures 1 to 4 walks per thread
+for each way of writing the step, unpinned, and then the count the miner
+would choose. Each run checks the known answers, and only the hashing is
+timed.
 
 On a Raspberry Pi 5 (4 threads, 10 s each) it does not pay:
 
@@ -224,8 +227,36 @@ On a Raspberry Pi 5 (4 threads, 10 s each) it does not pay:
 Two pads fill a core's 512 KiB L2, and four cores' eight pads (2 MiB) fill
 the shared L3, so the loads go out to DRAM. That is the scratchpad doing what
 it was sized for: one walk per core is the most a Pi 5 can run. Pinning
-changes nothing. The miner keeps one walk per thread, and on a Pi the lever
-left is the clock.
+changes nothing.
+
+CPUs with more cache per core gain a lot. On a 2-core Xeon with 2 MiB of L2
+a core (2 threads, 3 s each):
+
+| Walks per thread | Indexed | Unindexed | Ahead |
+|---|---|---|---|
+| 1 | 596.7 | 585.5 | **629.9** |
+| 2 | **908.2** | 946.3 | 895.1 |
+| 3 | **1,064.4** | 1,032.0 | 548.9 |
+| 4 | **1,014.8** | 997.5 | 519.3 |
+
+In bold: the step the miner uses for that count. Three walks per thread did
+69% more than the best single walk, and 78% more than v6.4.0's loop (one
+indexed walk). The faster steps keep one walk's eight registers in the CPU's,
+which several walks cannot all do, so with 2 to 4 walks the miner uses the
+indexed step (`walk::miner_step_for`). Zen 4 and Zen 5 cores have 1 MiB of
+L2 and the X3D parts 96-128 MB of L3, so they should gain too; the miner
+does not assume it.
+
+**The miner measures it.** Before its first Walk job, the CPU miner times 1
+to 4 walks per thread on all of its threads, each with the step it would
+use, up the counts and back down (about 6 s, once per process). It checks
+the known answers that way and mines with the fastest
+(`walk::walks_per_thread`), and it logs the rates. On a Pi that is one walk
+per thread; on the Xeon above, three, which `midstate bench-pow` measured at
+1,132 attempts/s on 2 threads against about 600 before.
+`MINER_WALKS_PER_THREAD=1` to `4` sets it instead. Each hash is exactly its
+nonce's walk: a test runs every way of writing the step, 1 to 4 walks per
+thread, against the known answers in every slot.
 
 ### The standalone bencher
 
@@ -405,9 +436,10 @@ pad. That is not the walk; it only shows what the writes cost.
     Message rate does not.
   - Consider adding 4 to `--share-bits` at the switch.
 - **`midstate bench-pow [--seconds N] [--threads T]`** measures Walk (one
-  thread and all threads) and the BLAKE3 chain on this machine. With `--gpu`
-  it measures the Walk on a GPU instead, and with `--interleave` several walks
-  stepped in turn per thread.
+  thread and all threads, with the walks per thread the miner chooses) and
+  the BLAKE3 chain on this machine. With `--gpu` it measures the Walk on a
+  GPU instead, and with `--interleave` 1 to 4 walks stepped in turn per
+  thread, each way of writing the step.
 
 ## Browser wallet
 
