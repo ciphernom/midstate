@@ -140,6 +140,8 @@ pub fn new_pad() -> Box<Pad> {
 
 thread_local! {
     static PAD: RefCell<Box<Pad>> = RefCell::new(new_pad());
+    /// This thread's scratchpads for [`walk_hash_batch`], grown as needed.
+    static PADS: RefCell<Vec<Box<Pad>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// The proof-of-work hash of `nonce` over `mining_hash`.
@@ -515,43 +517,120 @@ fn round_indexed<A: AesRound>(prog: &[u8; 8], r: &mut [u64; 8], c: &mut u64, pad
 // (`midstate bench-pow --interleave`), not assumed. Each hash is its walk's.
 
 /// The walks of `nonces`, `K` of them stepped in turn on this thread, with a
-/// scratchpad each.
+/// scratchpad each, their steps written as `code` says (not
+/// [`StepCode::NoStores`]). Step by step (A0 B0 C0 A1 ...), so that the walks'
+/// loads sit close together in the instruction stream, where an out-of-order
+/// core issues them together.
 #[inline(always)]
-fn walk_many_generic<A: AesRound, const K: usize>(mining_hash: &[u8; 32], nonces: &[u64; K], pads: &mut [Box<Pad>; K]) -> [[u8; 32]; K] {
+fn walk_many_written<A: AesRound, const K: usize>(
+    code: StepCode,
+    mining_hash: &[u8; 32],
+    nonces: &[u64; K],
+    pads: &mut [Box<Pad>; K],
+) -> [[u8; 32]; K] {
     let mut r = [[0u64; 8]; K];
     let mut prog = [[0u8; 8]; K];
-    let mut c = [0u64; K];
     for k in 0..K {
         (r[k], prog[k]) = start_generic::<A>(mining_hash, nonces[k], &mut pads[k]);
     }
-    for round in 0..WALK_STEPS / 8 {
-        macro_rules! steps {
-            ($($s:literal)*) => {$(
-                for k in 0..K {
-                    step::<A>($s, prog[k][$s], &mut r[k], &mut c[k], &mut pads[k]);
+    match code {
+        StepCode::Ahead => {
+            let mut x: [u64; K] = std::array::from_fn(|k| r[k][0]);
+            let mut out = [0u64; K];
+            for round in 0..WALK_STEPS / 8 {
+                macro_rules! steps {
+                    ($($s:literal)*) => {$(
+                        for k in 0..K {
+                            (x[k], out[k]) = step_ahead::<A, $s>(prog[k][$s], x[k], &mut r[k], &mut pads[k]);
+                        }
+                    )*};
                 }
-            )*};
-        }
-        steps!(0 1 2 3 4 5 6 7);
-        if (round + 1) % (WALK_REMIX / 8) == 0 {
-            for k in 0..K {
-                remix(&mut r[k], &mut prog[k]);
+                steps!(0 1 2 3 4 5 6 7);
+                if (round + 1) % (WALK_REMIX / 8) == 0 {
+                    for k in 0..K {
+                        remix(&mut r[k], &mut prog[k]);
+                        x[k] = r[k][0] ^ out[k];
+                    }
+                }
             }
         }
+        StepCode::Unindexed => {
+            let mut c = [0u64; K];
+            for round in 0..WALK_STEPS / 8 {
+                macro_rules! steps {
+                    ($($s:literal)*) => {$(
+                        for k in 0..K {
+                            step_unindexed::<A, $s, true>(prog[k][$s], &mut r[k], &mut c[k], &mut pads[k]);
+                        }
+                    )*};
+                }
+                steps!(0 1 2 3 4 5 6 7);
+                if (round + 1) % (WALK_REMIX / 8) == 0 {
+                    for k in 0..K {
+                        remix(&mut r[k], &mut prog[k]);
+                    }
+                }
+            }
+        }
+        StepCode::Indexed => {
+            let mut c = [0u64; K];
+            for round in 0..WALK_STEPS / 8 {
+                macro_rules! steps {
+                    ($($s:literal)*) => {$(
+                        for k in 0..K {
+                            step::<A>($s, prog[k][$s], &mut r[k], &mut c[k], &mut pads[k]);
+                        }
+                    )*};
+                }
+                steps!(0 1 2 3 4 5 6 7);
+                if (round + 1) % (WALK_REMIX / 8) == 0 {
+                    for k in 0..K {
+                        remix(&mut r[k], &mut prog[k]);
+                    }
+                }
+            }
+        }
+        StepCode::NoStores => panic!("a walk without its writes to the pad is not the walk"),
     }
     std::array::from_fn(|k| finish(mining_hash, nonces[k], &r[k]))
 }
 
+/// How the miner writes the step with `k` walks per thread: [`MINER_STEP`]
+/// for one, and [`step`] (indexed) for more. The faster ways keep a walk's
+/// eight registers in the CPU's; with several walks they cannot all fit. On
+/// a Xeon, 3 or 4 walks per thread did 2-13% better indexed than unindexed
+/// (2 did 3% worse, but 3 or 4 beat 2), and with `step_ahead`, 3 or 4 did
+/// worse than one.
+pub fn miner_step_for(k: usize) -> StepCode {
+    if k <= 1 {
+        MINER_STEP
+    } else {
+        StepCode::Indexed
+    }
+}
+
 /// The proof-of-work hashes of `K` nonces, their walks stepped in turn on
 /// this thread (`pads`: one scratchpad each), with the fastest AES this CPU
-/// has. Each is exactly [`walk_hash`] of its nonce.
+/// has and the miner's step for `K` walks ([`miner_step_for`]). Each is
+/// exactly [`walk_hash`] of its nonce.
 pub fn walk_hash_many<const K: usize>(mining_hash: &[u8; 32], nonces: &[u64; K], pads: &mut [Box<Pad>; K]) -> [[u8; 32]; K] {
+    walk_hash_many_written::<K>(miner_step_for(K), mining_hash, nonces, pads)
+}
+
+/// [`walk_hash_many`] with the step written as `code` says: for measuring
+/// the ways against each other.
+pub fn walk_hash_many_written<const K: usize>(
+    code: StepCode,
+    mining_hash: &[u8; 32],
+    nonces: &[u64; K],
+    pads: &mut [Box<Pad>; K],
+) -> [[u8; 32]; K] {
     match backend() {
         #[cfg(target_arch = "x86_64")]
-        Backend::AesNi => unsafe { x86::walk_many(mining_hash, nonces, pads) },
+        Backend::AesNi => unsafe { x86::walk_many(code, mining_hash, nonces, pads) },
         #[cfg(target_arch = "aarch64")]
-        Backend::Armv8 => unsafe { arm::walk_many(mining_hash, nonces, pads) },
-        _ => walk_many_generic::<SoftAes, K>(mining_hash, nonces, pads),
+        Backend::Armv8 => unsafe { arm::walk_many(code, mining_hash, nonces, pads) },
+        _ => walk_many_written::<SoftAes, K>(code, mining_hash, nonces, pads),
     }
 }
 
@@ -582,47 +661,174 @@ pub fn pin_to_cpu(cpu: usize) -> bool {
 /// `threads` threads for `duration`, pinned to a core each if `pin`; and
 /// whether every thread computed [`GOLDEN`] right that way before and after.
 pub fn bench_many<const K: usize>(threads: usize, duration: std::time::Duration, pin: bool) -> (f64, bool) {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::Arc;
+    bench_many_written::<K>(miner_step_for(K), threads, duration, pin)
+}
+
+/// [`bench_many`] with the step written as `code` says. Each thread checks the
+/// known answers before and after, and only the hashing between is timed.
+pub fn bench_many_written<const K: usize>(code: StepCode, threads: usize, duration: std::time::Duration, pin: bool) -> (f64, bool) {
+    let (rate, good) = time_many::<K>(code, threads, duration, pin, true);
+    (rate, good)
+}
+
+/// Attempts a second over `threads` threads stepping `K` walks each, for
+/// `duration` of hashing; with `check`, whether every thread computed the
+/// known answers that way before and after.
+fn time_many<const K: usize>(code: StepCode, threads: usize, duration: std::time::Duration, pin: bool, check: bool) -> (f64, bool) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Barrier};
     let mining_hash = *blake3::hash(b"midstate walk bench").as_bytes();
+    let threads = threads.max(1);
     let stop = Arc::new(AtomicBool::new(false));
-    let done = Arc::new(AtomicU64::new(0));
+    // Every thread starts hashing together, after its checks.
+    let ready = Arc::new(Barrier::new(threads + 1));
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-    let start = std::time::Instant::now();
-    let workers: Vec<_> = (0..threads.max(1))
+    let workers: Vec<_> = (0..threads)
         .map(|t| {
-            let (stop, done) = (stop.clone(), done.clone());
+            let (stop, ready) = (stop.clone(), ready.clone());
             std::thread::spawn(move || {
                 if pin {
                     pin_to_cpu(t % cores);
                 }
                 let mut pads: [Box<Pad>; K] = std::array::from_fn(|_| new_pad());
-                let mut good = golden_many::<K>(&mut pads);
+                let mut good = !check || golden_many::<K>(code, &mut pads);
                 let mut nonce = (t as u64) << 40;
+                ready.wait();
+                let begun = std::time::Instant::now();
+                let mut done = 0u64;
                 // At least one batch each, however short the run.
                 loop {
                     let nonces: [u64; K] = std::array::from_fn(|k| nonce + k as u64);
-                    std::hint::black_box(walk_hash_many::<K>(&mining_hash, &nonces, &mut pads));
+                    std::hint::black_box(walk_hash_many_written::<K>(code, &mining_hash, &nonces, &mut pads));
                     nonce += K as u64;
-                    done.fetch_add(K as u64, Ordering::Relaxed);
+                    done += K as u64;
                     if stop.load(Ordering::Relaxed) {
                         break;
                     }
                 }
-                good &= golden_many::<K>(&mut pads);
-                good
+                let rate = done as f64 / begun.elapsed().as_secs_f64();
+                good &= !check || golden_many::<K>(code, &mut pads);
+                (rate, good)
             })
         })
         .collect();
+    ready.wait();
     std::thread::sleep(duration);
     stop.store(true, Ordering::Relaxed);
-    let good = workers.into_iter().all(|w| w.join().unwrap_or(false));
-    (done.load(Ordering::Relaxed) as f64 / start.elapsed().as_secs_f64(), good)
+    workers.into_iter().fold((0.0, true), |(rate, good), w| match w.join() {
+        Ok((r, g)) => (rate + r, good && g),
+        Err(_) => (rate, false),
+    })
 }
 
-/// `bench-pow --interleave`: attempts a second with 1, 2 and 3 walks stepped
-/// in turn per thread, pinned to cores and not, each against 1 unpinned,
-/// with the temperature (`temp`, °C) after each. Prints as it goes.
+/// Most walks [`walk_hash_batch`] steps in turn on one thread.
+pub const MAX_WALKS_PER_THREAD: usize = 4;
+
+/// The walk hashes of `nonces` (1 to [`MAX_WALKS_PER_THREAD`] of them), their
+/// walks stepped in turn on this thread with its own scratchpads: what the
+/// CPU miner runs, [`walks_per_thread`] nonces at a time. Each is exactly
+/// [`walk_hash`] of its nonce.
+pub fn walk_hash_batch(mining_hash: &[u8; 32], nonces: &[u64]) -> Vec<(u64, [u8; 32])> {
+    fn run<const K: usize>(m: &[u8; 32], nonces: &[u64], pads: &mut Vec<Box<Pad>>) -> Vec<(u64, [u8; 32])> {
+        while pads.len() < K {
+            pads.push(new_pad());
+        }
+        let pads: &mut [Box<Pad>; K] = (&mut pads[..K]).try_into().expect("K pads");
+        let nonces: [u64; K] = nonces.try_into().expect("K nonces");
+        let hashes = walk_hash_many::<K>(m, &nonces, pads);
+        nonces.into_iter().zip(hashes).collect()
+    }
+    PADS.with(|pads| {
+        let Ok(mut pads) = pads.try_borrow_mut() else {
+            // Only reachable if a caller re-enters from inside a walk.
+            return nonces.iter().map(|&n| (n, walk_hash(mining_hash, n))).collect();
+        };
+        let mut out = Vec::with_capacity(nonces.len());
+        for chunk in nonces.chunks(MAX_WALKS_PER_THREAD) {
+            out.extend(match chunk.len() {
+                1 => run::<1>(mining_hash, chunk, &mut pads),
+                2 => run::<2>(mining_hash, chunk, &mut pads),
+                3 => run::<3>(mining_hash, chunk, &mut pads),
+                _ => run::<4>(mining_hash, chunk, &mut pads),
+            });
+        }
+        out
+    })
+}
+
+/// How many walks the CPU miner steps in turn per thread, chosen once per
+/// process: `MINER_WALKS_PER_THREAD` (1 to 4) if it is set, otherwise
+/// measured on `threads` threads (all of the miner's, so that their pads
+/// share the caches as they will while mining).
+///
+/// A walk's core spends most of each step waiting for the step's load from
+/// the pad, so several walks per thread fill the waits, until their pads no
+/// longer fit the core's cache: on a 2-core Xeon with 2 MiB of L2 a core, 3
+/// walks a thread did 87% more than one; on a Pi 5, whose 512 KiB of L2 holds
+/// one pad well, 2 did 75% less. So it is measured, not assumed.
+pub fn walks_per_thread(threads: usize) -> usize {
+    static CHOSEN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CHOSEN.get_or_init(|| choose_walks_per_thread(threads.max(1)))
+}
+
+fn choose_walks_per_thread(threads: usize) -> usize {
+    if let Ok(v) = std::env::var("MINER_WALKS_PER_THREAD") {
+        match v.trim().parse::<usize>() {
+            Ok(k) if (1..=MAX_WALKS_PER_THREAD).contains(&k) => {
+                tracing::info!("Midstate Walk: {k} walk(s) per thread, from MINER_WALKS_PER_THREAD");
+                return k;
+            }
+            _ => tracing::warn!("MINER_WALKS_PER_THREAD={v:?} is not 1 to {MAX_WALKS_PER_THREAD}: measuring instead"),
+        }
+    }
+    // About 6 s once per process, before the first Walk job mines (tests: a
+    // fraction of a second).
+    let each = std::time::Duration::from_millis(if cfg!(test) { 30 } else { 700 });
+    let rates = measure_walks_per_thread(threads, each);
+    let best = (1..=MAX_WALKS_PER_THREAD).max_by(|a, b| rates[a - 1].total_cmp(&rates[b - 1])).unwrap_or(1);
+    // The interleaved walk must give the known answers on this CPU before it
+    // mines; if it does not, one walk per thread (walk_hash) does.
+    let code = miner_step_for(best);
+    let good = match best {
+        1 => true,
+        2 => golden_many::<2>(code, &mut std::array::from_fn(|_| new_pad())),
+        3 => golden_many::<3>(code, &mut std::array::from_fn(|_| new_pad())),
+        _ => golden_many::<4>(code, &mut std::array::from_fn(|_| new_pad())),
+    };
+    let summary: Vec<String> = rates.iter().enumerate().map(|(i, r)| format!("{}: {r:.0}/s", i + 1)).collect();
+    if !good {
+        tracing::error!("Midstate Walk: {best} walks per thread got a known answer wrong; mining one walk per thread");
+        return 1;
+    }
+    tracing::info!(
+        "Midstate Walk: attempts with 1 to {MAX_WALKS_PER_THREAD} walks per thread on {threads} threads: {}; mining with {best} (MINER_WALKS_PER_THREAD sets it)",
+        summary.join(", ")
+    );
+    best
+}
+
+/// Attempts a second with 1 to [`MAX_WALKS_PER_THREAD`] walks per thread on
+/// `threads` threads, each with the step the miner would use for it
+/// ([`miner_step_for`]) and measured twice, up the counts and back down, so
+/// that a CPU warming up does not favour the ones measured first.
+pub fn measure_walks_per_thread(threads: usize, each: std::time::Duration) -> [f64; MAX_WALKS_PER_THREAD] {
+    let once = |k: usize| match k {
+        1 => time_many::<1>(miner_step_for(1), threads, each, false, false).0,
+        2 => time_many::<2>(miner_step_for(2), threads, each, false, false).0,
+        3 => time_many::<3>(miner_step_for(3), threads, each, false, false).0,
+        _ => time_many::<4>(miner_step_for(4), threads, each, false, false).0,
+    };
+    let mut rates = [0.0; MAX_WALKS_PER_THREAD];
+    for k in (1..=MAX_WALKS_PER_THREAD).chain((1..=MAX_WALKS_PER_THREAD).rev()) {
+        rates[k - 1] += once(k) / 2.0;
+    }
+    rates
+}
+
+/// `bench-pow --interleave`: attempts a second with 1 to 4 walks stepped in
+/// turn per thread, for each way of writing the step, each checking the known
+/// answers, with the temperature (`temp`, °C) after each row; then the count
+/// the miner would choose here. Prints as it goes.
 pub fn print_interleave(seconds: u64, threads: usize, temp: fn() -> Option<f32>) {
     let threads = if threads == 0 { std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) } else { threads };
     let d = std::time::Duration::from_secs(seconds.max(1));
@@ -631,29 +837,42 @@ pub fn print_interleave(seconds: u64, threads: usize, temp: fn() -> Option<f32>)
         d.as_secs(),
         backend_name()
     );
-    let mut first = None;
-    for (k, pin) in [(1, false), (1, true), (2, false), (2, true), (3, false), (3, true)] {
-        let (rate, good) = match k {
-            1 => bench_many::<1>(threads, d, pin),
-            2 => bench_many::<2>(threads, d, pin),
-            _ => bench_many::<3>(threads, d, pin),
-        };
-        let against = first.map(|f: f64| format!(" ({:+.1}%)", 100.0 * (rate / f - 1.0))).unwrap_or_default();
-        println!(
-            "  {k} walk{} per thread{:<8} {rate:>9.1} attempts/s{against}{}{}",
-            if k == 1 { " " } else { "s" },
-            if pin { ", pinned" } else { "" },
-            if good { "" } else { "  WRONG: a known answer came out wrong" },
-            temp().map(|t| format!(", {t:.1} °C after")).unwrap_or_default()
-        );
-        first.get_or_insert(rate);
+    let codes = [(StepCode::Indexed, "indexed"), (StepCode::Unindexed, "unindexed"), (StepCode::Ahead, "ahead")];
+    print!("  {:<18}", "attempts/s");
+    for (_, name) in &codes {
+        print!("{name:>13}");
     }
-    println!("Each line runs after the last, so a board that heats up throttles the later ones: compare the temperatures.");
+    println!();
+    let mut wrong = false;
+    for k in 1..=MAX_WALKS_PER_THREAD {
+        print!("  {k} walk{} per thread ", if k == 1 { " " } else { "s" });
+        for (code, _) in &codes {
+            let (rate, good) = match k {
+                1 => bench_many_written::<1>(*code, threads, d, false),
+                2 => bench_many_written::<2>(*code, threads, d, false),
+                3 => bench_many_written::<3>(*code, threads, d, false),
+                _ => bench_many_written::<4>(*code, threads, d, false),
+            };
+            wrong |= !good;
+            let mark = if !good { "!" } else if *code == miner_step_for(k) { "*" } else { " " };
+            print!("{rate:>12.1}{mark}");
+        }
+        let t = temp().map(|t| format!("  {t:.1} °C")).unwrap_or_default();
+        println!("{t}");
+    }
+    if wrong {
+        println!("  ! a known answer came out wrong that way");
+    }
+    println!("  * the step this CPU's miner uses with that many walks per thread");
+    let rates = measure_walks_per_thread(threads, std::time::Duration::from_millis(700));
+    let best = (1..=MAX_WALKS_PER_THREAD).max_by(|a, b| rates[a - 1].total_cmp(&rates[b - 1])).unwrap_or(1);
+    println!("The miner measures this itself when it starts (MINER_WALKS_PER_THREAD sets it) and would mine here with {best} walk(s) per thread.");
+    println!("Rows run one after another, so a board that heats up throttles the later ones: compare the temperatures.");
 }
 
 /// Whether [`walk_hash_many`] computes [`GOLDEN`], the known answers spread
 /// over its `K` walks (each walk's own mining hash and nonce).
-fn golden_many<const K: usize>(pads: &mut [Box<Pad>; K]) -> bool {
+fn golden_many<const K: usize>(code: StepCode, pads: &mut [Box<Pad>; K]) -> bool {
     let decode = |h: &str| {
         let mut b = [0u8; 32];
         hex::decode_to_slice(h, &mut b).map(|_| b)
@@ -664,7 +883,7 @@ fn golden_many<const K: usize>(pads: &mut [Box<Pad>; K]) -> bool {
         GOLDEN.iter().all(|(m, nonce, want)| {
             let (Ok(m), Ok(want)) = (decode(m), decode(want)) else { return false };
             let nonces: [u64; K] = std::array::from_fn(|k| if k == slot { *nonce } else { nonce.wrapping_add(1 + k as u64) });
-            walk_hash_many::<K>(&m, &nonces, pads)[slot] == want
+            walk_hash_many_written::<K>(code, &m, &nonces, pads)[slot] == want
         })
     })
 }
@@ -1207,8 +1426,13 @@ mod x86 {
     /// # Safety
     /// The CPU must support AES-NI and SSE2.
     #[target_feature(enable = "aes,sse2")]
-    pub(super) unsafe fn walk_many<const K: usize>(m: &[u8; 32], nonces: &[u64; K], pads: &mut [Box<super::Pad>; K]) -> [[u8; 32]; K] {
-        super::walk_many_generic::<AesNi, K>(m, nonces, pads)
+    pub(super) unsafe fn walk_many<const K: usize>(
+        code: super::StepCode,
+        m: &[u8; 32],
+        nonces: &[u64; K],
+        pads: &mut [Box<super::Pad>; K],
+    ) -> [[u8; 32]; K] {
+        super::walk_many_written::<AesNi, K>(code, m, nonces, pads)
     }
 
     /// One AESENC round, for cross-checks.
@@ -1284,8 +1508,13 @@ mod arm {
     /// # Safety
     /// The CPU must support the ARMv8 AES extension.
     #[target_feature(enable = "aes,neon")]
-    pub(super) unsafe fn walk_many<const K: usize>(m: &[u8; 32], nonces: &[u64; K], pads: &mut [Box<super::Pad>; K]) -> [[u8; 32]; K] {
-        super::walk_many_generic::<Armv8, K>(m, nonces, pads)
+    pub(super) unsafe fn walk_many<const K: usize>(
+        code: super::StepCode,
+        m: &[u8; 32],
+        nonces: &[u64; K],
+        pads: &mut [Box<super::Pad>; K],
+    ) -> [[u8; 32]; K] {
+        super::walk_many_written::<Armv8, K>(code, m, nonces, pads)
     }
 
     /// One AESENC round, for cross-checks.
@@ -1533,9 +1762,43 @@ mod tests {
         let three = walk_hash_many::<3>(&m, &[1, 42, 2], &mut pads3);
         assert_eq!(three[1], hex32(GOLDEN[2].2));
         assert_eq!(three[2], walk_hash(&m, 2));
-        assert!(golden_many::<2>(&mut pads2) && golden_many::<1>(&mut [new_pad()]));
+        assert!(golden_many::<2>(MINER_STEP, &mut pads2) && golden_many::<1>(MINER_STEP, &mut [new_pad()]));
         let (rate, good) = bench_many::<2>(2, std::time::Duration::from_millis(300), true);
         assert!(rate > 0.0 && good);
+    }
+
+    /// Every way of writing the step, interleaved 1 to 4 walks a thread,
+    /// gives the known answers in every slot, and the miner's batches are
+    /// each nonce's walk however many it takes at once.
+    #[test]
+    fn interleaved_walks_written_every_way_are_each_their_own() {
+        for code in [StepCode::Indexed, StepCode::Unindexed, StepCode::Ahead] {
+            assert!(golden_many::<1>(code, &mut std::array::from_fn(|_| new_pad())), "{code:?} 1");
+            assert!(golden_many::<2>(code, &mut std::array::from_fn(|_| new_pad())), "{code:?} 2");
+            assert!(golden_many::<3>(code, &mut std::array::from_fn(|_| new_pad())), "{code:?} 3");
+            assert!(golden_many::<4>(code, &mut std::array::from_fn(|_| new_pad())), "{code:?} 4");
+        }
+        let m = hex32(GOLDEN[2].0);
+        let nonces: Vec<u64> = vec![42, 7, 1 << 62, 9, 10, 42];
+        for n in 1..=nonces.len() {
+            let got = walk_hash_batch(&m, &nonces[..n]);
+            assert_eq!(got.len(), n);
+            for (i, (nonce, h)) in got.iter().enumerate() {
+                assert_eq!(*nonce, nonces[i]);
+                assert_eq!(*h, walk_hash_portable(&m, *nonce), "batch of {n}, slot {i}");
+            }
+        }
+        assert_eq!(walk_hash_batch(&m, &[]), vec![]);
+    }
+
+    /// The choice of walks per thread measures every count, and an override
+    /// out of range is refused.
+    #[test]
+    fn walks_per_thread_are_measured() {
+        let rates = measure_walks_per_thread(2, std::time::Duration::from_millis(60));
+        assert!(rates.iter().all(|r| *r > 0.0), "{rates:?}");
+        let k = walks_per_thread(2);
+        assert!((1..=MAX_WALKS_PER_THREAD).contains(&k));
     }
 
     #[test]

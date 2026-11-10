@@ -173,6 +173,10 @@ From block 371,500 the proof of work is Midstate Walk. It runs on the CPU, on NV
 - `--cuda-devices 0,2`: which GPUs (default: all; or `MINER_CUDA_DEVICES`).
 - `--cuda-walks N`: walks a GPU runs at once (default: sized to its multiprocessors and free memory; or `MINER_CUDA_WALKS`).
 - `MINER_DISABLE_GPU=1` keeps every GPU out, whatever `--backend` says.
+- `MINER_WALKS_PER_THREAD=1` to `4` sets how many walks each CPU thread
+  steps in turn. Unset, the miner measures 1 to 4 on all its threads before
+  its first Walk job (about 6 s) and logs the rates: one on a Pi 5, more on
+  CPUs with a lot of cache per core (docs/MIDSTATE_WALK.md).
 
 CUDA needs only the NVIDIA driver: the kernels are built into midstate, and the driver compiles them for the card it finds. Each GPU must reproduce the Walk's known answers before it mines. Every hash a GPU finds below a target is checked again on the CPU before it is sent, so a GPU that goes wrong (an overclock running hot) loses work, never a share or a block, and the log says which card. Where there is no driver, no GPU, or no GPU that passes, the miner says why once and mines on the CPU. The GPUs and the CPU threads never try the same nonce, and all of them drop a job as soon as the pool sends the next one.
 

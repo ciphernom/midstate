@@ -461,17 +461,18 @@ enum Command {
         /// board's temperature and power before and after.
         #[arg(long)]
         with_cpu: bool,
-        /// Measure walks stepped in turn on each thread (1, 2 and 3 per
-        /// thread, with the threads pinned to cores and not), each checked
-        /// against the known answers. A core waits on every step of one walk;
-        /// a second walk's steps can fill those waits.
+        /// Measure walks stepped in turn on each thread (1 to 4 per thread,
+        /// each way of writing the step), each checked against the known
+        /// answers. A core waits on every step of one walk; other walks'
+        /// steps can fill those waits. The miner chooses its count itself.
         #[arg(long)]
         interleave: bool,
     },
 }
 
-/// Midstate Walk attempts per second over `threads` threads for `duration`.
-fn walk_rate(mining_hash: [u8; 32], threads: usize, duration: std::time::Duration) -> f64 {
+/// Midstate Walk attempts per second over `threads` threads for `duration`,
+/// each thread stepping `walks` walks in turn, as the miner does.
+fn walk_rate(mining_hash: [u8; 32], threads: usize, walks: usize, duration: std::time::Duration) -> f64 {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
     let stop = Arc::new(AtomicBool::new(false));
@@ -483,9 +484,10 @@ fn walk_rate(mining_hash: [u8; 32], threads: usize, duration: std::time::Duratio
             std::thread::spawn(move || {
                 let mut nonce = t << 40;
                 while !stop.load(Ordering::Relaxed) {
-                    std::hint::black_box(midstate::core::walk::walk_hash(&mining_hash, nonce));
-                    nonce += 1;
-                    done.fetch_add(1, Ordering::Relaxed);
+                    let nonces: Vec<u64> = (0..walks as u64).map(|i| nonce + i).collect();
+                    std::hint::black_box(midstate::core::walk::walk_hash_batch(&mining_hash, &nonces));
+                    nonce += walks as u64;
+                    done.fetch_add(walks as u64, Ordering::Relaxed);
                 }
             })
         })
@@ -516,10 +518,13 @@ fn bench_pow(seconds: u64, threads: usize) {
         walk::WALK_STEPS,
         walk::backend_name()
     );
-    let one = walk_rate(mining_hash, 1, duration);
+    // As the miner chooses it, for all the threads (about 6 s).
+    let walks = walk::walks_per_thread(threads);
+    println!("  {walks} walk(s) stepped in turn per thread, as the miner chooses here");
+    let one = walk_rate(mining_hash, 1, walks, duration);
     println!("  1 thread   {:>10.1} attempts/s", one);
     if threads > 1 {
-        let all = walk_rate(mining_hash, threads, duration);
+        let all = walk_rate(mining_hash, threads, walks, duration);
         println!(
             "  {} threads {:>10.1} attempts/s  ({:.1} per thread, {:.0}% of {} × 1 thread)",
             threads,
