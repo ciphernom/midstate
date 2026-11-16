@@ -378,112 +378,154 @@ const ABANDONED_REPLY_WINDOW: Duration = Duration::from_secs(120);
 /// claims more work first.
 const INCOMPATIBLE_FOR: Duration = Duration::from_secs(3600);
 
-#[derive(Default)]
-struct SavedMeta {
-    /// `cursor` reflects the file (false until the file is first looked at).
-    known: bool,
-    /// Height where the saved headers end. `None`: no file.
-    cursor: Option<u64>,
-    /// Bumped by every clear, so a write queued before the clear is dropped.
-    generation: u64,
-}
-
 /// `sync_state.bin`: the PoW-checked headers sync sessions have gathered, so
 /// a later session resumes where they left off instead of starting over.
 ///
-/// # Reasoning
-/// Any peer used to be able to throw this file away. A session with a peer
-/// no further along than the saved headers deleted it, and that session's
-/// own saves then replaced the headers with a shorter run: a peer on a dead
-/// fork, or one merely at the same height, cost the node every header it
-/// had and the slow re-check of the pre-Walk ones. Now nothing but a clear
-/// (a finished sync, a peer caught feeding us bad blocks) removes it, and a
-/// write never replaces saved headers with ones that end lower.
+/// Layout (integers little-endian): an 8-byte magic, the height of the first
+/// header as a u64, then one `BatchHeader::to_record` per height. Fixed-size
+/// records put any height at a known offset, so where the saved headers end,
+/// and what the last of them is, take one small read however many there are.
 ///
-/// Writes run on the blocking pool, where they can land in any order; every
-/// file operation takes the lock, and the cursor and generation checks run
-/// under it.
+/// # Reasoning
+/// The file used to be rewritten whole, every header so far, after each
+/// 5,000-header chunk: quadratic in the length of the sync. A new node
+/// syncing ~380,000 headers wrote about 3 GB, and cloned its header list in
+/// memory each time, to save 82 MB. Now a chunk that continues the file is
+/// appended, and a different tip replaces just the records after the last
+/// header both agree on. Whether they agree is one comparison: each header
+/// names its parent's PoW hash, so headers that agree at one height agree
+/// at every height below it. A whole-file rewrite is left for a chain that
+/// doesn't share the file's, at most once a session.
+///
+/// Any peer used to be able to delete the file, and a session with a peer
+/// behind it then replaced it with fewer headers. Only a clear (a finished
+/// sync, a peer caught sending bad blocks) removes it now, and nothing
+/// replaces it with headers that end lower.
+///
+/// Writes go, in order, to one writer thread: the main loop decides what to
+/// write from what it has queued so far and never waits for the disk. The
+/// writer re-checks each write against the file, and a load first waits for
+/// it to finish what's queued. Appends aren't fsynced: a crash can at worst
+/// cost the newest headers, and `load` keeps the longest run of records that
+/// link up and drops the rest.
 #[derive(Default, Clone)]
-pub(crate) struct SavedHeaders(Arc<Mutex<SavedMeta>>);
+pub(crate) struct SavedHeaders(Arc<Mutex<SavedInner>>);
+
+const SAVED_MAGIC: &[u8; 8] = b"MSHDRS\x00\x02";
+const SAVED_PREFIX: u64 = 16;
+const RECORD: u64 = crate::core::types::HEADER_RECORD_LEN as u64;
+
+/// What the file holds, once every queued write has landed: heights
+/// `base..cursor`, the last of them `last`.
+#[derive(Clone)]
+struct Extent {
+    base: u64,
+    cursor: u64,
+    last: BatchHeader,
+}
+
+#[derive(Default)]
+struct SavedInner {
+    path: Option<PathBuf>,
+    /// `None`: not looked at yet. `Some(None)`: no usable file.
+    extent: Option<Option<Extent>>,
+    writer: Option<std::sync::mpsc::Sender<WriteJob>>,
+    /// Set by the writer when a write didn't match the file; the next
+    /// decision then looks at the file again.
+    stale: Arc<std::sync::atomic::AtomicBool>,
+}
+
+enum WriteJob {
+    /// Cut the file to end at `start`, then append `headers` from there.
+    Splice { path: PathBuf, start: u64, headers: Vec<BatchHeader> },
+    /// Replace the file with `headers`.
+    Rewrite { path: PathBuf, headers: Vec<BatchHeader> },
+    Remove { path: PathBuf },
+    /// Answer once every job queued before it has run.
+    Barrier(std::sync::mpsc::SyncSender<()>),
+}
 
 impl SavedHeaders {
     fn file(data_dir: &Path) -> PathBuf {
         data_dir.join("sync_state.bin")
     }
 
-    fn lock(&self) -> MutexGuard<'_, SavedMeta> {
+    fn lock(&self) -> MutexGuard<'_, SavedInner> {
         self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    fn read(path: &Path) -> Option<SyncStateBackup> {
-        let bytes = std::fs::read(path).ok()?;
-        bincode::deserialize(&bytes).ok()
-    }
-
-    /// Write through a temporary file, so a crash mid-write can't leave a
-    /// truncated file behind.
-    fn write(path: &Path, backup: &SyncStateBackup) -> bool {
-        let Ok(bytes) = bincode::serialize(backup) else { return false };
-        let tmp = path.with_extension("bin.tmp");
-        std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, path).is_ok()
     }
 
     /// The saved headers, if there are any.
     pub fn load(&self, data_dir: &Path) -> Option<SyncStateBackup> {
-        let mut meta = self.lock();
-        let backup = Self::read(&Self::file(data_dir));
-        meta.cursor = backup.as_ref().map(|b| b.cursor);
-        meta.known = true;
-        backup
+        self.flush();
+        let path = Self::file(data_dir);
+        let (headers, rewrite) = Self::read_all(&path);
+        let mut inner = self.lock();
+        inner.path = Some(path.clone());
+        inner.extent = Some(Self::extent_of(&headers));
+        if rewrite && !headers.is_empty() {
+            // An old-format file, or one with a damaged tail: store it in
+            // full in the current format, once.
+            Self::enqueue(&mut inner, WriteJob::Rewrite { path, headers: headers.clone() });
+        }
+        drop(inner);
+        let cursor = headers.last()?.height + 1;
+        Some(SyncStateBackup { cursor, peer_height: cursor, accumulated_headers: headers })
     }
 
     /// Where the saved headers end, if there are any.
     #[cfg(test)]
     pub fn cursor(&self, data_dir: &Path) -> Option<u64> {
-        let mut meta = self.lock();
-        if !meta.known {
-            meta.cursor = Self::read(&Self::file(data_dir)).map(|b| b.cursor);
-            meta.known = true;
-        }
-        meta.cursor
+        let inner = self.lock_with_extent(&Self::file(data_dir));
+        inner.extent.clone().flatten().map(|e| e.cursor)
     }
 
     pub fn clear(&self, data_dir: &Path) {
-        let mut meta = self.lock();
-        let _ = std::fs::remove_file(Self::file(data_dir));
-        meta.cursor = None;
-        meta.known = true;
-        meta.generation += 1;
-    }
-
-    /// Save `backup` on the blocking pool, unless the saved headers already
-    /// reach further.
-    pub fn store(&self, data_dir: &Path, backup: SyncStateBackup) {
-        let this = self.clone();
         let path = Self::file(data_dir);
-        let generation = self.lock().generation;
-        tokio::task::spawn_blocking(move || {
-            this.store_now(&path, &backup, generation);
-        });
+        let mut inner = self.lock();
+        inner.path = Some(path.clone());
+        inner.extent = Some(None);
+        Self::enqueue(&mut inner, WriteJob::Remove { path });
     }
 
-    pub(crate) fn store_now(&self, path: &Path, backup: &SyncStateBackup, generation: u64) -> bool {
-        let mut meta = self.lock();
-        if meta.generation != generation {
-            return false;
+    /// Save `accumulated`, a session's headers, the last `added` of them new.
+    pub fn save(&self, data_dir: &Path, accumulated: &[BatchHeader], added: usize) {
+        if added == 0 || accumulated.is_empty() {
+            return;
         }
-        if !meta.known {
-            meta.cursor = Self::read(path).map(|b| b.cursor);
-            meta.known = true;
+        let chunk_at = accumulated.len().saturating_sub(added);
+        let (first, last) = (&accumulated[chunk_at], &accumulated[accumulated.len() - 1]);
+        let (start, end) = (first.height, last.height + 1);
+        let path = Self::file(data_dir);
+
+        let mut inner = self.lock_with_extent(&path);
+        let extent = inner.extent.clone().flatten();
+        if extent.as_ref().map_or(false, |e| end < e.cursor) {
+            return; // the file reaches further
         }
-        if meta.cursor.map_or(false, |saved| backup.cursor < saved) {
-            return false;
-        }
-        let written = Self::write(path, backup);
-        if written {
-            meta.cursor = Some(backup.cursor);
-        }
-        written
+        let agrees = match &extent {
+            Some(e) if start == e.cursor => e.last.is_followed_by(first),
+            Some(e) if start > e.base && start < e.cursor => {
+                // A different tip: the record below `start` is on disk once
+                // the writer catches up.
+                drop(inner);
+                self.flush();
+                let below = Self::read_record(&path, e.base, start - 1);
+                inner = self.lock();
+                below.map_or(false, |b| b.is_followed_by(first))
+            }
+            _ => false,
+        };
+        let base = match (&extent, agrees) {
+            (Some(e), true) => {
+                Self::enqueue(&mut inner, WriteJob::Splice { path, start, headers: accumulated[chunk_at..].to_vec() });
+                e.base
+            }
+            _ => {
+                Self::enqueue(&mut inner, WriteJob::Rewrite { path, headers: accumulated.to_vec() });
+                accumulated[0].height
+            }
+        };
+        inner.extent = Some(Some(Extent { base, cursor: end, last: last.clone() }));
     }
 
     /// Keep a header chunk whose PoW checked out after the session that asked
@@ -491,66 +533,202 @@ impl SavedHeaders {
     /// added only where it continues the saved headers exactly, or, with
     /// nothing saved, where it continues our own chain (`links_to_local`).
     pub fn keep_chunk(&self, data_dir: &Path, chunk: Vec<BatchHeader>, links_to_local: bool) {
-        let this = self.clone();
+        let (Some(first), Some(last)) = (chunk.first(), chunk.last()) else { return };
+        let (start, end, last) = (first.height, last.height + 1, last.clone());
         let path = Self::file(data_dir);
-        let generation = self.lock().generation;
-        tokio::task::spawn_blocking(move || {
-            let span = chunk.first().zip(chunk.last()).map(|(a, b)| (a.height, b.height));
-            match (this.keep_chunk_now(&path, chunk, links_to_local, generation), span) {
-                (Some(cursor), Some((from, to))) => tracing::info!(
-                    "Kept headers {}..{}, verified after their sync session ended. The next sync resumes at {}.",
-                    from, to, cursor
-                ),
-                (None, Some((from, to))) => tracing::debug!(
-                    "Verified headers {}..{} outlived their sync session and don't continue the saved ones; dropped",
-                    from, to
-                ),
-                _ => {}
-            }
-        });
-    }
-
-    pub(crate) fn keep_chunk_now(&self, path: &Path, chunk: Vec<BatchHeader>, links_to_local: bool, generation: u64) -> Option<u64> {
-        let (first_height, first_prev_hash, first_prev_midstate) = {
-            let first = chunk.first()?;
-            (first.height, first.prev_header_hash, first.prev_midstate)
-        };
-        let mut meta = self.lock();
-        if meta.generation != generation {
-            return None;
-        }
-        let backup = match Self::read(path) {
-            Some(mut saved) => {
-                let last = saved.accumulated_headers.last()?;
-                if first_height != saved.cursor
-                    || last.height + 1 != first_height
-                    || first_prev_hash != last.extension.final_hash
-                    || first_prev_midstate != last.post_tx_midstate
-                {
-                    return None;
-                }
-                saved.cursor += chunk.len() as u64;
-                saved.peer_height = saved.peer_height.max(saved.cursor);
-                saved.accumulated_headers.extend(chunk);
-                saved
+        let mut inner = self.lock_with_extent(&path);
+        let base = match inner.extent.clone().flatten() {
+            Some(e) if start == e.cursor && e.last.is_followed_by(first) => {
+                Self::enqueue(&mut inner, WriteJob::Splice { path, start, headers: chunk });
+                e.base
             }
             None if links_to_local => {
-                let cursor = first_height + chunk.len() as u64;
-                SyncStateBackup { cursor, peer_height: cursor, accumulated_headers: chunk }
+                Self::enqueue(&mut inner, WriteJob::Rewrite { path, headers: chunk });
+                start
             }
-            None => return None,
+            _ => {
+                tracing::debug!("Headers {}..{} outlived their sync session and don't continue the saved ones; dropped", start, end - 1);
+                return;
+            }
         };
-        if !Self::write(path, &backup) {
-            return None;
-        }
-        meta.cursor = Some(backup.cursor);
-        meta.known = true;
-        Some(backup.cursor)
+        inner.extent = Some(Some(Extent { base, cursor: end, last }));
+        tracing::info!(
+            "Kept headers {}..{}, verified after their sync session ended. The next sync resumes at {}.",
+            start, end - 1, end
+        );
     }
 
-    #[cfg(test)]
-    pub(crate) fn generation(&self) -> u64 {
-        self.lock().generation
+    /// Wait until every write queued so far has reached the file.
+    pub fn flush(&self) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let queued = {
+            let mut inner = self.lock();
+            inner.writer.is_some() && Self::enqueue(&mut inner, WriteJob::Barrier(tx))
+        };
+        if queued {
+            let _ = rx.recv();
+        }
+    }
+
+    /// The lock, with `extent` describing the file at `path`. When it has to
+    /// be learnt (first use, or after a write went wrong) the file is read
+    /// once the writer has finished what's queued, never mid-write: its first
+    /// 16 bytes, its length and its last record.
+    fn lock_with_extent(&self, path: &Path) -> MutexGuard<'_, SavedInner> {
+        let needs_read = {
+            let inner = self.lock();
+            let stale = inner.stale.swap(false, Ordering::SeqCst);
+            stale || inner.path.as_deref() != Some(path) || inner.extent.is_none()
+        };
+        if !needs_read {
+            return self.lock();
+        }
+        self.flush();
+        let extent = Self::read_extent(path);
+        let mut inner = self.lock();
+        inner.path = Some(path.to_path_buf());
+        inner.extent = Some(extent);
+        inner
+    }
+
+    fn read_extent(path: &Path) -> Option<Extent> {
+        use std::io::Read;
+        let mut f = std::fs::File::open(path).ok()?;
+        let len = f.metadata().ok()?.len();
+        let mut prefix = [0u8; SAVED_PREFIX as usize];
+        f.read_exact(&mut prefix).ok()?;
+        if &prefix[..8] != SAVED_MAGIC {
+            // The old format, which `load` converts.
+            return Self::extent_of(&Self::read_all(path).0);
+        }
+        let base = u64::from_le_bytes(prefix[8..16].try_into().expect("8 bytes"));
+        let count = len.saturating_sub(SAVED_PREFIX) / RECORD;
+        let last = Self::read_record(path, base, base + count.checked_sub(1)?)?;
+        Some(Extent { base, cursor: base + count, last })
+    }
+
+    fn read_record(path: &Path, base: u64, height: u64) -> Option<BatchHeader> {
+        use std::io::{Read, Seek, SeekFrom};
+        let index = height.checked_sub(base)?;
+        let mut f = std::fs::File::open(path).ok()?;
+        f.seek(SeekFrom::Start(SAVED_PREFIX + index * RECORD)).ok()?;
+        let mut record = [0u8; crate::core::types::HEADER_RECORD_LEN];
+        f.read_exact(&mut record).ok()?;
+        let header = BatchHeader::from_record(&record);
+        (header.height == height).then_some(header)
+    }
+
+    /// Every saved header, and whether the file should be stored afresh: it
+    /// is in the old format, or its tail doesn't link up (only the run of
+    /// records from the start that does is returned).
+    fn read_all(path: &Path) -> (Vec<BatchHeader>, bool) {
+        let Ok(bytes) = std::fs::read(path) else { return (Vec::new(), false) };
+        if bytes.len() < SAVED_PREFIX as usize || &bytes[..8] != SAVED_MAGIC {
+            return match bincode::deserialize::<SyncStateBackup>(&bytes) {
+                Ok(old) => (Self::linked_prefix(old.accumulated_headers).0, true),
+                Err(_) => (Vec::new(), false),
+            };
+        }
+        let base = u64::from_le_bytes(bytes[8..16].try_into().expect("8 bytes"));
+        // `chunks_exact` drops a torn last record; what's before it is intact.
+        let headers = bytes[SAVED_PREFIX as usize..]
+            .chunks_exact(RECORD as usize)
+            .map(|r| BatchHeader::from_record(r.try_into().expect("record length")))
+            .collect::<Vec<_>>();
+        if headers.first().map_or(false, |h| h.height != base) {
+            return (Vec::new(), false);
+        }
+        Self::linked_prefix(headers)
+    }
+
+    /// The longest run from the start in which heights count up and each
+    /// header follows the one before; and whether anything was cut.
+    fn linked_prefix(mut headers: Vec<BatchHeader>) -> (Vec<BatchHeader>, bool) {
+        let keep = headers
+            .windows(2)
+            .position(|w| w[1].height != w[0].height + 1 || !w[0].is_followed_by(&w[1]))
+            .map_or(headers.len(), |i| i + 1);
+        let cut = keep < headers.len();
+        headers.truncate(keep);
+        (headers, cut)
+    }
+
+    fn extent_of(headers: &[BatchHeader]) -> Option<Extent> {
+        let (first, last) = (headers.first()?, headers.last()?);
+        Some(Extent { base: first.height, cursor: last.height + 1, last: last.clone() })
+    }
+
+    /// Queue `job` for the writer thread, starting it if need be.
+    fn enqueue(inner: &mut SavedInner, job: WriteJob) -> bool {
+        if inner.writer.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel::<WriteJob>();
+            let stale = inner.stale.clone();
+            let spawned = std::thread::Builder::new()
+                .name("saved-headers".into())
+                .spawn(move || {
+                    for job in rx {
+                        if !Self::run(job) {
+                            stale.store(true, Ordering::SeqCst);
+                        }
+                    }
+                });
+            if spawned.is_err() {
+                return false;
+            }
+            inner.writer = Some(tx);
+        }
+        inner.writer.as_ref().map_or(false, |tx| tx.send(job).is_ok())
+    }
+
+    /// Apply one write. False when the file wasn't what the write expected.
+    fn run(job: WriteJob) -> bool {
+        match job {
+            WriteJob::Barrier(done) => {
+                let _ = done.send(());
+                true
+            }
+            WriteJob::Remove { path } => {
+                let _ = std::fs::remove_file(&path);
+                true
+            }
+            WriteJob::Rewrite { path, headers } => {
+                let Some(first) = headers.first() else { return true };
+                let mut bytes = Vec::with_capacity(SAVED_PREFIX as usize + headers.len() * RECORD as usize);
+                bytes.extend_from_slice(SAVED_MAGIC);
+                bytes.extend_from_slice(&first.height.to_le_bytes());
+                for h in &headers {
+                    bytes.extend_from_slice(&h.to_record());
+                }
+                // Through a temporary file: a crash leaves the old file or the new one.
+                let tmp = path.with_extension("bin.tmp");
+                std::fs::write(&tmp, &bytes).is_ok() && std::fs::rename(&tmp, &path).is_ok()
+            }
+            WriteJob::Splice { path, start, headers } => {
+                use std::io::{Seek, SeekFrom, Write};
+                let Some(first) = headers.first() else { return true };
+                let Some(extent) = Self::read_extent(&path) else { return false };
+                if start <= extent.base || start > extent.cursor {
+                    return false;
+                }
+                let below = if start == extent.cursor {
+                    Some(extent.last)
+                } else {
+                    Self::read_record(&path, extent.base, start - 1)
+                };
+                if !below.map_or(false, |b| b.is_followed_by(first)) {
+                    return false;
+                }
+                let mut bytes = Vec::with_capacity(headers.len() * RECORD as usize);
+                for h in &headers {
+                    bytes.extend_from_slice(&h.to_record());
+                }
+                let at = SAVED_PREFIX + (start - extent.base) * RECORD;
+                let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&path) else { return false };
+                f.set_len(at).is_ok()
+                    && f.seek(SeekFrom::Start(at)).is_ok()
+                    && f.write_all(&bytes).is_ok()
+            }
+        }
     }
 }
 
@@ -606,6 +784,33 @@ pub struct SyncManager {
     /// The peer whose session already restarted once without the saved
     /// headers, after they didn't fit its chain. Reset by every new session.
     restarted_fresh: Option<PeerId>,
+    /// Header checkpoints: segments of the chain whose PoW needn't be
+    /// re-checked (see `crate::checkpoints`).
+    pub(crate) checkpoints: crate::checkpoints::Checkpoints,
+    /// How fast blocks are being verified, for the progress line.
+    block_pace: Option<BlockPace>,
+}
+
+#[derive(Clone, Copy)]
+struct BlockPace {
+    at: Instant,
+    height: u64,
+    /// Blocks a second, smoothed; 0 until there are two readings.
+    per_sec: f64,
+}
+
+/// ", ~24 min at 455/min": how long `to_go` blocks take at `per_sec`.
+pub fn pace_text(to_go: u64, per_sec: f64) -> String {
+    if per_sec <= 0.0 || to_go == 0 {
+        return String::new();
+    }
+    let minutes = (to_go as f64 / per_sec / 60.0).ceil() as u64;
+    let left = match minutes {
+        0..=1 => "~1 min".to_string(),
+        2..=89 => format!("~{} min", minutes),
+        _ => format!("~{} h {} min", minutes / 60, minutes % 60),
+    };
+    format!(", {} at {:.0}/min", left, per_sec * 60.0)
 }
 
 impl SyncManager {
@@ -812,14 +1017,12 @@ impl SyncManager {
         });
     }
 
-    pub fn save_backup(&self, data_dir: &std::path::PathBuf, cursor: u64, peer_height: u64) {
+    /// Save the session's headers, the last `added` of them new (all of them
+    /// for `usize::MAX`). See `SavedHeaders::save`.
+    pub fn save_backup(&self, data_dir: &std::path::PathBuf, added: usize) {
         if let Some(s) = &self.session {
             if let SyncPhase::Headers { accumulated, .. } = &s.phase {
-                self.saved.store(data_dir, SyncStateBackup {
-                    cursor,
-                    peer_height,
-                    accumulated_headers: accumulated.clone(),
-                });
+                self.saved.save(data_dir, accumulated, added);
             }
         }
     }
@@ -900,6 +1103,18 @@ impl SyncManager {
             },
             _ => None,
         }
+    }
+
+    /// The session's headers with heights in `from..to`, when it's fetching
+    /// headers and has them.
+    pub fn accumulated_between(&self, from: u64, to: u64) -> Vec<BatchHeader> {
+        let Some(SyncSession { phase: SyncPhase::Headers { accumulated, .. }, .. }) = &self.session else {
+            return Vec::new();
+        };
+        let Some(first) = accumulated.first().map(|h| h.height) else { return Vec::new() };
+        let lo = from.saturating_sub(first).min(accumulated.len() as u64) as usize;
+        let hi = to.saturating_sub(first).min(accumulated.len() as u64) as usize;
+        accumulated[lo..hi.max(lo)].to_vec()
     }
 
     /// Whether the Headers phase with `peer` is mid-check.
@@ -989,6 +1204,26 @@ impl SyncManager {
         }
         self.restarted_fresh = Some(peer);
         true
+    }
+
+    /// Note that blocks are verified up to `height`, and return how fast
+    /// they're coming, in blocks a second: an exponential moving average over
+    /// the readings, O(1) to keep. A reading after a long pause, or a lower
+    /// height (a new session from further back), starts the average afresh.
+    pub fn block_rate(&mut self, height: u64) -> Option<f64> {
+        const SMOOTHING: f64 = 0.3;
+        const STALE: Duration = Duration::from_secs(600);
+        let now = Instant::now();
+        let per_sec = match self.block_pace {
+            Some(p) if height == p.height => return (p.per_sec > 0.0).then_some(p.per_sec),
+            Some(p) if height > p.height && now.duration_since(p.at) < STALE => {
+                let latest = (height - p.height) as f64 / now.duration_since(p.at).as_secs_f64().max(1e-3);
+                if p.per_sec > 0.0 { SMOOTHING * latest + (1.0 - SMOOTHING) * p.per_sec } else { latest }
+            }
+            _ => 0.0,
+        };
+        self.block_pace = Some(BlockPace { at: now, height, per_sec });
+        (per_sec > 0.0).then_some(per_sec)
     }
 
     /// Blocks were saved: whatever went wrong before, sync works. Start the
@@ -1155,6 +1390,7 @@ impl SyncManager {
         }
 
         let mut new_cursor = cursor + headers.len() as u64;
+        let mut added = headers.len();
 
         match &mut self.session {
             Some(s) => {
@@ -1180,6 +1416,7 @@ impl SyncManager {
                         *accumulated = new_acc;
                         new_cursor = peer_height;
                         *c = new_cursor;
+                        added = usize::MAX; // new headers at the front: save them all
                     } else {
                         // Normal forward
                         if let (Some(last_acc), Some(first_new)) = (accumulated.last(), headers.first()) {
@@ -1195,7 +1432,7 @@ impl SyncManager {
                         *c = new_cursor;
                     }
 
-                    self.save_backup(data_dir, new_cursor, peer_height);
+                    self.save_backup(data_dir, added);
                 }
             }
             _ => unreachable!(),
@@ -1283,13 +1520,48 @@ mod tests {
             .collect()
     }
 
-    fn backup_of(headers: &[BatchHeader]) -> SyncStateBackup {
-        let cursor = headers.last().map_or(0, |h| h.height + 1);
-        SyncStateBackup { cursor, peer_height: cursor, accumulated_headers: headers.to_vec() }
+    /// Save all of `headers` as a session's, then wait for the writer.
+    fn save_all(saved: &SavedHeaders, dir: &Path, headers: &[BatchHeader]) {
+        saved.save(dir, headers, headers.len());
+        saved.flush();
     }
 
-    fn save(saved: &SavedHeaders, dir: &Path, headers: &[BatchHeader]) -> bool {
-        saved.store_now(&SavedHeaders::file(dir), &backup_of(headers), saved.generation())
+    fn file_len(dir: &Path) -> u64 {
+        std::fs::metadata(SavedHeaders::file(dir)).map(|m| m.len()).unwrap_or(0)
+    }
+
+    fn records(n: u64) -> u64 {
+        SAVED_PREFIX + n * RECORD
+    }
+
+    #[test]
+    fn a_header_record_round_trips_every_field() {
+        let header = chain(371_499, 1, 9).remove(0);
+        let back = BatchHeader::from_record(&header.to_record());
+        assert_eq!(back.to_record(), header.to_record());
+        assert_eq!(back.height, 371_499);
+        assert_eq!(back.prev_midstate, header.prev_midstate);
+        assert_eq!(back.extension.final_hash, header.extension.final_hash);
+    }
+
+    #[test]
+    fn a_session_continuing_the_file_appends_only_its_new_headers() {
+        let dir = tempdir().unwrap();
+        let saved = SavedHeaders::default();
+        let all = chain(100, 60, 1);
+
+        save_all(&saved, dir.path(), &all[..20]);
+        assert_eq!(file_len(dir.path()), records(20));
+
+        // Next chunk: the session has 40 headers, 20 of them new.
+        saved.save(dir.path(), &all[..40], 20);
+        saved.save(dir.path(), &all[..60], 20);
+        saved.flush();
+        assert_eq!(file_len(dir.path()), records(60), "appended, not rewritten");
+        let back = SavedHeaders::default().load(dir.path()).unwrap();
+        assert_eq!(back.cursor, 160);
+        assert_eq!(back.accumulated_headers.len(), 60);
+        assert_eq!(back.accumulated_headers[59].to_record(), all[59].to_record());
     }
 
     #[test]
@@ -1298,77 +1570,137 @@ mod tests {
         let saved = SavedHeaders::default();
         let all = chain(100, 50, 1);
 
-        assert!(save(&saved, dir.path(), &all[..40]));
+        save_all(&saved, dir.path(), &all[..40]);
         // A session with a peer that's behind, or on a fork of its own, has less.
-        assert!(!save(&saved, dir.path(), &all[..30]));
-        assert!(!save(&saved, dir.path(), &chain(100, 20, 2)));
+        save_all(&saved, dir.path(), &all[..30]);
+        save_all(&saved, dir.path(), &chain(100, 20, 2));
         assert_eq!(saved.cursor(dir.path()), Some(140));
-        // The same height (a different tip) and further are fine.
-        assert!(save(&saved, dir.path(), &chain(100, 40, 3)));
-        assert!(save(&saved, dir.path(), &all));
+        // The same height on another chain, and further, are fine.
+        save_all(&saved, dir.path(), &chain(100, 40, 3));
+        assert_eq!(SavedHeaders::default().load(dir.path()).unwrap().accumulated_headers[0].to_record(), chain(100, 1, 3)[0].to_record());
+        save_all(&saved, dir.path(), &all);
         assert_eq!(SavedHeaders::default().load(dir.path()).unwrap().cursor, 150);
+    }
+
+    #[test]
+    fn a_different_tip_replaces_only_the_headers_after_the_fork() {
+        let dir = tempdir().unwrap();
+        let saved = SavedHeaders::default();
+        let all = chain(100, 40, 1);
+        save_all(&saved, dir.path(), &all);
+
+        // A peer at the same height whose last header differs (a tip race):
+        // the session resumed one header short of it and got the peer's.
+        let mut theirs = all[..39].to_vec();
+        let mut tip = chain(139, 1, 5).remove(0);
+        tip.prev_header_hash = all[38].extension.final_hash;
+        tip.prev_midstate = all[38].post_tx_midstate;
+        theirs.push(tip.clone());
+        saved.save(dir.path(), &theirs, 1);
+        saved.flush();
+
+        assert_eq!(file_len(dir.path()), records(40), "one record replaced in place");
+        let back = SavedHeaders::default().load(dir.path()).unwrap();
+        assert_eq!(back.accumulated_headers[39].to_record(), tip.to_record());
+        assert_eq!(back.accumulated_headers[38].to_record(), all[38].to_record());
     }
 
     #[test]
     fn the_rule_holds_for_a_file_an_earlier_run_left() {
         let dir = tempdir().unwrap();
         let all = chain(100, 50, 1);
-        assert!(save(&SavedHeaders::default(), dir.path(), &all));
+        save_all(&SavedHeaders::default(), dir.path(), &all);
 
         // A new process that hasn't looked at the file yet.
         let saved = SavedHeaders::default();
-        assert!(!save(&saved, dir.path(), &all[..10]));
+        save_all(&saved, dir.path(), &all[..10]);
         assert_eq!(saved.load(dir.path()).unwrap().cursor, 150);
     }
 
     #[test]
-    fn a_write_queued_before_a_clear_is_dropped() {
+    fn a_clear_removes_what_was_queued_before_it() {
         let dir = tempdir().unwrap();
         let saved = SavedHeaders::default();
-        let queued_at = saved.generation();
+        saved.save(dir.path(), &chain(0, 10, 1), 10);
         saved.clear(dir.path());
-        assert!(!saved.store_now(&SavedHeaders::file(dir.path()), &backup_of(&chain(0, 10, 1)), queued_at));
+        saved.flush();
         assert!(saved.load(dir.path()).is_none());
+        assert!(!SavedHeaders::file(dir.path()).exists());
+    }
+
+    #[test]
+    fn a_file_in_the_old_format_is_read_and_converted() {
+        let dir = tempdir().unwrap();
+        let headers = chain(100, 30, 1);
+        let old = SyncStateBackup { cursor: 130, peer_height: 140, accumulated_headers: headers.clone() };
+        std::fs::write(SavedHeaders::file(dir.path()), bincode::serialize(&old).unwrap()).unwrap();
+
+        let saved = SavedHeaders::default();
+        let back = saved.load(dir.path()).unwrap();
+        assert_eq!(back.cursor, 130);
+        saved.flush();
+        let bytes = std::fs::read(SavedHeaders::file(dir.path())).unwrap();
+        assert_eq!(&bytes[..8], SAVED_MAGIC);
+        assert_eq!(bytes.len() as u64, records(30));
+    }
+
+    #[test]
+    fn a_damaged_tail_is_dropped_and_the_rest_kept() {
+        let dir = tempdir().unwrap();
+        let all = chain(100, 20, 1);
+        save_all(&SavedHeaders::default(), dir.path(), &all);
+
+        // A torn last record, then a crash-garbled one before it.
+        let path = SavedHeaders::file(dir.path());
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.extend_from_slice(&[7u8; 100]);
+        let garbled = (SAVED_PREFIX + 18 * RECORD) as usize;
+        bytes[garbled + 200] ^= 0xff; // record 18's prev_header_hash
+        std::fs::write(&path, &bytes).unwrap();
+
+        let back = SavedHeaders::default().load(dir.path()).unwrap();
+        assert_eq!(back.cursor, 118, "records 0..18 link up; 18 and after are dropped");
     }
 
     #[test]
     fn a_checked_chunk_joins_the_saved_headers_only_where_it_continues_them() {
         let dir = tempdir().unwrap();
-        let path = SavedHeaders::file(dir.path());
         let saved = SavedHeaders::default();
         let all = chain(100, 60, 1);
-        assert!(save(&saved, dir.path(), &all[..20]));
-        let generation = saved.generation();
+        save_all(&saved, dir.path(), &all[..20]);
 
         // Not where the saved headers end, or from another chain: dropped.
-        assert_eq!(saved.keep_chunk_now(&path, all[25..40].to_vec(), false, generation), None);
-        assert_eq!(saved.keep_chunk_now(&path, chain(120, 10, 2), false, generation), None);
+        saved.keep_chunk(dir.path(), all[25..40].to_vec(), false);
+        saved.keep_chunk(dir.path(), chain(120, 10, 2), false);
         // The very next headers: kept.
-        assert_eq!(saved.keep_chunk_now(&path, all[20..40].to_vec(), false, generation), Some(140));
+        saved.keep_chunk(dir.path(), all[20..40].to_vec(), false);
+        saved.flush();
 
         let kept = saved.load(dir.path()).unwrap();
         assert_eq!(kept.cursor, 140);
         assert_eq!(kept.accumulated_headers.len(), 40);
-        assert_eq!(kept.accumulated_headers.last().unwrap().height, 139);
+        assert_eq!(file_len(dir.path()), records(40));
     }
 
     #[test]
     fn with_nothing_saved_a_checked_chunk_is_kept_only_if_it_continues_our_chain() {
         let dir = tempdir().unwrap();
-        let path = SavedHeaders::file(dir.path());
         let saved = SavedHeaders::default();
         let headers = chain(500, 10, 1);
 
-        assert_eq!(saved.keep_chunk_now(&path, headers.clone(), false, saved.generation()), None);
+        saved.keep_chunk(dir.path(), headers.clone(), false);
+        saved.flush();
         assert!(saved.load(dir.path()).is_none());
-        assert_eq!(saved.keep_chunk_now(&path, headers, true, saved.generation()), Some(510));
+        saved.keep_chunk(dir.path(), headers, true);
+        saved.flush();
+        assert_eq!(saved.load(dir.path()).unwrap().cursor, 510);
     }
 
     #[test]
     fn a_peer_ahead_of_the_saved_headers_continues_them() {
         let dir = tempdir().unwrap();
         let mut sync = SyncManager::default();
-        assert!(save(&sync.saved, dir.path(), &chain(100, 50, 1)));
+        save_all(&sync.saved, dir.path(), &chain(100, 50, 1));
 
         let (headers, cursor) = sync.load_backup(&dir.path().to_path_buf(), 200);
         assert_eq!(cursor, Some(150));
@@ -1380,7 +1712,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let data_dir = dir.path().to_path_buf();
         let mut sync = SyncManager::default();
-        assert!(save(&sync.saved, dir.path(), &chain(100, 50, 1)));
+        save_all(&sync.saved, dir.path(), &chain(100, 50, 1));
 
         // At the same height: it re-sends its last header, which must link to ours.
         let (headers, cursor) = sync.load_backup(&data_dir, 150);
@@ -1415,6 +1747,29 @@ mod tests {
         assert!(!sync.take_abandoned_reply(a, 5000), "asked of another peer");
         assert!(!sync.take_abandoned_reply(PeerId::random(), 5000));
         assert!(sync.take_abandoned_reply(b, 5000));
+    }
+
+    #[test]
+    fn the_block_pace_is_smoothed_and_restarts_after_a_jump_back() {
+        let mut sync = SyncManager::default();
+        assert_eq!(sync.block_rate(1_000), None, "one reading is no rate yet");
+        sync.block_pace.as_mut().unwrap().at -= Duration::from_secs(100);
+        let first = sync.block_rate(2_000).unwrap();
+        assert!((first - 10.0).abs() < 0.5, "1,000 blocks in 100s: {first}");
+        sync.block_pace.as_mut().unwrap().at -= Duration::from_secs(100);
+        let second = sync.block_rate(4_000).unwrap();
+        assert!((second - (0.3 * 20.0 + 0.7 * first)).abs() < 0.5, "smoothed: {second}");
+        assert_eq!(sync.block_rate(4_000), Some(second), "no news, same rate");
+        assert_eq!(sync.block_rate(3_000), None, "a session from further back starts over");
+    }
+
+    #[test]
+    fn the_pace_reads_plainly() {
+        assert_eq!(pace_text(11_061, 455.0 / 60.0), ", ~25 min at 455/min");
+        assert_eq!(pace_text(380_000, 455.0 / 60.0), ", ~13 h 56 min at 455/min");
+        assert_eq!(pace_text(30, 10.0), ", ~1 min at 600/min");
+        assert_eq!(pace_text(0, 10.0), "");
+        assert_eq!(pace_text(100, 0.0), "");
     }
 
     #[test]

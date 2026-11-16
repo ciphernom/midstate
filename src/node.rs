@@ -2005,7 +2005,7 @@ async fn process_state_rebuild(
         // FIX: Pass an empty Vec instead of headers so we don't trip backward prepend panics!
         self.sync.restart_headers_with_step_back(peer, session.peer_height, session.peer_depth, Vec::new(), new_start, session.started_at);
 
-        let count = headers_start_height.saturating_sub(new_start).min(crate::network::MAX_GETHEADERS_COUNT);
+        let count = self.header_request_count(new_start, headers_start_height.min(session.peer_height));
         self.network.send(peer, Message::GetHeaders { start_height: new_start, count });
         return Ok(());
     }
@@ -2175,7 +2175,9 @@ async fn process_verified_batches_chunk(
             return Ok(());
         }
 
-        tracing::info!("Applied sync batches up to height {}/{}", current_cursor, peer_height);
+        let to_go = peer_height.saturating_sub(current_cursor);
+        let pace = self.sync.block_rate(current_cursor).map(|per_sec| crate::sync::pace_text(to_go, per_sec)).unwrap_or_default();
+        tracing::info!("Blocks {}/{} verified, {} to go{}", current_cursor, peer_height, to_go, pace);
 
         // RAM FLUSH & CHECKPOINT: We cannot hold 60,000 blocks in RAM on a Raspberry Pi.
         // Once we have a chunk of blocks, AND the candidate chain has definitively 
@@ -4781,7 +4783,7 @@ fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u12
         );
         self.sync.start(peer, peer_height, peer_depth, start_height, recovered_headers);
 
-        let count = MAX_GETHEADERS_COUNT.min(peer_height.saturating_sub(start_height));
+        let count = self.header_request_count(start_height, peer_height);
         self.network.send(peer, Message::GetHeaders { start_height, count });
     }
 
@@ -4794,6 +4796,35 @@ fn start_sync_session(&mut self, peer: PeerId, peer_height: u64, peer_depth: u12
             .filter(|&c| c > effective_height.saturating_sub(360) && c <= effective_height)
             .unwrap_or_else(|| effective_height.saturating_sub(360));
         base_start.min(effective_height)
+    }
+
+    /// How many headers to ask for from `start` toward `end`. Inside the
+    /// checkpointed range a request ends where a checkpoint segment does.
+    fn header_request_count(&self, start: u64, end: u64) -> u64 {
+        self.sync.checkpoints.request_count(start, end, MAX_GETHEADERS_COUNT)
+    }
+
+    /// Which headers of `chunk` the checkpoints vouch for. The chunk's first
+    /// segment may have started below it: those headers come from the
+    /// session, or below the session's, from our own chain, which the chunk
+    /// continues. Wrong ones there just mean that segment isn't vouched for.
+    fn vouched_by_checkpoints(&self, chunk: &[BatchHeader]) -> Vec<bool> {
+        let checkpoints = &self.sync.checkpoints;
+        let Some(first) = chunk.first() else { return Vec::new() };
+        if first.height >= checkpoints.covered_end() {
+            return Vec::new();
+        }
+        let segment_start = first.height / checkpoints.span() * checkpoints.span();
+        let mut before = Vec::new();
+        if segment_start < first.height {
+            let ours = self.sync.accumulated_between(segment_start, first.height);
+            let ours_from = ours.first().map_or(first.height, |h| h.height);
+            if segment_start < ours_from {
+                before = self.storage.batches.load_headers(segment_start, ours_from).unwrap_or_default();
+            }
+            before.extend(ours);
+        }
+        checkpoints.vouched(&before, chunk)
     }
 
     /// Ask every connected full node for its chain state, so a peer that's
@@ -5028,7 +5059,7 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, reply_start: u64, head
                     self.sync.restart_headers_with_step_back(from, peer_height, peer_depth, Vec::new(), new_start, std::time::Instant::now());
                     self.sync.restore_header_snapshot(snapshot);
 
-                    let count = crate::network::MAX_GETHEADERS_COUNT.min(peer_height - new_start);
+                    let count = self.header_request_count(new_start, peer_height);
                     self.network.send(from, Message::GetHeaders { start_height: new_start, count });
                     return Ok(());
                 }
@@ -5059,7 +5090,7 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, reply_start: u64, head
                             from, start_h, fresh
                         );
                         self.sync.restart_headers_with_step_back(from, peer_height, peer_depth, Vec::new(), fresh, started_at);
-                        let count = MAX_GETHEADERS_COUNT.min(peer_height - fresh);
+                        let count = self.header_request_count(fresh, peer_height);
                         self.network.send(from, Message::GetHeaders { start_height: fresh, count });
                         return Ok(());
                     }
@@ -5109,15 +5140,28 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, reply_start: u64, head
 
         // --- NEW: NON-BLOCKING PIPELINED VERIFICATION ---
         // Verify the PoW of this specific chunk immediately as it arrives on a background thread.
-        let chunk_owned = headers.clone();
         let tx = self.cmd_tx.as_ref().unwrap().clone();
         let session_started_at = self.sync.session_started_at().unwrap_or_else(std::time::Instant::now);
+        // Headers in segments the release's checkpoints vouch for skip the PoW
+        // check: for pre-Walk headers, a million sequential hashes each.
+        let vouched = self.vouched_by_checkpoints(&headers);
+        let skipped = vouched.iter().filter(|v| **v).count();
+        if skipped > 0 {
+            tracing::debug!(
+                "{} of headers {}..{} match this release's checkpoints; skipping their proof-of-work check",
+                skipped, start_h, start_h + headers.len() as u64 - 1
+            );
+        }
 
         tokio::spawn(async move {
-            let chunk_valid = tokio::task::spawn_blocking(move || {
+            // The chunk moves to the check and back rather than being copied.
+            let (headers, chunk_valid) = tokio::task::spawn_blocking(move || {
                 use rayon::prelude::*;
                 use crate::core::extension::verify_extension_at;
-                chunk_owned.par_iter().all(|header| {
+                let valid = headers.par_iter().enumerate().all(|(i, header)| {
+                    if vouched.get(i).copied().unwrap_or(false) {
+                        return true;
+                    }
                     // FIX: Compute the header hash here!
                     let mining_hash = crate::core::types::compute_header_hash(header);
                     // The height picks the proof of work. The pre-check above made
@@ -5129,7 +5173,8 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, reply_start: u64, head
                         &header.extension,
                         &header.target,
                     ).is_ok()
-                })
+                });
+                (headers, valid)
             }).await.expect("Header verification task panicked");
 
            let _ = tx.send(NodeCommand::FinishSyncHeadersChunk {
@@ -5191,8 +5236,20 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, reply_start: u64, head
         }
 
         let mut new_cursor = cursor + headers.len() as u64; 
-        let pct = (new_cursor as f64 / peer_height as f64) * 100.0;
-        tracing::info!("✓ Verified and saved chunk. Sync progress: {}/{} ({:.1}%)", new_cursor, peer_height, pct);
+        // Headers only: it used to read "Sync progress: 380435/380435 (100.0%)"
+        // with every block still to come, and its percentage was of the peer's
+        // whole chain, so it began at 97% or so.
+        if new_cursor < peer_height {
+            tracing::info!(
+                "✓ Headers {}/{} verified and saved, {} to go",
+                new_cursor, peer_height, peer_height - new_cursor
+            );
+        } else {
+            tracing::info!(
+                "✓ All headers to {} verified. Next: the blocks, from {}",
+                peer_height, self.state.height
+            );
+        }
 
         match self.sync.accumulate_verified_headers(from, headers, peer_height, &self.data_dir) {
             Ok(nc) => { new_cursor = nc; }
@@ -5201,7 +5258,7 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, reply_start: u64, head
 
         if new_cursor < peer_height {
             // Need more headers — request next chunk
-            let count = MAX_GETHEADERS_COUNT.min(peer_height - new_cursor);
+            let count = self.header_request_count(new_cursor, peer_height);
             self.network.send(from, Message::GetHeaders { start_height: new_cursor, count });
 
             self.sync.update_progress(new_cursor);
@@ -6400,31 +6457,16 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, reply_start: u64, head
         self.cache_current_state();
 
         // OFFLOAD HEAVY REORG DISK I/O TO THREADPOOL ---
+        // One transaction: unburn the abandoned blocks' keys (the Ghost DB
+        // entry fix), write the blocks, burn their keys, save the state, and
+        // sync the disk once (Storage::commit_blocks). The history moves into
+        // the task and back rather than being copied: up to ~10 MB a checkpoint.
         let storage_clone = self.storage.clone();
         let state_clone = self.state.clone();
-        let history_clone = new_history.clone();
-        
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            // 0. UNBURN ABANDONED ADDRESSES (Fix for the Ghost DB entry bug)
-            for batch in &abandoned_batches {
-                if let Err(e) = storage_clone.unburn_batch_addresses(batch) {
-                    tracing::warn!("Failed to unburn abandoned batch addresses: {}", e);
-                }
-            }
 
-            // 1. WRITE BATCHES
-            for (height, _, batch) in &history_clone {
-                storage_clone.save_batch(*height, batch)?;
-            }
-            // 2. COMMIT STATE 
-            storage_clone.save_state(&state_clone)?;
-            // 3. BURN ADDRESSES
-            for (height, _, batch) in &history_clone {
-                if let Err(e) = storage_clone.burn_batch_addresses(batch, *height) {
-                    tracing::warn!("burn_batch_addresses failed at height {}: {}", height, e);
-                }
-            }
-            Ok(())
+        let new_history = tokio::task::spawn_blocking(move || -> Result<_> {
+            storage_clone.commit_blocks(&abandoned_batches, &new_history, &state_clone)?;
+            Ok(new_history)
         }).await.expect("Reorg DB task panicked")?;
 
         self.mempool.re_add(abandoned_txs, &self.state);
@@ -8548,14 +8590,20 @@ mod complex_tests {
             _ => return false, // timed out, or channel closed
         };
 
-        if let NodeCommand::FinishSyncBatchesChunk {
-            peer, headers, fork_height, candidate_state, cursor, new_history,
-            is_fast_forward, is_valid, error_msg, session_started_at, peer_height, peer_depth,
-        } = cmd {
-            let _ = node.process_verified_batches_chunk(
+        match cmd {
+            NodeCommand::FinishSyncBatchesChunk {
                 peer, headers, fork_height, candidate_state, cursor, new_history,
                 is_fast_forward, is_valid, error_msg, session_started_at, peer_height, peer_depth,
-            ).await;
+            } => {
+                let _ = node.process_verified_batches_chunk(
+                    peer, headers, fork_height, candidate_state, cursor, new_history,
+                    is_fast_forward, is_valid, error_msg, session_started_at, peer_height, peer_depth,
+                ).await;
+            }
+            NodeCommand::FinishSyncHeadersChunk { peer, headers, is_valid, session_started_at } => {
+                let _ = node.process_verified_headers_chunk(peer, headers, is_valid, session_started_at).await;
+            }
+            _ => {}
         }
         true
     }
@@ -9623,13 +9671,8 @@ fn build_divergent_chain(
         }
         let (tip, _, headers) = extension_of(&node, 6);
         let saved_to = tip.height + 6;
-        let backup = crate::sync::SyncStateBackup {
-            cursor: saved_to,
-            peer_height: saved_to,
-            accumulated_headers: headers.clone(),
-        };
-        let generation = node.sync.saved.generation();
-        assert!(node.sync.saved.store_now(&node.data_dir.join("sync_state.bin"), &backup, generation));
+        node.sync.saved.save(&node.data_dir, &headers, headers.len());
+        node.sync.saved.flush();
 
         // A peer at exactly that height resumes one header short of it.
         let peer = PeerId::random();
@@ -9682,6 +9725,79 @@ fn build_divergent_chain(
 
         node.handle_message(stuck, claims(depth + 1), None).await.unwrap();
         assert_eq!(node.sync.session.as_ref().map(|s| s.peer), Some(stuck), "more work: tried again");
+    }
+
+    // ── Header checkpoints ──────────────────────────────────────────────
+
+    /// Our chain and `n` more headers whose proof of work is broken but which
+    /// link up, and a checkpoint table of `span`-height segments over them.
+    fn checkpointed_chain(node: &Node, n: usize, span: u64) -> (Vec<BatchHeader>, crate::checkpoints::Checkpoints) {
+        let (_, mut ahead) = build_divergent_chain(&node.state, n);
+        for h in &mut ahead {
+            h.extension.nonce ^= 0xdead_beef; // the PoW no longer checks out
+        }
+        let mut chain = node.storage.batches.load_headers(0, node.state.height).unwrap();
+        chain.extend(ahead);
+        assert_eq!(chain.len() as u64 % span, 0, "the test wants whole segments");
+        let table = chain
+            .chunks_exact(span as usize)
+            .enumerate()
+            .flat_map(|(k, seg)| crate::checkpoints::segment_digest(k as u64, seg))
+            .collect();
+        (chain, crate::checkpoints::Checkpoints::new(span, table))
+    }
+
+    /// Fetch `chain` from a peer in one session; true if the headers were
+    /// accepted (the session went on past fetching headers).
+    async fn headers_accepted(
+        node: &mut Node,
+        rx: &mut tokio::sync::mpsc::Receiver<NodeCommand>,
+        chain: &[BatchHeader],
+    ) -> bool {
+        let peer = PeerId::random();
+        node.start_sync_session(peer, chain.len() as u64, u128::MAX / 2, None);
+        let start = node.sync.awaited_header_start(peer).unwrap();
+        node.handle_sync_headers(peer, start, chain[start as usize..].to_vec()).await.unwrap();
+        while pump_commands(node, rx).await {}
+        node.sync.session.as_ref().map_or(false, |s| s.peer == peer && !matches!(s.phase, SyncPhase::Headers { .. }))
+    }
+
+    /// Headers in segments the checkpoints vouch for skip the PoW check.
+    /// Without a table the same headers are checked, and these fail it.
+    #[tokio::test]
+    async fn headers_the_checkpoints_vouch_for_skip_the_pow_check() {
+        let dir = tempdir().unwrap();
+        let (mut node, mut rx) = create_test_node_with_commands(dir.path()).await;
+        for _ in 0..3 {
+            node.try_mine().await.unwrap();
+        }
+        let (chain, checkpoints) = checkpointed_chain(&node, 8, 4);
+
+        node.sync.checkpoints = crate::checkpoints::Checkpoints::new(4, Vec::new());
+        assert!(!headers_accepted(&mut node, &mut rx, &chain).await, "no table: the broken PoW is caught");
+
+        node.sync.abort("next case");
+        node.sync.checkpoints = checkpoints;
+        assert!(headers_accepted(&mut node, &mut rx, &chain).await, "vouched for: accepted without the PoW check");
+    }
+
+    /// `midstate checkpoints` digests a node's own stored headers, segment by
+    /// segment, and stops at whole segments.
+    #[tokio::test]
+    async fn the_checkpoint_table_is_built_from_the_stored_chain() {
+        let dir = tempdir().unwrap();
+        let mut node = create_test_node(dir.path()).await;
+        for _ in 0..9 {
+            node.try_mine().await.unwrap();
+        }
+        let stored = node.storage.batches.load_headers(0, node.state.height).unwrap();
+        let table = crate::checkpoints::build_table(&node.storage, node.state.height, 4).unwrap();
+        assert_eq!(table.len() as u64, node.state.height / 4 * 32);
+        assert_eq!(&table[32..64], &crate::checkpoints::segment_digest(1, &stored[4..8])[..]);
+
+        // And headers from that table are vouched for.
+        let checkpoints = crate::checkpoints::Checkpoints::new(4, table);
+        assert!(checkpoints.vouched(&[], &stored[..8]).iter().all(|v| *v));
     }
 
     // ── Database Lock Retry Test ────────────────────────────────────────

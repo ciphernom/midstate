@@ -572,6 +572,55 @@ pub fn get_archived_signature(&self, wots_pk: &[u8; 32]) -> Result<Option<Vec<u8
         Ok(())
     }
 
+    /// Write a run of blocks, the one-time keys they spent, and the state
+    /// they lead to, as ONE transaction.
+    ///
+    /// # Reasoning
+    /// Saving each block and burning its keys separately cost two redb
+    /// commits per block, each waiting for the disk to sync: 2,000 of them
+    /// for a sync checkpoint of 1,000 blocks, seconds on an SSD and far
+    /// longer on a Raspberry Pi's SD card. The node's main loop, which also
+    /// drives the network, waited the whole time, and peers dropped it. In one
+    /// transaction the copy-on-write B-tree copies each page it touches
+    /// once, not once per block, and the disk syncs once.
+    ///
+    /// It is all-or-nothing too. The state used to be saved before the keys
+    /// were burnt, so a crash between the two left a node whose state was
+    /// ahead of its spent-key records.
+    ///
+    /// `abandoned` are the blocks a reorg replaces: their keys are unburnt
+    /// first. A key that fails to burn or unburn is logged and skipped, as
+    /// it was when each had a transaction of its own.
+    pub fn commit_blocks(
+        &self,
+        abandoned: &[crate::core::Batch],
+        blocks: &[(u64, [u8; 32], crate::core::Batch)],
+        state: &State,
+    ) -> Result<()> {
+        // Serialise before taking the write lock: no other writer waits on it.
+        let state_bytes = bincode::serialize(state)?;
+        let write_txn = self.db.begin_write()?;
+        for batch in abandoned {
+            if let Err(e) = Self::unburn_batch_addresses_in(&write_txn, batch) {
+                tracing::warn!("Failed to unburn abandoned batch addresses: {}", e);
+            }
+        }
+        for (height, _, batch) in blocks {
+            self.batches.save_in(&write_txn, *height, batch)?;
+        }
+        for (height, _, batch) in blocks {
+            if let Err(e) = Self::burn_batch_addresses_in(&write_txn, batch) {
+                tracing::warn!("burn_batch_addresses failed at height {}: {}", height, e);
+            }
+        }
+        {
+            let mut table = write_txn.open_table(STATE_TABLE)?;
+            table.insert("current", state_bytes.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
     /// Loads the persisted current state from the redb-backed STATE_TABLE.
     ///
     /// Routes through the canonical [`deserialize_state`], which rebuilds
@@ -748,6 +797,13 @@ pub fn get_archived_signature(&self, wots_pk: &[u8; 32]) -> Result<Option<Vec<u8
     ///   re-sign, which is the failure this whole subsystem exists to prevent.
     pub fn unburn_batch_addresses(&self, batch: &crate::core::Batch) -> Result<()> {
         let write_txn = self.db.begin_write()?;
+        Self::unburn_batch_addresses_in(&write_txn, batch)?;
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// `unburn_batch_addresses` inside the caller's write transaction.
+    fn unburn_batch_addresses_in(write_txn: &redb::WriteTransaction, batch: &crate::core::Batch) -> Result<()> {
         {
             let mut spent_table = write_txn.open_table(SPENT_ADDRESSES_TABLE)?;
             let mut sig_archive_table = write_txn.open_table(SIGNATURE_ARCHIVE_TABLE)?;
@@ -796,7 +852,6 @@ pub fn get_archived_signature(&self, wots_pk: &[u8; 32]) -> Result<Option<Vec<u8
                 }
             }
         }
-        write_txn.commit()?;
         Ok(())
     }
 
@@ -894,6 +949,13 @@ pub fn get_archived_signature(&self, wots_pk: &[u8; 32]) -> Result<Option<Vec<u8
     ///   edit, out of scope here. See the module note in `mss::mss_sigs_in_stack`.
     pub fn burn_batch_addresses(&self, batch: &crate::core::Batch, _block_height: u64) -> Result<()> {
         let write_txn = self.db.begin_write()?;
+        Self::burn_batch_addresses_in(&write_txn, batch)?;
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// `burn_batch_addresses` inside the caller's write transaction.
+    fn burn_batch_addresses_in(write_txn: &redb::WriteTransaction, batch: &crate::core::Batch) -> Result<()> {
         {
             let mut spent_table = write_txn.open_table(SPENT_ADDRESSES_TABLE)?;
             let mut mss_idx_table = write_txn.open_table(MSS_LEAF_INDEX_TABLE)?;
@@ -977,7 +1039,6 @@ pub fn get_archived_signature(&self, wots_pk: &[u8; 32]) -> Result<Option<Vec<u8
                 }
             }
         }
-        write_txn.commit()?;
         Ok(())
     }
 
@@ -1437,5 +1498,42 @@ mod burn_tests {
 
         assert_eq!(st.query_mss_leaf_index(&master_pk).unwrap(), sig.leaf_index + 1);
         assert!(st.query_spent_addresses(&batch).unwrap().contains_key(&sig.wots_pk));
+    }
+
+    /// A checkpoint's blocks, the keys they spent, the keys of the blocks a
+    /// reorg replaced, and the state all land in one transaction.
+    #[test]
+    fn commit_blocks_writes_blocks_keys_and_state_together() {
+        let dir = tempdir().unwrap();
+        let st = store(&dir);
+
+        let mut a = mss::keygen(&[9u8; 32], 4).unwrap();
+        let mut b = mss::keygen(&[10u8; 32], 4).unwrap();
+        let (pk_a, pk_b) = (a.public_key(), b.public_key());
+        let sig_a = a.sign(&[0x45u8; 32]).unwrap();
+        let sig_b = b.sign(&[0x45u8; 32]).unwrap();
+
+        // The block a reorg replaces, already on disk with its key burnt.
+        let replaced = batch_of(vec![reveal(htlc_predicate(&pk_a), Witness::sig(sig_a.to_bytes()), 6)]);
+        st.save_batch(1, &replaced).unwrap();
+        st.burn_batch_addresses(&replaced, 1).unwrap();
+
+        let winner = batch_of(vec![reveal(htlc_predicate(&pk_b), Witness::sig(sig_b.to_bytes()), 7)]);
+        let next = batch_of(vec![]);
+        let state = State::genesis().0;
+        st.commit_blocks(
+            &[replaced.clone()],
+            &[(1, [0u8; 32], winner.clone()), (2, [0u8; 32], next)],
+            &state,
+        )
+        .unwrap();
+
+        assert!(st.query_spent_addresses(&replaced).unwrap().is_empty(), "the replaced block's key is unburnt");
+        assert!(st.query_spent_addresses(&winner).unwrap().contains_key(&sig_b.wots_pk));
+        assert_eq!(st.query_mss_leaf_index(&pk_b).unwrap(), sig_b.leaf_index + 1);
+        let stored = st.load_batch(1).unwrap().expect("block 1");
+        assert_eq!(stored.transactions.len(), 1);
+        assert!(st.load_batch(2).unwrap().is_some());
+        assert_eq!(st.load_state().unwrap().expect("state").height, state.height);
     }
 }

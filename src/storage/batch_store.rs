@@ -155,10 +155,18 @@ impl BatchStore {
     /// its extracted Header, and its generated Neutrino Filter.
     pub fn save(&self, height: u64, batch: &Batch) -> Result<()> {
         let write_txn = self.db.begin_write()?;
+        self.save_in(&write_txn, height, batch)?;
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// `save` inside the caller's write transaction, so a run of blocks can
+    /// share one commit (see `Storage::commit_blocks`).
+    pub(crate) fn save_in(&self, write_txn: &redb::WriteTransaction, height: u64, batch: &Batch) -> Result<()> {
         // First, while whatever is stored at `height` is still there: a reorg
         // overwrites heights in place, and the balance index must unapply the
         // old block before the new one replaces it.
-        self.balances.on_save(&write_txn, height, batch)?;
+        self.balances.on_save(write_txn, height, batch)?;
         {
             let mut b = write_txn.open_table(super::BATCHES_TABLE)?;
             let mut h = write_txn.open_table(super::HEADERS_TABLE)?;
@@ -176,8 +184,7 @@ impl BatchStore {
         // Index inside the SAME transaction as the batch. A batch on disk whose
         // index entries are missing is a silently wrong search result, and a
         // crash between two commits would produce exactly that.
-        super::search_index::index_batch_in_txn(&write_txn, height, batch)?;
-        write_txn.commit()?;
+        super::search_index::index_batch_in_txn(write_txn, height, batch)?;
         Ok(())
     }
 

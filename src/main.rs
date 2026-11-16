@@ -468,6 +468,26 @@ enum Command {
         #[arg(long)]
         interleave: bool,
     },
+    /// Write the header checkpoint table from a synced node's database, for
+    /// a release to ship as src/checkpoints.bin. New nodes then skip the
+    /// proof-of-work check on those headers: about an hour of all-cores work
+    /// on a desktop for the chain before the Midstate Walk, far more on a
+    /// Raspberry Pi. Stop the node first, or point at a copy of its data
+    /// directory. Anyone with a synced node can run it and compare the digest
+    /// it prints.
+    Checkpoints {
+        /// The node's data directory.
+        #[arg(long, default_value = "./data")]
+        data_dir: PathBuf,
+        /// Cover heights below this, rounded down to a whole segment. Default:
+        /// the Midstate Walk activation, where the costly proof of work ends.
+        /// Never within 1,000 blocks of the tip.
+        #[arg(long)]
+        to: Option<u64>,
+        /// Where to write the table.
+        #[arg(long, default_value = "checkpoints.bin")]
+        out: PathBuf,
+    },
 }
 
 /// Midstate Walk attempts per second over `threads` threads for `duration`,
@@ -1202,8 +1222,10 @@ async fn main() -> Result<()> {
     }
     tracing_subscriber::registry()
         .with(
+            // tower_http at debug logged two lines per HTTP request: with an
+            // explorer open, most of a node's log. RUST_LOG still overrides.
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "midstate=info,tower_http=debug".into()),
+                .unwrap_or_else(|_| "midstate=info,tower_http=warn".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         // The last few hundred lines, for the miner dashboard's Logs tab.
@@ -1250,6 +1272,7 @@ async fn main() -> Result<()> {
                 anyhow::bail!("Pool server cannot run in WebAssembly");
             }
         }
+        Command::Checkpoints { data_dir, to, out } => write_checkpoints(data_dir, to, out),
         Command::BenchPow { seconds, threads, gpu, gpu_adapter, gpu_walks, with_cpu, interleave } => {
             if interleave {
                 midstate::core::walk::print_interleave(seconds, threads, midstate::rpc::miner_mode::temp_c);
@@ -5979,6 +6002,25 @@ async fn keygen(rpc_port: Option<u16>, rpc_host: String) -> Result<()> {
         println!("  Address:  {}", midstate::core::types::encode_address_with_checksum(&address));
     }
     println!("\n⚠️  Keep the seed safe! Anyone with it can spend coins sent to this address.");
+    Ok(())
+}
+
+/// `midstate checkpoints`: see `Command::Checkpoints` and `midstate::checkpoints`.
+fn write_checkpoints(data_dir: PathBuf, to: Option<u64>, out: PathBuf) -> Result<()> {
+    use midstate::checkpoints::{build_table, SPAN};
+    let storage = midstate::storage::Storage::open(data_dir.join("db")).context(
+        "opening the node's database. If the node is running, stop it first, or use a copy of its data directory",
+    )?;
+    let tip = storage.load_state()?.map(|s| s.height).unwrap_or(0);
+    let to = to
+        .unwrap_or(midstate::core::types::WALK_ACTIVATION_HEIGHT)
+        .min(tip.saturating_sub(1_000));
+    let table = build_table(&storage, to, SPAN)?;
+    std::fs::write(&out, &table).with_context(|| format!("writing {}", out.display()))?;
+    let segments = (table.len() / 32) as u64;
+    println!("Wrote {} checkpoints, heights 0..{}, to {}.", segments, segments * SPAN, out.display());
+    println!("Table digest: {}", hex::encode(blake3::hash(&table).as_bytes()));
+    println!("Copy it to src/checkpoints.bin and rebuild. Anyone with a synced node can rebuild it and compare the digest.");
     Ok(())
 }
 

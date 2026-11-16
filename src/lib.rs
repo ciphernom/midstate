@@ -35,6 +35,8 @@ pub mod pool;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod sync;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod checkpoints;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod mix;

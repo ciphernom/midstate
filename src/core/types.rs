@@ -791,6 +791,50 @@ pub struct BatchHeader {
     pub prev_header_hash: [u8; 32], 
 }
 
+/// Length of `BatchHeader::to_record`.
+pub const HEADER_RECORD_LEN: usize = 216;
+
+impl BatchHeader {
+    /// Every field, fixed-size, in a fixed order (integers little-endian):
+    /// the records of the saved-headers file, where a fixed size puts any
+    /// height at a known offset, and what header checkpoints hash. Unlike
+    /// `compute_header_hash`, the input to the proof of work, it leaves out
+    /// nothing: not `height`, not `prev_midstate`.
+    pub fn to_record(&self) -> [u8; HEADER_RECORD_LEN] {
+        let mut r = [0u8; HEADER_RECORD_LEN];
+        r[0..8].copy_from_slice(&self.height.to_le_bytes());
+        r[8..40].copy_from_slice(&self.prev_midstate);
+        r[40..72].copy_from_slice(&self.post_tx_midstate);
+        r[72..80].copy_from_slice(&self.extension.nonce.to_le_bytes());
+        r[80..112].copy_from_slice(&self.extension.final_hash);
+        r[112..120].copy_from_slice(&self.timestamp.to_le_bytes());
+        r[120..152].copy_from_slice(&self.target);
+        r[152..184].copy_from_slice(&self.state_root);
+        r[184..216].copy_from_slice(&self.prev_header_hash);
+        r
+    }
+
+    pub fn from_record(r: &[u8; HEADER_RECORD_LEN]) -> Self {
+        let u64_at = |i: usize| u64::from_le_bytes(r[i..i + 8].try_into().expect("8 bytes"));
+        let h32_at = |i: usize| -> [u8; 32] { r[i..i + 32].try_into().expect("32 bytes") };
+        BatchHeader {
+            height: u64_at(0),
+            prev_midstate: h32_at(8),
+            post_tx_midstate: h32_at(40),
+            extension: Extension { nonce: u64_at(72), final_hash: h32_at(80) },
+            timestamp: u64_at(112),
+            target: h32_at(120),
+            state_root: h32_at(152),
+            prev_header_hash: h32_at(184),
+        }
+    }
+
+    /// Whether `next` follows this header on its chain.
+    pub fn is_followed_by(&self, next: &BatchHeader) -> bool {
+        next.prev_header_hash == self.extension.final_hash && next.prev_midstate == self.post_tx_midstate
+    }
+}
+
 pub fn compute_header_hash(header: &BatchHeader) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&header.prev_header_hash);
