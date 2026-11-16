@@ -483,6 +483,10 @@ impl MidstateNetwork {
         let _: Option<WebRtcCertificate> = webrtc_cert;
 
         let mut swarm = builder
+            .with_dns_config(
+                libp2p::dns::ResolverConfig::cloudflare(),
+                libp2p::dns::ResolverOpts::default(),
+            )
             .with_relay_client(noise::Config::new, yamux::Config::default)?
             .with_behaviour(|key: &libp2p::identity::Keypair, relay_client| {
                 let local_peer = key.public().to_peer_id();
