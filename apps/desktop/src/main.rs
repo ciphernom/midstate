@@ -7,6 +7,7 @@ mod app;
 mod bridge;
 mod theme;
 mod views;
+mod watchdog;
 
 use std::io::Write;
 
@@ -97,9 +98,14 @@ fn main() -> eframe::Result {
         let _ = std::fs::create_dir_all(&base);
         base.join("midstate-desktop.log")
     };
-    // Truncating: one file per run, so what a user sends is the run they are
-    // describing rather than a pile of old sessions.
+    // One file per run, so what a user sends is the run they are describing
+    // rather than a pile of old sessions. The run before is kept beside it:
+    // the run worth reading is often the one that froze or crashed, and
+    // starting the app again is how the user got out of it.
+    let prev_log_path = log_path.with_file_name("midstate-desktop.prev.log");
+    let _ = std::fs::rename(&log_path, &prev_log_path);
     let log_file = std::fs::File::create(&log_path).ok().map(std::sync::Arc::new);
+    let panic_log = log_file.clone();
 
     tracing_subscriber::fmt()
         // Escape codes are noise in a file that gets pasted into a chat window.
@@ -111,6 +117,31 @@ fn main() -> eframe::Result {
         .with_writer(move || Tee(log_file.clone()))
         .init();
 
+    // Release builds abort on a panic (`panic = "abort"`) and, on Windows,
+    // have no stderr for the default hook to print to: the one record of
+    // what went wrong went nowhere, while the window hung white and Windows
+    // gathered up the crash. The message goes into the log first, written
+    // straight to the file (not through tracing, which may be what
+    // panicked), so it is on disk before the abort.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        let since_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let text = format!(
+            "PANIC at unix time {since_epoch} on thread '{}': {info}\n{}\n",
+            thread.name().unwrap_or("unnamed"),
+            std::backtrace::Backtrace::force_capture()
+        );
+        if let Some(f) = &panic_log {
+            let mut w: &std::fs::File = f;
+            let _ = w.write_all(text.as_bytes());
+            let _ = w.flush();
+        }
+        default_hook(info);
+    }));
+
     // First line out, before anything can fail. Its presence or absence in the
     // log splits "died before main" from "died during startup".
     tracing::info!(
@@ -119,7 +150,8 @@ fn main() -> eframe::Result {
         std::env::consts::OS,
         std::env::consts::ARCH,
     );
-    tracing::info!("log file: {}", log_path.display());
+    tracing::info!("log file: {} (the previous run's: {})", log_path.display(), prev_log_path.display());
+    watchdog::start();
 
     // Brand-coloured badge for the window, taskbar and dock.
     let icon = eframe::egui::IconData {

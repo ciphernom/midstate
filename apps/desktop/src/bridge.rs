@@ -6,7 +6,9 @@
 use eframe::egui;
 use midstate_walletd::api::*;
 use midstate_walletd::WalletdHandle;
+use std::collections::HashMap;
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 
 pub enum Action {
     LoadStatus,
@@ -216,14 +218,148 @@ pub enum Msg {
     StreamCode(String),
 }
 
+/// Reads (`Load*` actions) on their way to walletd, by kind.
+///
+/// # Reasoning
+/// The interface polls: the Trade tab four reads every three seconds, the
+/// ribbon and the dashboard more. While walletd is busy (a commit's proof of
+/// work, a long scan) the polls kept coming, each a new task queued behind
+/// the last, and once walletd was free it answered every stale copy in turn
+/// before getting back to the swap it was meant to be watching, as the
+/// interface drowned in their answers. A read already in flight is not sent
+/// again; it is marked, and sent once more when the first lands, so the last
+/// answer always postdates the last request. At most two of a kind exist at
+/// once, however long walletd takes.
+#[derive(Clone, Default)]
+pub struct Reads(Arc<Mutex<HashMap<std::mem::Discriminant<Action>, bool>>>);
+
+impl Reads {
+    /// Whether to send `action` now: false when a read of its kind is
+    /// already in flight, which is then marked to go once more.
+    fn claim(&self, action: &Action) -> bool {
+        let key = std::mem::discriminant(action);
+        let mut reads = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        match reads.get_mut(&key) {
+            Some(again) => {
+                *again = true;
+                false
+            }
+            None => {
+                reads.insert(key, false);
+                true
+            }
+        }
+    }
+
+    /// A read of this kind has landed: whether to send it once more.
+    fn finish(&self, key: std::mem::Discriminant<Action>) -> bool {
+        let mut reads = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        match reads.get_mut(&key) {
+            Some(again) if *again => {
+                *again = false;
+                true
+            }
+            _ => {
+                reads.remove(&key);
+                false
+            }
+        }
+    }
+}
+
+impl Action {
+    /// A copy of this action if it is a read (`Load*`): those take nothing
+    /// and change nothing, so copies of one in flight can be merged.
+    fn read_copy(&self) -> Option<Action> {
+        use Action::*;
+        Some(match self {
+            LoadStatus => LoadStatus,
+            LoadBalance => LoadBalance,
+            LoadCoins => LoadCoins,
+            LoadAddresses => LoadAddresses,
+            LoadHistory => LoadHistory,
+            LoadSends => LoadSends,
+            LoadNodeInfo => LoadNodeInfo,
+            LoadMining => LoadMining,
+            LoadChat => LoadChat,
+            LoadChatDict => LoadChatDict,
+            LoadChannels => LoadChannels,
+            LoadInvoices => LoadInvoices,
+            LoadHub => LoadHub,
+            LoadMyOrders => LoadMyOrders,
+            LoadSwaps => LoadSwaps,
+            LoadMyBids => LoadMyBids,
+            LoadHubs => LoadHubs,
+            LoadEvmAccount => LoadEvmAccount,
+            LoadOrderBook => LoadOrderBook,
+            LoadDexConfig => LoadDexConfig,
+            LoadBonds => LoadBonds,
+            LoadMwbAccount => LoadMwbAccount,
+            LoadMwbBook => LoadMwbBook,
+            LoadMwbOrders => LoadMwbOrders,
+            LoadMwbSwaps => LoadMwbSwaps,
+            LoadMwbNode => LoadMwbNode,
+            LoadMwbHistory => LoadMwbHistory,
+            LoadMwbCoins => LoadMwbCoins,
+            LoadBondRules => LoadBondRules,
+            LoadRentals => LoadRentals,
+            LoadPlans => LoadPlans,
+            _ => return None,
+        })
+    }
+}
+
 pub fn dispatch(
     rt: &tokio::runtime::Handle,
     h: WalletdHandle,
     tx: Sender<Msg>,
     ctx: egui::Context,
     action: Action,
+    reads: &Reads,
 ) {
+    let Some(copy) = action.read_copy() else {
+        rt.spawn(perform(h, tx, ctx, action));
+        return;
+    };
+    if !reads.claim(&action) {
+        return;
+    }
+    let slot = Slot { reads: reads.clone(), key: std::mem::discriminant(&action), held: true };
     rt.spawn(async move {
+        let mut slot = slot;
+        perform(h.clone(), tx.clone(), ctx.clone(), action).await;
+        while slot.reads.finish(slot.key) {
+            perform(h.clone(), tx.clone(), ctx.clone(), copy.read_copy().expect("a read")).await;
+        }
+        slot.held = false;
+    });
+}
+
+/// A read's place in [`Reads`] while it is in flight. Freed if the task
+/// ends without finishing (a panic, the runtime shutting down), so that kind
+/// of read is never left blocked.
+struct Slot {
+    reads: Reads,
+    key: std::mem::Discriminant<Action>,
+    held: bool,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        if self.held {
+            self.reads.0.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.key);
+        }
+    }
+}
+
+/// One action against walletd, its answer sent to the interface.
+fn perform(
+    h: WalletdHandle,
+    tx: Sender<Msg>,
+    ctx: egui::Context,
+    action: Action,
+) -> impl std::future::Future<Output = ()> + Send {
+    async move {
         let out = |m: Msg| {
             let _ = tx.send(m);
             ctx.request_repaint();
@@ -500,5 +636,45 @@ pub fn dispatch(
                 Msg::PlansDone("Moving what you were paid into your balance: follow it on the Send tab.".into())
             }),
         }
-    });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A read already in flight is not sent again: it is sent once more
+    /// when it lands, however many times it was asked for meanwhile.
+    #[test]
+    fn a_read_in_flight_goes_once_more_not_once_per_poll() {
+        let reads = Reads::default();
+        assert!(reads.claim(&Action::LoadMwbSwaps), "the first goes");
+        for _ in 0..5 {
+            assert!(!reads.claim(&Action::LoadMwbSwaps), "copies wait");
+        }
+        assert!(reads.claim(&Action::LoadBalance), "other reads are not held up");
+        let key = std::mem::discriminant(&Action::LoadMwbSwaps);
+        assert!(reads.finish(key), "once more, for the copies asked for meanwhile");
+        assert!(!reads.finish(key), "and then it is done");
+        assert!(reads.claim(&Action::LoadMwbSwaps), "free again");
+    }
+
+    /// A read whose task dies frees its kind rather than blocking it.
+    #[test]
+    fn a_read_that_never_lands_does_not_block_its_kind() {
+        let reads = Reads::default();
+        assert!(reads.claim(&Action::LoadBalance));
+        let key = std::mem::discriminant(&Action::LoadBalance);
+        drop(Slot { reads: reads.clone(), key, held: true });
+        assert!(reads.claim(&Action::LoadBalance), "freed");
+        drop(Slot { reads: reads.clone(), key, held: false });
+        assert!(!reads.claim(&Action::LoadBalance), "a finished slot leaves the next read alone");
+    }
+
+    #[test]
+    fn only_reads_are_merged() {
+        assert!(Action::LoadMwbSwaps.read_copy().is_some());
+        assert!(Action::MwbTake { order_id: "o".into() }.read_copy().is_none());
+        assert!(Action::Send { to: "a".into(), amount: 1, private: false }.read_copy().is_none());
+    }
 }

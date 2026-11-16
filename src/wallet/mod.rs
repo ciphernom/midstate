@@ -210,6 +210,9 @@ impl Drop for WalletFileLock {
 pub struct Wallet {
     path: PathBuf,
     password: Vec<u8>,
+    /// The key saves encrypt with, derived once a session: Argon2id is the
+    /// slow part of a save (see `crypto::FileKey`).
+    file_key: std::sync::OnceLock<crypto::FileKey>,
     pub data: WalletData,
     /// Coin records the chain has confirmed are already spent.
     ///
@@ -245,6 +248,7 @@ impl Wallet {
             wots_hold: None,
             path: path.to_path_buf(),
             password: password.to_vec(),
+            file_key: Default::default(),
             data: WalletData::empty(),
         };
         wallet.save()?;
@@ -266,6 +270,7 @@ impl Wallet {
             wots_hold: None,
             path: path.to_path_buf(),
             password: password.to_vec(),
+            file_key: Default::default(),
             data,
         };
         wallet.save()?;
@@ -286,6 +291,7 @@ impl Wallet {
             wots_hold: None,
             path: path.to_path_buf(),
             password: password.to_vec(),
+            file_key: Default::default(),
             data,
         };
         wallet.save()?;
@@ -555,13 +561,14 @@ pub fn import_scanned(
         };
 
         let encrypted = std::fs::read(path)?;
-        let plaintext = crypto::decrypt(&encrypted, password)?;
+        let (plaintext, key) = crypto::decrypt_keyed(&encrypted, password)?;
         let data: WalletData = serde_json::from_slice(&plaintext)?;
         Ok(Self {
             known_spent: Default::default(),
             wots_hold: None,
             path: path.to_path_buf(),
             password: password.to_vec(),
+            file_key: key.into(),
             data,
         })
     }
@@ -583,9 +590,15 @@ pub fn import_scanned(
         };
 
         let plaintext = serde_json::to_vec(&self.data)?;
-        let encrypted = crypto::encrypt(&plaintext, &self.password)?;
-        std::fs::write(&self.path, encrypted)?;
-        Ok(())
+        let key = match self.file_key.get() {
+            Some(key) => key,
+            None => {
+                let _ = self.file_key.set(crypto::FileKey::new(&self.password)?);
+                self.file_key.get().expect("just set")
+            }
+        };
+        let encrypted = crypto::encrypt_with(&plaintext, key)?;
+        write_replacing(&self.path, &encrypted)
     }
 
     // ── Key generation ──────────────────────────────────────────────────────
@@ -1991,6 +2004,37 @@ pub fn coinbase_salt(mining_seed: &[u8; 32], height: u64, index: u64) -> [u8; 32
     hash_concat(&height_key, &(index | 0x8000000000000000).to_le_bytes())
 }
 
+/// Replace the file at `path` with `bytes`, whole or not at all.
+///
+/// # Reasoning
+/// `std::fs::write` truncates the file first, so a crash, a full disk or a
+/// power cut part-way left a wallet file cut short: unreadable, with the
+/// swap journal and send records in it. Written beside it, flushed to disk
+/// and renamed over it, the file is always the old one or the new one.
+///
+/// Windows refuses the rename while another program holds the file open
+/// without sharing it (a backup or scanning tool, briefly); the bytes are
+/// then written in place, as before.
+fn write_replacing(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let written = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        tracing::debug!("wallet saved in place ({e})");
+        std::fs::write(path, bytes)?;
+    }
+    Ok(())
+}
+
 /// The coins of `ids` that are coinbase rewards `state`'s next block may not
 /// spend yet (see [`crate::core::State::coinbase_matures_at`]).
 pub fn maturing_in(state: &crate::core::State, ids: &[[u8; 32]]) -> std::collections::HashSet<[u8; 32]> {
@@ -2827,6 +2871,30 @@ let c3 = w.import_coin([3; 32], 40_000, [30; 32], None).unwrap();
 
         assert_eq!(w.coins().len(), 2);
         assert_eq!(w.total_value(), 5); // 4 + 1
+    }
+
+    /// Saves encrypt with the key the session derived once, and replace the
+    /// file whole: the salt stays, no temporary file is left behind, and
+    /// the file opens with its password after every save.
+    #[test]
+    fn saves_reuse_the_session_key_and_replace_the_file_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.dat");
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let salt = |p: &Path| std::fs::read(p).unwrap()[..16].to_vec();
+        let first = salt(&path);
+        w.import_coin([3; 32], 8, [4; 32], None).unwrap();
+        assert_eq!(salt(&path), first, "the same key, so the same salt");
+        assert!(!dir.path().join("wallet.dat.tmp").exists());
+        drop(w);
+
+        let mut w = Wallet::open(&path, b"pass").unwrap();
+        assert_eq!(w.coins().len(), 1);
+        w.import_coin([5; 32], 2, [6; 32], None).unwrap();
+        assert_eq!(salt(&path), first, "an opened wallet keeps the file's key");
+        drop(w);
+        assert_eq!(Wallet::open(&path, b"pass").unwrap().coins().len(), 2);
+        assert!(Wallet::open(&path, b"wrong").is_err());
     }
 
     /// Maturity holds back a maturing reward and, at a one-time address,

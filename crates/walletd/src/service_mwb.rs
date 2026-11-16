@@ -6,7 +6,7 @@
 //! decides lives in `mwb_trade` and `mwb_negotiate`, and this module only
 //! reads the chains, moves messages and broadcasts what they decide.
 
-use super::{now_secs, SendMeta, Service};
+use super::{note_slow, now_secs, SendMeta, Service};
 use crate::api::*;
 use crate::mwb::min_fee;
 use crate::mwb_account::{BlockView, MwbAccount, SwapOutputs, LOCK_LABEL, REORG};
@@ -27,6 +27,7 @@ use midwimble::core::mw::crypto::Point32;
 use midwimble::core::mw::stealth::{StealthAddress, WalletKeys};
 use midwimble::core::mw::transaction::{Kernel, Transaction as MwbTx};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Instant;
 
 /// Midwimble blocks scanned per tick.
 const MWB_SCAN_CHUNK: u64 = 500;
@@ -134,6 +135,17 @@ fn mwb_full_weight(node: &midwimble::node::NodeHandle, height: u64, tip: u64) ->
         .unwrap_or(0)
 }
 
+/// Blocks a search for a swap's spend reads in one tick, on either chain.
+///
+/// # Reasoning
+/// The searches run on the actor, which answers nothing else until they
+/// return. A cursor far behind its tip (a swap journalled before its
+/// cursors were, or a wallet back after days closed) would read every block
+/// in between in one go: minutes, with the interface waiting on every
+/// request. Bounded, a tick costs at most this many block reads, and the
+/// cursor still catches up faster than one block a second.
+const SEARCH_PER_TICK: u64 = 256;
+
 /// Both chains as one tick sees them.
 struct LiveChains<'a> {
     mds: midstate::core::State,
@@ -164,8 +176,8 @@ impl Chains for LiveChains<'_> {
         if let Some(w) = self.mds_mempool.iter().find_map(find) {
             return (Some(w), from);
         }
-        let tip = self.mds.height;
-        for h in from..tip {
+        let end = self.mds.height.min(from.saturating_add(SEARCH_PER_TICK));
+        for h in from..end {
             match self.mds_node.storage.batches.load(h) {
                 Ok(Some(batch)) => {
                     if let Some(w) = batch.transactions.iter().find_map(find) {
@@ -179,7 +191,7 @@ impl Chains for LiveChains<'_> {
                 }
             }
         }
-        (None, tip)
+        (None, end)
     }
     fn mwb_output(&self, c: &Point32) -> Option<(u64, Point32)> {
         self.mwb.utxos.get(c).map(|e| (e.height, e.owner_key))
@@ -192,8 +204,8 @@ impl Chains for LiveChains<'_> {
         if let Some(k) = self.mwb_mempool.iter().find_map(find) {
             return (Some(k), from);
         }
-        let tip = self.mwb.height;
-        for h in from..tip {
+        let end = self.mwb.height.min(from.saturating_add(SEARCH_PER_TICK));
+        for h in from..end {
             match self.mwb_node.storage().load_batch(h) {
                 Ok(Some(b)) => {
                     if let Some(k) = find(&b.body) {
@@ -207,7 +219,7 @@ impl Chains for LiveChains<'_> {
                 }
             }
         }
-        (None, tip)
+        (None, end)
     }
 }
 
@@ -716,25 +728,31 @@ impl Service {
         if !self.mwb.loaded {
             return;
         }
+        let t = Instant::now();
         if let Err(e) = self.mwb_scan(&h, &keys).await {
             tracing::warn!("midwimble scan: {e:#}");
         }
         self.mwb_backfill_times(&h);
         self.mwb_rebroadcast_sends(&h).await;
+        note_slow("the midwimble scan", t);
         // Orders, negotiations and swaps read midstate's tip; while midstate
         // catches up that tip is stale, so they wait for it.
         if self.node.is_syncing() {
             return;
         }
         let now = now_secs();
+        let t = Instant::now();
         self.mwb_read_bus(mds_tip, &keys, now).await;
         self.mwb_negotiation_timers(now);
         self.mwb_advertise(mds_tip);
+        note_slow("reading swap messages", t);
         self.mwb.book.retain(|_, e| e.advert.expires > mds_tip && mds_tip <= e.heard + ADVERT_STALE);
         self.mwb.lingers.retain(|_, l| l.until > now);
+        let t = Instant::now();
         if let Err(e) = self.mwb_advance_swaps(&h).await {
             tracing::warn!("swap tick: {e:#}");
         }
+        note_slow("the MDW swap tick", t);
     }
 
     async fn mwb_scan(&mut self, h: &midwimble::node::NodeHandle, keys: &WalletKeys) -> Result<()> {

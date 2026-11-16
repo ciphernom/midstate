@@ -488,6 +488,17 @@ impl NodeHandle {
         self.state.read().await.commitments.contains(&commitment)
     }
 
+    /// Commits waiting in the mempool: the count its admission work goes by
+    /// (`Mempool::required_commit_pow`). Counted in place, nothing cloned.
+    pub async fn pending_commits(&self) -> usize {
+        self.mempool_txs
+            .read()
+            .await
+            .iter()
+            .filter(|(t, _)| matches!(t, Transaction::Commit { .. }))
+            .count()
+    }
+
     pub async fn get_mempool_info(&self) -> (usize, Vec<Transaction>) {
         let size = *self.mempool_size.read().await;
         let txs = self.mempool_txs.read().await.iter().map(|(t, _)| t.clone()).collect();

@@ -19,7 +19,7 @@ use midstate::wallet::Wallet;
 use midstate::core::Transaction;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 #[path = "service_mwb.rs"]
@@ -35,6 +35,36 @@ mod plans_glue;
 mod co_bond_glue;
 
 const TICK: Duration = Duration::from_secs(2);
+
+/// How long one step of the actor may take before the log says so.
+const SLOW_STEP: Duration = Duration::from_secs(2);
+
+/// Log a step that held the actor past [`SLOW_STEP`]: everything else waited
+/// behind it, the interface's requests included. A user who says the wallet
+/// froze can then send a log that says where.
+fn note_slow(step: &str, since: Instant) {
+    let took = since.elapsed();
+    if took >= SLOW_STEP {
+        tracing::warn!("walletd: {step} took {:.1}s; requests waited behind it", took.as_secs_f64());
+    }
+}
+
+/// Log a request that waited ten seconds or more for its answer, at most one
+/// line every ten seconds.
+fn note_slow_reply(what: &str, asked: Instant) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let waited = asked.elapsed();
+    if waited < Duration::from_secs(10) {
+        return;
+    }
+    let now = now_secs();
+    let last = LAST.load(Relaxed);
+    if now >= last + 10 && LAST.compare_exchange(last, now, Relaxed, Relaxed).is_ok() {
+        tracing::warn!("walletd: a {what} request waited {:.0}s for its answer", waited.as_secs_f64());
+    }
+}
+
 /// How long a commit monitor waits for the commitment to enter chain state
 /// before declaring the send stalled (user can retry; pending is preserved).
 const COMMIT_PATIENCE: Duration = Duration::from_secs(15 * 60);
@@ -192,6 +222,21 @@ enum Internal {
     PoolReply { id: [u8; 32], reply: co_bond_glue::PoolReply },
 }
 
+impl Cmd {
+    /// For the log, when handling it is slow. Requests are named where they
+    /// are asked (`ask!`), so they are only "a request" here.
+    fn label(&self) -> &'static str {
+        match self {
+            Cmd::Internal(Internal::TryReveal(_)) => "revealing a send",
+            Cmd::Internal(Internal::CommitStalled(_)) => "a stalled commit",
+            Cmd::Internal(Internal::RevealConfirmed(_)) => "a confirmed send",
+            Cmd::Internal(Internal::Tick) => "the tick",
+            Cmd::Internal(Internal::PoolReply { .. }) => "a pool's reply",
+            _ => "a request",
+        }
+    }
+}
+
 // ── Public handle ───────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -203,15 +248,21 @@ pub struct WalletdHandle {
 macro_rules! ask {
     ($self:ident, $variant:ident { $($f:ident : $v:expr),* }) => {{
         let (resp, rx) = oneshot::channel();
+        let asked = Instant::now();
         $self.tx.send(Cmd::$variant { $($f: $v,)* resp }).await
             .map_err(|_| anyhow!("wallet service is not running"))?;
-        rx.await.map_err(|_| anyhow!("wallet service dropped the request"))?
+        let answer = rx.await.map_err(|_| anyhow!("wallet service dropped the request"))?;
+        note_slow_reply(stringify!($variant), asked);
+        answer
     }};
     ($self:ident, $variant:ident) => {{
         let (resp, rx) = oneshot::channel();
+        let asked = Instant::now();
         $self.tx.send(Cmd::$variant(resp)).await
             .map_err(|_| anyhow!("wallet service is not running"))?;
-        rx.await.map_err(|_| anyhow!("wallet service dropped the request"))?
+        let answer = rx.await.map_err(|_| anyhow!("wallet service dropped the request"))?;
+        note_slow_reply(stringify!($variant), asked);
+        answer
     }};
 }
 
@@ -706,6 +757,34 @@ pub fn spawn(
     handle
 }
 
+/// Solve a commit's proof of work, at the work the node's mempool asks now,
+/// on every core but one and off the actor's thread.
+///
+/// # Reasoning
+/// The actor waits on this, and every request behind it waits on the actor:
+/// on one core the floor of 2^24 hashes holds the wallet for seconds on a
+/// laptop, and more under load. The mempool admits a commit by the commits
+/// waiting in it (`Mempool::required_commit_pow`); asking more, by counting
+/// every commitment the chain holds, only made the wait longer.
+async fn solve_commit_pow(node: &NodeHandle, commitment: [u8; 32]) -> Result<u64> {
+    let state = node.get_state().await;
+    let required = midstate::mempool::Mempool::calculate_required_pow(node.pending_commits().await);
+    let (height, header_hash) = (state.height, state.header_hash);
+    let threads = midstate::core::transaction::commit_pow_threads();
+    let started = Instant::now();
+    let nonce = tokio::task::spawn_blocking(move || {
+        midstate::core::transaction::mine_pow_parallel(&commitment, required, height, header_hash, threads)
+    })
+    .await
+    .context("commit PoW task panicked")?
+    .ok_or_else(|| anyhow!("no proof-of-work nonce solves this commit at this block; it is tried again after the next"))?;
+    tracing::info!(
+        "commit proof of work: {required} bits in {:.1}s on {threads} thread(s)",
+        started.elapsed().as_secs_f64()
+    );
+    Ok(nonce)
+}
+
 // ── The actor ───────────────────────────────────────────────────────────────
 
 struct SendMeta {
@@ -785,10 +864,18 @@ impl Service {
         loop {
             tokio::select! {
                 cmd = rx.recv() => match cmd {
-                    Some(cmd) => self.handle(cmd).await,
+                    Some(cmd) => {
+                        let (what, started) = (cmd.label(), Instant::now());
+                        self.handle(cmd).await;
+                        note_slow(what, started);
+                    }
                     None => break,
                 },
-                _ = ticker.tick() => self.handle(Cmd::Internal(Internal::Tick)).await,
+                _ = ticker.tick() => {
+                    let started = Instant::now();
+                    self.handle(Cmd::Internal(Internal::Tick)).await;
+                    note_slow("the tick", started);
+                }
             }
         }
     }
@@ -2561,17 +2648,7 @@ impl Service {
     /// Grind the commit anti-spam PoW against current chain parameters and
     /// broadcast `Transaction::Commit`, then start the mined-watch monitor.
     async fn broadcast_commit(&mut self, commitment: [u8; 32]) -> Result<()> {
-        let state = self.node.get_state().await;
-        let required =
-            midstate::mempool::Mempool::calculate_required_pow(state.commitments.len());
-        let height = state.height;
-        let header_hash = state.header_hash;
-
-        let spam_nonce = tokio::task::spawn_blocking(move || {
-            midstate::core::transaction::mine_pow(&commitment, required, height, header_hash)
-        })
-        .await
-        .context("commit PoW task panicked")?;
+        let spam_nonce = solve_commit_pow(&self.node, commitment).await?;
 
         self.node
             .send_transaction(Transaction::Commit { commitment, spam_nonce })
@@ -3700,14 +3777,7 @@ impl Service {
 
     /// Grind PoW for an externally-built commitment and broadcast the Commit.
     async fn commit_external(&self, commitment: [u8; 32]) -> Result<()> {
-        let state = self.node.get_state().await;
-        let required = midstate::mempool::Mempool::calculate_required_pow(state.commitments.len());
-        let (h, hh) = (state.height, state.header_hash);
-        let spam_nonce = tokio::task::spawn_blocking(move || {
-            midstate::core::transaction::mine_pow(&commitment, required, h, hh)
-        })
-        .await
-        .context("commit PoW task panicked")?;
+        let spam_nonce = solve_commit_pow(&self.node, commitment).await?;
         self.node
             .send_transaction(Transaction::Commit { commitment, spam_nonce })
             .await
@@ -7156,23 +7226,33 @@ impl Service {
         // Midwimble runs on its own node, so the MDW account scans whether or
         // not midstate has caught up; what needs midstate's tip waits for it
         // inside (adverts, takes, swap steps).
+        let t = Instant::now();
         self.tick_mwb(status.height).await;
+        note_slow("the midwimble tick", t);
         if status.is_syncing {
             return;
         }
+        let t = Instant::now();
         if let Err(e) = self.tick_channels(status.height).await {
             tracing::warn!("channel tick: {e:#}");
         }
+        note_slow("the channel tick", t);
+        let t = Instant::now();
         if let Err(e) = self.tick_swaps(status.height).await {
             tracing::warn!("swap tick: {e:#}");
         }
+        note_slow("the ETH swap tick", t);
         let tip = status.height;
+        let t = Instant::now();
         self.check_new_mss_trees();
         self.refresh_bonds_live().await;
         self.advance_registrations().await;
         self.tick_co_bonds().await;
+        note_slow("the bond tick", t);
+        let t = Instant::now();
         self.tick_rentals(tip).await;
         self.tick_plans(tip).await;
+        note_slow("the rental and plan tick", t);
 
         // A restore pass records the window it starts with at height 0; one
         // whose start was never recorded (interrupted between passes) restarts.
@@ -7211,7 +7291,9 @@ impl Service {
 
         // Storage-backed scan is synchronous — keep it off the actor thread.
         let node = self.node.clone();
+        let t = Instant::now();
         let scan = tokio::task::spawn_blocking(move || node.scan_addresses(&addrs, start, end)).await;
+        note_slow("the coin scan", t);
 
         let found = match scan {
             Ok(Ok(coins)) => coins,

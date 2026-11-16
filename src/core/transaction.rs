@@ -117,6 +117,96 @@ pub fn mine_pow(commitment: &[u8; 32], required_pow: u32, current_height: u64, h
     }
 }
 
+/// [`mine_pow`] on `threads` threads, each searching its own stride of the
+/// nonce space. `None` if no nonce at all solves it.
+///
+/// # Reasoning
+/// A commit's proof of work is the long wait in every send: 2^24 hashes at
+/// the floor and up to 2^30 under spam, while the wallet that sends waits on
+/// it. Strides need no coordination beyond one flag, read every 4,096 hashes,
+/// so T threads finish about T times sooner, in O(1) memory.
+///
+/// One thread searches nonces in order, exactly as `mine_pow` does, and
+/// finds the same nonce. The whole space is 2^32 nonces under one anchor: at
+/// 30 bits that holds about four solutions, and none at all about 1.8% of
+/// the time. `mine_pow` would then search forever; this returns `None`, and
+/// the next block's header gives a fresh space.
+///
+/// # Formal Specification
+/// ```text
+/// Pre:  threads ≥ 1
+/// Post: result = Some(n) ⇒ n = pack(k, anchor) for a k whose preimage (as in
+///         mine_pow) hashes to ≥ required_pow leading zero bits
+///       result = None ⇒ no k < 2^32 does
+///       threads = 1 ∧ result = Some(n) ⇒ n = mine_pow(..)
+/// ```
+pub fn mine_pow_parallel(
+    commitment: &[u8; 32],
+    required_pow: u32,
+    current_height: u64,
+    header_hash: [u8; 32],
+    threads: usize,
+) -> Option<u64> {
+    search_pow(commitment, required_pow, current_height, header_hash, threads, 1 << 32)
+}
+
+/// [`mine_pow_parallel`] over the first `space` nonces.
+fn search_pow(
+    commitment: &[u8; 32],
+    required_pow: u32,
+    current_height: u64,
+    header_hash: [u8; 32],
+    threads: usize,
+    space: u64,
+) -> Option<u64> {
+    // The preimage and the anchor exactly as mine_pow builds them.
+    let mut data = [0u8; 68];
+    let (len, anchor) = if current_height >= crate::core::types::COMMIT_REPLAY_FIX_ACTIVATION_HEIGHT {
+        data[0..32].copy_from_slice(&header_hash);
+        data[32..64].copy_from_slice(commitment);
+        (68, current_height.saturating_sub(1) as u32)
+    } else {
+        data[0..4].copy_from_slice(&(current_height as u32).to_le_bytes());
+        data[4..36].copy_from_slice(commitment);
+        (40, current_height as u32)
+    };
+    let threads = threads.clamp(1, 256) as u64;
+    let found = std::sync::OnceLock::new();
+    std::thread::scope(|s| {
+        for first in 0..threads {
+            let found = &found;
+            s.spawn(move || {
+                let mut data = data;
+                let mut n = first;
+                let mut until_check = 4096u32;
+                while n < space {
+                    data[len - 4..len].copy_from_slice(&(n as u32).to_le_bytes());
+                    let h = crate::core::types::hash(&data[..len]);
+                    if crate::core::types::count_leading_zeros(&h) >= required_pow {
+                        let _ = found.set(n as u32);
+                        return;
+                    }
+                    n += threads;
+                    until_check -= 1;
+                    if until_check == 0 {
+                        if found.get().is_some() {
+                            return;
+                        }
+                        until_check = 4096;
+                    }
+                }
+            });
+        }
+    });
+    found.into_inner().map(|n| pack_spam_nonce(n, anchor))
+}
+
+/// Threads for a wallet's commit proof of work: every core but one, which
+/// stays for the node and the interface.
+pub fn commit_pow_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1).max(1))
+}
+
 /// Evaluate the Commit-PoW associated with a commitment.
 ///
 /// # Reasoning
@@ -1642,6 +1732,50 @@ mod tests {
         validate_transaction(&state, &tx).unwrap();
         // State should not have the commitment
         assert!(!state.commitments.contains(&commitment));
+    }
+
+    // ── Parallel commit proof of work ───────────────────────────────────
+
+    /// The leading zero bits of a packed nonce's hash, rebuilt as
+    /// `mine_pow` hashes it.
+    fn pow_zeros(commitment: &[u8; 32], packed: u64, height: u64, header_hash: [u8; 32]) -> (u32, u32) {
+        let (anchor, n) = unpack_spam_nonce(packed);
+        let h = if height >= crate::core::types::COMMIT_REPLAY_FIX_ACTIVATION_HEIGHT {
+            let mut d = [0u8; 68];
+            d[0..32].copy_from_slice(&header_hash);
+            d[32..64].copy_from_slice(commitment);
+            d[64..68].copy_from_slice(&n.to_le_bytes());
+            hash(&d)
+        } else {
+            commit_pow_hash(commitment, n, anchor)
+        };
+        (count_leading_zeros(&h), anchor)
+    }
+
+    /// One thread finds exactly `mine_pow`'s nonce; several find a valid one
+    /// under the same anchor. Both preimage layouts.
+    #[test]
+    fn parallel_commit_pow_agrees_with_mine_pow() {
+        let header_hash = hash(b"tip header");
+        for height in [5, crate::core::types::COMMIT_REPLAY_FIX_ACTIVATION_HEIGHT + 5] {
+            for i in 0..4u8 {
+                let commitment = hash(&[i, height as u8]);
+                let one = mine_pow_parallel(&commitment, 12, height, header_hash, 1).unwrap();
+                assert_eq!(one, mine_pow(&commitment, 12, height, header_hash));
+                let many = mine_pow_parallel(&commitment, 12, height, header_hash, 3).unwrap();
+                let (zeros, anchor) = pow_zeros(&commitment, many, height, header_hash);
+                assert!(zeros >= 12);
+                assert_eq!(anchor, unpack_spam_nonce(one).0);
+            }
+        }
+    }
+
+    /// A space with no solution ends the search rather than looping.
+    #[test]
+    fn a_commit_pow_search_without_a_solution_ends() {
+        let c = hash(b"no solution");
+        assert_eq!(search_pow(&c, 255, 10, [0; 32], 2, 10_000), None);
+        assert!(search_pow(&c, 1, 10, [0; 32], 2, 10_000).is_some());
     }
 
     // ── Coinbase maturity ───────────────────────────────────────────────

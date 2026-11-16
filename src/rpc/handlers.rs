@@ -35,7 +35,10 @@ pub async fn get_mss_state(State(node): State<AppState>, Json(req): Json<GetMssS
 pub async fn get_state(State(node): State<AppState>) -> Json<GetStateResponse> {
     let state = node.get_state().await;
     let safe_depth = node.get_safe_depth().await;
-    let required_pow = crate::mempool::Mempool::calculate_required_pow(state.commitments.len());
+    // What the mempool asks of a commit now (`commit_transaction` below and
+    // the node's own admission): it counts the commits waiting in it, not
+    // every commitment the chain holds.
+    let required_pow = crate::mempool::Mempool::calculate_required_pow(node.pending_commits().await);
      let webrtc_addrs = node.get_webrtc_addrs().await
     .into_iter()
     .filter(|addr| {

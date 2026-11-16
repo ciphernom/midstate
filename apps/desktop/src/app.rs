@@ -1,9 +1,10 @@
 //! Application state and frame loop. All chain/wallet truth arrives as
 //! [`Msg`]s from the bridge; the UI only renders state and emits [`Action`]s.
 
-use crate::bridge::{dispatch, Action, Msg};
+use crate::bridge::{dispatch, Action, Msg, Reads};
 use crate::theme;
 use crate::views;
+use crate::watchdog;
 use eframe::egui::{self, Align2, Color32, FontId, RichText};
 use midstate_walletd::api::*;
 use midstate_walletd::WalletdHandle;
@@ -86,10 +87,16 @@ pub enum Onboard {
     Unlock,
 }
 
+/// How long a frame may spend on walletd's messages before drawing.
+const MESSAGE_BUDGET: std::time::Duration = std::time::Duration::from_millis(8);
+
 pub struct App {
     rt: tokio::runtime::Runtime,
     pub msg_tx: Sender<Msg>,
     msg_rx: Receiver<Msg>,
+    /// Reads already on their way, so polls do not pile up behind a busy
+    /// walletd (see `Reads`).
+    reads: Reads,
     pub handle: Option<WalletdHandle>,
     pub boot_error: Option<String>,
 
@@ -410,6 +417,7 @@ impl App {
             rt,
             msg_tx,
             msg_rx,
+            reads: Reads::default(),
             handle: None,
             boot_error: None,
             status: None,
@@ -612,7 +620,7 @@ impl App {
     /// Fire an action on the runtime (no-op until walletd is up).
     pub fn go(&self, ctx: &egui::Context, action: Action) {
         if let Some(h) = self.handle.clone() {
-            dispatch(self.rt.handle(), h, self.msg_tx.clone(), ctx.clone(), action);
+            dispatch(self.rt.handle(), h, self.msg_tx.clone(), ctx.clone(), action, &self.reads);
         }
     }
 
@@ -1292,9 +1300,21 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let _frame_mark = watchdog::Frame::begin(ctx.input(|i| i.viewport().minimized.unwrap_or(false)));
+        watchdog::doing("handling walletd's messages", "");
+        // Messages come in bursts: walletd answers at once everything that
+        // queued while it was busy. Handle what fits in a few milliseconds
+        // and leave the rest to the next frame, so no burst holds the window
+        // still.
+        let budget = std::time::Instant::now() + MESSAGE_BUDGET;
         while let Ok(msg) = self.msg_rx.try_recv() {
             self.on_msg(ctx, msg);
+            if std::time::Instant::now() >= budget {
+                ctx.request_repaint();
+                break;
+            }
         }
+        watchdog::doing("polling", "");
         // Theme: track the OS unless overridden, and re-tone when it flips.
         let os_dark = ctx.system_theme().map(|t| t == egui::Theme::Dark).unwrap_or(true);
         theme::set_os_dark(os_dark);
@@ -1433,6 +1453,7 @@ impl eframe::App for App {
             }
         }
 
+        watchdog::doing("drawing", "the ribbon");
         egui::TopBottomPanel::top("ribbon")
             .frame(
                 egui::Frame::default()
@@ -1474,11 +1495,13 @@ impl eframe::App for App {
         // never be drawn. Hold onboarding open until the phrase has been
         // shown AND confirmed — the quiz clears `mnemonic` on success.
         if !status.exists || !status.unlocked || !self.mnemonic.is_empty() {
+            watchdog::doing("drawing", "onboarding");
             views::onboarding::show(self, ctx, &status);
             self.draw_toasts(ctx);
             return;
         }
 
+        watchdog::doing("drawing", "the tab rail");
         egui::SidePanel::left("rail")
             .exact_width(200.0)
             .resizable(false)
@@ -1512,6 +1535,7 @@ impl eframe::App for App {
                 });
             });
 
+        watchdog::doing("drawing the tab", self.tab.name());
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(theme::bg()).inner_margin(egui::Margin::symmetric(28, 20)))
             .show(ctx, |ui| {
