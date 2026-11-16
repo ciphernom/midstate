@@ -15,8 +15,11 @@ use crate::storage::Storage;
 use anyhow::{bail, Result};
 use rayon::prelude::*;
 use libp2p::PeerId;
-use std::collections::BTreeMap;
-use std::time::Instant;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 pub struct Syncer {
     storage: Storage,
@@ -366,6 +369,215 @@ pub(crate) struct SyncStateBackup {
     pub accumulated_headers: Vec<BatchHeader>,
 }
 
+/// How long a GetBatches sent by an ended session is remembered. Requests
+/// time out after 60s (`network::MidstateNetwork::new`), so no reply can come
+/// later than this.
+const ABANDONED_REPLY_WINDOW: Duration = Duration::from_secs(120);
+
+/// How long a peer whose headers broke our rules is left alone, unless it
+/// claims more work first.
+const INCOMPATIBLE_FOR: Duration = Duration::from_secs(3600);
+
+#[derive(Default)]
+struct SavedMeta {
+    /// `cursor` reflects the file (false until the file is first looked at).
+    known: bool,
+    /// Height where the saved headers end. `None`: no file.
+    cursor: Option<u64>,
+    /// Bumped by every clear, so a write queued before the clear is dropped.
+    generation: u64,
+}
+
+/// `sync_state.bin`: the PoW-checked headers sync sessions have gathered, so
+/// a later session resumes where they left off instead of starting over.
+///
+/// # Reasoning
+/// Any peer used to be able to throw this file away. A session with a peer
+/// no further along than the saved headers deleted it, and that session's
+/// own saves then replaced the headers with a shorter run: a peer on a dead
+/// fork, or one merely at the same height, cost the node every header it
+/// had and the slow re-check of the pre-Walk ones. Now nothing but a clear
+/// (a finished sync, a peer caught feeding us bad blocks) removes it, and a
+/// write never replaces saved headers with ones that end lower.
+///
+/// Writes run on the blocking pool, where they can land in any order; every
+/// file operation takes the lock, and the cursor and generation checks run
+/// under it.
+#[derive(Default, Clone)]
+pub(crate) struct SavedHeaders(Arc<Mutex<SavedMeta>>);
+
+impl SavedHeaders {
+    fn file(data_dir: &Path) -> PathBuf {
+        data_dir.join("sync_state.bin")
+    }
+
+    fn lock(&self) -> MutexGuard<'_, SavedMeta> {
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn read(path: &Path) -> Option<SyncStateBackup> {
+        let bytes = std::fs::read(path).ok()?;
+        bincode::deserialize(&bytes).ok()
+    }
+
+    /// Write through a temporary file, so a crash mid-write can't leave a
+    /// truncated file behind.
+    fn write(path: &Path, backup: &SyncStateBackup) -> bool {
+        let Ok(bytes) = bincode::serialize(backup) else { return false };
+        let tmp = path.with_extension("bin.tmp");
+        std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, path).is_ok()
+    }
+
+    /// The saved headers, if there are any.
+    pub fn load(&self, data_dir: &Path) -> Option<SyncStateBackup> {
+        let mut meta = self.lock();
+        let backup = Self::read(&Self::file(data_dir));
+        meta.cursor = backup.as_ref().map(|b| b.cursor);
+        meta.known = true;
+        backup
+    }
+
+    /// Where the saved headers end, if there are any.
+    #[cfg(test)]
+    pub fn cursor(&self, data_dir: &Path) -> Option<u64> {
+        let mut meta = self.lock();
+        if !meta.known {
+            meta.cursor = Self::read(&Self::file(data_dir)).map(|b| b.cursor);
+            meta.known = true;
+        }
+        meta.cursor
+    }
+
+    pub fn clear(&self, data_dir: &Path) {
+        let mut meta = self.lock();
+        let _ = std::fs::remove_file(Self::file(data_dir));
+        meta.cursor = None;
+        meta.known = true;
+        meta.generation += 1;
+    }
+
+    /// Save `backup` on the blocking pool, unless the saved headers already
+    /// reach further.
+    pub fn store(&self, data_dir: &Path, backup: SyncStateBackup) {
+        let this = self.clone();
+        let path = Self::file(data_dir);
+        let generation = self.lock().generation;
+        tokio::task::spawn_blocking(move || {
+            this.store_now(&path, &backup, generation);
+        });
+    }
+
+    pub(crate) fn store_now(&self, path: &Path, backup: &SyncStateBackup, generation: u64) -> bool {
+        let mut meta = self.lock();
+        if meta.generation != generation {
+            return false;
+        }
+        if !meta.known {
+            meta.cursor = Self::read(path).map(|b| b.cursor);
+            meta.known = true;
+        }
+        if meta.cursor.map_or(false, |saved| backup.cursor < saved) {
+            return false;
+        }
+        let written = Self::write(path, backup);
+        if written {
+            meta.cursor = Some(backup.cursor);
+        }
+        written
+    }
+
+    /// Keep a header chunk whose PoW checked out after the session that asked
+    /// for it had ended, most often because its peer dropped mid-check. It is
+    /// added only where it continues the saved headers exactly, or, with
+    /// nothing saved, where it continues our own chain (`links_to_local`).
+    pub fn keep_chunk(&self, data_dir: &Path, chunk: Vec<BatchHeader>, links_to_local: bool) {
+        let this = self.clone();
+        let path = Self::file(data_dir);
+        let generation = self.lock().generation;
+        tokio::task::spawn_blocking(move || {
+            let span = chunk.first().zip(chunk.last()).map(|(a, b)| (a.height, b.height));
+            match (this.keep_chunk_now(&path, chunk, links_to_local, generation), span) {
+                (Some(cursor), Some((from, to))) => tracing::info!(
+                    "Kept headers {}..{}, verified after their sync session ended. The next sync resumes at {}.",
+                    from, to, cursor
+                ),
+                (None, Some((from, to))) => tracing::debug!(
+                    "Verified headers {}..{} outlived their sync session and don't continue the saved ones; dropped",
+                    from, to
+                ),
+                _ => {}
+            }
+        });
+    }
+
+    pub(crate) fn keep_chunk_now(&self, path: &Path, chunk: Vec<BatchHeader>, links_to_local: bool, generation: u64) -> Option<u64> {
+        let (first_height, first_prev_hash, first_prev_midstate) = {
+            let first = chunk.first()?;
+            (first.height, first.prev_header_hash, first.prev_midstate)
+        };
+        let mut meta = self.lock();
+        if meta.generation != generation {
+            return None;
+        }
+        let backup = match Self::read(path) {
+            Some(mut saved) => {
+                let last = saved.accumulated_headers.last()?;
+                if first_height != saved.cursor
+                    || last.height + 1 != first_height
+                    || first_prev_hash != last.extension.final_hash
+                    || first_prev_midstate != last.post_tx_midstate
+                {
+                    return None;
+                }
+                saved.cursor += chunk.len() as u64;
+                saved.peer_height = saved.peer_height.max(saved.cursor);
+                saved.accumulated_headers.extend(chunk);
+                saved
+            }
+            None if links_to_local => {
+                let cursor = first_height + chunk.len() as u64;
+                SyncStateBackup { cursor, peer_height: cursor, accumulated_headers: chunk }
+            }
+            None => return None,
+        };
+        if !Self::write(path, &backup) {
+            return None;
+        }
+        meta.cursor = Some(backup.cursor);
+        meta.known = true;
+        Some(backup.cursor)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn generation(&self) -> u64 {
+        self.lock().generation
+    }
+}
+
+/// Counts block checks running on the blocking pool. The guard is moved into
+/// the check, so the count drops when it ends, even if it panics.
+#[derive(Default, Clone)]
+pub(crate) struct ChecksRunning(Arc<AtomicUsize>);
+
+pub(crate) struct CheckGuard(Arc<AtomicUsize>);
+
+impl ChecksRunning {
+    pub fn start(&self) -> CheckGuard {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        CheckGuard(self.0.clone())
+    }
+
+    pub fn count(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for CheckGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Manager for the non-blocking sync session state machine.
 /// Extracted to shrink the Node god module. Node holds one and delegates
 /// session work here. For simplicity (per plan), heavy callbacks (apply/reorg/
@@ -380,6 +592,20 @@ pub struct SyncManager {
     pub(crate) backoff_until: Option<Instant>,
     pub in_progress: bool,
     // Rate limiting state for header/batch requests can be co-located here later.
+    /// The headers saved for resuming (`sync_state.bin`).
+    pub(crate) saved: SavedHeaders,
+    /// Block checks (`handle_sync_batches`) still running.
+    pub(crate) batch_checks: ChecksRunning,
+    /// GetBatches sent by sessions that have ended: per peer, the requested
+    /// start height and when its session ended. A late reply to one is not a
+    /// competing chain, just blocks nobody is waiting for.
+    abandoned: HashMap<PeerId, Vec<(u64, Instant)>>,
+    /// Peers whose headers broke our consensus rules, with the work they
+    /// claimed then.
+    incompatible: HashMap<PeerId, (u128, Instant)>,
+    /// The peer whose session already restarted once without the saved
+    /// headers, after they didn't fit its chain. Reset by every new session.
+    restarted_fresh: Option<PeerId>,
 }
 
 impl SyncManager {
@@ -406,6 +632,7 @@ impl SyncManager {
             );
             if let Some(s) = self.session.take() {
                 tracing::info!("Aborted sync session with {} ({}): {}", s.peer, s.phase_name(), reason);
+                self.abandon_requests(&s);
             }
             (self.retry_count, Some(backoff))
         } else {
@@ -422,6 +649,10 @@ impl SyncManager {
 
     pub fn start(&mut self, peer: PeerId, peer_height: u64, peer_depth: u128, start_height: u64, recovered_headers: Vec<BatchHeader>) {
         // Now owns the session creation logic (moved from node during Phase 3).
+        if let Some(old) = self.session.take() {
+            self.abandon_requests(&old);
+        }
+        self.restarted_fresh = None;
         let now = Instant::now();
         self.session = Some(SyncSession {
             peer,
@@ -584,16 +815,10 @@ impl SyncManager {
     pub fn save_backup(&self, data_dir: &std::path::PathBuf, cursor: u64, peer_height: u64) {
         if let Some(s) = &self.session {
             if let SyncPhase::Headers { accumulated, .. } = &s.phase {
-                let backup = SyncStateBackup {
+                self.saved.store(data_dir, SyncStateBackup {
                     cursor,
                     peer_height,
                     accumulated_headers: accumulated.clone(),
-                };
-                let path = data_dir.join("sync_state.bin");
-                tokio::task::spawn_blocking(move || {
-                    if let Ok(bytes) = bincode::serialize(&backup) {
-                        let _ = std::fs::write(&path, bytes);
-                    }
                 });
             }
         }
@@ -641,8 +866,136 @@ impl SyncManager {
     }
 
     pub fn finish_sync(&mut self) {
-        self.session = None;
+        if let Some(s) = self.session.take() {
+            self.abandon_requests(&s);
+        }
         self.in_progress = false;
+    }
+
+    /// Whether `peer` and `started_at` name the session running now.
+    ///
+    /// # Reasoning
+    /// Header, block and state-rebuild checks run on the blocking pool and
+    /// report back through the command channel with the peer and start time
+    /// of the session that asked for them. A session's peer can drop while
+    /// its check runs; the session is aborted and another starts, sometimes
+    /// with the same peer. Matching on the peer alone let such a leftover
+    /// result take over the new session: it re-armed it for the old peer,
+    /// which was usually gone, and the request failed and aborted it.
+    pub fn is_session(&self, peer: PeerId, started_at: Instant) -> bool {
+        self.session.as_ref().map_or(false, |s| s.peer == peer && s.started_at == started_at)
+    }
+
+    pub fn session_started_at(&self) -> Option<Instant> {
+        self.session.as_ref().map(|s| s.started_at)
+    }
+
+    /// The cursor the Headers phase is waiting on, if the session is with
+    /// `peer`, in that phase, and has a request out (no chunk being checked).
+    pub fn awaited_header_start(&self, peer: PeerId) -> Option<u64> {
+        match &self.session {
+            Some(s) if s.peer == peer => match &s.phase {
+                SyncPhase::Headers { cursor, verifying: false, .. } => Some(*cursor),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Whether the Headers phase with `peer` is mid-check.
+    pub fn is_checking_headers(&self, peer: PeerId) -> bool {
+        matches!(&self.session, Some(s) if s.peer == peer
+            && matches!(s.phase, SyncPhase::Headers { verifying: true, .. }))
+    }
+
+    fn abandon_requests(&mut self, s: &SyncSession) {
+        match &s.phase {
+            SyncPhase::Batches { in_flight, .. }
+            | SyncPhase::VerifyingBatches { in_flight, .. }
+            | SyncPhase::PipelinedRebuild { in_flight, .. } => {
+                let in_flight = in_flight.clone();
+                self.abandon_in_flight(&in_flight);
+            }
+            _ => {}
+        }
+    }
+
+    /// Remember the GetBatches in `in_flight` as sent by a session that has
+    /// ended, so their replies are recognised when they come.
+    pub(crate) fn abandon_in_flight(&mut self, in_flight: &BTreeMap<u64, PeerId>) {
+        let now = Instant::now();
+        self.prune_abandoned(now);
+        for (&start, &peer) in in_flight {
+            self.abandoned.entry(peer).or_default().push((start, now));
+        }
+    }
+
+    fn prune_abandoned(&mut self, now: Instant) {
+        self.abandoned.retain(|_, requests| {
+            requests.retain(|&(_, at)| now.duration_since(at) < ABANDONED_REPLY_WINDOW);
+            !requests.is_empty()
+        });
+    }
+
+    /// Whether batches from `peer` starting at `start` answer a GetBatches
+    /// whose session has ended. A match is used up.
+    pub fn take_abandoned_reply(&mut self, peer: PeerId, start: u64) -> bool {
+        self.prune_abandoned(Instant::now());
+        let Some(requests) = self.abandoned.get_mut(&peer) else { return false };
+        let count = crate::network::MAX_GETBATCHES_COUNT;
+        let Some(i) = requests.iter().position(|&(req, _)| start >= req && start < req.saturating_add(count)) else {
+            return false;
+        };
+        requests.swap_remove(i);
+        if requests.is_empty() {
+            self.abandoned.remove(&peer);
+        }
+        true
+    }
+
+    /// Forget any ended session's request to `peer` that a reply starting at
+    /// `start` would match: a new request outside any session wants that reply.
+    pub fn forget_abandoned(&mut self, peer: PeerId, start: u64) {
+        while self.take_abandoned_reply(peer, start) {}
+    }
+
+    /// Remember that `peer`'s headers broke our consensus rules while it
+    /// claimed `depth`.
+    pub fn mark_incompatible(&mut self, peer: PeerId, depth: u128) {
+        self.incompatible.insert(peer, (depth, Instant::now()));
+    }
+
+    /// Whether to leave `peer`, now claiming `depth`, alone: its headers broke
+    /// our rules and it has claimed no more work since. A peer stuck on a
+    /// chain from before a fork would otherwise be synced from, and rejected,
+    /// every time it reconnected.
+    pub fn is_incompatible(&mut self, peer: PeerId, depth: u128) -> bool {
+        match self.incompatible.get(&peer) {
+            Some(&(claimed, at)) if depth <= claimed && at.elapsed() < INCOMPATIBLE_FOR => true,
+            Some(_) => {
+                self.incompatible.remove(&peer);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Mark the session as restarted without the saved headers. False if it
+    /// already was, so a session can't loop on it.
+    pub fn note_fresh_restart(&mut self) -> bool {
+        let Some(peer) = self.session.as_ref().map(|s| s.peer) else { return false };
+        if self.restarted_fresh == Some(peer) {
+            return false;
+        }
+        self.restarted_fresh = Some(peer);
+        true
+    }
+
+    /// Blocks were saved: whatever went wrong before, sync works. Start the
+    /// next retry without the backoff the earlier failures built up.
+    pub fn note_progress(&mut self) {
+        self.retry_count = 0;
+        self.backoff_until = None;
     }
 
     pub fn get_sync_role_for_peer(&self, from: PeerId) -> Option<&'static str> {
@@ -731,7 +1084,7 @@ impl SyncManager {
     }
 
     pub fn clear_backup(&self, data_dir: &std::path::PathBuf) {
-        let _ = std::fs::remove_file(data_dir.join("sync_state.bin"));
+        self.saved.clear(data_dir);
     }
 
     pub fn take_headers_for_verification(&mut self) -> Option<(Vec<BatchHeader>, Option<Box<State>>, PeerId, u64, u128, Instant)> {
@@ -851,22 +1204,30 @@ impl SyncManager {
         Ok(new_cursor)
     }
 
+    /// The saved headers to resume a session with `peer_height` from, and
+    /// the height to resume at.
+    ///
+    /// A peer ahead of the saved headers continues them. A peer at or behind
+    /// their end (another peer's headers got us there) resumes one header
+    /// short of its own tip: it sends that one header, which has to link to
+    /// ours, and the session goes on to its blocks. Either way the file is
+    /// left alone; it used to be deleted here, which threw away every saved
+    /// header whenever a peer at the same height, or one stuck on a dead fork
+    /// further down, came along.
     pub fn load_backup(&mut self, data_dir: &std::path::PathBuf, peer_height: u64) -> (Vec<BatchHeader>, Option<u64>) {
-        let sync_file_path = data_dir.join("sync_state.bin");
-        let mut recovered_headers = Vec::new();
-        let mut recovered_cursor = None;
-
-        if let Ok(bytes) = std::fs::read(&sync_file_path) {
-            if let Ok(backup) = bincode::deserialize::<SyncStateBackup>(&bytes) {
-                if peer_height > backup.cursor {
-                    recovered_headers = backup.accumulated_headers;
-                    recovered_cursor = Some(backup.cursor);
-                } else {
-                    let _ = std::fs::remove_file(&sync_file_path);
-                }
-            }
+        let Some(backup) = self.saved.load(data_dir) else {
+            return (Vec::new(), None);
+        };
+        if peer_height > backup.cursor {
+            return (backup.accumulated_headers, Some(backup.cursor));
         }
-        (recovered_headers, recovered_cursor)
+        let resume = peer_height.saturating_sub(1);
+        let mut headers = backup.accumulated_headers;
+        headers.retain(|h| h.height < resume);
+        match headers.last() {
+            Some(last) if last.height + 1 == resume => (headers, Some(resume)),
+            _ => (Vec::new(), None),
+        }
     }
 
     /// Helper to know the current phase name for logging (avoids exposing full enum everywhere).
@@ -887,5 +1248,238 @@ impl SyncSession {
             SyncPhase::VerifyingBatches { .. } => "VerifyingBatches",
             SyncPhase::PipelinedRebuild { .. } => "PipelinedRebuild",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::types::Extension;
+    use tempfile::tempdir;
+
+    /// `n` linked headers from `start`. Different seeds give different chains.
+    fn chain(start: u64, n: u64, seed: u8) -> Vec<BatchHeader> {
+        let mut prev_header_hash = [seed; 32];
+        let mut prev_midstate = [seed.wrapping_add(1); 32];
+        (start..start + n)
+            .map(|height| {
+                let tag = [&height.to_le_bytes()[..], &[seed][..]].concat();
+                let final_hash = *blake3::hash(&[&tag[..], b"hash"].concat()).as_bytes();
+                let post_tx_midstate = *blake3::hash(&[&tag[..], b"mid"].concat()).as_bytes();
+                let header = BatchHeader {
+                    height,
+                    prev_midstate,
+                    post_tx_midstate,
+                    extension: Extension { nonce: 0, final_hash },
+                    timestamp: height,
+                    target: [0xff; 32],
+                    state_root: [0; 32],
+                    prev_header_hash,
+                };
+                prev_header_hash = final_hash;
+                prev_midstate = post_tx_midstate;
+                header
+            })
+            .collect()
+    }
+
+    fn backup_of(headers: &[BatchHeader]) -> SyncStateBackup {
+        let cursor = headers.last().map_or(0, |h| h.height + 1);
+        SyncStateBackup { cursor, peer_height: cursor, accumulated_headers: headers.to_vec() }
+    }
+
+    fn save(saved: &SavedHeaders, dir: &Path, headers: &[BatchHeader]) -> bool {
+        saved.store_now(&SavedHeaders::file(dir), &backup_of(headers), saved.generation())
+    }
+
+    #[test]
+    fn saved_headers_are_never_replaced_by_ones_that_end_lower() {
+        let dir = tempdir().unwrap();
+        let saved = SavedHeaders::default();
+        let all = chain(100, 50, 1);
+
+        assert!(save(&saved, dir.path(), &all[..40]));
+        // A session with a peer that's behind, or on a fork of its own, has less.
+        assert!(!save(&saved, dir.path(), &all[..30]));
+        assert!(!save(&saved, dir.path(), &chain(100, 20, 2)));
+        assert_eq!(saved.cursor(dir.path()), Some(140));
+        // The same height (a different tip) and further are fine.
+        assert!(save(&saved, dir.path(), &chain(100, 40, 3)));
+        assert!(save(&saved, dir.path(), &all));
+        assert_eq!(SavedHeaders::default().load(dir.path()).unwrap().cursor, 150);
+    }
+
+    #[test]
+    fn the_rule_holds_for_a_file_an_earlier_run_left() {
+        let dir = tempdir().unwrap();
+        let all = chain(100, 50, 1);
+        assert!(save(&SavedHeaders::default(), dir.path(), &all));
+
+        // A new process that hasn't looked at the file yet.
+        let saved = SavedHeaders::default();
+        assert!(!save(&saved, dir.path(), &all[..10]));
+        assert_eq!(saved.load(dir.path()).unwrap().cursor, 150);
+    }
+
+    #[test]
+    fn a_write_queued_before_a_clear_is_dropped() {
+        let dir = tempdir().unwrap();
+        let saved = SavedHeaders::default();
+        let queued_at = saved.generation();
+        saved.clear(dir.path());
+        assert!(!saved.store_now(&SavedHeaders::file(dir.path()), &backup_of(&chain(0, 10, 1)), queued_at));
+        assert!(saved.load(dir.path()).is_none());
+    }
+
+    #[test]
+    fn a_checked_chunk_joins_the_saved_headers_only_where_it_continues_them() {
+        let dir = tempdir().unwrap();
+        let path = SavedHeaders::file(dir.path());
+        let saved = SavedHeaders::default();
+        let all = chain(100, 60, 1);
+        assert!(save(&saved, dir.path(), &all[..20]));
+        let generation = saved.generation();
+
+        // Not where the saved headers end, or from another chain: dropped.
+        assert_eq!(saved.keep_chunk_now(&path, all[25..40].to_vec(), false, generation), None);
+        assert_eq!(saved.keep_chunk_now(&path, chain(120, 10, 2), false, generation), None);
+        // The very next headers: kept.
+        assert_eq!(saved.keep_chunk_now(&path, all[20..40].to_vec(), false, generation), Some(140));
+
+        let kept = saved.load(dir.path()).unwrap();
+        assert_eq!(kept.cursor, 140);
+        assert_eq!(kept.accumulated_headers.len(), 40);
+        assert_eq!(kept.accumulated_headers.last().unwrap().height, 139);
+    }
+
+    #[test]
+    fn with_nothing_saved_a_checked_chunk_is_kept_only_if_it_continues_our_chain() {
+        let dir = tempdir().unwrap();
+        let path = SavedHeaders::file(dir.path());
+        let saved = SavedHeaders::default();
+        let headers = chain(500, 10, 1);
+
+        assert_eq!(saved.keep_chunk_now(&path, headers.clone(), false, saved.generation()), None);
+        assert!(saved.load(dir.path()).is_none());
+        assert_eq!(saved.keep_chunk_now(&path, headers, true, saved.generation()), Some(510));
+    }
+
+    #[test]
+    fn a_peer_ahead_of_the_saved_headers_continues_them() {
+        let dir = tempdir().unwrap();
+        let mut sync = SyncManager::default();
+        assert!(save(&sync.saved, dir.path(), &chain(100, 50, 1)));
+
+        let (headers, cursor) = sync.load_backup(&dir.path().to_path_buf(), 200);
+        assert_eq!(cursor, Some(150));
+        assert_eq!(headers.len(), 50);
+    }
+
+    #[test]
+    fn a_peer_at_or_behind_the_saved_headers_resumes_one_header_short_of_its_tip() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().to_path_buf();
+        let mut sync = SyncManager::default();
+        assert!(save(&sync.saved, dir.path(), &chain(100, 50, 1)));
+
+        // At the same height: it re-sends its last header, which must link to ours.
+        let (headers, cursor) = sync.load_backup(&data_dir, 150);
+        assert_eq!(cursor, Some(149));
+        assert_eq!(headers.last().unwrap().height, 148);
+
+        // Behind: a peer lagging, or one stuck on a fork further down.
+        let (headers, cursor) = sync.load_backup(&data_dir, 130);
+        assert_eq!(cursor, Some(129));
+        assert_eq!(headers.last().unwrap().height, 128);
+
+        // Below where the saved headers start: nothing to resume from.
+        let (headers, cursor) = sync.load_backup(&data_dir, 100);
+        assert!(headers.is_empty());
+        assert_eq!(cursor, None);
+
+        // None of that touched the file.
+        assert_eq!(SavedHeaders::default().load(dir.path()).unwrap().cursor, 150);
+    }
+
+    #[test]
+    fn replies_to_an_ended_sessions_requests_are_recognised_once() {
+        let mut sync = SyncManager::default();
+        let (a, b) = (PeerId::random(), PeerId::random());
+        let count = crate::network::MAX_GETBATCHES_COUNT;
+        sync.abandon_in_flight(&BTreeMap::from([(1000, a), (1000 + count, a), (5000, b)]));
+
+        assert!(sync.take_abandoned_reply(a, 1000));
+        assert!(!sync.take_abandoned_reply(a, 1000), "a match is used up");
+        // A reply can start part-way into the range asked for.
+        assert!(sync.take_abandoned_reply(a, 1000 + count + 7));
+        assert!(!sync.take_abandoned_reply(a, 5000), "asked of another peer");
+        assert!(!sync.take_abandoned_reply(PeerId::random(), 5000));
+        assert!(sync.take_abandoned_reply(b, 5000));
+    }
+
+    #[test]
+    fn a_new_request_outside_any_session_wants_its_reply() {
+        let mut sync = SyncManager::default();
+        let peer = PeerId::random();
+        sync.abandon_in_flight(&BTreeMap::from([(1000, peer)]));
+        sync.forget_abandoned(peer, 1200);
+        assert!(!sync.take_abandoned_reply(peer, 1200));
+    }
+
+    #[test]
+    fn a_peer_whose_headers_broke_the_rules_is_left_alone_until_it_claims_more_work() {
+        let mut sync = SyncManager::default();
+        let stuck = PeerId::random();
+        sync.mark_incompatible(stuck, 49_337_247_483_311);
+
+        assert!(sync.is_incompatible(stuck, 49_337_247_483_311));
+        assert!(sync.is_incompatible(stuck, 49_000_000_000_000));
+        assert!(!sync.is_incompatible(PeerId::random(), 1));
+        assert!(!sync.is_incompatible(stuck, 49_337_247_483_312));
+        // Claiming more work lifted the mark for good.
+        assert!(!sync.is_incompatible(stuck, 1));
+    }
+
+    #[test]
+    fn a_result_belongs_to_the_session_that_asked_for_it() {
+        let mut sync = SyncManager::default();
+        let peer = PeerId::random();
+        sync.start(peer, 200, 1, 100, Vec::new());
+        let first = sync.session_started_at().unwrap();
+        assert!(sync.is_session(peer, first));
+        assert!(!sync.is_session(PeerId::random(), first));
+
+        // The peer drops and is straight back: a new session with the same peer.
+        sync.abort("sync peer disconnected");
+        std::thread::sleep(Duration::from_millis(2));
+        sync.start(peer, 200, 1, 100, Vec::new());
+        assert!(!sync.is_session(peer, first));
+        assert!(sync.is_session(peer, sync.session_started_at().unwrap()));
+    }
+
+    #[test]
+    fn a_session_drops_the_saved_headers_only_once() {
+        let mut sync = SyncManager::default();
+        let peer = PeerId::random();
+        sync.start(peer, 200, 1, 100, Vec::new());
+        assert!(sync.note_fresh_restart());
+        assert!(!sync.note_fresh_restart());
+
+        sync.start(peer, 201, 1, 100, Vec::new());
+        assert!(sync.note_fresh_restart(), "a new session may again");
+    }
+
+    #[test]
+    fn the_headers_phase_only_takes_the_reply_it_is_waiting_for() {
+        let mut sync = SyncManager::default();
+        let peer = PeerId::random();
+        sync.start(peer, 200, 1, 100, Vec::new());
+        assert_eq!(sync.awaited_header_start(peer), Some(100));
+        assert_eq!(sync.awaited_header_start(PeerId::random()), None);
+        assert!(!sync.is_checking_headers(peer));
+
+        sync.set_header_verifying(peer, true);
+        assert!(sync.is_checking_headers(peer));
+        assert_eq!(sync.awaited_header_start(peer), None, "nothing is awaited mid-check");
     }
 }
