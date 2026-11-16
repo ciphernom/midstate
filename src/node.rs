@@ -1610,7 +1610,11 @@ pub async fn new(
         // /webrtc-direct/ addresses is this certificate's fingerprint, so
         // regenerating it each boot invalidates every saved multiaddr —
         // browser wallets pointed at their own node, bootstrap lists, the lot.
+        // A build without the `webrtc` feature serves no browsers and needs none.
+        #[cfg(feature = "webrtc")]
         let webrtc_cert = load_or_create_webrtc_cert(&data_dir);
+        #[cfg(not(feature = "webrtc"))]
+        let webrtc_cert = None;
 
         let network = MidstateNetwork::new(
             keypair,
@@ -7988,6 +7992,7 @@ fn restrict_permissions(path: &std::path::Path) {
 ///
 /// Returns `None` only if generation itself fails, in which case the caller
 /// falls back to an ephemeral certificate rather than refusing to start.
+#[cfg(feature = "webrtc")]
 fn load_or_create_webrtc_cert(data_dir: &PathBuf) -> Option<libp2p_webrtc::tokio::Certificate> {
     use libp2p_webrtc::tokio::Certificate;
 

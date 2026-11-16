@@ -73,7 +73,7 @@ enum Cmd {
     SyncStatus(oneshot::Sender<SyncStatus>),
     NodeInfo(oneshot::Sender<NodeInfo>),
     MiningStatus(oneshot::Sender<MiningView>),
-    StartMining { threads: usize, pool_url: String, resp: oneshot::Sender<Result<()>> },
+    StartMining { threads: usize, backend: MinerBackend, pool_url: String, resp: oneshot::Sender<Result<()>> },
     StopMining { resp: oneshot::Sender<Result<()>> },
     RescanFrom { height: u64, resp: oneshot::Sender<Result<()>> },
     Consolidate { address: String, resp: oneshot::Sender<Result<String>> },
@@ -286,13 +286,14 @@ impl WalletdHandle {
         Ok(ask!(self, MiningStatus))
     }
     /// `threads = 0` means every core, matching the CLI's `--threads` default.
+    /// `backend` is what hashes: GPUs and CPU (auto), GPUs only, or CPU only.
     /// `pool_url` may be blank or a loopback address to use this machine's own
     /// pool; anything else points the hasher at a remote pool.
     ///
     /// Returns as soon as startup is *scheduled* — poll `mining_status` for
     /// progress. Bringing a pool up takes seconds and must never block the actor.
-    pub async fn start_mining(&self, threads: usize, pool_url: String) -> Result<()> {
-        ask!(self, StartMining { threads: threads, pool_url: pool_url })
+    pub async fn start_mining(&self, threads: usize, backend: MinerBackend, pool_url: String) -> Result<()> {
+        ask!(self, StartMining { threads: threads, backend: backend, pool_url: pool_url })
     }
     pub async fn stop_mining(&self) -> Result<()> {
         ask!(self, StopMining {})
@@ -874,8 +875,8 @@ impl Service {
             Cmd::MiningStatus(resp) => {
                 let _ = resp.send(self.mining_status_cmd().await);
             }
-            Cmd::StartMining { threads, pool_url, resp } => {
-                let _ = resp.send(self.start_mining_cmd(threads, pool_url).await);
+            Cmd::StartMining { threads, backend, pool_url, resp } => {
+                let _ = resp.send(self.start_mining_cmd(threads, backend, pool_url).await);
             }
             Cmd::StopMining { resp } => {
                 self.mining.stop().await;
@@ -3259,7 +3260,7 @@ impl Service {
     /// the supervisor publishes progress through `mining_status`, because
     /// bringing a pool up and waiting for it to answer takes seconds and must
     /// not freeze every other wallet query while it happens.
-    async fn start_mining_cmd(&mut self, threads: usize, pool_url: String) -> Result<()> {
+    async fn start_mining_cmd(&mut self, threads: usize, backend: MinerBackend, pool_url: String) -> Result<()> {
         if self.wallet.is_none() {
             bail!("unlock the wallet before mining — rewards need somewhere to go");
         }
@@ -3268,7 +3269,7 @@ impl Service {
         if mdw.merge_rpc.is_none() {
             self.merge = None;
         }
-        self.mining.start(payout, threads, pool_url, mdw).await;
+        self.mining.start(payout, threads, backend, pool_url, mdw).await;
         Ok(())
     }
 
@@ -3293,6 +3294,7 @@ impl Service {
             default_pool_url: crate::mining::MiningSupervisor::default_pool_url(),
             local_pool: st.local_pool,
             threads: st.threads,
+            backend: st.backend,
             max_threads: std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(1),

@@ -17,7 +17,7 @@ pub enum Action {
     LoadSends,
     LoadNodeInfo,
     LoadMining,
-    StartMining { threads: usize, pool_url: String },
+    StartMining { threads: usize, backend: MinerBackend, pool_url: String },
     StopMining,
     NewPhrase,
     CheckPhrase { phrase: String },
@@ -245,10 +245,10 @@ pub fn dispatch(
             Action::LoadSends => run!("sends", h.sends(), Msg::Sends),
             Action::LoadNodeInfo => run!("node info", h.node_info(), Msg::Node),
             Action::LoadMining => run!("mining status", h.mining_status(), Msg::Mining),
-            Action::StartMining { threads, pool_url } => {
+            Action::StartMining { threads, backend, pool_url } => {
                 // Report the resulting status either way: a refused start needs
                 // to clear the button's optimistic state, not just toast.
-                match h.start_mining(threads, pool_url).await {
+                match h.start_mining(threads, backend, pool_url).await {
                     Ok(()) => run!("mining status", h.mining_status(), Msg::Mining),
                     Err(e) => {
                         out(Msg::Err { what: "start mining", err: format!("{e:#}") });

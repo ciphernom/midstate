@@ -5,7 +5,12 @@ edition = "2021"
 description = "Headless wallet service for the Midstate desktop app: owns the wallet file, embeds the full node, and drives the commit→reveal state machines."
 
 [dependencies]
-midstate = { path = "../.." }
+# Without WebRTC (default-features = false): the embedded node serves no
+# browsers, and an upstream WebRTC bug opens files until the app hits its limit.
+# Build the app on its own (`cargo build -p midstate-desktop`, as CI does): a
+# build that also selects the root package (`--workspace`) unifies features
+# and brings WebRTC back.
+midstate = { path = "../..", default-features = false }
 k256 = { version = "0.13", features = ["ecdsa"] }
 sha3 = "0.10"
 bip32 = "0.5"

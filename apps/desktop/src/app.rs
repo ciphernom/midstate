@@ -106,6 +106,8 @@ pub struct App {
     pub mining: Option<MiningView>,
     /// Hasher thread count the user has dialled in. 0 = every core.
     pub mining_threads: usize,
+    /// What the hasher hashes on: GPUs and CPU, GPUs only, or CPU only.
+    pub mining_backend: MinerBackend,
     /// Pool the hasher should connect to. Blank means this machine's own pool.
     pub mining_pool: String,
     /// True once the user has edited the pool field, so a status refresh stops
@@ -420,6 +422,7 @@ impl App {
             node: None,
             mining: None,
             mining_threads: 0,
+            mining_backend: MinerBackend::Auto,
             mining_pool: String::new(),
             mining_pool_touched: false,
             tab: Tab::Dashboard,
@@ -764,6 +767,7 @@ impl App {
                 // reflect a session that was already running when we attached.
                 if self.mining.is_none() {
                     self.mining_threads = m.threads;
+                    self.mining_backend = m.backend;
                 }
                 if !self.mining_pool_touched && self.mining_pool.is_empty() {
                     self.mining_pool = if m.pool_url.is_empty() {

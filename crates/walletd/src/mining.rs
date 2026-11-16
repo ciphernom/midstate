@@ -7,7 +7,7 @@
 //!
 //! ```text
 //!   midstate pool   --bind-addr 127.0.0.1:PORT --rpc-port 8545 --fee 0 ...
-//!   midstate miner  --pool-url stratum+tcp://HOST:PORT --payout-address ...
+//!   midstate miner  --pool-url stratum+tcp://HOST:PORT --payout-address ... [--backend gpu|cpu]
 //! ```
 //!
 //! Pointed at a remote pool, only the hasher is spawned.
@@ -51,6 +51,7 @@
 //! - **Never load-bearing.** Every failure path leaves mining off, records the
 //!   reason in `phase`, and leaves the wallet fully usable.
 
+use crate::api::MinerBackend;
 use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -114,6 +115,8 @@ pub struct MiningState {
     pub local_pool: bool,
     /// Hasher threads. 0 means "all cores", matching the CLI default.
     pub threads: usize,
+    /// What the hasher hashes on.
+    pub backend: MinerBackend,
     pub stratum_port: u16,
     pub audit_port: u16,
     pub started_at: Option<Instant>,
@@ -135,19 +138,45 @@ pub struct MdwMining {
     pub outdated: bool,
 }
 
+/// Whether `binary`'s `sub` command takes `flag`, by its `--help`. A
+/// `midstate` older than a flag refuses it outright, which would stop mining
+/// altogether, so new flags are offered only to a binary that knows them.
+async fn takes(binary: &Path, sub: &str, flag: &str) -> bool {
+    Command::new(binary)
+        .args([sub, "--help"])
+        .kill_on_drop(true)
+        .output()
+        .await
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(flag))
+}
+
+/// `midstate miner` arguments for `backend`. "auto" is the hasher's own
+/// default, so only a choice of GPU or CPU is said, and only to a binary
+/// that takes `--backend`.
+async fn backend_args(backend: MinerBackend, binary: &Path) -> Vec<String> {
+    if backend == MinerBackend::Auto {
+        return Vec::new();
+    }
+    if !takes(binary, "miner", "--backend").await {
+        tracing::warn!("{} predates --backend; the hasher mines with its default", binary.display());
+        return Vec::new();
+    }
+    vec!["--backend".into(), backend.as_str().into()]
+}
+
+/// The hasher's environment for `backend`. MINER_DISABLE_GPU keeps the
+/// GPUs out whatever `--backend` says, and every `midstate` that mines on a
+/// GPU honours it: a CPU choice holds even on a binary that predates
+/// `--backend`.
+fn backend_env(backend: MinerBackend) -> Option<(&'static str, &'static str)> {
+    (backend == MinerBackend::Cpu).then_some(("MINER_DISABLE_GPU", "1"))
+}
+
 impl MdwMining {
     /// As far as `binary` takes it. A `midstate` older than MDW mining
     /// refuses these flags outright, which would stop mining altogether, so
     /// a run on one mines midstate alone and says why.
     async fn supported_by(mut self, binary: &Path) -> Self {
-        async fn takes(binary: &Path, sub: &str, flag: &str) -> bool {
-            Command::new(binary)
-                .args([sub, "--help"])
-                .kill_on_drop(true)
-                .output()
-                .await
-                .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(flag))
-        }
         if self.address.is_some() && !takes(binary, "miner", "--midwimble-address").await {
             tracing::warn!("{} predates MDW mining; mining midstate alone", binary.display());
             return Self { outdated: true, ..Self::default() };
@@ -192,6 +221,7 @@ impl Default for MiningState {
             pool_url: String::new(),
             local_pool: true,
             threads: 0,
+            backend: MinerBackend::Auto,
             stratum_port: 0,
             audit_port: 0,
             started_at: None,
@@ -319,6 +349,8 @@ impl MiningSupervisor {
 
     /// Begins startup and returns immediately.
     ///
+    /// `backend` is what the hasher hashes on (`--backend`).
+    ///
     /// # Formal Specification
     /// ```text
     /// Pre:  payout parses as a Midstate address ∧ phase ∈ {Idle, Error}
@@ -331,7 +363,14 @@ impl MiningSupervisor {
     /// # Safety / Invariants
     /// - **No partial state.** If the hasher fails to launch, any pool this call
     ///   started is killed before `Error` is published.
-    pub async fn start(&self, payout_address: String, threads: usize, pool_url: String, mdw: MdwMining) {
+    pub async fn start(
+        &self,
+        payout_address: String,
+        threads: usize,
+        backend: MinerBackend,
+        pool_url: String,
+        mdw: MdwMining,
+    ) {
         {
             let st = self.state.read().await;
             if st.phase == MiningPhase::Running || st.phase.is_busy() {
@@ -359,6 +398,7 @@ impl MiningSupervisor {
                 pool_url: effective.clone(),
                 local_pool: local,
                 threads,
+                backend,
                 started_at: Some(Instant::now()),
                 mdw: mdw.clone(),
                 ..Default::default()
@@ -367,7 +407,7 @@ impl MiningSupervisor {
 
         let this = self.clone();
         tokio::spawn(async move {
-            if let Err(e) = this.start_inner(payout_address, threads, effective, local, mdw).await {
+            if let Err(e) = this.start_inner(payout_address, threads, backend, effective, local, mdw).await {
                 tracing::warn!("mining failed to start: {e:#}");
                 this.kill_children().await;
                 let mut st = this.state.write().await;
@@ -382,6 +422,7 @@ impl MiningSupervisor {
         &self,
         payout_address: String,
         threads: usize,
+        backend: MinerBackend,
         pool_url: String,
         local: bool,
         mdw: MdwMining,
@@ -436,14 +477,20 @@ impl MiningSupervisor {
         };
 
         self.set_message("starting hasher…".into()).await;
-        let miner = Command::new(&binary)
+        let mut hasher = Command::new(&binary);
+        hasher
             .current_dir(&self.work_dir)
             .arg("miner")
             .arg("--pool-url").arg(&url)
             .arg("--payout-address").arg(&payout_address)
             .arg("--worker").arg("desktop")
             .arg("--threads").arg(threads.to_string())
-            .args(mdw.miner_args())
+            .args(backend_args(backend, &binary).await)
+            .args(mdw.miner_args());
+        if let Some((key, value)) = backend_env(backend) {
+            hasher.env(key, value);
+        }
+        let miner = hasher
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| anyhow!("could not launch hasher: {e}"))?;
@@ -456,7 +503,7 @@ impl MiningSupervisor {
         st.stratum_port = stratum_port;
         st.audit_port = audit_port;
         st.started_at = Some(Instant::now());
-        tracing::info!("mining running: {} threads via {}", threads, st.pool_url);
+        tracing::info!("mining running: {} threads, backend {}, via {}", threads, backend.as_str(), st.pool_url);
         Ok(())
     }
 
@@ -757,6 +804,31 @@ mod tests {
         assert!(left_out.miner_args().is_empty() && left_out.pool_args().is_empty());
         // Nothing asked of it, nothing to check.
         assert_eq!(MdwMining::default().supported_by(&old).await, MdwMining::default());
+    }
+
+    /// "auto" is the hasher's default and goes unsaid; a choice of GPU or CPU
+    /// is said to a binary that takes `--backend`, and a CPU choice holds on
+    /// one that doesn't, through MINER_DISABLE_GPU.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_backend_reaches_the_hasher() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = |name: &str, help: &str| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, format!("#!/bin/sh\necho '{help}'\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+        let current = fake("current", "--pool-url --payout-address --threads --backend");
+        let old = fake("old", "--pool-url --payout-address --worker --threads");
+        assert!(backend_args(MinerBackend::Auto, &current).await.is_empty());
+        assert_eq!(backend_args(MinerBackend::Gpu, &current).await, ["--backend", "gpu"]);
+        assert_eq!(backend_args(MinerBackend::Cpu, &current).await, ["--backend", "cpu"]);
+        assert!(backend_args(MinerBackend::Cpu, &old).await.is_empty());
+        assert_eq!(backend_env(MinerBackend::Cpu), Some(("MINER_DISABLE_GPU", "1")));
+        assert_eq!(backend_env(MinerBackend::Gpu), None);
+        assert_eq!(backend_env(MinerBackend::Auto), None);
     }
 
     #[test]

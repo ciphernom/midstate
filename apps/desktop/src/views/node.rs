@@ -8,6 +8,7 @@ use crate::bridge::Action;
 use crate::theme::{self, ago, fmt_dt, short_hex, units};
 use crate::views::mdw::{self as m, mdw};
 use eframe::egui::{self, FontId, RichText, Ui};
+use midstate_walletd::api::MinerBackend;
 
 pub fn show(app: &mut App, ui: &mut Ui) {
     theme::heading(ui, "Node");
@@ -371,9 +372,10 @@ fn mining_panel(app: &mut App, ui: &mut Ui, syncing: bool) {
             ui.label(RichText::new(text).color(colour).size(12.5));
             if phase == "running" {
                 ui.label(
-                    RichText::new(format!("· {} · {} threads",
+                    RichText::new(format!("· {} · {} threads · {}",
                         fmt_secs(m.uptime_secs),
-                        if m.threads == 0 { "all".to_string() } else { m.threads.to_string() }))
+                        if m.threads == 0 { "all".to_string() } else { m.threads.to_string() },
+                        m.backend.as_str()))
                         .color(theme::muted()).size(11.5),
                 );
             }
@@ -465,7 +467,7 @@ fn mining_panel(app: &mut App, ui: &mut Ui, syncing: bool) {
                 );
                 theme::hint(ui, MINING_AUDIT_NOTE);
             } else {
-                ui.columns(2, |c| {
+                ui.columns(3, |c| {
                     theme::stat(&mut c[0], "Uptime", &fmt_secs(m.uptime_secs), "");
                     theme::stat(
                         &mut c[1],
@@ -473,6 +475,7 @@ fn mining_panel(app: &mut App, ui: &mut Ui, syncing: bool) {
                         &if m.threads == 0 { "all".into() } else { m.threads.to_string() },
                         "",
                     );
+                    theme::stat(&mut c[2], "Backend", m.backend.as_str(), "");
                 });
                 row(ui, "pool", &m.pool_url, None);
                 theme::hint(
@@ -541,6 +544,31 @@ fn mining_panel(app: &mut App, ui: &mut Ui, syncing: bool) {
         // Idle / error: full controls.
         let max = m.max_threads.max(1);
 
+        // What hashes: the CLI's `--backend`, as presets like the threads below.
+        ui.horizontal(|ui| {
+            ui.label(theme::mono("backend").size(11.5));
+            for backend in MinerBackend::ALL {
+                let selected = app.mining_backend == backend;
+                let text = if selected {
+                    RichText::new(backend.as_str()).color(theme::ink())
+                } else {
+                    RichText::new(backend.as_str()).color(theme::muted())
+                };
+                if ui.selectable_label(selected, text).clicked() {
+                    app.mining_backend = backend;
+                }
+            }
+        });
+        theme::hint(
+            ui,
+            match app.mining_backend {
+                MinerBackend::Auto => "NVIDIA GPUs where there are any (the driver is all they need), beside the CPU threads.",
+                MinerBackend::Gpu => "GPUs only, leaving the CPU to you. Without a usable GPU, the CPU threads mine instead.",
+                MinerBackend::Cpu => "CPU threads only, leaving the graphics card to you.",
+            },
+        );
+
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label(theme::mono("threads").size(11.5));
             for (label, value) in [
@@ -569,7 +597,9 @@ fn mining_panel(app: &mut App, ui: &mut Ui, syncing: bool) {
         });
         theme::hint(
             ui,
-            if app.mining_threads == 0 {
+            if app.mining_backend == MinerBackend::Gpu {
+                "With GPUs only, these threads mine only if no GPU is usable."
+            } else if app.mining_threads == 0 {
                 "Using every core. Leave one or two free if you want the machine responsive."
             } else {
                 "Fewer threads means less heat and a more usable machine."
@@ -622,6 +652,7 @@ fn mining_panel(app: &mut App, ui: &mut Ui, syncing: bool) {
                 ui.ctx(),
                 Action::StartMining {
                     threads: app.mining_threads,
+                    backend: app.mining_backend,
                     pool_url: app.mining_pool.clone(),
                 },
             );

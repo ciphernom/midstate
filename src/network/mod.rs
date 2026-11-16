@@ -7,7 +7,10 @@ pub use protocol::{Message, MidstateCodec, MIDSTATE_PROTOCOL, MAX_GETBATCHES_COU
 
 use anyhow::Result;
 use futures::StreamExt;
+#[cfg(feature = "webrtc")]
 use libp2p_core::muxing::StreamMuxerBox;
+#[cfg(feature = "webrtc")]
+use libp2p::Transport;
 use libp2p::{
     autonat,
     dcutr,
@@ -23,7 +26,6 @@ use libp2p::{
     identity::Keypair,
     Multiaddr, PeerId, Swarm,
     core::ConnectedPoint,
-    Transport    
 };
 
 use std::collections::{HashMap, HashSet};
@@ -35,6 +37,17 @@ use std::time::Instant;
 
 /// Max addresses to send in a single PEX Addr message.
 pub const MAX_PEX_ADDRS: usize = 50;
+
+/// The DTLS certificate behind this node's `/webrtc-direct/` address.
+///
+/// Browsers (light-client wallets) reach a node only over WebRTC, which the
+/// `webrtc` feature brings. A build without it — the desktop wallet's embedded
+/// node — serves no browsers, so it has no certificate to hold: the stand-in
+/// type has no values, and `None` is all a caller can pass.
+#[cfg(feature = "webrtc")]
+pub type WebRtcCertificate = libp2p_webrtc::tokio::Certificate;
+#[cfg(not(feature = "webrtc"))]
+pub type WebRtcCertificate = std::convert::Infallible;
 
 // ── Light Client Protection Constants ────────────────────────────────────────
 
@@ -426,42 +439,50 @@ impl MidstateNetwork {
     /// `/certhash/` component of every `/webrtc-direct/` listen address.
     /// Pass `Some` to keep that address stable across restarts; `None`
     /// generates an ephemeral one, which is fine for short-lived tooling but
-    /// means saved multiaddrs stop resolving after a restart.
+    /// means saved multiaddrs stop resolving after a restart. Without the
+    /// `webrtc` feature there is no WebRTC transport, and it must be `None`.
     pub async fn new(
         keypair: Keypair,
         listen_addr: Multiaddr,
         bootstrap_peers: Vec<Multiaddr>,
         static_banned_peers: HashSet<PeerId>,
-        webrtc_cert: Option<libp2p_webrtc::tokio::Certificate>,
+        webrtc_cert: Option<WebRtcCertificate>,
     ) -> Result<Self> {
         let peer_id = keypair.public().to_peer_id();
         tracing::info!("Local peer id: {}", peer_id);
 
-        // Consumed inside the transport closure below. `take()` rather than a
-        // move so this compiles whether the builder wants FnOnce or FnMut.
-        let mut webrtc_cert = webrtc_cert;
-
-        let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair.clone())
+        let builder = libp2p::SwarmBuilder::with_existing_identity(keypair.clone())
             .with_tokio()
             .with_tcp(
                 tcp::Config::default().nodelay(true),
                 noise::Config::new,
                 yamux::Config::default,
             )?
-            .with_quic()
-.with_other_transport(move |keypair| {
+            .with_quic();
+
+        // WebRTC: how browsers reach a node. Only with the `webrtc` feature.
+        #[cfg(feature = "webrtc")]
+        let builder = {
+            // Consumed inside the transport closure below. `take()` rather than a
+            // move so this compiles whether the builder wants FnOnce or FnMut.
+            let mut webrtc_cert = webrtc_cert;
+            builder.with_other_transport(move |keypair| {
                 let certificate = match webrtc_cert.take() {
                     Some(cert) => cert,
                     None => libp2p_webrtc::tokio::Certificate::generate(&mut rand::rngs::OsRng)
                         .expect("WebRTC certificate generation"),
                 };
 
-
                 Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
                     libp2p_webrtc::tokio::Transport::new(keypair.clone(), certificate)
                         .map(|(peer_id, conn), _| (peer_id, StreamMuxerBox::new(conn)))
                 )
             })?
+        };
+        #[cfg(not(feature = "webrtc"))]
+        let _: Option<WebRtcCertificate> = webrtc_cert;
+
+        let mut swarm = builder
             .with_relay_client(noise::Config::new, yamux::Config::default)?
             .with_behaviour(|key: &libp2p::identity::Keypair, relay_client| {
                 let local_peer = key.public().to_peer_id();
@@ -583,6 +604,7 @@ let autonat = autonat::Behaviour::new(
             }
         }
         // Listen for WebRTC direct connections from browsers
+        #[cfg(feature = "webrtc")]
         if let Some(webrtc_addr) = tcp_to_webrtc(&listen_addr) {
             match net.swarm.listen_on(webrtc_addr.clone()) {
                 Ok(_) => tracing::info!("WebRTC listening on {}", webrtc_addr),
@@ -1751,6 +1773,7 @@ pub fn socket_to_multiaddr(addr: SocketAddr) -> Multiaddr {
 
 /// Convert a TCP multiaddr to its WebRTC-direct equivalent.
 /// /ip4/0.0.0.0/tcp/9333 → /ip4/0.0.0.0/udp/9091/webrtc-direct
+#[cfg(feature = "webrtc")]
 fn tcp_to_webrtc(addr: &Multiaddr) -> Option<Multiaddr> {
     let mut components = addr.iter().collect::<Vec<_>>();
     let tcp_idx = components.iter().position(|p| matches!(p, libp2p::multiaddr::Protocol::Tcp(_)))?;

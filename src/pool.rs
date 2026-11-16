@@ -2091,6 +2091,7 @@ pub async fn run_stratum_pool(
     // curl-able for monitoring and native tooling, while browsers get a path
     // that needs no CA certificate and receives pushed jobs instead of polling.
     // Failure here is non-fatal — Stratum and HTTP keep working.
+    #[cfg(feature = "webrtc")]
     if let Some(udp_port) = webrtc_port {
         let webrtc_state = state.clone();
         tokio::spawn(async move {
@@ -2098,6 +2099,10 @@ pub async fn run_stratum_pool(
         });
     } else {
         tracing::info!("pool WebRTC listener disabled (pass --webrtc-port to enable)");
+    }
+    #[cfg(not(feature = "webrtc"))]
+    if let Some(udp_port) = webrtc_port {
+        tracing::warn!("--webrtc-port {udp_port} ignored: this build has no WebRTC (the `webrtc` feature is off)");
     }
 
     // ── Core Polling & Template Builder Task ──
@@ -2971,18 +2976,22 @@ async fn post_http_submit(
 // `/midstate/light-push/2.0.0` reader works the same way, so the client side is
 // a near-copy of code that already works.
 
+#[cfg(feature = "webrtc")]
 /// Request/response protocol: miner opens a stream, sends one request, reads one
 /// response, stream closes.
 pub const POOL_PROTOCOL: libp2p::StreamProtocol =
     libp2p::StreamProtocol::new("/midstate/pool/1.0.0");
+#[cfg(feature = "webrtc")]
 /// Push protocol: the pool opens a stream to a miner and sends one notification.
 pub const POOL_PUSH_PROTOCOL: libp2p::StreamProtocol =
     libp2p::StreamProtocol::new("/midstate/pool-push/1.0.0");
 
+#[cfg(feature = "webrtc")]
 /// Cap on a single inbound pool request. Requests are tiny (an address, a job id
 /// and a nonce); anything larger is malformed or hostile.
 const MAX_POOL_MSG_SIZE: u32 = 64 * 1024;
 
+#[cfg(feature = "webrtc")]
 /// Reads one 4-byte-LE-length-prefixed JSON payload from a libp2p stream.
 async fn read_framed<T: futures::AsyncRead + Unpin>(io: &mut T) -> anyhow::Result<Vec<u8>> {
     use futures::AsyncReadExt;
@@ -2997,6 +3006,7 @@ async fn read_framed<T: futures::AsyncRead + Unpin>(io: &mut T) -> anyhow::Resul
     Ok(buf)
 }
 
+#[cfg(feature = "webrtc")]
 /// Writes one 4-byte-LE-length-prefixed JSON payload to a libp2p stream.
 async fn write_framed<T: futures::AsyncWrite + Unpin>(
     io: &mut T,
@@ -3010,6 +3020,7 @@ async fn write_framed<T: futures::AsyncWrite + Unpin>(
     Ok(())
 }
 
+#[cfg(feature = "webrtc")]
 /// Loads the pool's libp2p identity from disk, generating it on first run.
 ///
 /// # Why this must persist
@@ -3030,6 +3041,7 @@ fn load_or_create_identity(path: &std::path::Path) -> anyhow::Result<libp2p::ide
     Ok(kp)
 }
 
+#[cfg(feature = "webrtc")]
 /// Writes private key material with owner-only permissions.
 ///
 /// Both files this guards hold secrets: the libp2p identity is the pool's
@@ -3060,6 +3072,7 @@ fn write_secret(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
     }
 }
 
+#[cfg(feature = "webrtc")]
 /// Loads the pool's WebRTC certificate from disk, generating it on first run.
 ///
 /// # Why this must persist
@@ -3092,6 +3105,7 @@ fn load_or_create_certificate(
     Ok(cert)
 }
 
+#[cfg(feature = "webrtc")]
 /// Closes the write side, then waits for the peer to close theirs before the
 /// stream is dropped.
 ///
@@ -3121,6 +3135,7 @@ async fn graceful_close(mut stream: libp2p::Stream) {
     .await;
 }
 
+#[cfg(feature = "webrtc")]
 /// Handles one inbound pool stream: read a request, answer it, close.
 async fn handle_pool_stream(
     state: Arc<PoolState>,
@@ -3177,6 +3192,7 @@ async fn handle_pool_stream(
     Ok(())
 }
 
+#[cfg(feature = "webrtc")]
 /// Builds the pool's minimal libp2p swarm: webrtc-direct transport plus the
 /// stream behaviour, and nothing else — no Kademlia, identify or relay, since
 /// miners dial the pool by an address they already hold.
@@ -3213,6 +3229,7 @@ fn build_pool_swarm(
         .build())
 }
 
+#[cfg(feature = "webrtc")]
 /// Boots the pool's WebRTC listener and its job-push loop.
 ///
 /// Returns immediately; the swarm runs on a spawned task. The dialable multiaddr

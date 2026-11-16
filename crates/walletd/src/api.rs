@@ -142,6 +142,37 @@ pub struct NodeInfo {
     pub safe_depth: u64,
 }
 
+/// What the hasher hashes on: `midstate miner --backend`.
+///
+/// Mining on a desktop shares the machine with whoever is using it. Auto
+/// takes every NVIDIA GPU (through CUDA, where the driver is installed) as
+/// well as the CPU threads; someone gaming or rendering wants the graphics
+/// card left alone (Cpu), someone working wants the cores left alone (Gpu).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MinerBackend {
+    /// GPUs where there are usable ones, beside the CPU threads.
+    #[default]
+    Auto,
+    /// GPUs only; the CPU threads mine only if no GPU is usable.
+    Gpu,
+    /// CPU threads only; the GPUs stay free.
+    Cpu,
+}
+
+impl MinerBackend {
+    pub const ALL: [MinerBackend; 3] = [MinerBackend::Auto, MinerBackend::Gpu, MinerBackend::Cpu];
+
+    /// The `--backend` value, which is also how the UI names it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Gpu => "gpu",
+            Self::Cpu => "cpu",
+        }
+    }
+}
+
 /// Local mining status. The desktop supervises child processes — optionally a
 /// loopback Stratum pool, always a hasher — rather than mining in-process; see
 /// `walletd::mining` for why.
@@ -168,6 +199,9 @@ pub struct MiningView {
     pub local_pool: bool,
     /// Hasher threads; 0 means every core.
     pub threads: usize,
+    /// What the hasher hashes on.
+    #[serde(default)]
+    pub backend: MinerBackend,
     /// Cores available, for bounding the thread control.
     pub max_threads: usize,
     /// Estimated hashes per second. Local pool only.

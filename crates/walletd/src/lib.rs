@@ -41,8 +41,8 @@ pub mod swapbook;
 pub mod service;
 
 pub use api::{
-    AddressInfo, Balance, CoinView, HistoryView, MiningView, NodeInfo, SendProgress, SendStage,
-    SyncStatus, WalletEvent, WalletStatus,
+    AddressInfo, Balance, CoinView, HistoryView, MinerBackend, MiningView, NodeInfo, SendProgress,
+    SendStage, SyncStatus, WalletEvent, WalletStatus,
 };
 pub use node_host::{start_node, NodeConfig};
 pub use service::{spawn, WalletdHandle};
