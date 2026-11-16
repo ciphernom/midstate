@@ -238,10 +238,19 @@ pub struct TransactionInfo {
 pub struct MempoolInputInfo {
     pub coin_id: String,
     pub value: u64,
-    /// The Phase-1 commitment this input opens, when present — lets the
-    /// explorer link a pending Reveal back to its Commit in the other queue.
+    /// The data commitment of the state thread this input spends, when it
+    /// spends one (`InputReveal::commitment`).
+    ///
+    /// Not the Phase-1 commitment: that is the transaction's own
+    /// `TransactionInfo::commitment`, which is what links a pending Reveal to
+    /// its Commit in the other queue.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commitment: Option<String>,
+    /// Address of the coin being spent (BLAKE3 of its script), so the explorer
+    /// can show who a pending transfer spends from. `default` keeps clients
+    /// tolerant of older nodes that omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

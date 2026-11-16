@@ -264,6 +264,7 @@ pub async fn get_mempool(State(node): State<AppState>) -> Json<GetMempoolRespons
             coin_id: hex::encode(i.coin_id()),
             value: i.value,
             commitment: i.commitment.map(hex::encode),
+            address: Some(hex::encode(i.predicate.address())),
         }).collect();
 
         let outs: Vec<MempoolOutputInfo> = outputs.iter().map(|o| match o {
