@@ -234,6 +234,8 @@ $$R_h = \max\left(1, V_{init} \gg \min\left(\left\lfloor \frac{h}{Y} \right\rflo
 
 The total coinbase value $V_{cb}$ must exactly equal $R_h + \sum \phi$ (the block reward plus all transaction fees). Furthermore, to comply with the uniform denomination constraint, $V_{cb}$ must be decomposed perfectly into its binary power-of-two components. Every $o \in B_{coinbase}$ must satisfy $o.v = 2^k$ for some integer $k$.
 
+**Coinbase maturity.** From $h = 400,000$, an output created by the coinbase of block $c$ may only be spent (by a `Reveal` or `Consolidate`) in a block of height $h \geq c + M$, with $M = 100$. A reorg erases the rewards of the blocks it abandons; the delay keeps payments made from such a reward from vanishing with it. Nodes track the coinbase identifiers of the last $M - 1$ blocks by height. That window is a function of those blocks alone and enters no state root, so the rule is a soft fork.
+
 ## 7. Network and Privacy Layer
 
 ### 7.1. Dandelion++ Routing
@@ -462,3 +464,4 @@ Consensus rules are bound to strict block height activation gates. Blocks mined 
 6.  **Strict Median-Time-Past ($h = 70,000$):** Enforces strict block timestamp monotonicity against the 11-block median.
 7.  **Recent PoW Wiggle Room ($h = 80,000$):** Modifies the Commit PoW check. Instead of validating against the exact current block height, the PoW is considered valid if it meets the difficulty threshold when evaluated against any valid block height in the range $[h - 1000, h]$.
 8.  **Strict Intra-block Reuse Ban ($h = 85,000$):** Enforces that no WOTS key may be reused even within the same block or sync chunk.
+9.  **Coinbase Maturity ($h = 400,000$, soft fork):** A coinbase output becomes spendable $M = 100$ blocks after the block that created it (§6.5).

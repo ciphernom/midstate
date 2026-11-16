@@ -360,6 +360,7 @@ cdcdcdcdcdcdcdcdcdcdcd5056010500000000002027010500000000000226242110101010411101
             header_hash: [0u8; 32],
             chain_mmr: crate::core::mmr::MerkleMountainRange::new(),
             burned_wots: UtxoAccumulator::new(),
+            coinbase_window: Default::default(),
         }
     }
 

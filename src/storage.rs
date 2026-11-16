@@ -94,17 +94,47 @@ pub const FILTERS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("fil
 /// The first `save_state` after a successful legacy load writes the
 /// state back in the current format, so the migration self-disables on
 /// every running node.
-fn deserialize_state(bytes: &[u8]) -> Result<State> {
+///
+/// # Coinbase maturity window
+///
+/// States saved before coinbase maturity end at `burned_wots` (`StateV4`
+/// below) or earlier, and load with an empty window. The returned `bool`
+/// says so; the loading [`Storage`] then refills the window from the stored
+/// blocks (see [`Storage::refill_coinbase_window`]).
+fn deserialize_state(bytes: &[u8]) -> Result<(State, bool)> {
     use bincode::Options;
 
     // FIX: Match bincode::serialize()'s implicit Fixint encoding!
     let strict = bincode::DefaultOptions::new()
         .with_limit(100_000_000)
-        .with_fixint_encoding(); 
+        .with_fixint_encoding();
 
+    let mut before_window = false;
     let mut state = match strict.deserialize::<State>(bytes) {
         Ok(s) => s,
         Err(strict_err) => {
+            before_window = true;
+
+            // V4 -> V5: the layout before the coinbase maturity window. MUST
+            // match it exactly (everything up to burned_wots, nothing after).
+            #[derive(serde::Deserialize)]
+            struct StateV4 {
+                midstate: [u8; 32],
+                coins: crate::core::mmr::UtxoAccumulator,
+                commitments: crate::core::mmr::UtxoAccumulator,
+                depth: u128,
+                target: [u8; 32],
+                height: u64,
+                timestamp: u64,
+                #[serde(default)]
+                commitment_heights: im::HashMap<[u8; 32], u64>,
+                #[serde(default)]
+                chain_mmr: crate::core::mmr::MerkleMountainRange,
+                header_hash: [u8; 32],
+                #[serde(default)]
+                burned_wots: crate::core::mmr::UtxoAccumulator,
+            }
+
             // V3 -> V4 Safe Migration Fallback
             // This struct MUST exactly match the V3 disk format (NO burned_wots field!)
             #[derive(serde::Deserialize)]
@@ -123,6 +153,23 @@ fn deserialize_state(bytes: &[u8]) -> Result<State> {
                 header_hash: [u8; 32],
             }
 
+            if let Ok(v4) = strict.deserialize::<StateV4>(bytes) {
+                State {
+                    midstate: v4.midstate,
+                    coins: v4.coins,
+                    commitments: v4.commitments,
+                    depth: v4.depth,
+                    target: v4.target,
+                    height: v4.height,
+                    timestamp: v4.timestamp,
+                    commitment_heights: v4.commitment_heights,
+                    expirations: im::OrdMap::new(),
+                    chain_mmr: v4.chain_mmr,
+                    header_hash: v4.header_hash,
+                    burned_wots: v4.burned_wots,
+                    coinbase_window: Default::default(),
+                }
+            } else {
             match strict.deserialize::<StateV3>(bytes) {
                 Ok(v3) => State {
                     midstate: v3.midstate,
@@ -137,6 +184,7 @@ fn deserialize_state(bytes: &[u8]) -> Result<State> {
                     chain_mmr: v3.chain_mmr,
                     header_hash: v3.header_hash,
                     burned_wots: crate::core::mmr::UtxoAccumulator::new(), // Add the empty V4 SMT
+                    coinbase_window: Default::default(),
                 },
                 Err(_) => match legacy::deserialize_legacy_state(bytes) {
                     Ok(migrated) => {
@@ -153,6 +201,7 @@ fn deserialize_state(bytes: &[u8]) -> Result<State> {
                         return Err(anyhow::anyhow!("State deserialization failed: {}", strict_err));
                     }
                 },
+            }
             }
         }
     };
@@ -174,7 +223,7 @@ fn deserialize_state(bytes: &[u8]) -> Result<State> {
     }
     state.expirations = staging.into_iter().collect();
 
-    Ok(state)
+    Ok((state, before_window))
 }
 
 /// Pre-domain-separation wire format support. Module-private — no part of
@@ -284,9 +333,10 @@ mod legacy {
             height: legacy.height,
             timestamp: legacy.timestamp,
             commitment_heights: legacy.commitment_heights,
-            expirations: im::OrdMap::new(), 
+            expirations: im::OrdMap::new(),
             chain_mmr,
             header_hash: legacy.header_hash,
+            coinbase_window: Default::default(),
         })
     }
 }
@@ -547,17 +597,74 @@ pub fn get_archived_signature(&self, wots_pk: &[u8; 32]) -> Result<Option<Vec<u8
     /// Loads a historical snapshot to serve to a peer.
     ///
     /// Routes through the canonical [`deserialize_state`], which rebuilds
-    /// the SMT caches and the `expirations` index automatically.
+    /// the SMT caches and the `expirations` index automatically, and refills
+    /// the coinbase maturity window of a state saved before it existed.
     pub fn load_state_snapshot(&self, height: u64) -> Result<Option<State>> {
         let snapshot_dir = self.batches.base_path().parent().unwrap().join("snapshots");
         let path = snapshot_dir.join(format!("state_{}.bin", height));
 
         if path.exists() {
             let bytes = std::fs::read(&path)?;
-            let state = deserialize_state(&bytes)?;
+            let (mut state, before_window) = deserialize_state(&bytes)?;
+            if before_window {
+                self.refill_coinbase_window(&mut state);
+            }
             Ok(Some(state))
         } else {
             Ok(None)
+        }
+    }
+
+    /// Refill the coinbase maturity window of a state saved before the
+    /// window existed, from the coinbases of the blocks on disk.
+    ///
+    /// # Reasoning
+    /// The window holds the coinbase ids of the `COINBASE_MATURITY - 1`
+    /// blocks below the state, so those blocks say exactly what belongs in
+    /// it: recording their coinbases gives the window a node that had always
+    /// run this version would hold. It runs once, the first time an upgraded
+    /// node loads a state saved by an older one, and reads 99 blocks.
+    ///
+    /// A block missing from disk (a pruned node reading an old snapshot)
+    /// leaves its coinbase out, and is logged. Pruning keeps the last
+    /// `PRUNE_DEPTH` blocks, so the current state always has them all; and
+    /// nodes that upgrade a while before `COINBASE_MATURITY_ACTIVATION_HEIGHT`
+    /// have a window filled by the blocks they apply long before it counts.
+    ///
+    /// # Formal Specification
+    /// ```text
+    /// Pre:  state.coinbase_window is empty
+    /// Post: ∀ c ∈ [state.height − COINBASE_MATURITY + 1, state.height) with
+    ///         block c on disk • every coinbase id of block c is in the window
+    ///         at height c
+    /// ```
+    fn refill_coinbase_window(&self, state: &mut State) {
+        let start = state.height.saturating_sub(crate::core::COINBASE_MATURITY - 1);
+        let mut missing = 0u64;
+        for h in start..state.height {
+            match self.load_batch(h) {
+                Ok(Some(batch)) => {
+                    let ids: Vec<[u8; 32]> = batch.coinbase.iter().map(|cb| cb.coin_id()).collect();
+                    state.coinbase_window.record(h, &ids);
+                }
+                _ => missing += 1,
+            }
+        }
+        state.coinbase_window.prune(state.height);
+        if missing > 0 {
+            tracing::warn!(
+                "Coinbase maturity window at height {}: {} of the last {} blocks are not on disk; \
+                 their rewards are not held back",
+                state.height,
+                missing,
+                state.height - start
+            );
+        } else {
+            tracing::info!(
+                "Coinbase maturity window filled from the last {} blocks ({} rewards still maturing)",
+                state.height - start,
+                state.coinbase_window.len()
+            );
         }
     }
 
@@ -624,17 +731,23 @@ pub fn get_archived_signature(&self, wots_pk: &[u8; 32]) -> Result<Option<Vec<u8
     /// Loads the persisted current state from the redb-backed STATE_TABLE.
     ///
     /// Routes through the canonical [`deserialize_state`], which rebuilds
-    /// the SMT caches and the `expirations` index automatically.
+    /// the SMT caches and the `expirations` index automatically, and refills
+    /// the coinbase maturity window of a state saved before it existed.
     pub fn load_state(&self) -> Result<Option<State>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(STATE_TABLE)?;
-        match table.get("current")? {
-            Some(bytes) => {
-                let state = deserialize_state(bytes.value())?;
-                Ok(Some(state))
-            }
-            None => Ok(None),
+        let decoded = match table.get("current")? {
+            Some(bytes) => deserialize_state(bytes.value())?,
+            None => return Ok(None),
+        };
+        // Drop the read transaction before reading blocks for the refill.
+        drop(table);
+        drop(read_txn);
+        let (mut state, before_window) = decoded;
+        if before_window {
+            self.refill_coinbase_window(&mut state);
         }
+        Ok(Some(state))
     }
 
     pub fn save_mining_seed(&self, seed: &[u8; 32]) -> Result<()> {
@@ -1295,6 +1408,56 @@ mod burn_tests {
         Predicate::Script {
             bytecode: script::compile_htlc(&[0x11u8; 32], receiver_pk, 500_000, &[0x22u8; 32]),
         }
+    }
+
+    /// The coinbase maturity window is saved with the state, and a state
+    /// saved before the window existed (the V4 layout: the same bytes, less
+    /// the window at the end) loads with the window refilled from the stored
+    /// blocks: the very window a node that had always kept one holds. Both
+    /// for the current state and for a snapshot.
+    #[test]
+    fn the_coinbase_window_is_saved_and_refilled_for_older_states() {
+        use crate::core::types::CoinbaseOutput;
+        let dir = tempdir().unwrap();
+        let st = store(&dir);
+        let n = crate::core::COINBASE_MATURITY;
+        let tip = 2 * n + 5;
+        let mut state = State::genesis().0;
+        for h in 0..tip {
+            let mut b = batch_of(vec![]);
+            b.coinbase = (0..2u8)
+                .map(|i| CoinbaseOutput { address: [h as u8; 32], value: 1 << i, salt: [i; 32] })
+                .collect();
+            st.save_batch(h, &b).unwrap();
+            let ids: Vec<[u8; 32]> = b.coinbase.iter().map(|c| c.coin_id()).collect();
+            state.coinbase_window.record(h, &ids);
+            state.coinbase_window.prune(h + 1);
+        }
+        state.height = tip;
+        assert_eq!(state.coinbase_window.len() as u64, 2 * (n - 1));
+
+        st.save_state(&state).unwrap();
+        assert_eq!(st.load_state().unwrap().unwrap().coinbase_window, state.coinbase_window);
+
+        let mut v4 = bincode::serialize(&state).unwrap();
+        let window = bincode::serialized_size(&state.coinbase_window).unwrap() as usize;
+        v4.truncate(v4.len() - window);
+        let (old, before_window) = deserialize_state(&v4).unwrap();
+        assert!(before_window && old.coinbase_window.is_empty(), "the V4 layout loads without a window");
+        {
+            let txn = st.db.begin_write().unwrap();
+            txn.open_table(STATE_TABLE).unwrap().insert("current", v4.as_slice()).unwrap();
+            txn.commit().unwrap();
+        }
+        let refilled = st.load_state().unwrap().unwrap();
+        assert_eq!(refilled.coinbase_window, state.coinbase_window, "refilled from the blocks");
+        assert_eq!(refilled.height, tip);
+
+        let snapshots = dir.path().join("snapshots");
+        std::fs::create_dir_all(&snapshots).unwrap();
+        std::fs::write(snapshots.join(format!("state_{tip}.bin")), &v4).unwrap();
+        let snap = st.load_state_snapshot(tip).unwrap().unwrap();
+        assert_eq!(snap.coinbase_window, state.coinbase_window, "a snapshot is refilled too");
     }
 
     /// THE regression test. An MSS leaf spent through an HTLC predicate must

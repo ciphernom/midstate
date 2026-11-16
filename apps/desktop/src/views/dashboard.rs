@@ -55,6 +55,18 @@ pub fn show(app: &mut App, ui: &mut Ui) {
     mdw_money(app, ui);
 
     if let Some(b) = &b {
+        if b.immature > 0 {
+            theme::hint(
+                ui,
+                &format!(
+                    "{} more is newly mined and still maturing: a reward can be spent once its \
+                     block is buried deep enough to survive a reorg{}. Until then it is not \
+                     counted as spendable.",
+                    units(b.immature),
+                    b.matures_at.map(|h| format!(" (all of it from block {h})")).unwrap_or_default()
+                ),
+            );
+        }
         if b.unconfirmed > 0 {
             theme::hint(
                 ui,

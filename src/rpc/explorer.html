@@ -2003,10 +2003,14 @@ async function showCoin(q, results, seq) {
     const born = results.find(r => r.result_type === 'output_coin_id' || r.result_type === 'coinbase_coin_id');
     const died = results.find(r => r.result_type === 'input_coin_id');
 
-    let alive = null, bb = null, db = null;
+    let alive = null, bb = null, db = null, maturesAt = null;
     try {
         [alive, bb, db] = await Promise.all([
-            fetch('/coin/' + q).then(r => r.ok ? r.json() : null).then(d => d ? d.exists : null).catch(() => null),
+            fetch('/coin/' + q).then(r => r.ok ? r.json() : null).then(d => {
+                // Set while the coin is a mining reward still maturing.
+                if (d && d.matures_at != null) maturesAt = d.matures_at;
+                return d ? d.exists : null;
+            }).catch(() => null),
             born ? getBatch(born.height) : null,
             died ? getBatch(died.height) : null,
         ]);
@@ -2041,6 +2045,9 @@ async function showCoin(q, results, seq) {
     } else if (spending) {
         line = 'pending';
         deathEnd = `<span class="life-tag pending">${ic('hourglass')}being spent</span><a onclick="switchTab('mempool')">mempool</a>`;
+    } else if (alive && maturesAt != null) {
+        line = '';
+        deathEnd = `<span class="life-tag pending">${ic('hourglass')}maturing</span><span class="dim">spendable from ${fmtInt(maturesAt)}</span>`;
     } else if (alive) {
         line = '';
         deathEnd = `<span class="life-tag alive"><i class="dot alive"></i>exists</span><span class="dim">now</span>`;

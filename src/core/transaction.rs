@@ -351,6 +351,37 @@ pub fn check_output_coin_ids(
     Ok(())
 }
 
+/// Coinbase maturity: from [`COINBASE_MATURITY_ACTIVATION_HEIGHT`], refuse a
+/// spend of a coinbase output fewer than [`COINBASE_MATURITY`] blocks old.
+///
+/// # Reasoning
+/// Read-only, so it sits with the coin existence checks, before any
+/// mutation. It reads `state.height`, the height of the block the spend is
+/// in: the block being applied, or for the mempool the next one. A reward
+/// the next block may spend stays spendable in every later one, so a spend
+/// the mempool admits never matures out of validity.
+///
+/// # Formal Specification
+/// ```text
+/// Pre:  true
+/// Post: result = Err(_) ⇔ state.height ≥ COINBASE_MATURITY_ACTIVATION_HEIGHT
+///                         ∧ state.coinbase_matures_at(coin_id) ≠ None
+/// ```
+pub fn check_coinbase_maturity(state: &State, coin_id: &[u8; 32]) -> Result<()> {
+    if state.height < COINBASE_MATURITY_ACTIVATION_HEIGHT {
+        return Ok(());
+    }
+    if let Some(matures) = state.coinbase_matures_at(coin_id) {
+        bail!(
+            "Coinbase output {} is immature: spendable from block {} (this is block {})",
+            hex::encode(coin_id),
+            matures,
+            state.height
+        );
+    }
+    Ok(())
+}
+
 /// Apply a transaction that has already passed signature verification.
 /// Skips the verify_predicate call — all other validation still runs.
 ///
@@ -449,6 +480,7 @@ pub fn apply_transaction_no_sig_check(state: &mut State, tx: &Transaction) -> Re
                 if !state.coins.contains(&coin_id) {
                     bail!("Coin {} not found or already spent", hex::encode(coin_id));
                 }
+                check_coinbase_maturity(state, &coin_id)?;
             }
 
             // NOTE: verify_predicate intentionally skipped here — already done in parallel
@@ -548,6 +580,7 @@ pub fn apply_transaction_no_sig_check(state: &mut State, tx: &Transaction) -> Re
                 if !state.coins.contains(&input.coin_id()) {
                     bail!("Coin {} not found or already spent", hex::encode(input.coin_id()));
                 }
+                check_coinbase_maturity(state, &input.coin_id())?;
             }
             // Final read-only gate before any mutation (see check_output_coin_ids).
             check_output_coin_ids(state, &input_coin_ids, outputs)?;
@@ -761,6 +794,7 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
                 if !state.coins.contains(&coin_id) {
                     bail!("Coin {} not found or already spent", hex::encode(coin_id));
                 }
+                check_coinbase_maturity(state, &coin_id)?;
 
                 // Script Execution Engine
                 if !verify_predicate(&input.predicate, witness, &expected, state.height, outputs, input.value, input.commitment, &sums) {
@@ -887,6 +921,7 @@ pub fn apply_transaction(state: &mut State, tx: &Transaction) -> Result<()> {
                 if !state.coins.contains(&coin_id) {
                     bail!("Coin {} not found or already spent", hex::encode(coin_id));
                 }
+                check_coinbase_maturity(state, &coin_id)?;
             }
 
             let sums = covenant_input_sums(inputs);
@@ -1095,6 +1130,7 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
                 if !state.coins.contains(&coin_id) {
                     bail!("Coin {} not found", hex::encode(coin_id));
                 }
+                check_coinbase_maturity(state, &coin_id)?;
                 if !verify_predicate(&input.predicate, witness, &expected, state.height, outputs, input.value, input.commitment, &sums) {
                     bail!("Predicate execution failed for input {}", i);
                 }
@@ -1150,6 +1186,7 @@ pub fn validate_transaction(state: &State, tx: &Transaction) -> Result<()> {
             for input in inputs.iter() {
                 let coin_id = input.coin_id();
                 if !state.coins.contains(&coin_id) { bail!("Coin {} not found", hex::encode(coin_id)); }
+                check_coinbase_maturity(state, &coin_id)?;
             }
             let sums = covenant_input_sums(inputs);
             // From V5, reject a Consolidate whose shared predicate reads per-input
@@ -1190,6 +1227,7 @@ mod tests {
             header_hash: [0u8; 32],
             chain_mmr: crate::core::mmr::MerkleMountainRange::new(),
             burned_wots: UtxoAccumulator::new(),
+            coinbase_window: Default::default(),
         }
     }
 
@@ -1604,5 +1642,113 @@ mod tests {
         validate_transaction(&state, &tx).unwrap();
         // State should not have the commitment
         assert!(!state.commitments.contains(&commitment));
+    }
+
+    // ── Coinbase maturity ───────────────────────────────────────────────
+
+    /// A state at height `at` holding rewards (16 units each) that block
+    /// `mined` paid to one P2PK address, with a sealed commitment spending
+    /// them: as a Reveal of the first, or a Consolidate of both.
+    fn reward_spend(mined: u64, at: u64, consolidate: bool) -> (State, Transaction) {
+        let mut state = empty_state();
+        state.height = at;
+        let v2 = is_v2_at(at);
+        let seed = [0x42u8; 32];
+        let owner_pk = wots::keygen(&seed);
+        let rewards: Vec<InputReveal> = [b"reward a", b"reward b"]
+            .iter()
+            .map(|tag| InputReveal {
+                predicate: Predicate::p2pk(&owner_pk),
+                value: 16,
+                salt: hash(*tag),
+                commitment: None,
+            })
+            .collect();
+        let ids: Vec<[u8; 32]> = rewards.iter().map(|r| r.coin_id()).collect();
+        for id in &ids {
+            state.coins.insert(*id, v2);
+        }
+        state.coinbase_window.record(mined, &ids);
+
+        let inputs = if consolidate { rewards } else { rewards[..1].to_vec() };
+        let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
+        let outputs = vec![OutputData::Standard { address: hash(b"recipient"), value: 8, salt: [0x11; 32] }];
+        let hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
+        let salt = [0x22u8; 32];
+        let commitment = compute_commitment(&input_ids, &hashes, &salt);
+        state.commitments.insert(commitment, v2);
+        state.commitment_heights.insert(commitment, at);
+
+        let sig = Witness::sig(wots::sig_to_bytes(&wots::sign(&seed, &commitment)));
+        let tx = if consolidate {
+            Transaction::Consolidate { inputs, witness: sig, outputs, salt }
+        } else {
+            Transaction::Reveal { inputs, witnesses: vec![sig], outputs, salt }
+        };
+        (state, tx)
+    }
+
+    /// Every path that spends a coin, for a reward mined at `mined` and spent
+    /// at `at`: the mempool, a template, a block (signatures pre-verified).
+    fn spend_verdicts(mined: u64, at: u64, consolidate: bool) -> Vec<Result<()>> {
+        let (state, tx) = reward_spend(mined, at, consolidate);
+        vec![
+            validate_transaction(&state, &tx),
+            apply_transaction(&mut state.clone(), &tx),
+            apply_transaction_no_sig_check(&mut state.clone(), &tx),
+        ]
+    }
+
+    fn all_ok(verdicts: &[Result<()>]) -> bool {
+        verdicts.iter().all(|v| v.is_ok())
+    }
+
+    fn all_immature(verdicts: &[Result<()>]) -> bool {
+        verdicts
+            .iter()
+            .all(|v| matches!(v, Err(e) if e.to_string().contains("immature")))
+    }
+
+    /// Before activation a reward spends at any age; from activation it
+    /// waits exactly `COINBASE_MATURITY` blocks, on every path, for a Reveal
+    /// and for a Consolidate.
+    #[test]
+    fn a_reward_waits_coinbase_maturity_blocks_from_activation() {
+        let a = COINBASE_MATURITY_ACTIVATION_HEIGHT;
+        let n = COINBASE_MATURITY;
+        for consolidate in [false, true] {
+            assert!(all_ok(&spend_verdicts(a - 2, a - 1, consolidate)), "before activation: not enforced");
+            assert!(all_immature(&spend_verdicts(a - 1, a, consolidate)), "mined just before activation, held from it");
+            assert!(all_immature(&spend_verdicts(a, a + n - 1, consolidate)), "one block short");
+            assert!(all_ok(&spend_verdicts(a, a + n, consolidate)), "exactly matured");
+            assert!(all_ok(&spend_verdicts(a - 1, a - 1 + n, consolidate)), "a pre-activation reward matures the same way");
+        }
+    }
+
+    /// The refusal leaves the state as it found it (the check runs before
+    /// any mutation), and names the block the reward is spendable from.
+    #[test]
+    fn a_refused_reward_spend_changes_nothing() {
+        let a = COINBASE_MATURITY_ACTIVATION_HEIGHT;
+        for consolidate in [false, true] {
+            let (state, tx) = reward_spend(a, a + 1, consolidate);
+            let mut after = state.clone();
+            let err = apply_transaction(&mut after, &tx).unwrap_err().to_string();
+            assert!(err.contains(&format!("spendable from block {}", a + COINBASE_MATURITY)), "{err}");
+            let v2 = is_v2_at(state.height);
+            assert_eq!(after.coins.root(v2), state.coins.root(v2));
+            assert_eq!(after.commitments.root(v2), state.commitments.root(v2));
+            assert_eq!(after.midstate, state.midstate);
+        }
+    }
+
+    /// A coin that no coinbase made is never held, however young.
+    #[test]
+    fn ordinary_coins_are_not_held() {
+        let a = COINBASE_MATURITY_ACTIVATION_HEIGHT;
+        let (mut state, tx) = reward_spend(a, a + 1, false);
+        state.coinbase_window = Default::default();
+        assert!(validate_transaction(&state, &tx).is_ok());
+        assert!(apply_transaction(&mut state, &tx).is_ok());
     }
 }

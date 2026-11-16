@@ -538,6 +538,9 @@ fn apply_batch_internal(
             bail!("Duplicate coinbase coin");
         }
     }
+    // Every block's coinbase enters the maturity window, from genesis on, so
+    // the window is complete whenever the rule activates.
+    state.coinbase_window.record(state.height, &coinbase_ids);
 
     // 7. Finalize
     state.midstate = future_midstate;
@@ -579,6 +582,9 @@ fn apply_batch_internal(
 
     state.depth += block_work;
     state.height += 1;
+    // Rewards the next block may spend leave the window: O(log n), one height
+    // a block.
+    state.coinbase_window.prune(state.height);
 
     state.timestamp = batch.timestamp;
 
@@ -1103,6 +1109,42 @@ mod tests {
         assert_eq!(state.height, WALK_ACTIVATION_HEIGHT + 2);
     }
 
+    // ── Coinbase maturity window ────────────────────────────────────────
+
+    /// Applying blocks keeps the window to exactly the rewards the next
+    /// block may not spend, without the window ever touching the state
+    /// root: the same blocks apply to a state that has no window at all
+    /// (an old node's), to the same roots.
+    #[cfg(feature = "fast-mining")]
+    #[test]
+    fn applied_blocks_keep_the_maturity_window() {
+        let mut state = genesis_state();
+        let mut windowless = genesis_state();
+        let mut timestamps = vec![state.timestamp];
+        let mut mined: Vec<(u64, Vec<[u8; 32]>)> = Vec::new();
+        while state.height < COINBASE_MATURITY_ACTIVATION_HEIGHT + 2 * COINBASE_MATURITY {
+            let ts = state.timestamp + TARGET_BLOCK_TIME;
+            let batch = make_empty_batch(&state, block_reward(state.height), ts);
+            mined.push((state.height, batch.coinbase.iter().map(|c| c.coin_id()).collect()));
+            apply_batch(&mut state, &batch, &timestamps, &mut std::collections::HashMap::new()).unwrap();
+            apply_batch(&mut windowless, &batch, &timestamps, &mut std::collections::HashMap::new()).unwrap();
+            windowless.coinbase_window = Default::default();
+            timestamps.push(ts);
+            state.target = adjust_difficulty(&state);
+            windowless.target = adjust_difficulty(&windowless);
+
+            for (c, ids) in &mined {
+                let immature = state.height < c + COINBASE_MATURITY;
+                for id in ids {
+                    assert_eq!(state.coinbase_window.created_at(id), immature.then_some(*c), "block {c} at {}", state.height);
+                    assert_eq!(state.coinbase_matures_at(id), immature.then_some(c + COINBASE_MATURITY));
+                }
+            }
+            assert_eq!(state.header_hash, windowless.header_hash);
+            assert_eq!(state.midstate, windowless.midstate);
+        }
+    }
+
     // ── validate_timestamp ──────────────────────────────────────────────
 
     #[test]
@@ -1144,6 +1186,7 @@ mod tests {
             chain_mmr: crate::core::mmr::MerkleMountainRange::new(),
             header_hash: [0; 32],
             burned_wots: crate::core::mmr::UtxoAccumulator::new(),
+            coinbase_window: Default::default(),
         };
 
         let timestamps = vec![prev.timestamp];

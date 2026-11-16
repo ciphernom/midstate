@@ -829,6 +829,78 @@ pub fn import_scanned(
             .collect()
     }
 
+    /// Remove from `live` what no spend may use yet: the coinbase rewards in
+    /// `maturing`, and every coin at a one-time (WOTS) address holding one.
+    /// Returns the value held back.
+    ///
+    /// # Reasoning
+    /// The co-spend rule spends a WOTS address all at once, because its key
+    /// signs once. Such an address therefore waits for its youngest reward:
+    /// spending its other coins now would sign with the key while a coin it
+    /// guards cannot move, and moving that coin later would sign again. Each
+    /// MSS coin stands alone, so only the maturing ones wait.
+    ///
+    /// # Formal Specification
+    /// ```text
+    /// Pre:  true
+    /// Post: let Waiting = { c.address | c ∈ coins ∧ c.coin_id ∈ maturing ∩ live
+    ///                                  ∧ c.address is not an MSS address }
+    ///       live' = { id ∈ live | id ∉ maturing ∧ address(id) ∉ Waiting }
+    ///       result = Σ value(id) over live \ live'
+    /// ```
+    pub fn hold_back_maturing(
+        &self,
+        live: &mut Vec<[u8; 32]>,
+        maturing: &std::collections::HashSet<[u8; 32]>,
+    ) -> u64 {
+        if maturing.is_empty() {
+            return 0;
+        }
+        let mss: std::collections::HashSet<[u8; 32]> =
+            self.data.mss_keys.iter().map(|k| compute_address(&k.master_pk)).collect();
+        let live_set: std::collections::HashSet<[u8; 32]> = live.iter().copied().collect();
+        let mut coin = std::collections::HashMap::new();
+        let mut waiting = std::collections::HashSet::new();
+        for c in &self.data.coins {
+            coin.insert(c.coin_id, (c.address, c.value));
+            if maturing.contains(&c.coin_id) && live_set.contains(&c.coin_id) && !mss.contains(&c.address) {
+                waiting.insert(c.address);
+            }
+        }
+        let mut held = 0u64;
+        let mut counted = std::collections::HashSet::new();
+        live.retain(|id| {
+            let (address, value) = coin.get(id).copied().unwrap_or(([0; 32], 0));
+            let keep = !maturing.contains(id) && !waiting.contains(&address);
+            if !keep && counted.insert(*id) {
+                held = held.saturating_add(value);
+            }
+            keep
+        });
+        held
+    }
+
+    /// The coins a new spend may use now: live in `state`, not in `exclude`
+    /// (inputs already promised to a pending commit), not behind a one-time
+    /// key that has signed, and not held back by coinbase maturity (see
+    /// [`Self::hold_back_maturing`]).
+    pub fn spendable_now(
+        &self,
+        state: &crate::core::State,
+        exclude: &std::collections::HashSet<[u8; 32]>,
+    ) -> Vec<[u8; 32]> {
+        let mut live: Vec<[u8; 32]> = self
+            .data
+            .coins
+            .iter()
+            .filter(|c| !c.wots_signed && !exclude.contains(&c.coin_id) && state.coins.contains(&c.coin_id))
+            .map(|c| c.coin_id)
+            .collect();
+        let maturing = maturing_in(state, &live);
+        self.hold_back_maturing(&mut live, &maturing);
+        live
+    }
+
     /// Resolve a coin reference (index, hex prefix, or full hex).
     pub fn resolve_coin(&self, reference: &str) -> Result<[u8; 32]> {
         if let Ok(idx) = reference.parse::<usize>() {
@@ -1919,6 +1991,12 @@ pub fn coinbase_salt(mining_seed: &[u8; 32], height: u64, index: u64) -> [u8; 32
     hash_concat(&height_key, &(index | 0x8000000000000000).to_le_bytes())
 }
 
+/// The coins of `ids` that are coinbase rewards `state`'s next block may not
+/// spend yet (see [`crate::core::State::coinbase_matures_at`]).
+pub fn maturing_in(state: &crate::core::State, ids: &[[u8; 32]]) -> std::collections::HashSet<[u8; 32]> {
+    ids.iter().copied().filter(|id| state.coinbase_matures_at(id).is_some()).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2749,6 +2827,40 @@ let c3 = w.import_coin([3; 32], 40_000, [30; 32], None).unwrap();
 
         assert_eq!(w.coins().len(), 2);
         assert_eq!(w.total_value(), 5); // 4 + 1
+    }
+
+    /// Maturity holds back a maturing reward and, at a one-time address,
+    /// every coin behind the same key: the co-spend rule spends them in one
+    /// signature, so they wait together. At an MSS address only the maturing
+    /// coin waits.
+    #[test]
+    fn maturing_rewards_hold_back_their_one_time_address() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+
+        let reward = w.import_coin([1; 32], 4, [10; 32], None).unwrap();
+        let addr = w.find_coin(&reward).unwrap().address;
+        let sibling = w.import_scanned(addr, 1, [20; 32], None).unwrap().unwrap();
+        let other = w.import_coin([2; 32], 8, [30; 32], None).unwrap();
+        let mss_addr = w.generate_mss(4, None).unwrap();
+        let mss_reward = w.import_scanned(mss_addr, 16, [40; 32], None).unwrap().unwrap();
+        let mss_other = w.import_scanned(mss_addr, 32, [50; 32], None).unwrap().unwrap();
+
+        let maturing: std::collections::HashSet<[u8; 32]> = [reward, mss_reward].into_iter().collect();
+        let mut live = vec![reward, sibling, other, mss_reward, mss_other];
+        assert_eq!(w.hold_back_maturing(&mut live, &maturing), 4 + 1 + 16);
+        assert_eq!(live, vec![other, mss_other]);
+
+        // A maturing coin already gone from `live` holds nothing back.
+        let mut rest = vec![sibling, other];
+        assert_eq!(w.hold_back_maturing(&mut rest, &maturing), 0);
+        assert_eq!(rest, vec![sibling, other]);
+
+        let mut all = vec![reward, sibling, other];
+        assert_eq!(w.hold_back_maturing(&mut all, &std::collections::HashSet::new()), 0);
+        assert_eq!(all.len(), 3);
     }
 
     #[test]

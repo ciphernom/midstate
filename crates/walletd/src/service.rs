@@ -1553,6 +1553,15 @@ impl Service {
             .iter()
             .map(|m| midstate::core::compute_address(&m.master_pk))
             .collect();
+        // Coins a spend may not use yet: rewards still maturing, and what
+        // shares a one-time address with one (see Wallet::hold_back_maturing).
+        let live_ids: Vec<[u8; 32]> =
+            w.coins().iter().map(|c| c.coin_id).filter(|id| state.coins.contains(id)).collect();
+        let maturing = midstate::wallet::maturing_in(&state, &live_ids);
+        let mut ready = live_ids.clone();
+        w.hold_back_maturing(&mut ready, &maturing);
+        let ready: HashSet<[u8; 32]> = ready.into_iter().collect();
+        b.matures_at = maturing.iter().filter_map(|id| state.coinbase_matures_at(id)).max();
         for c in w.coins() {
             let live = state.coins.contains(&c.coin_id);
             if in_flight_ids.contains(&c.coin_id) {
@@ -1562,6 +1571,8 @@ impl Service {
                 // is real but cannot be spent without signing with that key
                 // again (see Coins); gone, that signature spent it. Neither is
                 // money on its way in.
+            } else if live && !ready.contains(&c.coin_id) {
+                b.immature += c.value;
             } else if live {
                 b.confirmed += c.value;
             } else {
@@ -1591,6 +1602,7 @@ impl Service {
                 live: state.coins.contains(&c.coin_id),
                 wots_signed: c.wots_signed,
                 in_flight: in_flight_ids.contains(&c.coin_id),
+                matures_at: state.coinbase_matures_at(&c.coin_id),
             })
             .collect())
     }
@@ -2101,12 +2113,7 @@ impl Service {
 
         let in_flight_ids = self.in_flight_inputs();
         let w = self.wallet.as_mut().unwrap();
-        let live: Vec<[u8; 32]> = w
-            .coins()
-            .iter()
-            .filter(|c| !c.wots_signed && !in_flight_ids.contains(&c.coin_id) && state.coins.contains(&c.coin_id))
-            .map(|c| c.coin_id)
-            .collect();
+        let live = w.spendable_now(&state, &in_flight_ids);
         let SendPlan { input_coin_ids, outputs, change_seeds, fee, .. } =
             sendplan::plan_send(w, &live, address, value)?;
         let salt = outputs
@@ -2521,19 +2528,11 @@ impl Service {
             );
         }
 
-        // Live coins: on-chain AND not already promised to a pending commit.
+        // Live coins: on-chain, not already promised to a pending commit, and
+        // not a reward still maturing.
         let in_flight_ids = self.in_flight_inputs();
         let w = self.wallet.as_mut().unwrap();
-        let live: Vec<[u8; 32]> = w
-            .coins()
-            .iter()
-            .filter(|c| {
-                !c.wots_signed
-                    && !in_flight_ids.contains(&c.coin_id)
-                    && state.coins.contains(&c.coin_id)
-            })
-            .map(|c| c.coin_id)
-            .collect();
+        let live = w.spendable_now(&state, &in_flight_ids);
 
         let SendPlan { input_coin_ids, outputs, change_seeds, in_sum: _, fee, amount } =
             sendplan::plan_send(w, &live, dest, amount)?;
@@ -3006,6 +3005,19 @@ impl Service {
                 total += c.value;
             }
         }
+        let maturing = midstate::wallet::maturing_in(&state, &live);
+        if !maturing.is_empty() {
+            if !is_mss_addr {
+                // Its key signs once, and every coin there goes in that one
+                // signature: the address waits for its youngest reward.
+                let until = maturing.iter().filter_map(|id| state.coinbase_matures_at(id)).max().unwrap_or(0);
+                bail!(
+                    "a mining reward at that address is still maturing; its one-time key signs \
+                     once, for every coin there, so consolidate it from block {until}"
+                );
+            }
+            total -= w.hold_back_maturing(&mut live, &maturing);
+        }
         if live.len() < 2 {
             bail!(
                 "that address has {} live coin(s) — consolidation is for grouped sibling coins (2 or more)",
@@ -3069,11 +3081,16 @@ impl Service {
         let state = self.node.get_state().await;
 
         let live_of = |w: &Wallet| -> Vec<[u8; 32]> {
-            w.coins()
+            let mut live: Vec<[u8; 32]> = w
+                .coins()
                 .iter()
                 .filter(|c| state.coins.contains(&c.coin_id))
                 .map(|c| c.coin_id)
-                .collect()
+                .collect();
+            // Rewards still maturing wait, with their one-time addresses.
+            let maturing = midstate::wallet::maturing_in(&state, &live);
+            w.hold_back_maturing(&mut live, &maturing);
+            live
         };
 
         let (targets, live) = {
@@ -3513,14 +3530,7 @@ impl Service {
 
         let in_flight = self.in_flight_inputs();
         let w = self.wallet.as_mut().unwrap();
-        let live: Vec<[u8; 32]> = w
-            .coins()
-            .iter()
-            .filter(|c| {
-                !c.wots_signed && !in_flight.contains(&c.coin_id) && state.coins.contains(&c.coin_id)
-            })
-            .map(|c| c.coin_id)
-            .collect();
+        let live = w.spendable_now(&state, &in_flight);
         let plan = sendplan::plan_fixed_outputs(w, &live, recipient)?;
         let (commitment, _salt) =
             w.prepare_commit(&plan.input_coin_ids, &plan.outputs, plan.change_seeds, false, false)?;
@@ -5892,14 +5902,7 @@ impl Service {
 
         let in_flight = self.in_flight_inputs();
         let w = self.wallet.as_mut().unwrap();
-        let live: Vec<[u8; 32]> = w
-            .coins()
-            .iter()
-            .filter(|c| {
-                !c.wots_signed && !in_flight.contains(&c.coin_id) && state.coins.contains(&c.coin_id)
-            })
-            .map(|c| c.coin_id)
-            .collect();
+        let live = w.spendable_now(&state, &in_flight);
         let plan = sendplan::plan_fixed_outputs(w, &live, outputs)?;
         let (commitment, _salt) =
             w.prepare_commit(&plan.input_coin_ids, &plan.outputs, plan.change_seeds, false, false)?;

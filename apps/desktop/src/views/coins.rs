@@ -67,7 +67,7 @@ fn holdings(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
     // change, so it is worth seeing at a glance.
     let live: Vec<_> = app.coins.iter().filter(|c| c.live && !c.in_flight).collect();
     let total: u64 = live.iter().map(|c| c.value).sum();
-    let spendable = live.iter().filter(|c| !c.wots_signed).count();
+    let spendable = live.iter().filter(|c| !c.wots_signed && c.matures_at.is_none()).count();
     let reusable = live.iter().filter(|c| c.kind == "mss").count();
 
     ui.columns(4, |c| {
@@ -132,6 +132,8 @@ fn holdings(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
                     theme::badge(ui, "off-chain", theme::muted());
                 } else if c.wots_signed {
                     theme::badge(ui, "signed", theme::muted());
+                } else if let Some(block) = c.matures_at {
+                    theme::badge(ui, &format!("maturing · block {block}"), theme::muted());
                 } else {
                     theme::badge(ui, "spendable", theme::ink());
                 }

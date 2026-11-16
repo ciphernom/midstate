@@ -175,6 +175,10 @@ pub struct CheckCoinRequest {
 pub struct CheckCoinResponse {
     pub exists: bool,
     pub coin: String,
+    /// Set while the coin is a mining reward still maturing: the first
+    /// block that may spend it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matures_at: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -483,6 +487,9 @@ pub struct CheckOutputRequest {
 pub struct CheckOutputResponse {
     pub coin_id: String,
     pub exists: bool,
+    /// As [`CheckCoinResponse::matures_at`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matures_at: Option<u64>,
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GetTxByInputRequest {

@@ -323,11 +323,7 @@ impl Service {
         let state = self.live().await;
         let in_flight = self.in_flight_inputs();
         let Some(w) = self.wallet.as_ref() else { return Vec::new() };
-        w.coins()
-            .iter()
-            .filter(|c| !c.wots_signed && !in_flight.contains(&c.coin_id) && state.coins.contains(&c.coin_id))
-            .map(|c| c.coin_id)
-            .collect()
+        w.spendable_now(&state, &in_flight)
     }
 
     fn owned_plan(&self, id: &str) -> Result<(usize, InheritancePlan)> {

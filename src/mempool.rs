@@ -762,6 +762,13 @@ impl Mempool {
                         if inputs.iter().any(|i| !state.coins.contains(&i.coin_id())) {
                             return true;
                         }
+                        // Admitted before coinbase maturity activated, invalid
+                        // from it: evict rather than retry every template.
+                        if inputs.iter().any(|i| {
+                            crate::core::transaction::check_coinbase_maturity(state, &i.coin_id()).is_err()
+                        }) {
+                            return true;
+                        }
 
                         let input_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
                         let output_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
@@ -869,6 +876,7 @@ mod tests {
             header_hash: [0u8; 32],
             chain_mmr: crate::core::mmr::MerkleMountainRange::new(),
             burned_wots: UtxoAccumulator::new(),
+            coinbase_window: Default::default(),
         }
     }
 

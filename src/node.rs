@@ -405,6 +405,13 @@ impl NodeHandle {
         self.state.read().await.coins.contains(&coin)
     }
 
+    /// Whether `coin` is unspent, and while it is a mining reward still
+    /// maturing, the first block that may spend it.
+    pub async fn coin_status(&self, coin: [u8; 32]) -> (bool, Option<u64>) {
+        let state = self.state.read().await;
+        (state.coins.contains(&coin), state.coinbase_matures_at(&coin))
+    }
+
     /// An SMT inclusion proof for `coin` against the tip header, with the four
     /// roots its `state_root` commits to: `H(H(H(coins, commitments),
     /// chain_mmr), burned_wots)`, where the chain root is from before the tip
@@ -2558,7 +2565,10 @@ async fn handle_light_request(
                     return LightResponse::error("Invalid coin hex");
                 }
                 let exists = self.state.coins.contains(&coin_bytes);
-                LightResponse::success(serde_json::json!({ "exists": exists }))
+                match self.state.coinbase_matures_at(&coin_bytes) {
+                    Some(block) => LightResponse::success(serde_json::json!({ "exists": exists, "matures_at": block })),
+                    None => LightResponse::success(serde_json::json!({ "exists": exists })),
+                }
             }
             LightRequest::CheckCommitment { commitment } => {
                 let mut commitment_bytes = [0u8; 32];
@@ -4352,6 +4362,11 @@ if is_valid && !self.known_pex_addrs.contains_key(&addr_str) {
                     tracing::debug!("MixJoin rejected from peer {}: coin does not exist", from);
                     return Ok(());
                 }
+                // An immature reward would sink the whole mix at its Reveal.
+                if self.state.coinbase_matures_at(&coin_id).is_some() {
+                    tracing::debug!("MixJoin rejected from peer {}: coin is an immature coinbase output", from);
+                    return Ok(());
+                }
 
                 // Client always mines MIX_JOIN_POW_BITS. The Bayesian system handles dropping 
                 // bad peers independently, so we don't need a hidden PoW trap here.
@@ -4394,6 +4409,10 @@ if is_valid && !self.known_pex_addrs.contains_key(&addr_str) {
                 let coin_id = input.coin_id();
                 if !self.state.coins.contains(&coin_id) {
                     tracing::debug!("MixFee rejected from peer {}: fee coin does not exist", from);
+                    return Ok(());
+                }
+                if self.state.coinbase_matures_at(&coin_id).is_some() {
+                    tracing::debug!("MixFee rejected from peer {}: fee coin is an immature coinbase output", from);
                     return Ok(());
                 }
 
@@ -9072,6 +9091,92 @@ mod complex_tests {
         let change_coin_id = compute_coin_id(&change_addr, change_value, &change_salt);
         assert!(node.state.coins.contains(&recipient_coin_id), "recipient coin must exist");
         assert!(node.state.coins.contains(&change_coin_id), "change coin must exist");
+    }
+
+    // ── Coinbase maturity ───────────────────────────────────────────────
+
+    /// Coinbase maturity through the node, across its activation
+    /// (fast-mining: rewards wait `COINBASE_MATURITY` = 3 blocks from block
+    /// 40). A reward too young to spend is turned away by the mempool, and a
+    /// block spending it is refused, though an old node, which keeps no
+    /// window, accepts that same block: the rule only refuses, a soft fork.
+    /// Once the reward is old enough the same Reveal goes through.
+    #[cfg(feature = "fast-mining")]
+    #[tokio::test]
+    async fn a_fresh_reward_is_refused_until_it_matures() {
+        use crate::core::{COINBASE_MATURITY, COINBASE_MATURITY_ACTIVATION_HEIGHT};
+        let dir = tempdir().unwrap();
+        let mut node = create_test_node(dir.path()).await;
+        let empty_block = |node: &Node| make_valid_batch(&node.state, 10, vec![]);
+        while node.state.height < COINBASE_MATURITY_ACTIVATION_HEIGHT {
+            let b = empty_block(&node);
+            node.handle_new_batch(b, None).await.unwrap();
+        }
+
+        // Block `mined` pays its first reward to a key we hold
+        // (make_valid_batch derives its coinbase from the parent midstate).
+        let mined = node.state.height;
+        let seed_root = node.state.midstate;
+        let b = empty_block(&node);
+        node.handle_new_batch(b, None).await.unwrap();
+        let cb_seed = crate::wallet::coinbase_seed(&seed_root, mined, 0);
+        let cb_owner_pk = wots::keygen(&cb_seed);
+        let cb_salt = crate::wallet::coinbase_salt(&seed_root, mined, 0);
+        let value = decompose_value(block_reward(mined))[0];
+        let coin_id = compute_coin_id(&compute_address(&cb_owner_pk), value, &cb_salt);
+        assert!(node.state.coins.contains(&coin_id));
+        let spendable_from = mined + COINBASE_MATURITY;
+        assert_eq!(node.state.coinbase_matures_at(&coin_id), Some(spendable_from));
+
+        // The Commit binds no coin, so it is mined straight away.
+        let outputs = vec![OutputData::Standard { address: hash(b"payee"), value: value / 2, salt: hash(b"payee salt") }];
+        let hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
+        let tx_salt = hash(b"maturity tx salt");
+        let commitment = compute_commitment(&[coin_id], &hashes, &tx_salt);
+        let spam_nonce = crate::core::transaction::mine_pow(
+            &commitment,
+            crate::core::transaction::MIN_COMMIT_POW_BITS,
+            node.state.height,
+            node.state.header_hash,
+        );
+        let b = make_valid_batch(&node.state, 10, vec![Transaction::Commit { commitment, spam_nonce }]);
+        node.handle_new_batch(b, None).await.unwrap();
+        assert!(node.state.commitments.contains(&commitment));
+
+        let sig = wots::sign(&cb_seed, &commitment);
+        let reveal = Transaction::Reveal {
+            inputs: vec![InputReveal { predicate: Predicate::p2pk(&cb_owner_pk), value, salt: cb_salt, commitment: None }],
+            witnesses: vec![Witness::sig(wots::sig_to_bytes(&sig))],
+            outputs,
+            salt: tx_salt,
+        };
+        assert!(node.state.height < spendable_from, "the test must try while the reward is young");
+
+        // The mempool turns it away.
+        let err = validate_transaction(&node.state, &reveal).unwrap_err().to_string();
+        assert!(err.contains("immature"), "{err}");
+
+        // A block spending it, as a miner without the rule builds it.
+        let mut old_node = node.state.clone();
+        old_node.coinbase_window = Default::default();
+        let bad = make_valid_batch(&old_node, 10, vec![reveal.clone()]);
+        crate::core::state::apply_batch(&mut old_node, &bad, &[], &mut std::collections::HashMap::new())
+            .expect("an old node accepts the block");
+        let tip = node.state.height;
+        let _ = node.handle_new_batch(bad, None).await;
+        assert_eq!(node.state.height, tip, "this node refuses it");
+        assert!(node.state.coins.contains(&coin_id), "and the reward stays unspent");
+
+        // Old enough: the same Reveal goes through.
+        while node.state.height < spendable_from {
+            let b = empty_block(&node);
+            node.handle_new_batch(b, None).await.unwrap();
+        }
+        assert_eq!(node.state.coinbase_matures_at(&coin_id), None);
+        validate_transaction(&node.state, &reveal).expect("the mempool takes it");
+        let good = make_valid_batch(&node.state, 10, vec![reveal]);
+        node.handle_new_batch(good, None).await.unwrap();
+        assert!(!node.state.coins.contains(&coin_id), "spent once mature");
     }
 
     // ── Wallet Send Flow End-to-End ─────────────────────────────────────

@@ -65,6 +65,7 @@ impl Sim {
                 chain_mmr: MerkleMountainRange::new(),
                 header_hash: [0; 32],
                 burned_wots: UtxoAccumulator::new(),
+                coinbase_window: Default::default(),
             },
             mds_reveals: Vec::new(),
             mwb,

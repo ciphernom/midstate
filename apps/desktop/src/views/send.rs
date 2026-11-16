@@ -265,7 +265,11 @@ pub fn show(app: &mut App, ui: &mut Ui) {
 /// little dust behind; undershooting makes the planner reject the send, which
 /// is the more annoying failure.
 fn estimated_fee(app: &App) -> u64 {
-    let inputs = app.coins.iter().filter(|c| c.live && !c.wots_signed && !c.in_flight).count();
+    let inputs = app
+        .coins
+        .iter()
+        .filter(|c| c.live && !c.wots_signed && !c.in_flight && c.matures_at.is_none())
+        .count();
     // Matches the walletd fee model: ~1636 bytes per input, ~100 per output,
     // at 10 units per KiB, with headroom.
     let bytes = 100 + 1636 * inputs.max(1) as u64 + 100 * 8;

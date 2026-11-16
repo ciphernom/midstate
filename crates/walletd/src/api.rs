@@ -26,6 +26,14 @@ pub struct Balance {
     /// Value locked as inputs of live pending commits (in-flight sends).
     pub in_flight: u64,
     pub coin_count: usize,
+    /// Mining rewards on chain but still maturing (not in `confirmed`), with
+    /// any coin sharing a one-time address with one: spendable from
+    /// `matures_at`.
+    #[serde(default)]
+    pub immature: u64,
+    /// The block from which everything in `immature` is spendable.
+    #[serde(default)]
+    pub matures_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -42,6 +50,10 @@ pub struct CoinView {
     pub wots_signed: bool,
     /// True when the coin is an input of a live pending commit.
     pub in_flight: bool,
+    /// Set while the coin is a mining reward still maturing: the first
+    /// block that may spend it.
+    #[serde(default)]
+    pub matures_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

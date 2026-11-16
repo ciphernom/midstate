@@ -219,11 +219,12 @@ pub async fn check_coin(
     Json(req): Json<CheckCoinRequest>,
 ) -> Result<Json<CheckCoinResponse>, ErrorResponse> {
     let coin = parse_hex32(&req.coin, "coin")?;
-    let exists = node.check_coin(coin).await;
+    let (exists, matures_at) = node.coin_status(coin).await;
 
     Ok(Json(CheckCoinResponse {
         exists,
         coin: hex::encode(coin),
+        matures_at,
     }))
 }
 
@@ -527,6 +528,11 @@ pub async fn mix_register(
                 error: "Input coin does not exist or is already spent".into(),
             });
         }
+        if let Some(block) = state.coinbase_matures_at(&coin_id) {
+            return Err(ErrorResponse {
+                error: format!("Input coin is a newly mined reward, spendable from block {}", block),
+            });
+        }
     }
     // -------------------------------------------------------------------
 
@@ -564,6 +570,11 @@ pub async fn mix_fee(
         if !state.coins.contains(&coin_id) {
             return Err(ErrorResponse {
                 error: "Fee input coin does not exist or is already spent".into(),
+            });
+        }
+        if let Some(block) = state.coinbase_matures_at(&coin_id) {
+            return Err(ErrorResponse {
+                error: format!("Fee input coin is a newly mined reward, spendable from block {}", block),
             });
         }
     }
@@ -1077,10 +1088,11 @@ pub async fn check_coin_get(
     axum::extract::Path(coin_hex): axum::extract::Path<String>,
 ) -> Result<Json<CheckCoinResponse>, ErrorResponse> {
     let coin = parse_hex32(&coin_hex, "coin")?;
-    let exists = node.check_coin(coin).await;
+    let (exists, matures_at) = node.coin_status(coin).await;
     Ok(Json(CheckCoinResponse {
         exists,
         coin: hex::encode(coin),
+        matures_at,
     }))
 }
 
@@ -1091,10 +1103,11 @@ pub async fn check_output(
     let address = parse_hex32(&req.address, "address")?;
     let salt    = parse_hex32(&req.salt,    "salt")?;
     let coin_id = compute_coin_id(&address, req.value, &salt);
-    let exists  = node.check_coin(coin_id).await;
+    let (exists, matures_at) = node.coin_status(coin_id).await;
     Ok(Json(CheckOutputResponse {
         coin_id: hex::encode(coin_id),
         exists,
+        matures_at,
     }))
 }
 

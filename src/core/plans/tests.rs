@@ -26,6 +26,7 @@ fn state_at(height: u64) -> State {
         header_hash: [0u8; 32],
         chain_mmr: crate::core::mmr::MerkleMountainRange::new(),
         burned_wots: UtxoAccumulator::new(),
+        coinbase_window: Default::default(),
     }
 }
 

@@ -2695,15 +2695,27 @@ async fn wallet_balance(path: &PathBuf, rpc_port: u16, rpc_host: String) -> Resu
 
     let mut live_count = 0usize;
     let mut live_value = 0u64;
+    let mut maturing_value = 0u64;
+    let mut matures_by = 0u64;
     for wc in wallet.coins() {
-        if require_coin_live(&client, rpc_port, &rpc_host, wc.coin_id).await? {
+        let (live, matures_at) = coin_status_rpc(&client, rpc_port, &rpc_host, &hex::encode(wc.coin_id))
+            .await
+            .with_context(|| format!("could not check coin {} against the node", hex::encode(wc.coin_id)))?;
+        if live {
             live_count += 1;
             live_value += wc.value;
+            if let Some(block) = matures_at {
+                maturing_value += wc.value;
+                matures_by = matures_by.max(block);
+            }
         }
     }
 
     println!("Coins in wallet:  {}", wallet.coin_count());
     println!("Live on-chain:    {} (value: {})", live_count, live_value);
+    if maturing_value > 0 {
+        println!("  of which mined, maturing: {} (all spendable from block {})", maturing_value, matures_by);
+    }
     println!("Unused keys:      {}", wallet.keys().len());
     println!("Pending commits:  {}", wallet.pending().len());
     Ok(())
@@ -2816,14 +2828,20 @@ async fn wallet_consolidate(
     let mut live_coins = Vec::new();
     let mut dead_coins = Vec::new();
     let mut total_val = 0u64;
+    let mut maturing = std::collections::HashSet::new();
+    let mut matures_by = 0u64;
     for wc in wallet.coins() {
         if wc.address == target_addr {
-            match check_coin_rpc(&client, rpc_port, &rpc_host, &hex::encode(wc.coin_id)).await {
-                Ok(true) => {
+            match coin_status_rpc(&client, rpc_port, &rpc_host, &hex::encode(wc.coin_id)).await {
+                Ok((true, matures_at)) => {
                     live_coins.push(wc.coin_id);
                     total_val += wc.value;
+                    if let Some(block) = matures_at {
+                        maturing.insert(wc.coin_id);
+                        matures_by = matures_by.max(block);
+                    }
                 }
-                Ok(false) => dead_coins.push(wc.coin_id),
+                Ok((false, _)) => dead_coins.push(wc.coin_id),
                 Err(e) => anyhow::bail!(
                     "could not check coin {} against the node: {e}. Refusing to consolidate on \
                      an incomplete view of the chain.",
@@ -2843,6 +2861,26 @@ async fn wallet_consolidate(
             dead_coins.len()
         );
         wallet.mark_spent(dead_coins);
+    }
+
+    if !maturing.is_empty() {
+        let is_mss_addr = wallet
+            .data
+            .mss_keys
+            .iter()
+            .any(|k| midstate::core::compute_address(&k.master_pk) == target_addr);
+        if !is_mss_addr {
+            // Its key signs once, for every coin there: the address waits for
+            // its youngest reward.
+            anyhow::bail!(
+                "A mining reward at this address is still maturing. Its one-time key signs once, \
+                 for every coin there, so consolidate it from block {}.",
+                matures_by
+            );
+        }
+        let held = wallet.hold_back_maturing(&mut live_coins, &maturing);
+        total_val -= held;
+        println!("Leaving out {} in newly mined rewards still maturing (spendable from block {}).", held, matures_by);
     }
 
     if live_coins.len() < 2 {
@@ -3028,10 +3066,16 @@ async fn wallet_defrag(
     println!("Checking on-chain status of wallet coins...");
     let mut live_coins = Vec::new();
     let mut dead_coins = Vec::new();
+    let mut maturing = std::collections::HashSet::new();
     for wc in wallet.coins() {
-        match check_coin_rpc(&client, rpc_port, &rpc_host, &hex::encode(wc.coin_id)).await {
-            Ok(true) => live_coins.push(wc.coin_id),
-            Ok(false) => dead_coins.push(wc.coin_id),
+        match coin_status_rpc(&client, rpc_port, &rpc_host, &hex::encode(wc.coin_id)).await {
+            Ok((true, matures_at)) => {
+                live_coins.push(wc.coin_id);
+                if matures_at.is_some() {
+                    maturing.insert(wc.coin_id);
+                }
+            }
+            Ok((false, _)) => dead_coins.push(wc.coin_id),
             Err(e) => anyhow::bail!(
                 "could not check coin {} against the node: {e}. Refusing to defrag on an \
                  incomplete view of the chain.",
@@ -3042,6 +3086,11 @@ async fn wallet_defrag(
     // Defrag sweeps grouped siblings too, so it meets the same co-spend gate.
     if !dead_coins.is_empty() {
         wallet.mark_spent(dead_coins);
+    }
+    // Rewards still maturing wait, with their one-time addresses.
+    let held = wallet.hold_back_maturing(&mut live_coins, &maturing);
+    if held > 0 {
+        println!("Leaving out {} in newly mined rewards still maturing.", held);
     }
 
     // 1. Initial Assessment & Extract Target Addresses
@@ -3079,12 +3128,7 @@ async fn wallet_defrag(
         println!("⚠️  Imported {} previously-unknown sibling coin(s) at these addresses.", imported);
         println!("   Re-evaluating live coins...");
         // Re-evaluate live coins since we imported new ones that MUST be co-spent
-        live_coins.clear();
-        for wc in wallet.coins() {
-            if require_coin_live(&client, rpc_port, &rpc_host, wc.coin_id).await? {
-                live_coins.push(wc.coin_id);
-            }
-        }
+        live_coins = spendable_coins_rpc(&client, rpc_port, &rpc_host, &wallet).await?;
     } else {
         println!("✓ Completeness check passed. No unknown siblings found.");
     }
@@ -3233,12 +3277,7 @@ async fn wallet_send(
         ParsedOutput::Stateful(_, _) => 0,
     }).sum();
 
-    let mut live_coins = Vec::new();
-    for wc in wallet.coins() {
-        if require_coin_live(&client, rpc_port, &rpc_host, wc.coin_id).await? {
-            live_coins.push(wc.coin_id);
-        }
-    }
+    let live_coins = spendable_coins_rpc(&client, rpc_port, &rpc_host, &wallet).await?;
 
     if private {
         // Find standard outputs for private send logic
@@ -3679,12 +3718,7 @@ async fn wallet_mix(
     let base_url = format!("http://{}:{}", rpc_host, rpc_port);
 
     // Find live coins
-    let mut live_coins = Vec::new();
-    for wc in wallet.coins() {
-        if require_coin_live(&client, rpc_port, &rpc_host, wc.coin_id).await? {
-            live_coins.push(wc.coin_id);
-        }
-    }
+    let live_coins = spendable_coins_rpc(&client, rpc_port, &rpc_host, &wallet).await?;
 
     // Select the coin to mix
     let mix_coin_id: [u8; 32] = if let Some(ref coin_ref) = coin_arg {
@@ -4810,13 +4844,8 @@ async fn wallet_issue_license(
     }
 
     // Find inputs to fund the burn + fee
-    let mut live_coins = Vec::new();
     let client = reqwest::Client::new();
-    for wc in wallet.coins() {
-        if require_coin_live(&client, rpc_port, &rpc_host, wc.coin_id).await? {
-            live_coins.push(wc.coin_id);
-        }
-    }
+    let live_coins = spendable_coins_rpc(&client, rpc_port, &rpc_host, &wallet).await?;
 
     let target_fee = 100;
     let needed = burn_amount + target_fee;
@@ -4927,13 +4956,8 @@ async fn wallet_buy_license(
     println!();
 
     // Find coins to fund the purchase (price + fees + buffer)
-    let mut live_coins = Vec::new();
     let client = reqwest::Client::new();
-    for wc in wallet.coins() {
-        if require_coin_live(&client, rpc_port, &rpc_host, wc.coin_id).await? {
-            live_coins.push(wc.coin_id);
-        }
-    }
+    let live_coins = spendable_coins_rpc(&client, rpc_port, &rpc_host, &wallet).await?;
 
     let needed = price + transfer_fee + burn_amount + 200; // buffer for fees
     let selected = wallet.select_coins(needed, &live_coins)?;
@@ -5582,36 +5606,66 @@ println!("\n✓ MSS Address Generated!");
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Is this coin still unspent, according to the node?
-///
-/// Unlike a bare `check_coin_rpc`, a transport failure here is an error rather
-/// than a `false`. That distinction matters: folding "cannot reach the node"
-/// into "coin is spent" silently drops a live coin from selection, which at
-/// best under-selects and at worst strands an address behind the WOTS
-/// co-spend rule — every coin at a one-time address must be spent together,
-/// so a wrongly-omitted sibling can block that address permanently.
-async fn require_coin_live(
-    client: &reqwest::Client,
-    rpc_port: u16,
-    rpc_host: &str,
-    coin_id: [u8; 32],
-) -> Result<bool> {
-    check_coin_rpc(client, rpc_port, rpc_host, &hex::encode(coin_id))
-        .await
-        .with_context(|| {
-            format!(
-                "could not check coin {} against the node; refusing to act on an incomplete \
-                 view of the chain",
-                hex::encode(coin_id)
-            )
-        })
+async fn check_coin_rpc(client: &reqwest::Client, rpc_port: u16, rpc_host: &str, coin_hex: &str) -> Result<bool> {
+    Ok(coin_status_rpc(client, rpc_port, rpc_host, coin_hex).await?.0)
 }
 
-async fn check_coin_rpc(client: &reqwest::Client, rpc_port: u16, rpc_host: &str, coin_hex: &str) -> Result<bool> {
+/// Whether the coin is unspent and, while it is a mining reward still
+/// maturing, the first block that may spend it. A node that predates
+/// coinbase maturity reports no maturity.
+async fn coin_status_rpc(client: &reqwest::Client, rpc_port: u16, rpc_host: &str, coin_hex: &str) -> Result<(bool, Option<u64>)> {
     let url = format!("http://{}:{}/check", rpc_host, rpc_port);
     let req = rpc::CheckCoinRequest { coin: coin_hex.to_string() };
     let resp: rpc::CheckCoinResponse = client.post(&url).json(&req).send().await?.json().await?;
-    Ok(resp.exists)
+    Ok((resp.exists, resp.matures_at))
+}
+
+/// The wallet's coins a new spend may use, according to the node: unspent,
+/// and not held back by coinbase maturity (rewards still maturing, with
+/// every coin at a one-time address holding one: see
+/// `Wallet::hold_back_maturing`). Says what it holds back.
+///
+/// A transport failure here is an error rather than a "spent". That
+/// distinction matters: folding "cannot reach the node" into "coin is spent"
+/// silently drops a live coin from selection, which at best under-selects
+/// and at worst strands an address behind the WOTS co-spend rule — every
+/// coin at a one-time address must be spent together, so a wrongly-omitted
+/// sibling can block that address permanently.
+async fn spendable_coins_rpc(
+    client: &reqwest::Client,
+    rpc_port: u16,
+    rpc_host: &str,
+    wallet: &Wallet,
+) -> Result<Vec<[u8; 32]>> {
+    let mut live = Vec::new();
+    let mut maturing = std::collections::HashSet::new();
+    let mut until = 0u64;
+    for wc in wallet.coins() {
+        let (exists, matures_at) = coin_status_rpc(client, rpc_port, rpc_host, &hex::encode(wc.coin_id))
+            .await
+            .with_context(|| {
+                format!(
+                    "could not check coin {} against the node; refusing to act on an incomplete \
+                     view of the chain",
+                    hex::encode(wc.coin_id)
+                )
+            })?;
+        if exists {
+            live.push(wc.coin_id);
+            if let Some(block) = matures_at {
+                maturing.insert(wc.coin_id);
+                until = until.max(block);
+            }
+        }
+    }
+    let held = wallet.hold_back_maturing(&mut live, &maturing);
+    if held > 0 {
+        println!(
+            "Holding back {} in newly mined rewards still maturing (all spendable from block {}).",
+            held, until
+        );
+    }
+    Ok(live)
 }
 
 /// Fetches a list of active network peers from the stateless seed registry.

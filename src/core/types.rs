@@ -245,6 +245,117 @@ pub struct State {
     pub header_hash: [u8; 32],
     #[serde(default)]
     pub burned_wots: UtxoAccumulator,
+    /// The coinbase outputs not yet spendable: what coinbase maturity reads.
+    /// Not part of any consensus hash (see [`CoinbaseWindow`]).
+    #[serde(default)]
+    pub coinbase_window: CoinbaseWindow,
+}
+
+/// The coinbase outputs of the last `COINBASE_MATURITY - 1` blocks, by the
+/// height that mined them: the outputs a block may not spend yet.
+///
+/// # Reasoning
+/// The UTXO set holds bare coin ids, so it cannot say which coin a coinbase
+/// made, or when. Maturity only asks that of coins younger than
+/// [`COINBASE_MATURITY`], so the window holds those and no more: memory in
+/// proportion to 99 blocks' coinbases, not to the length of the chain. Even
+/// at a thousand outputs a block, a busy pool's, that is under 10 MB.
+///
+/// It is a function of the last blocks alone, so every node holds the same
+/// window for the same chain without it being in the state root. That is
+/// what lets maturity arrive as a soft fork: no root changes.
+///
+/// Saved with the state as the per-height log; the id lookup is rebuilt as
+/// it loads. A lookup is O(1), recording or retiring a block O(log n).
+///
+/// # Formal Specification
+/// ```text
+/// Invariant, for a state at height h (the next block to apply):
+///   created_at(id) = Some(c)  ⇔  block c's coinbase created id
+///                                 ∧ h - COINBASE_MATURITY < c < h
+/// ```
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "CoinbaseLog", into = "CoinbaseLog")]
+pub struct CoinbaseWindow {
+    /// Height → the coinbase ids that block created, in output order.
+    by_height: im::OrdMap<u64, Vec<[u8; 32]>>,
+    /// Coin id → the height that created it. Derived from `by_height`.
+    created: im::HashMap<[u8; 32], u64>,
+}
+
+/// What a [`CoinbaseWindow`] saves: the per-height log alone.
+#[derive(Serialize, Deserialize)]
+struct CoinbaseLog {
+    by_height: im::OrdMap<u64, Vec<[u8; 32]>>,
+}
+
+impl From<CoinbaseLog> for CoinbaseWindow {
+    fn from(log: CoinbaseLog) -> Self {
+        let mut created = im::HashMap::new();
+        for (height, ids) in &log.by_height {
+            for id in ids {
+                created.insert(*id, *height);
+            }
+        }
+        Self { by_height: log.by_height, created }
+    }
+}
+
+impl From<CoinbaseWindow> for CoinbaseLog {
+    fn from(window: CoinbaseWindow) -> Self {
+        Self { by_height: window.by_height }
+    }
+}
+
+impl CoinbaseWindow {
+    /// The height whose coinbase created `coin_id`, if that is in the window.
+    pub fn created_at(&self, coin_id: &[u8; 32]) -> Option<u64> {
+        self.created.get(coin_id).copied()
+    }
+
+    /// Coinbase outputs in the window.
+    pub fn len(&self) -> usize {
+        self.created.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.created.is_empty()
+    }
+
+    /// Lowest and highest heights with outputs in the window.
+    pub fn span(&self) -> Option<(u64, u64)> {
+        Some((self.by_height.get_min()?.0, self.by_height.get_max()?.0))
+    }
+
+    /// Record the coinbase of the block at `height`.
+    pub fn record(&mut self, height: u64, coin_ids: &[[u8; 32]]) {
+        if coin_ids.is_empty() {
+            return;
+        }
+        for id in coin_ids {
+            self.created.insert(*id, height);
+        }
+        let mut ids = self.by_height.remove(&height).unwrap_or_default();
+        ids.extend_from_slice(coin_ids);
+        self.by_height.insert(height, ids);
+    }
+
+    /// Retire the outputs a block at `height` may spend: those mined at
+    /// `height - COINBASE_MATURITY` or earlier.
+    pub fn prune(&mut self, height: u64) {
+        let Some(limit) = height.checked_sub(COINBASE_MATURITY) else { return };
+        while let Some(&(oldest, _)) = self.by_height.get_min() {
+            if oldest > limit {
+                break;
+            }
+            for id in self.by_height.remove(&oldest).unwrap_or_default() {
+                // An id spent and mined again later belongs to the later block.
+                if self.created.get(&id) == Some(&oldest) {
+                    self.created.remove(&id);
+                }
+            }
+        }
+    }
 }
 
 /// The Bitcoin block this chain is anchored to.
@@ -348,10 +459,25 @@ impl State {
             commitment_heights: im::HashMap::new(),
             expirations: im::OrdMap::new(),
             chain_mmr: crate::core::mmr::MerkleMountainRange::new(),
-            header_hash: initial_midstate, 
+            header_hash: initial_midstate,
              burned_wots: UtxoAccumulator::new(),
+            coinbase_window: CoinbaseWindow::default(),
         };
         (state, genesis_coinbase)
+    }
+
+    /// The first block that may spend `coin_id`, while it is a coinbase
+    /// output the next block (`self.height`) may not spend yet.
+    ///
+    /// # Reasoning
+    /// Wallets ask this, not the consensus rule: it holds whether or not
+    /// [`COINBASE_MATURITY_ACTIVATION_HEIGHT`] has passed. A spend takes a
+    /// Commit, then a Reveal blocks later; one started just before activation
+    /// would be refused when it landed after it. Holding fresh rewards from
+    /// now on costs a miner at most `COINBASE_MATURITY` blocks' wait.
+    pub fn coinbase_matures_at(&self, coin_id: &[u8; 32]) -> Option<u64> {
+        let matures = self.coinbase_window.created_at(coin_id)?.saturating_add(COINBASE_MATURITY);
+        (self.height < matures).then_some(matures)
     }
     
 pub fn header(&self) -> BatchHeader {
@@ -1125,6 +1251,50 @@ pub const REUSE_ENFORCE_ACTIVATION_HEIGHT: u64 = u64::MAX;
 
 pub const COMMIT_POW_WINDOW: u64 = 1000;
 
+/// Blocks a coinbase output waits before it may be spent: the coinbase of
+/// block `h` is spendable from block `h + COINBASE_MATURITY`.
+///
+/// # Reasoning
+/// A reorg takes the reward of every block it abandons out of existence, and
+/// with it every transaction downstream of that reward. An ordinary
+/// transaction is mined again on the new chain; one spending a reward that is
+/// gone never can be, and whoever was paid from it loses the payment. Making
+/// a reward wait until its block is buried keeps that loss from spreading.
+///
+/// 100 blocks, as Bitcoin and midwimble use (midwimble's
+/// `COINBASE_MATURITY`): about 100 minutes at one-minute blocks.
+#[cfg(not(feature = "fast-mining"))]
+pub const COINBASE_MATURITY: u64 = 100;
+/// Test builds: three blocks, as midwimble's fast-mining builds.
+#[cfg(feature = "fast-mining")]
+pub const COINBASE_MATURITY: u64 = 3;
+
+/// Activation height for coinbase maturity (see [`COINBASE_MATURITY`]).
+///
+/// # Reasoning
+/// A soft fork: the rule only refuses blocks, so every block valid under it
+/// is valid to a node that does not know it, and those nodes keep following
+/// the upgraded chain. Nothing it reads is in the state root, and the root
+/// does not change. Rewards mined just before this height are held too:
+/// from here on a block may not spend any reward fewer than
+/// `COINBASE_MATURITY` blocks old, whenever it was mined.
+///
+/// # Safety / Invariants
+/// - **Consensus-critical:** every node must start enforcing at exactly this
+///   height. Scheduled about two weeks past the tip at the time of writing
+///   (~380,430), so miners can upgrade first; a majority of hashpower must
+///   have upgraded by then, or a block an old miner builds on an immature
+///   reward splits the chain.
+#[cfg(not(feature = "fast-mining"))]
+pub const COINBASE_MATURITY_ACTIVATION_HEIGHT: u64 = 400_000;
+/// Test builds cross it after a few dozen blocks.
+#[cfg(feature = "fast-mining")]
+pub const COINBASE_MATURITY_ACTIVATION_HEIGHT: u64 = 40;
+
+// The window keeps a block's coinbase until it matures, which takes at least
+// one block more than the block it was mined in.
+const _: () = assert!(COINBASE_MATURITY >= 2);
+
 // ── Economics ───────────────────────────────────────────────────────────────
 
 /// Blocks per year at TARGET_BLOCK_TIME seconds per block.
@@ -1607,5 +1777,94 @@ mod tests {
         for c in &cb {
             assert!(c.value.is_power_of_two(), "coinbase value {} not power of 2", c.value);
         }
+    }
+
+    // ── Coinbase maturity window ────────────────────────────────────────
+
+    fn coinbase_ids(height: u64, n: u8) -> Vec<[u8; 32]> {
+        (0..n).map(|i| hash_concat(&height.to_le_bytes(), &[i])).collect()
+    }
+
+    /// Driven the way `apply_batch` drives it (record block h, then prune
+    /// for block h + 1), the window holds exactly the rewards the next block
+    /// may not spend, and no more.
+    #[test]
+    fn the_window_holds_exactly_the_immature_rewards() {
+        let mut w = CoinbaseWindow::default();
+        let next = 3 * COINBASE_MATURITY;
+        for h in 0..next {
+            w.record(h, &coinbase_ids(h, 2));
+            w.prune(h + 1);
+            assert!(w.len() as u64 <= 2 * (COINBASE_MATURITY - 1), "bounded at height {h}");
+        }
+        for c in 0..next {
+            let immature = next < c + COINBASE_MATURITY;
+            for id in coinbase_ids(c, 2) {
+                assert_eq!(w.created_at(&id), immature.then_some(c), "block {c}");
+            }
+        }
+        assert_eq!(w.len() as u64, 2 * (COINBASE_MATURITY - 1));
+        assert_eq!(w.span(), Some((next - COINBASE_MATURITY + 1, next - 1)));
+    }
+
+    /// A reward id spent and paid again by a later coinbase is the later
+    /// block's: retiring the earlier block leaves it in the window.
+    #[test]
+    fn a_reward_paid_again_belongs_to_the_later_block() {
+        let mut w = CoinbaseWindow::default();
+        let id = [7u8; 32];
+        w.record(10, &[id]);
+        w.record(11, &[id]);
+        w.prune(10 + COINBASE_MATURITY);
+        assert_eq!(w.created_at(&id), Some(11));
+        w.prune(11 + COINBASE_MATURITY);
+        assert_eq!(w.created_at(&id), None);
+        assert!(w.is_empty());
+        assert_eq!(w.span(), None);
+    }
+
+    /// The window saves as its per-height log alone, and comes back with
+    /// the id lookup rebuilt.
+    #[test]
+    fn the_window_saves_its_log_and_rebuilds_the_lookup() {
+        let mut w = CoinbaseWindow::default();
+        w.record(5, &coinbase_ids(5, 3));
+        w.record(6, &coinbase_ids(6, 1));
+        let bytes = bincode::serialize(&w).unwrap();
+        // Map length, then per height: key, list length, 32 bytes an id.
+        assert_eq!(bytes.len(), 8 + (8 + 8 + 3 * 32) + (8 + 8 + 32));
+        let back: CoinbaseWindow = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(back.len(), 4);
+        for id in coinbase_ids(5, 3) {
+            assert_eq!(back.created_at(&id), Some(5));
+        }
+        assert_eq!(back.created_at(&coinbase_ids(6, 1)[0]), Some(6));
+    }
+
+    /// `coinbase_matures_at` counts from the block that mined the reward,
+    /// says nothing of coins no coinbase made, and nothing once the next
+    /// block may spend it.
+    #[test]
+    fn coinbase_matures_at_counts_from_the_mining_block() {
+        let (mut st, _) = State::genesis();
+        let id = [9u8; 32];
+        st.coinbase_window.record(49, &[id]);
+        st.height = 50;
+        assert_eq!(st.coinbase_matures_at(&id), Some(49 + COINBASE_MATURITY));
+        assert_eq!(st.coinbase_matures_at(&[1u8; 32]), None, "not a reward");
+        st.height = 49 + COINBASE_MATURITY;
+        assert_eq!(st.coinbase_matures_at(&id), None, "spendable once COINBASE_MATURITY blocks deep");
+    }
+
+    /// Adding the window changed no consensus hash: the header a state
+    /// commits to is the same with or without it.
+    #[test]
+    fn the_window_is_in_no_consensus_hash() {
+        let (mut st, _) = State::genesis();
+        let before = st.header();
+        st.coinbase_window.record(0, &coinbase_ids(0, 4));
+        let after = st.header();
+        assert_eq!(compute_header_hash(&before), compute_header_hash(&after));
+        assert_eq!(before.state_root, after.state_root);
     }
 }

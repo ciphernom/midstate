@@ -1178,12 +1178,7 @@ impl Service {
                     store
                 };
                 let w = self.wallet.as_mut().ok_or_else(|| anyhow!("wallet is locked"))?;
-                let live: Vec<[u8; 32]> = w
-                    .coins()
-                    .iter()
-                    .filter(|c| !c.wots_signed && !in_flight.contains(&c.coin_id) && state.coins.contains(&c.coin_id))
-                    .map(|c| c.coin_id)
-                    .collect();
+                let live = w.spendable_now(&state, &in_flight);
                 let plan = sendplan::plan_fixed_outputs(w, &live, sw.mds_lock_outputs())?;
                 let (commitment, _) = w.prepare_commit(&plan.input_coin_ids, &plan.outputs, plan.change_seeds, false, false)?;
                 // The send and the journal entry naming it, in one write.

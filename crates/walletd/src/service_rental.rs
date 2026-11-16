@@ -194,12 +194,7 @@ impl Service {
 
         let in_flight = self.in_flight_inputs();
         let w = self.wallet.as_mut().unwrap();
-        let live: Vec<[u8; 32]> = w
-            .coins()
-            .iter()
-            .filter(|c| !c.wots_signed && !in_flight.contains(&c.coin_id) && state.coins.contains(&c.coin_id))
-            .map(|c| c.coin_id)
-            .collect();
+        let live = w.spendable_now(&state, &in_flight);
         let plan = sendplan::plan_fixed_outputs(w, &live, outputs)?;
         let (commitment, _) = w.prepare_commit(&plan.input_coin_ids, &plan.outputs, plan.change_seeds, false, false)?;
         w.save()?;
@@ -438,14 +433,14 @@ impl Service {
         let in_flight = self.in_flight_inputs();
         let w = self.wallet.as_mut().unwrap();
         let trees: HashSet<[u8; 32]> = w.mss_keys().iter().map(|k| compute_address(&k.master_pk)).collect();
-        let usable: Vec<(&midstate::wallet::WalletCoin, bool)> = w
+        let live = w.spendable_now(&state, &in_flight);
+        let usable: HashSet<[u8; 32]> = live.iter().copied().collect();
+        let prefer: Vec<[u8; 32]> = w
             .coins()
             .iter()
-            .filter(|c| !c.wots_signed && !in_flight.contains(&c.coin_id) && state.coins.contains(&c.coin_id))
-            .map(|c| (c, trees.contains(&c.address)))
+            .filter(|c| usable.contains(&c.coin_id) && trees.contains(&c.address))
+            .map(|c| c.coin_id)
             .collect();
-        let live: Vec<[u8; 32]> = usable.iter().map(|(c, _)| c.coin_id).collect();
-        let prefer: Vec<[u8; 32]> = usable.iter().filter(|(_, mss)| *mss).map(|(c, _)| c.coin_id).collect();
         let plan = rental::plan_take(w, &live, &prefer, &offer, coin, &mining_key)?;
         let salt: [u8; 32] = rand::random();
         let hashes: Vec<[u8; 32]> = plan.outputs.iter().map(|o| o.hash_for_commitment()).collect();
