@@ -510,7 +510,8 @@ impl Service {
 
     pub(super) async fn mwb_send(&mut self, to: &str, amount: u64) -> Result<String> {
         let keys = self.mwb_ready_to_spend()?;
-        let to = StealthAddress::decode(to.trim()).context("not a midwimble address")?;
+        let to = self.resolve_mdw(to)?;
+        let to = StealthAddress::decode(&to).context("not a midwimble address")?;
         let h = self.mwb_node.clone().unwrap();
         let tip = h.state().height;
         let tx = self.mwb.store.account.build_send(&keys, &to, amount, tip)?;

@@ -208,6 +208,8 @@ impl RpcServer {
             .route("/batch/:height", get(get_batch))
             .route("/search", post(search))
             .route("/coin/:coin_id", get(check_coin_get))
+            .route("/name/:name", get(get_name))
+            .route("/names/market", get(get_name_market))
             .route("/block/:height", get(get_block_raw))
             .route("/health", get(health))
             .route("/filters", post(get_filters))

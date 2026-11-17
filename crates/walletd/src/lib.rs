@@ -39,6 +39,8 @@ pub mod sendplan;
 pub mod swap;
 pub mod swapbook;
 pub mod service;
+/// MSN-1 names, for clients that check one before sending it.
+pub use midstate::core::names;
 
 pub use api::{
     AddressInfo, Balance, CoinView, HistoryView, MinerBackend, MiningView, NodeInfo, SendProgress,

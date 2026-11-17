@@ -33,3 +33,6 @@ pub mod rental;
 
 // Inheritance plans and payment streams: covenants on existing opcodes.
 pub mod plans;
+
+// MSN-1 names: one registry thread, on existing opcodes.
+pub mod names;

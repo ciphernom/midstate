@@ -15,6 +15,7 @@ pub enum Tab {
     Dashboard,
     Send,
     Receive,
+    Names,
     History,
     Coins,
     Chat,
@@ -27,10 +28,11 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub const ALL: [Tab; 12] = [
+    pub const ALL: [Tab; 13] = [
         Tab::Dashboard,
         Tab::Send,
         Tab::Receive,
+        Tab::Names,
         Tab::History,
         Tab::Coins,
         Tab::Chat,
@@ -46,6 +48,7 @@ impl Tab {
             Tab::Dashboard => "Dashboard",
             Tab::Send => "Send",
             Tab::Receive => "Receive",
+            Tab::Names => "Names",
             Tab::History => "History",
             Tab::Coins => "Coins",
             Tab::Chat => "Chat",
@@ -106,6 +109,28 @@ pub struct App {
     pub balance: Option<Balance>,
     pub coins: Vec<CoinView>,
     pub addresses: Vec<AddressInfo>,
+    /// Names this wallet registered (MSN-1), and the one being typed.
+    pub names: Vec<NameView>,
+    pub name_input: String,
+    /// The name whose records are open for editing, and the edit.
+    pub name_edit: Option<(String, NameEdit)>,
+    pub name_years: u64,
+    /// The name looked up in Find, and the spend waiting on a confirm.
+    pub name_card: Option<NameCard>,
+    pub name_confirm: Option<&'static str>,
+    pub name_market: Vec<MarketView>,
+    pub name_deals: Vec<SoldView>,
+    /// Market filters: search text, kind (0 all, 1 sale, 2 rent), sort (0 cheapest, 1 dearest, 2 ending soonest).
+    pub market_query: String,
+    pub market_kind: usize,
+    pub market_sort: usize,
+    /// A watch's price cap, in gMDS (empty: claim only).
+    pub watch_max: String,
+    /// The name being given away, and to whom.
+    pub name_give: Option<(String, String)>,
+    pub names_last_poll: f64,
+    /// The name an offer is being made for, and its price (gMDS) and days.
+    pub name_offer: Option<(String, bool, String, String)>,
     pub history: Vec<HistoryView>,
     pub sends: Vec<SendProgress>,
     pub node: Option<NodeInfo>,
@@ -141,6 +166,8 @@ pub struct App {
     pub send_private: bool,
     pub addr_ok: Option<bool>,
     pub addr_reason: Option<String>,
+    /// The address a name in `send_to` pays.
+    pub addr_resolved: Option<String>,
 
     // Receive
     pub recv_label: String,
@@ -448,6 +475,22 @@ impl App {
             send_private: false,
             addr_ok: None,
             addr_reason: None,
+            addr_resolved: None,
+            names: Vec::new(),
+            name_input: String::new(),
+            name_edit: None,
+            name_years: 1,
+            name_card: None,
+            name_confirm: None,
+            name_market: Vec::new(),
+            name_deals: Vec::new(),
+            market_query: String::new(),
+            market_kind: 0,
+            market_sort: 0,
+            watch_max: String::new(),
+            name_give: None,
+            names_last_poll: 0.0,
+            name_offer: None,
             recv_label: String::new(),
             recv_mss: true,
             current_addr: None,
@@ -629,6 +672,8 @@ impl App {
             Action::LoadBalance,
             Action::LoadCoins,
             Action::LoadAddresses,
+            Action::LoadNames,
+            Action::LoadMarket,
             Action::LoadHistory,
             Action::LoadSends,
             Action::LoadMwbAccount,
@@ -884,11 +929,29 @@ impl App {
                 self.go(ctx, Action::LoadBalance);
             }
             Msg::RetryOk => self.go(ctx, Action::LoadSends),
-            Msg::AddressValid { addr, ok, reason } => {
+            Msg::AddressValid { addr, ok, reason, resolved } => {
                 if addr == self.send_to.trim() {
                     self.addr_ok = Some(ok);
                     self.addr_reason = reason;
+                    self.addr_resolved = resolved;
                 }
+            }
+            Msg::Names(n) => self.names = n,
+            Msg::NameFound(c) => self.name_card = Some(c),
+            Msg::Market(m) => self.name_market = m,
+            Msg::NameDeals(d) => self.name_deals = d,
+            Msg::NameChanged => {
+                self.busy = false;
+                self.name_input.clear();
+                self.name_edit = None;
+                self.name_offer = None;
+                self.name_confirm = None;
+                self.name_give = None;
+                self.go(ctx, Action::LoadMarket);
+                if let Some(c) = &self.name_card {
+                    self.go(ctx, Action::FindName { name: c.name.trim_end_matches(".mds").to_string(), years: self.name_years });
+                }
+                self.go(ctx, Action::LoadNames);
             }
             Msg::RescanOk => {
                 self.settings_msg = "Rescanning — balance updates as the scan runs.".into();
@@ -1219,7 +1282,7 @@ impl App {
                 // Background loads fail benignly while locked; don't banner those.
                 let background = matches!(
                     what,
-                    "status" | "balance" | "coins" | "addresses" | "history" | "sends" | "node info" | "chat" | "channels" | "channel identity" | "invoices" | "hub" | "order book" | "base account" | "dex settings" | "swap quote" | "my orders" | "swaps" | "my bids" | "hubs" | "bonds" | "mdw account" | "mdw book" | "mdw orders" | "mdw swaps" | "mdw node" | "mdw history" | "mdw coins" | "bond rules" | "rentals" | "plans"
+                    "status" | "balance" | "coins" | "addresses" | "history" | "sends" | "node info" | "chat" | "channels" | "channel identity" | "invoices" | "hub" | "order book" | "base account" | "dex settings" | "swap quote" | "my orders" | "swaps" | "my bids" | "hubs" | "bonds" | "mdw account" | "mdw book" | "mdw orders" | "mdw swaps" | "mdw node" | "mdw history" | "mdw coins" | "bond rules" | "rentals" | "plans" | "names" | "market" | "name deals"
                 );
                 if background {
                     tracing::debug!("{what}: {err}");
@@ -1430,6 +1493,15 @@ impl eframe::App for App {
                 }
             }
         }
+        if self.tab == Tab::Names && self.handle.is_some() {
+            let t = self.t0.elapsed().as_secs_f64();
+            if t - self.names_last_poll > 5.0 {
+                self.names_last_poll = t;
+                self.go(ctx, Action::LoadNames);
+                self.go(ctx, Action::LoadMarket);
+                self.go(ctx, Action::LoadNameDeals);
+            }
+        }
         if self.tab == Tab::Plans && self.handle.is_some() {
             let t = self.t0.elapsed().as_secs_f64();
             if t - self.plans_last_poll > 5.0 {
@@ -1547,6 +1619,7 @@ impl eframe::App for App {
                                 Tab::Dashboard => views::dashboard::show(self, ui),
                                 Tab::Send => views::send::show(self, ui),
                                 Tab::Receive => views::receive::show(self, ui),
+                                Tab::Names => views::names::show(self, ui),
                                 Tab::History => views::history::show(self, ui),
                                 Tab::Coins => views::coins::show(self, ui),
                                 Tab::Chat => views::chat::show(self, ui),

@@ -5,6 +5,7 @@ pub mod coins;
 pub mod dashboard;
 pub mod history;
 pub mod mdw;
+pub mod names;
 pub mod node;
 pub mod onboarding;
 pub mod plans;

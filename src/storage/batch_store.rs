@@ -33,17 +33,24 @@ pub struct BatchStore {
     /// Address balances and supply, kept in step with every write below when
     /// the node runs with `--rich-list`. Off (its hooks do nothing) otherwise.
     balances: super::balance_index::BalanceIndex,
+    /// The MSN-1 name registry, kept in step the same way. Always on.
+    names: super::name_index::NameIndex,
 }
 
 impl BatchStore {
     pub fn new(db: Arc<Database>, legacy_fs_path: PathBuf) -> Result<Self> {
-        let store = Self { db, legacy_fs_path, balances: Default::default() };
+        let store = Self { db, legacy_fs_path, balances: Default::default(), names: Default::default() };
         Ok(store)
     }
 
     /// The rich-list index's switch and worker, shared by every clone of this store.
     pub fn balances(&self) -> &super::balance_index::BalanceIndex {
         &self.balances
+    }
+
+    /// The name index's hooks and worker, shared by every clone of this store.
+    pub fn names(&self) -> &super::name_index::NameIndex {
+        &self.names
     }
 
     
@@ -76,6 +83,7 @@ impl BatchStore {
         // Before the deletes: the balance index unapplies the doomed blocks,
         // reading them from the batch table in this same transaction.
         self.balances.on_truncate(&write_txn, new_tip_height)?;
+        self.names.on_truncate(&write_txn, new_tip_height)?;
         {
             let mut b = write_txn.open_table(super::BATCHES_TABLE)?;
             let mut h = write_txn.open_table(super::HEADERS_TABLE)?;
@@ -167,6 +175,7 @@ impl BatchStore {
         // overwrites heights in place, and the balance index must unapply the
         // old block before the new one replaces it.
         self.balances.on_save(write_txn, height, batch)?;
+        self.names.on_save(write_txn, height, batch)?;
         {
             let mut b = write_txn.open_table(super::BATCHES_TABLE)?;
             let mut h = write_txn.open_table(super::HEADERS_TABLE)?;

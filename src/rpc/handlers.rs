@@ -1099,6 +1099,84 @@ pub async fn check_coin_get(
     }))
 }
 
+fn deal_json(d: &crate::core::names::Deal) -> serde_json::Value {
+    use crate::core::names::Deal;
+    let addr = |a: &[u8; 32]| crate::core::types::encode_address_with_checksum(a);
+    match d {
+        Deal::None => serde_json::Value::Null,
+        Deal::Sale { price, payee } => serde_json::json!({ "kind": "sale", "price": price, "payee": addr(payee) }),
+        Deal::Rent { price, payee, span } => serde_json::json!({ "kind": "rent", "price": price, "payee": addr(payee), "span": span }),
+        Deal::Rented { price, payee, until } => serde_json::json!({ "kind": "rented", "price": price, "payee": addr(payee), "until": until }),
+    }
+}
+
+/// `GET /names/market`: names offered for sale or rent now.
+pub async fn get_name_market(State(node): State<AppState>) -> Response {
+    match crate::storage::name_index::listings(node.storage.db()) {
+        Ok(list) => Json(
+            list.iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "name": format!("{}{}", r.name, crate::core::names::SUFFIX),
+                        "tier": crate::core::names::TIERS[r.tier as usize],
+                        "expires": r.expires,
+                        "deal": deal_json(&r.deal),
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": e.to_string() }))).into_response(),
+    }
+}
+
+/// `GET /name/:name`: a name's holder, expiry and records, and where an MDS
+/// payment to it goes now (MSN-1).
+pub async fn get_name(
+    State(node): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Response {
+    use crate::core::names;
+    let error = |code: StatusCode, e: String| (code, Json(serde_json::json!({ "error": e }))).into_response();
+    if let Err(e) = names::normalize(&name) {
+        return error(StatusCode::BAD_REQUEST, e.to_string());
+    }
+    match crate::storage::name_index::lookup(node.storage.db(), &name) {
+        Ok(Some(r)) => {
+            let used = |k: &[u8; 32]| node.storage.query_mss_leaf_index(k).unwrap_or(0);
+            let records: Vec<_> = r
+                .records
+                .iter()
+                .map(|rec| {
+                    let (kind, value) = rec.describe();
+                    let mut v = serde_json::json!({ "type": kind, "value": value });
+                    if let names::Rec::MdsKey { key, height } = rec {
+                        v["signatures_left"] = (1u64 << *height).saturating_sub(used(key)).into();
+                    }
+                    v
+                })
+                .collect();
+            let pays = (!r.lapsed()).then(|| names::pays(&r.records, used)).flatten();
+            Json(serde_json::json!({
+                "name": format!("{}{}", r.name, names::SUFFIX),
+                "owner": hex::encode(r.owner),
+                "slot": r.slot,
+                "since": r.since,
+                "expires": r.expires,
+                "lapsed": r.lapsed(),
+                "tier": names::TIERS[r.tier as usize],
+                "rate": names::RATES[r.tier as usize],
+                "deal": deal_json(&r.deal),
+                "pays": pays.map(|a| crate::core::types::encode_address_with_checksum(&a)),
+                "records": records,
+            }))
+            .into_response()
+        }
+        Ok(None) => error(StatusCode::NOT_FOUND, "not registered".into()),
+        Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
+    }
+}
+
 pub async fn check_output(
     State(node): State<AppState>,
     Json(req): Json<CheckOutputRequest>,

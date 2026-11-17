@@ -32,6 +32,15 @@ pub enum Action {
     Send { to: String, amount: u64, private: bool },
     RetrySend { id: String },
     ValidateAddress { addr: String },
+    LoadNames,
+    RegisterName { name: String, years: u64 },
+    NameAct { name: String, act: NameAction },
+    TakeName { name: String, rent: bool },
+    FindName { name: String, years: u64 },
+    LoadMarket,
+    LoadNameDeals,
+    WatchName { name: String, years: u64, max_price: Option<u64> },
+    UnwatchName { name: String },
     RescanFrom { height: u64 },
     Consolidate { address: String },
     Defrag { max_inputs: usize },
@@ -144,7 +153,13 @@ pub enum Msg {
     AddressCreated(AddressInfo),
     SendStarted,
     RetryOk,
-    AddressValid { addr: String, ok: bool, reason: Option<String> },
+    /// `resolved`: the address a name pays.
+    AddressValid { addr: String, ok: bool, reason: Option<String>, resolved: Option<String> },
+    Names(Vec<NameView>),
+    NameFound(NameCard),
+    Market(Vec<MarketView>),
+    NameDeals(Vec<SoldView>),
+    NameChanged,
     RescanOk,
     ConsolidateStarted(String),
     DefragDone(String),
@@ -277,6 +292,9 @@ impl Action {
             LoadBalance => LoadBalance,
             LoadCoins => LoadCoins,
             LoadAddresses => LoadAddresses,
+            LoadNames => LoadNames,
+            LoadMarket => LoadMarket,
+            LoadNameDeals => LoadNameDeals,
             LoadHistory => LoadHistory,
             LoadSends => LoadSends,
             LoadNodeInfo => LoadNodeInfo,
@@ -377,6 +395,17 @@ fn perform(
             Action::LoadBalance => run!("balance", h.balance(), Msg::Balance),
             Action::LoadCoins => run!("coins", h.coins(), Msg::Coins),
             Action::LoadAddresses => run!("addresses", h.addresses(), Msg::Addresses),
+            Action::LoadNames => run!("names", h.names(), Msg::Names),
+            Action::RegisterName { name, years } => run!("register name", h.register_name(name, years), |_| Msg::NameChanged),
+            Action::NameAct { name, act } => run!("name", h.name_action(name, act), |_| Msg::NameChanged),
+            Action::TakeName { name, rent } => run!("take name", h.take_name(name, rent), |_| Msg::NameChanged),
+            Action::FindName { name, years } => run!("find name", h.find_name(name, years), Msg::NameFound),
+            Action::LoadMarket => run!("market", h.name_market(), Msg::Market),
+            Action::LoadNameDeals => run!("name deals", h.name_deals(), Msg::NameDeals),
+            Action::WatchName { name, years, max_price } => {
+                run!("watch name", h.watch_name(name, years, max_price), |_| Msg::NameChanged)
+            }
+            Action::UnwatchName { name } => run!("unwatch name", h.unwatch_name(name), |_| Msg::NameChanged),
             Action::LoadHistory => run!("history", h.history(), Msg::History),
             Action::LoadSends => run!("sends", h.sends(), Msg::Sends),
             Action::LoadNodeInfo => run!("node info", h.node_info(), Msg::Node),
@@ -421,8 +450,12 @@ fn perform(
             Action::ValidateAddress { addr } => {
                 // Keep the reason: "checksum mismatch" and "this key is burned"
                 // need very different responses from the person.
-                let reason = h.validate_address(addr.clone()).await.err().map(|e| e.to_string());
-                out(Msg::AddressValid { addr, ok: reason.is_none(), reason });
+                let r = h.validate_address(addr.clone()).await;
+                let (resolved, reason) = match r {
+                    Ok(a) => (a, None),
+                    Err(e) => (None, Some(e.to_string())),
+                };
+                out(Msg::AddressValid { addr, ok: reason.is_none(), reason, resolved });
             }
             Action::RescanFrom { height } => {
                 run!("rescan", h.rescan_from(height), |_| Msg::RescanOk)

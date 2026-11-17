@@ -1643,6 +1643,9 @@ pub async fn new(
         )
         .await?;
 
+        // MSN-1 names: always followed, before any block is stored.
+        storage.enable_name_index(state.height)?;
+
         let mut recent_headers = VecDeque::new();
         let window = DIFFICULTY_LOOKBACK as u64;
         let start_height = state.height.saturating_sub(window);

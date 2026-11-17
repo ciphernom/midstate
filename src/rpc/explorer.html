@@ -25,7 +25,7 @@ function toggleTheme(){var d=document.documentElement,n=d.getAttribute('data-the
     <div class="hdr-center">
         <div class="search-bar">
             <span id="ic-search"></span>
-            <input type="text" id="top-search" placeholder="block, address, coin id…" spellcheck="false" autocomplete="off" onkeydown="if(event.key === 'Enter') handleTopSearch()">
+            <input type="text" id="top-search" placeholder="block, address, name.mds, coin id…" spellcheck="false" autocomplete="off" onkeydown="if(event.key === 'Enter') handleTopSearch()">
             <button class="btn" onclick="handleTopSearch()" title="Search">⏎</button>
         </div>
     </div>
@@ -61,7 +61,7 @@ function toggleTheme(){var d=document.documentElement,n=d.getAttribute('data-the
     <div class="term-log" id="term-log"></div>
     <div class="term-input-row">
         <span class="prompt">▸</span>
-        <input type="text" id="cmd-input" placeholder="height, address, coin id, commitment, mempool, decompile <hex>" autocomplete="off" spellcheck="false">
+        <input type="text" id="cmd-input" placeholder="height, address, name.mds, coin id, commitment, mempool, decompile <hex>" autocomplete="off" spellcheck="false">
     </div>
 </div>
 
@@ -1685,6 +1685,7 @@ async function execQuery(cmd, seq) {
     if (/^[0-9][0-9,]*$/.test(cmd)) return loadBlock(parseInt(cmd.replace(/,/g, ''), 10), seq);
     if (/^[0-9a-f]{72}$/.test(lc)) return loadAddress(lc, seq);
     if (/^[0-9a-f]{64}$/.test(lc)) return resolveHash(lc, seq);
+    if (/^[a-z0-9-]+\.mds$/.test(lc)) return loadName(lc, seq);
     if (lc.startsWith('decompile ')) {
         const hex = cmd.split(/\s+/)[1] || '';
         if (hex.length > 10) {
@@ -2078,9 +2079,37 @@ async function showCoin(q, results, seq) {
 }
 
 // ── Address view ────────────────────────────────────────────────────────
-const addrView = { addr: null, coins: [], from: null, to: null, results: null, indexed: null, scanning: false };
+const addrView = { addr: null, name: null, coins: [], from: null, to: null, results: null, indexed: null, scanning: false };
 
-async function loadAddress(input, seq, prefetched) {
+/** MSN-1: a name opens the address its records pay, with the records. */
+async function loadName(name, seq) {
+    let res, body;
+    try {
+        res = await fetch(`/name/${encodeURIComponent(name)}`);
+        body = await res.json();
+    } catch (e) {
+        return showMessage('alert', 'node not reachable', seq);
+    }
+    if (seq !== routeSeq) return;
+    if (!res.ok) return showMessage('search', `${name}: ${body.error || 'not found'}`, seq);
+    if (!body.pays) {
+        const why = body.lapsed ? 'lapsed: anyone may claim it' : 'takes no MDS payment now';
+        return showMessage('search', `${body.name}: ${why}`, seq, body.records.map(r => `${r.type} ${r.value}`).join(' · '));
+    }
+    return loadAddress(body.pays, seq, null, body);
+}
+
+function nameRecordsHtml(n) {
+    const left = r => r.signatures_left != null ? ` · ${fmtInt(r.signatures_left)} signatures left` : '';
+    const rows = n.records.map(r => `<div style="font-family:monospace;font-size:12px"><span class="dim">${escHtml(r.type)}</span> ${escHtml(r.value)}${left(r)}</div>`).join('');
+    const d = n.deal;
+    const deal = !d ? '' : d.kind === 'sale' ? ` · for sale at ${fmtAmtText(d.price)}`
+        : d.kind === 'rent' ? ` · for rent at ${fmtAmtText(d.price)} per ${fmtInt(d.span)} blocks`
+        : ` · rented out until block ${fmtInt(d.until)}`;
+    return `<div style="margin:8px 0"><div class="dim">${escHtml(n.name)} · ${escHtml(n.tier)} · held by ${shortHex(n.owner)} since block ${fmtInt(n.since)}, to block ${fmtInt(n.expires)}${deal}</div>${rows}</div>`;
+}
+
+async function loadAddress(input, seq, prefetched, name) {
     let addr = String(input).toLowerCase();
     if (addr.length === 72) {
         const check = validateAddressChecksum(addr);
@@ -2095,7 +2124,7 @@ async function loadAddress(input, seq, prefetched) {
     activeQuery = addr;
     activeBatch = null;
     renderBatchList();
-    Object.assign(addrView, { addr, coins: [], from: null, to: null, results: prefetched || null, indexed: null, scanning: true });
+    Object.assign(addrView, { addr, name: name || null, coins: [], from: null, to: null, results: prefetched || null, indexed: null, scanning: true });
     const mv = mainView();
     mv.innerHTML = addressHtml();
     mv.scrollTop = 0;
@@ -2185,9 +2214,10 @@ function addressHtml() {
     const nCoins = ix ? ix.coins : (s.scanning ? null : alive.length);
     const span = s.to != null ? s.to - s.from : 5000;
     let h = `<div class="ah">${identicon(s.addr, 50)}<div class="ah-main">
-            <div class="ah-label">${ic('wallet')}ADDRESS</div>
+            <div class="ah-label">${ic('wallet')}ADDRESS${s.name ? ` · ${escHtml(s.name.name)}` : ''}</div>
             <div class="ah-addr"><span>${full}</span><button class="icon-btn" onclick="copyToClipboard('${full}', this)" title="Copy">${ic('copy')}</button></div>
         </div></div>
+        ${s.name ? nameRecordsHtml(s.name) : ''}
         <div class="ah-bal">${bal == null ? '<span class="dim">…</span>' : fmtAmt(bal)}</div>
         <div class="chips">
             ${nCoins != null ? `<span class="chip" title="Coins it holds"><i class="dot alive"></i>${fmtInt(nCoins)}</span>` : ''}

@@ -33,6 +33,8 @@ mod rental_glue;
 mod plans_glue;
 #[path = "service_co_bond.rs"]
 mod co_bond_glue;
+#[path = "service_names.rs"]
+mod names_glue;
 
 const TICK: Duration = Duration::from_secs(2);
 
@@ -99,7 +101,17 @@ enum Cmd {
     Sends(oneshot::Sender<Vec<SendProgress>>),
     Send { to: String, amount: u64, private: bool, resp: oneshot::Sender<Result<String>> },
     RetrySend { id: String, resp: oneshot::Sender<Result<()>> },
-    ValidateAddress { addr: String, resp: oneshot::Sender<Result<()>> },
+    /// `Some(address)` when `addr` is a name.
+    ValidateAddress { addr: String, resp: oneshot::Sender<Result<Option<String>>> },
+    RegisterName { name: String, years: u64, resp: oneshot::Sender<Result<String>> },
+    NameAct { name: String, act: NameAction, resp: oneshot::Sender<Result<()>> },
+    TakeName { name: String, rent: bool, resp: oneshot::Sender<Result<String>> },
+    FindName { name: String, years: u64, resp: oneshot::Sender<Result<NameCard>> },
+    NameMarket { resp: oneshot::Sender<Result<Vec<MarketView>>> },
+    NameDeals { resp: oneshot::Sender<Result<Vec<SoldView>>> },
+    WatchName { name: String, years: u64, max_price: Option<u64>, resp: oneshot::Sender<Result<()>> },
+    UnwatchName { name: String, resp: oneshot::Sender<Result<()>> },
+    Names(oneshot::Sender<Vec<NameView>>),
     SyncStatus(oneshot::Sender<SyncStatus>),
     NodeInfo(oneshot::Sender<NodeInfo>),
     MiningStatus(oneshot::Sender<MiningView>),
@@ -324,8 +336,43 @@ impl WalletdHandle {
     pub async fn retry_send(&self, id: String) -> Result<()> {
         ask!(self, RetrySend { id: id })
     }
-    pub async fn validate_address(&self, addr: String) -> Result<()> {
+    /// `Some(address)` when `addr` is a name: the address it pays now.
+    pub async fn validate_address(&self, addr: String) -> Result<Option<String>> {
         ask!(self, ValidateAddress { addr: addr })
+    }
+    /// Register a name (`nick` or `nick.mds`) for this wallet, for `years`.
+    pub async fn register_name(&self, name: String, years: u64) -> Result<String> {
+        ask!(self, RegisterName { name: name, years: years })
+    }
+    /// Change a name this wallet holds.
+    pub async fn name_action(&self, name: String, act: NameAction) -> Result<()> {
+        ask!(self, NameAct { name: name, act: act })
+    }
+    /// Buy a name offered for sale, or rent one offered for rent.
+    pub async fn take_name(&self, name: String, rent: bool) -> Result<String> {
+        ask!(self, TakeName { name: name, rent: rent })
+    }
+    /// What a name is now and what it would cost, for `years` of holding.
+    pub async fn find_name(&self, name: String, years: u64) -> Result<NameCard> {
+        ask!(self, FindName { name: name, years: years })
+    }
+    pub async fn name_market(&self) -> Result<Vec<MarketView>> {
+        ask!(self, NameMarket {})
+    }
+    pub async fn name_deals(&self) -> Result<Vec<SoldView>> {
+        ask!(self, NameDeals {})
+    }
+    /// Claim a name for `years` the block it is free; buy it if offered for at most `max_price`.
+    pub async fn watch_name(&self, name: String, years: u64, max_price: Option<u64>) -> Result<()> {
+        ask!(self, WatchName { name: name, years: years, max_price: max_price })
+    }
+    pub async fn unwatch_name(&self, name: String) -> Result<()> {
+        ask!(self, UnwatchName { name: name })
+    }
+    pub async fn names(&self) -> Result<Vec<NameView>> {
+        let (resp, rx) = oneshot::channel();
+        self.tx.send(Cmd::Names(resp)).await.map_err(|_| anyhow!("wallet service is not running"))?;
+        rx.await.map_err(|_| anyhow!("wallet service dropped the request"))
     }
     pub async fn sync_status(&self) -> Result<SyncStatus> {
         Ok(ask!(self, SyncStatus))
@@ -737,6 +784,7 @@ pub fn spawn(
         swaps: SwapBook::default(),
         bonds: BondBook::default(),
         rentals: Default::default(),
+        names: Default::default(),
         market: Default::default(),
         plans: Default::default(),
         co_bond_call: None,
@@ -829,6 +877,8 @@ struct Service {
     bonds: BondBook,
     /// Bonds offered for rent and rented (see `crate::rental`). Persisted.
     rentals: crate::rental::RentalBook,
+    /// Names this wallet registered (see `service_names`). Persisted.
+    names: names_glue::NameBook,
     /// The bond rental market as read off the chain; rebuilt every run.
     market: crate::rental::Market,
     /// Inheritance plans and payment streams (see `crate::plans`). Persisted:
@@ -955,6 +1005,33 @@ impl Service {
             }
             Cmd::ValidateAddress { addr, resp } => {
                 let _ = resp.send(self.validate_address(&addr).await);
+            }
+            Cmd::RegisterName { name, years, resp } => {
+                let _ = resp.send(self.register_name(&name, years).await);
+            }
+            Cmd::NameAct { name, act, resp } => {
+                let _ = resp.send(self.name_action(&name, act).await);
+            }
+            Cmd::TakeName { name, rent, resp } => {
+                let _ = resp.send(self.take_name(&name, rent).await);
+            }
+            Cmd::FindName { name, years, resp } => {
+                let _ = resp.send(self.find_name(&name, years));
+            }
+            Cmd::NameMarket { resp } => {
+                let _ = resp.send(self.name_market());
+            }
+            Cmd::NameDeals { resp } => {
+                let _ = resp.send(self.name_deals());
+            }
+            Cmd::WatchName { name, years, max_price, resp } => {
+                let _ = resp.send(self.watch_name(&name, years, max_price));
+            }
+            Cmd::UnwatchName { name, resp } => {
+                let _ = resp.send(self.unwatch_name(&name));
+            }
+            Cmd::Names(resp) => {
+                let _ = resp.send(self.name_views());
             }
             Cmd::SyncStatus(resp) => {
                 let _ = resp.send(self.sync_status().await);
@@ -1457,6 +1534,7 @@ impl Service {
         self.sync_wots_hold();
         self.bonds = BondBook::load(&self.wallet_path).0;
         self.rentals_load();
+        self.names_load();
         self.plans_load();
         self.scan_pos = 0;
         self.persist_scan_pos();
@@ -1492,6 +1570,7 @@ impl Service {
             let _ = self.events.send(WalletEvent::Warning { text });
         }
         self.rentals_load();
+        self.names_load();
         self.plans_load();
         self.mwb_load();
         // Mining that ran through the lock signs MDW blocks again.
@@ -2578,15 +2657,15 @@ impl Service {
     /// Decode a destination and reject it if its one-time key has already
     /// signed. Same consensus lookup as the send gate, run while typing so the
     /// problem surfaces before any value moves.
-    async fn validate_address(&self, addr: &str) -> Result<()> {
-        let dest = sendplan::decode_address(addr)?;
+    async fn validate_address(&self, addr: &str) -> Result<Option<String>> {
+        let dest = self.resolve_destination(addr)?;
         if self.key_signed_on_chain(&dest) {
             bail!(
                 "this address has already spent its one-time key — anything sent to it \
                  cannot be recovered"
             );
         }
-        Ok(())
+        Ok(midstate::core::names::is_name(addr).then(|| midstate::core::encode_address_with_checksum(&dest)))
     }
 
     async fn start_send(&mut self, to: &str, amount: u64, private: bool) -> Result<String> {
@@ -2596,7 +2675,7 @@ impl Service {
         if self.node.is_syncing() {
             bail!("node is still syncing — sending against a stale coin set would fail");
         }
-        let dest = sendplan::decode_address(to)?;
+        let dest = self.resolve_destination(to)?;
         self.ensure_restore_done()?;
         self.verify_mss_indices().await?;
 
@@ -2876,6 +2955,10 @@ impl Service {
         }
         if self.rentals.by_take(&commitment).is_some() {
             self.reveal_take(commitment, pending).await;
+            return;
+        }
+        if self.names.by_commit(&commitment).is_some() {
+            self.reveal_name(commitment, pending).await;
             return;
         }
         if self.rentals.by_cancel(&commitment).is_some() {
@@ -7252,6 +7335,7 @@ impl Service {
         let t = Instant::now();
         self.tick_rentals(tip).await;
         self.tick_plans(tip).await;
+        self.tick_names(tip).await;
         note_slow("the rental and plan tick", t);
 
         // A restore pass records the window it starts with at height 0; one

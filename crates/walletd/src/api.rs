@@ -56,6 +56,123 @@ pub struct CoinView {
     pub matures_at: Option<u64>,
 }
 
+/// A name this wallet holds or is getting (MSN-1).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NameView {
+    /// `nick.mds`.
+    pub name: String,
+    /// registering, registered, updating, taken, lost or failed.
+    pub status: String,
+    pub note: String,
+    /// Where an MDS payment to it goes now.
+    pub pays: Option<String>,
+    /// The last height it is held at.
+    pub expires: u64,
+    /// platinum, gold, silver or bronze: what a year of it burns.
+    pub tier: String,
+    /// What it is offered as, or whom it is rented to; empty if nothing.
+    pub deal: String,
+    /// This wallet rents it, rather than holding it.
+    pub renter: bool,
+    /// Renew a year at a time when 60 days are left, burning the year's price.
+    pub auto_renew: bool,
+    pub records: Vec<NameRecordView>,
+    /// What the records editor starts from.
+    pub mdw: bool,
+    pub identity: bool,
+    pub evm: bool,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NameRecordView {
+    /// mds-key, mds-address, mdw, evm, identity, text or other.
+    pub kind: String,
+    pub value: String,
+}
+
+/// What a name is now, and what this wallet could do with it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct NameCard {
+    pub name: String,
+    pub tier: String,
+    /// Burned per year of holding, in units.
+    pub rate: u64,
+    /// available, unclaimed (a premium name), lapsed, held, for sale,
+    /// for rent, rented or yours.
+    pub state: String,
+    /// The years the burn is for.
+    pub years: u64,
+    /// Burned to register or claim it for `years`; 0 if it cannot be.
+    pub burn: u64,
+    /// Paid to its holder: to buy it, or for one rental.
+    pub price: u64,
+    pub rent_days: u64,
+    /// A rental taken now lasts until this height.
+    pub rent_until: u64,
+    /// The last height it is held at (or would be, if registered now).
+    pub expires: u64,
+    pub since: u64,
+    /// About what the network fee comes to, in units.
+    pub fee: u64,
+    pub tip: u64,
+    pub records: Vec<NameRecordView>,
+}
+
+/// A sale or rental that landed.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SoldView {
+    pub name: String,
+    /// sale or rent.
+    pub kind: String,
+    pub price: u64,
+    pub height: u64,
+}
+
+/// A name offered on the market.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MarketView {
+    pub name: String,
+    pub tier: String,
+    /// sale or rent.
+    pub kind: String,
+    /// Paid to its holder, in units: the whole price, or per rental.
+    pub price: u64,
+    /// Blocks a rental lasts.
+    pub span: u64,
+    pub expires: u64,
+    /// This wallet's own offer.
+    pub mine: bool,
+}
+
+/// A change to a name this wallet holds.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum NameAction {
+    Edit(NameEdit),
+    /// Offer it to whoever pays `price` (units).
+    Sell { price: u64 },
+    /// Offer its records for `days` at a time, for `price` (units) each time.
+    RentOut { price: u64, days: u64 },
+    /// Take an offer down.
+    Unlist,
+    Renew { years: u64 },
+    AutoRenew(bool),
+    /// Hand it to another wallet: a control key (64 hex), or the holder of a name.
+    Give { to: String },
+}
+
+/// The records a held name should carry besides its payment keys.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct NameEdit {
+    /// This wallet's MDW address.
+    pub mdw: bool,
+    /// Its identity key: people can ask it for a fresh address, an invoice, a channel.
+    pub identity: bool,
+    /// Its Base account.
+    pub evm: bool,
+    pub text: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AddressInfo {
     /// 72-char checksummed hex.

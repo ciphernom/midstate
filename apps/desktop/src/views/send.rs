@@ -29,16 +29,16 @@ pub fn show(app: &mut App, ui: &mut Ui) {
     theme::panel_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
 
-        theme::hint(ui, "Recipient address");
+        theme::hint(ui, "Recipient address or name");
         let r = ui.add(
             TextEdit::singleline(&mut app.send_to)
-                .hint_text("72-character address")
+                .hint_text("72-character address, or name.mds")
                 .font(egui::TextStyle::Monospace)
                 .desired_width(f32::INFINITY),
         );
         if r.changed() {
             let t = app.send_to.trim().to_string();
-            if t.len() == 72 {
+            if t.len() == 72 || midstate_walletd::names::is_name(&t) {
                 app.addr_ok = None;
                 app.go(&ctx, Action::ValidateAddress { addr: t });
             } else {
@@ -55,6 +55,9 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                     app.send_asset = 1;
                 }
             });
+        } else if let (Some(true), Some(a)) = (app.addr_ok, &app.addr_resolved) {
+            // A name: show where it pays now, before anything is sent.
+            ui.label(RichText::new(format!("pays {}", theme::grouped_hash(a, 24))).monospace().size(11.0).color(theme::bright()));
         } else if app.addr_ok == Some(false) && !app.send_to.trim().is_empty() {
             // Could be a typo, or a one-time key that has already signed —
             // walletd says which, and they call for different responses.
@@ -299,7 +302,8 @@ fn send_mdw(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
                 .desired_width(f32::INFINITY),
         );
         let to = app.mwb_send_to.trim().to_string();
-        let to_ok = !to.is_empty() && midstate_walletd::mwb::check_address(&to).is_ok();
+        // A name pays the MDW address in its records; walletd looks it up.
+        let to_ok = !to.is_empty() && (midstate_walletd::mwb::check_address(&to).is_ok() || midstate_walletd::names::is_name(&to));
         if !to.is_empty() && !to_ok {
             if to.len() == 72 && to.chars().all(|c| c.is_ascii_hexdigit()) {
                 ui.horizontal(|ui| {

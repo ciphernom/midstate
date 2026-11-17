@@ -1,5 +1,6 @@
 mod batch_store;
 pub mod balance_index;
+pub mod name_index;
 pub mod search_index;
 pub use batch_store::BatchStore;
 
@@ -370,6 +371,15 @@ impl Storage {
         let outcome = index.enable(&self.db, chain_len)?;
         index.spawn_worker(self.db.clone());
         Ok(outcome)
+    }
+
+    /// Turn on the name index (MSN-1) for a chain of `chain_len` blocks and
+    /// start its worker, which catches up in the background.
+    pub fn enable_name_index(&self, chain_len: u64) -> Result<()> {
+        let index = self.batches.names();
+        index.enable(&self.db, chain_len)?;
+        index.spawn_worker(self.db.clone());
+        Ok(())
     }
 
     /// Build the search index up to `tip`, resuming if a previous run was
