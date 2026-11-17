@@ -166,32 +166,32 @@ impl Chains for LiveChains<'_> {
     fn mds_coin(&self, id: &[u8; 32]) -> bool {
         self.mds.coins.contains(id)
     }
-    fn mds_spend(&self, coin: &[u8; 32], from: u64) -> (Option<Vec<Vec<u8>>>, u64) {
-        let find = |tx: &Transaction| -> Option<Vec<Vec<u8>>> {
-            let Transaction::Reveal { inputs, witnesses, .. } = tx else { return None };
-            let i = inputs.iter().position(|i| &i.coin_id() == coin)?;
-            let midstate::core::types::Witness::ScriptInputs(items) = witnesses.get(i)?;
-            Some(items.clone())
+    fn mds_spends(&self, coins: &[[u8; 32]], from: u64) -> (Vec<Vec<Vec<u8>>>, u64) {
+        let mut out = Vec::new();
+        let mut take = |tx: &Transaction| {
+            let Transaction::Reveal { inputs, witnesses, .. } = tx else { return };
+            for (i, input) in inputs.iter().enumerate() {
+                if coins.contains(&input.coin_id()) {
+                    if let Some(midstate::core::types::Witness::ScriptInputs(items)) = witnesses.get(i) {
+                        out.push(items.clone());
+                    }
+                }
+            }
         };
-        if let Some(w) = self.mds_mempool.iter().find_map(find) {
-            return (Some(w), from);
-        }
+        self.mds_mempool.iter().for_each(&mut take);
+        // Blocks are stored at heights below the state's.
         let end = self.mds.height.min(from.saturating_add(SEARCH_PER_TICK));
         for h in from..end {
             match self.mds_node.storage.batches.load(h) {
-                Ok(Some(batch)) => {
-                    if let Some(w) = batch.transactions.iter().find_map(find) {
-                        return (Some(w), h);
-                    }
-                }
+                Ok(Some(batch)) => batch.transactions.iter().for_each(&mut take),
                 Ok(None) => {}
                 Err(e) => {
                     tracing::warn!("midstate block {h} unreadable: {e:#}");
-                    return (None, h);
+                    return (out, h);
                 }
             }
         }
-        (None, end)
+        (out, end.max(from))
     }
     fn mwb_output(&self, c: &Point32) -> Option<(u64, Point32)> {
         self.mwb.utxos.get(c).map(|e| (e.height, e.owner_key))
@@ -1201,8 +1201,13 @@ impl Service {
                 let plan = sendplan::plan_fixed_outputs(w, &live, sw.mds_lock_outputs())?;
                 let (commitment, _) = w.prepare_commit(&plan.input_coin_ids, &plan.outputs, plan.change_seeds, false, false)?;
                 // The send and the journal entry naming it, in one write.
+                // Spends of the lock are looked for from here, even if the
+                // lock is claimed before this wallet sees it.
                 let mut journal = journal;
                 journal.swaps[i].mds_lock_commitment = Some(commitment);
+                if journal.swaps[i].mds_scan_from == 0 {
+                    journal.swaps[i].mds_scan_from = state.height.saturating_sub(1).max(1);
+                }
                 w.data.mwb_state = Some(journal.to_value()?);
                 w.save()?;
                 self.mwb.store = journal;
@@ -1231,7 +1236,13 @@ impl Service {
                     self.mwb.store.account.record_payment(&tx, "swap lock", sw.mdw_amount, LOCK_LABEL, Some(&tag))?;
                 }
                 if self.mwb.store.swaps[i].mwb_broadcast.is_none() {
-                    self.mwb.store.swaps[i].mwb_broadcast = Some(mwb_tip);
+                    // The claim is looked for from here, even if the lock is
+                    // claimed before this wallet sees it.
+                    let s = &mut self.mwb.store.swaps[i];
+                    s.mwb_broadcast = Some(mwb_tip);
+                    if s.mwb_scan_from == 0 {
+                        s.mwb_scan_from = mwb_tip.saturating_sub(1).max(1);
+                    }
                     self.mwb_save()?;
                 }
                 self.mwb.pushed.insert((sw.id, 0), mwb_tip);

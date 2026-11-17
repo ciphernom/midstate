@@ -27,7 +27,7 @@
 
 use crate::mwb::{extract_adaptor_secret, finish_spend, JointView, KernelPlan};
 use crate::mwb_account::{scalar, MwbAccount};
-use crate::mwb_link::{and_claim_witness, and_preimages_from_witness, or_claim_witness, refund_witness, LinkRecord, LinkSecret, K_AND};
+use crate::mwb_link::{and_claim_witness, or_claim_witness, refund_witness, LinkRecord, LinkSecret};
 use crate::mwb_wire::{Advert, Session, Side};
 use crate::swap::{may_reveal, REVEAL_CUTOFF_BLOCKS};
 use anyhow::{anyhow, bail, ensure, Result};
@@ -392,9 +392,8 @@ impl MwbSwap {
     /// Taker, selling MDW: the secret from the witness that spent a lock
     /// coin, if it is the maker's AND claim.
     pub fn secret_from_witness(&self, items: &[Vec<u8>]) -> Option<[u8; 32]> {
-        let preimages = and_preimages_from_witness(items, K_AND)?;
         let link = self.link.link().ok()?;
-        link.recover_t(&preimages).map(|t| t.to_bytes())
+        link.recover_t_from_items(items).map(|t| t.to_bytes())
     }
 }
 
@@ -553,9 +552,10 @@ pub trait Chains {
     fn mds_tip(&self) -> u64;
     fn mwb_tip(&self) -> u64;
     fn mds_coin(&self, id: &[u8; 32]) -> bool;
-    /// The witness of the input that spends `coin`, looked for in the
-    /// mempool and in blocks from `from` up; and where the block search got to.
-    fn mds_spend(&self, coin: &[u8; 32], from: u64) -> (Option<Vec<Vec<u8>>>, u64);
+    /// The witnesses of every input spending one of `coins`, in the mempool
+    /// and in blocks from `from` up; and the height the block search reached
+    /// (every block below it was read).
+    fn mds_spends(&self, coins: &[[u8; 32]], from: u64) -> (Vec<Vec<Vec<u8>>>, u64);
     /// An unspent output: the height of its block, and its owner key.
     fn mwb_output(&self, commitment: &Point32) -> Option<(u64, Point32)>;
     /// How many of midwimble's blocks from `height` to the tip counted in
@@ -619,21 +619,35 @@ pub fn observe(sw: &mut MwbSwap, c: &impl Chains, mine_pending: bool) -> Obs {
         Leg::Mwb => (mwb_lock, mds_lock),
     };
 
-    // The taker reads the secret off the maker's claim of the taker's lock.
-    if sw.role == Role::Taker && sw.t.is_none() && mine != Lock::Absent {
+    // The taker reads the secret off the maker's claim of the taker's lock:
+    // on midstate any spend of any lock coin, whatever its witness's shape.
+    // A lock that went out is searched from when it went out, even if this
+    // wallet never saw it before it was claimed.
+    let mut searching = false;
+    let (mut mine, theirs) = (mine, theirs);
+    if sw.role == Role::Taker && sw.t.is_none() {
         match sw.side {
-            Side::SellMds => {
+            Side::SellMds if mine != Lock::Absent || (sw.mwb_broadcast.is_some() && sw.mwb_scan_from > 0) => {
                 let (k, next) = c.mwb_kernel(&sw.claim_plan.excess, &sw.claim_plan.owner_excess, sw.mwb_scan_from);
                 sw.mwb_scan_from = next;
                 sw.t = k.and_then(|k| sw.secret_from_kernel(&k));
-            }
-            Side::SellMdw => {
-                if let Some(first) = ids.first() {
-                    let (w, next) = c.mds_spend(first, sw.mds_scan_from);
-                    sw.mds_scan_from = next;
-                    sw.t = w.and_then(|w| sw.secret_from_witness(&w));
+                searching = sw.t.is_none() && sw.mwb_scan_from < mwb_tip;
+                if sw.t.is_some() && sw.mwb_seen.is_none() {
+                    sw.mwb_seen = Some(mwb_tip);
+                    mine = Lock::Spent;
                 }
             }
+            Side::SellMdw if !ids.is_empty() && (mine != Lock::Absent || (sw.mds_lock_commitment.is_some() && sw.mds_scan_from > 0)) => {
+                let (ws, reached) = c.mds_spends(&ids, sw.mds_scan_from);
+                sw.mds_scan_from = sw.mds_scan_from.max(reached);
+                sw.t = ws.iter().find_map(|w| sw.secret_from_witness(w));
+                searching = sw.t.is_none() && sw.mds_scan_from < mds_tip;
+                if !ws.is_empty() && sw.mds_seen.is_none() {
+                    sw.mds_seen = Some(mds_tip);
+                    mine = Lock::Spent;
+                }
+            }
+            _ => {}
         }
     }
 
@@ -658,6 +672,7 @@ pub fn observe(sw: &mut MwbSwap, c: &impl Chains, mine_pending: bool) -> Obs {
         mine,
         theirs,
         mine_pending,
+        searching,
         revealed: if sw.role == Role::Taker { sw.t } else { None },
         claimed,
         refunded,
@@ -689,6 +704,9 @@ pub struct Obs {
     /// Our lock's broadcast is still under way (a midstate send not yet
     /// abandoned, or a funding transaction not yet refused).
     pub mine_pending: bool,
+    /// Taker: the search for the maker's claim of our lock has not yet read
+    /// every block, so a lock not seen may still turn out claimed.
+    pub searching: bool,
     /// Taker: the secret, read off the maker's claim and checked against `T`.
     pub revealed: Option<[u8; 32]>,
     /// Our claim of their lock is in a block.
@@ -814,7 +832,7 @@ pub fn decide(sw: &MwbSwap, o: &Obs) -> Decision {
                     // only while it is still useful.
                     let act = if reveal_tip <= deadline { Act::LockMine } else { Act::None };
                     Decision::go(Phase::LockingMine, act, format!("our {} lock is on its way", chain(sw.my_leg())))
-                } else if refund_open {
+                } else if refund_open && !o.searching {
                     Decision::go(
                         Phase::Failed("our lock never reached the chain, so nothing was locked".into()),
                         Act::None,
@@ -887,7 +905,7 @@ pub fn decide(sw: &MwbSwap, o: &Obs) -> Decision {
                 }
             } else if refund_open && o.mine != Lock::Absent {
                 Decision::go(Phase::Refunding, Act::Refund, "refunding our lock")
-            } else if refund_open && !o.mine_pending {
+            } else if refund_open && !o.mine_pending && !o.searching {
                 Decision::go(Phase::Failed("our lock never reached the chain, so nothing was locked".into()), Act::None, "")
             } else {
                 Decision::wait(&sw.phase, refund_wait())

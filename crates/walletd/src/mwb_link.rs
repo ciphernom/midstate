@@ -433,6 +433,30 @@ impl VerifiedLink {
     /// Post: Some(t) ⇒ t·G = T
     ///       None    ⇔ ∀ j • (opened[j] + preimages[j])·G ≠ T   (every instance spoiled)
     /// ```
+    /// AND lock: `t` from the items of a claim's witness, whatever their
+    /// order and whatever else the witness holds. The lock's script takes
+    /// any true selector and leaves items beneath its own alone, so the
+    /// shape [`and_claim_witness`] writes is not the only one a claim can
+    /// have: each item that hashes to an instance's unopened half is tried
+    /// with that instance's opened half.
+    ///
+    /// ```text
+    /// Post: Some(t) ⇒ t·G = T
+    ///       None    ⇔ no item u, instance j with BLAKE3(u) = unopened_hashes[j]
+    ///                 ∧ (opened[j] + u)·G = T
+    /// ```
+    pub fn recover_t_from_items(&self, items: &[Vec<u8>]) -> Option<Scalar> {
+        let t_pt = decompress(&self.t_point)?;
+        items.iter().find_map(|it| {
+            let u: [u8; 32] = it.as_slice().try_into().ok()?;
+            let h = hash(&u);
+            self.unopened_hashes.iter().zip(&self.opened).filter(|(uh, _)| **uh == h).find_map(|(_, o)| {
+                let t = o + scalar_from_bytes(&u)?;
+                (RistrettoPoint::mul_base(&t) == t_pt).then_some(t)
+            })
+        })
+    }
+
     pub fn recover_t(&self, preimages: &[Vec<u8>]) -> Option<Scalar> {
         let t_pt = decompress(&self.t_point)?;
         preimages.iter().zip(&self.opened).find_map(|(u, o)| {
@@ -529,6 +553,24 @@ pub fn refund_witness(sig: &[u8]) -> Vec<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn t_is_recovered_from_a_claim_of_any_shape() {
+        let s = LinkSecret::generate(K_AND);
+        let ch = Challenge::random(K_AND);
+        let link = verify(&s.commit(), &ch, &s.open(&ch)).unwrap();
+        let unopened = s.unopened(&ch);
+        let ours = and_claim_witness(&[7; 64], &unopened);
+        let mut odd = ours.clone();
+        *odd.last_mut().unwrap() = vec![2];
+        odd.insert(0, vec![9; 32]);
+        let one = vec![vec![1; 40], unopened[17].to_vec(), vec![0, 1]];
+        for w in [&ours, &odd, &one] {
+            assert_eq!(link.recover_t_from_items(w), Some(s.t()));
+        }
+        assert_eq!(and_preimages_from_witness(&odd, K_AND), None, "the old parser missed it");
+        assert_eq!(link.recover_t_from_items(&[vec![1; 32], vec![1]]), None);
+    }
 
     #[test]
     fn honest_link_verifies_and_both_extractions_work() {

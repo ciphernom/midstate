@@ -156,19 +156,22 @@ impl Chains for Sim {
     fn mds_coin(&self, id: &[u8; 32]) -> bool {
         self.mds.coins.contains(id)
     }
-    fn mds_spend(&self, coin: &[u8; 32], from: u64) -> (Option<Vec<Vec<u8>>>, u64) {
+    fn mds_spends(&self, coins: &[[u8; 32]], from: u64) -> (Vec<Vec<Vec<u8>>>, u64) {
+        let mut out = Vec::new();
         for (h, tx) in &self.mds_reveals {
             if *h < from {
                 continue;
             }
             if let MdsTx::Reveal { inputs, witnesses, .. } = tx {
-                if let Some(i) = inputs.iter().position(|i| &i.coin_id() == coin) {
-                    let Witness::ScriptInputs(items) = &witnesses[i];
-                    return (Some(items.clone()), self.mds.height);
+                for (i, input) in inputs.iter().enumerate() {
+                    if coins.contains(&input.coin_id()) {
+                        let Witness::ScriptInputs(items) = &witnesses[i];
+                        out.push(items.clone());
+                    }
                 }
             }
         }
-        (None, self.mds.height)
+        (out, self.mds.height)
     }
     fn mwb_output(&self, c: &Point32) -> Option<(u64, Point32)> {
         self.mwb.utxos.get(c).map(|e| (e.height, e.owner_key))
@@ -617,5 +620,51 @@ fn selling_mds_waits_for_its_opcode() -> Result<()> {
     sim.mds.height = SELL_MDS_FROM - 1;
     let (_, mut taker) = wallets(Side::SellMdw, &mut sim);
     Negotiation::take(&order(Side::SellMdw).advert()?, &KeyPair::random(), &mut Wallet::ctx(&taker.keys, &mut taker.account, &sim))?;
+    Ok(())
+}
+
+#[test]
+fn a_maker_claiming_with_a_selector_of_its_own_still_pays_the_taker() -> Result<()> {
+    // The lock's script takes any true selector; our wallets write `1`. A
+    // maker that writes `2` must not leave the taker unable to read the
+    // secret, or it would keep both locks.
+    let mut sim = Sim::new();
+    let (mut maker, mut taker) = wallets(Side::SellMdw, &mut sim);
+    negotiate(Side::SellMdw, &sim, &mut maker, &mut taker)?;
+    let mut done = false;
+    for _ in 0..600 {
+        turn(&mut maker, &mut sim, false)?;
+        let m = maker.swap.as_mut().unwrap();
+        if !done && m.phase == Phase::Claiming && m.mds_spend_commitment.is_some() {
+            sim.mine();
+            let dest = m.mds_dest.unwrap();
+            let sp = build_mds_spend(m, MdsSpendKind::Claim, &dest)?;
+            let MdsTx::Reveal { inputs, witnesses, outputs, salt } = midstate_walletd::mwb_trade::sign_mds_spend(m, MdsSpendKind::Claim, &sp)? else {
+                bail!("not a reveal")
+            };
+            let witnesses = witnesses
+                .into_iter()
+                .map(|w| {
+                    let Witness::ScriptInputs(mut items) = w;
+                    *items.last_mut().unwrap() = vec![2];
+                    Witness::ScriptInputs(items)
+                })
+                .collect();
+            sim.mds_reveal(MdsTx::Reveal { inputs, witnesses, outputs, salt })?;
+            m.reveal_sent = true;
+            done = true;
+        }
+        turn(&mut taker, &mut sim, false)?;
+        if maker.swap.as_ref().unwrap().phase.settled() && taker.swap.as_ref().unwrap().phase.settled() {
+            break;
+        }
+        sim.mine();
+    }
+    assert!(done, "the maker never reached its claim");
+    let (m, t) = (maker.swap.as_ref().unwrap(), taker.swap.as_ref().unwrap());
+    assert_eq!((m.phase.clone(), t.phase.clone()), (Phase::Done, Phase::Done));
+    assert_eq!(t.t, m.t, "the taker read the secret off the odd claim");
+    let got = mwb_received(&taker.keys, &sim);
+    assert!(got > MDW_AMOUNT - MWB_FEE && got < MDW_AMOUNT, "taker received {got}");
     Ok(())
 }
