@@ -28,6 +28,8 @@ pub const FRAG_MAGIC: [u8; 4] = *b"MDXF";
 pub const TAKER_MAGIC: [u8; 4] = *b"MDXT";
 pub const ANN_VER: u8 = 1;
 pub const TAKER_VER: u8 = 1;
+/// MDXT version 2: a bid fill as several coins ([`FillAnnouncement`]).
+pub const FILL_VER: u8 = 2;
 
 /// magic 4 + groupId 6 + idx 1 + total 1
 pub const FRAG_HEADER_BYTES: usize = 12;
@@ -69,6 +71,93 @@ pub struct TakerAnnouncement {
     pub timeout_height: u64,
     pub value: u64,
     pub wei_amount: u128,
+}
+
+/// A seller's fill of a resting bid, as any amount: MDXT version 2.
+///
+/// Version 1 ([`TakerAnnouncement`]) names one coin, so it can only fill a
+/// bid whose amount, with the buyer's claim fee on top, is a power of two.
+/// Here the lock is `decompose_value(total)` coins at one covenant address,
+/// with salts derived from the announcement ([`fill_salt`]), and the claim
+/// must pay `min_payout` (the bid's amount) to `receiver_addr`; what `total`
+/// has over it pays the buyer's claim fee.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FillAnnouncement {
+    /// The seller's refund key.
+    pub taker_mds_pk: [u8; 32],
+    pub secret_hash: [u8; 32],
+    pub receiver_addr: [u8; 32],
+    pub timeout_height: u64,
+    pub min_payout: u64,
+    pub total: u64,
+    pub wei_amount: u128,
+}
+
+/// Salt of coin `i` of a version-2 fill lock.
+pub fn fill_salt(secret_hash: &[u8; 32], taker_mds_pk: &[u8; 32], i: u32) -> [u8; 32] {
+    let mut m = Vec::with_capacity(16 + 68);
+    m.extend_from_slice(b"midstate.mdxt.fill-salt.v2");
+    m.extend_from_slice(secret_hash);
+    m.extend_from_slice(taker_mds_pk);
+    m.extend_from_slice(&i.to_le_bytes());
+    hash(&m)
+}
+
+impl FillAnnouncement {
+    pub const LEN: usize = 4 + 1 + 32 * 3 + 8 * 3 + 16;
+
+    pub fn script(&self) -> Vec<u8> {
+        script::compile_covenant_htlc(
+            &self.secret_hash,
+            &self.receiver_addr,
+            self.min_payout,
+            self.timeout_height,
+            &self.taker_mds_pk,
+        )
+    }
+
+    pub fn address(&self) -> [u8; 32] {
+        hash(&self.script())
+    }
+
+    /// The lock's coins: `(value, salt)`, in output order.
+    pub fn coins(&self) -> Vec<(u64, [u8; 32])> {
+        crate::core::decompose_value(self.total)
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| (v, fill_salt(&self.secret_hash, &self.taker_mds_pk, i as u32)))
+            .collect()
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::LEN);
+        out.extend_from_slice(&TAKER_MAGIC);
+        out.push(FILL_VER);
+        out.extend_from_slice(&self.taker_mds_pk);
+        out.extend_from_slice(&self.secret_hash);
+        out.extend_from_slice(&self.receiver_addr);
+        put_u64(&mut out, self.timeout_height);
+        put_u64(&mut out, self.min_payout);
+        put_u64(&mut out, self.total);
+        put_u128(&mut out, self.wei_amount);
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        if b.len() != Self::LEN || b[..4] != TAKER_MAGIC || b[4] != FILL_VER {
+            return None;
+        }
+        let mut o = 5usize;
+        let taker_mds_pk = take32(b, &mut o)?;
+        let secret_hash = take32(b, &mut o)?;
+        let receiver_addr = take32(b, &mut o)?;
+        let u64_at = |o: &mut usize| -> Option<u64> { Some(u64::from_be_bytes(take(b, o, 8)?.try_into().ok()?)) };
+        let timeout_height = u64_at(&mut o)?;
+        let min_payout = u64_at(&mut o)?;
+        let total = u64_at(&mut o)?;
+        let wei_amount = u128::from_be_bytes(take(b, &mut o, 16)?.try_into().ok()?);
+        (total > 0).then_some(Self { taker_mds_pk, secret_hash, receiver_addr, timeout_height, min_payout, total, wei_amount })
+    }
 }
 
 fn log2_exact(v: u64) -> Result<u8> {
@@ -292,6 +381,7 @@ impl FragmentPool {
 pub enum Announcement {
     Maker(MakerAnnouncement),
     Taker(TakerAnnouncement),
+    Fill(FillAnnouncement),
 }
 
 /// Classify one burn payload. Fragments go to the pool and only yield an
@@ -307,6 +397,9 @@ pub fn ingest(payload: &[u8], pool: &mut FragmentPool) -> Option<Announcement> {
     let body = pool.add(f)?;
     if let Some(m) = MakerAnnouncement::decode(&body) {
         return Some(Announcement::Maker(m));
+    }
+    if let Some(f) = FillAnnouncement::decode(&body) {
+        return Some(Announcement::Fill(f));
     }
     TakerAnnouncement::decode(&body).map(Announcement::Taker)
 }
@@ -398,6 +491,36 @@ pub fn limit_reclaim_input(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fill_announcement_round_trips_through_fragments() {
+        let a = FillAnnouncement {
+            taker_mds_pk: [1; 32],
+            secret_hash: [2; 32],
+            receiver_addr: [3; 32],
+            timeout_height: 400_123,
+            min_payout: 3 << 30,
+            total: (3 << 30) + 9_000,
+            wei_amount: 12_345_678_901_234_567,
+        };
+        let mut pool = FragmentPool::new();
+        let mut got = None;
+        for f in fragment(&a.encode(), &[9; 6]).unwrap() {
+            assert!(f.len() <= MAX_BURN_DATA_SIZE);
+            if let Some(x) = ingest(&f, &mut pool) {
+                got = Some(x);
+            }
+        }
+        match got {
+            Some(Announcement::Fill(b)) => assert_eq!(a, b),
+            other => panic!("expected a fill, got {other:?}"),
+        }
+        let coins = a.coins();
+        assert_eq!(coins.iter().map(|c| c.0).sum::<u64>(), a.total);
+        assert!(coins.iter().all(|c| c.0.is_power_of_two()));
+        // Version 1 does not read it, and it does not read version 1.
+        assert!(TakerAnnouncement::decode(&a.encode()).is_none());
+    }
 
     fn unit(b: u8, value: u64, wei: u128) -> AnnUnit {
         AnnUnit { secret_hash: [b; 32], salt: [b ^ 0xff; 32], value, wei_amount: wei }

@@ -20,6 +20,8 @@ pub mod bond;
 pub mod channels;
 pub mod co_bond;
 pub mod dex;
+pub mod eth_trade;
+pub mod eth_wire;
 pub mod evm;
 pub mod ledger;
 pub mod mining;

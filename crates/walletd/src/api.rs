@@ -866,6 +866,9 @@ pub struct OrderBookView {
     pub asks: Vec<AskView>,
     /// Highest Base block folded into the book.
     pub base_cursor: u64,
+    /// Base blocks the book has still to read before it is current.
+    #[serde(default)]
+    pub behind: u64,
     pub mds_cursor: u64,
     pub last_error: Option<String>,
     /// What the last scan decoded. An empty book with zero events means the
@@ -1200,4 +1203,77 @@ pub struct MwbSwapView {
     /// Unix seconds.
     pub created: u64,
     pub updated: u64,
+}
+
+// ── MDS <-> ETH on Base ─────────────────────────────────────────────────────
+
+/// A sell order heard on the bus (or one of ours).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EthAdvertView {
+    pub order_id: String,
+    /// The seller's Base account, checksummed.
+    pub seller: String,
+    /// MDS (units) for sale now.
+    pub mds: u64,
+    pub min: u64,
+    /// Wei per 2^30 units.
+    pub wei_per_gmds: String,
+    pub expires: u64,
+    pub mine: bool,
+}
+
+/// One of our sell orders.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EthOrderView {
+    pub id: String,
+    /// Still for sale.
+    pub mds: u64,
+    pub sold: u64,
+    pub min: u64,
+    pub wei_per_gmds: String,
+    pub expires: u64,
+    /// "open", "cancelled", "filled" or "expired".
+    pub status: String,
+    /// Sales of this order still under way.
+    pub running: usize,
+}
+
+/// A trade this wallet is in, or was.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EthSwapView {
+    pub id: String,
+    /// "buy" (we buy MDS from a sell order), "sell" (our sell order was
+    /// taken), "fill" (we sell into a buy order), "bid" (our buy order was
+    /// filled).
+    pub kind: String,
+    pub phase: String,
+    /// MDS we get or give.
+    pub mds: u64,
+    pub wei: String,
+    /// Plain-language state, or why it ended.
+    pub note: String,
+    pub settled: bool,
+    /// Who we trade with on Base, when known.
+    pub counterparty: String,
+    /// Unix time our ETH may be refunded (buys), or the reservation ends (fills).
+    pub eth_deadline: u64,
+    /// Midstate height the MDS lock may be taken back from.
+    pub timeout: u64,
+    /// Our latest Base transaction, for Basescan.
+    pub base_tx: Option<String>,
+    pub created: u64,
+    pub updated: u64,
+}
+
+/// The ETH market as this wallet sees it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct EthMarketView {
+    /// Sell orders on the bus, cheapest first.
+    pub sells: Vec<EthAdvertView>,
+    pub orders: Vec<EthOrderView>,
+    pub swaps: Vec<EthSwapView>,
+    /// Midstate's tip, for expiries.
+    pub tip: u64,
+    /// The last time Base could not be read, and why.
+    pub base_error: Option<String>,
 }

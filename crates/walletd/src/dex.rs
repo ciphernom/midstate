@@ -147,6 +147,8 @@ pub struct OrderBook {
     pub bids: HashMap<[u8; 32], Bid>,
     pub asks: Vec<Ask>,
     pub taker_locks: Vec<(u64, TakerAnnouncement)>,
+    /// Version-2 fills of resting bids (several coins, any amount).
+    pub fills: Vec<(u64, midstate::core::dex::FillAnnouncement)>,
     /// Highest Base block folded in, so scanning resumes rather than restarts.
     pub base_cursor: u64,
     /// Highest midstate height scanned for announcements.
@@ -175,7 +177,11 @@ impl OrderBook {
             return Ok(0);
         }
         let from = self.base_cursor.saturating_add(1);
-        let (events, raw_logs) = client.scan_events_counted(from, to).await?;
+        // Whatever was read is applied and the cursor moves to where the
+        // read got: a range Base would not serve is retried next time, never
+        // skipped, and one bad range no longer throws away the rest.
+        let part = client.scan(from, to).await;
+        let (events, raw_logs, reached) = (part.events, part.raw, part.reached);
         let n = events.len();
         self.stats.undecoded += raw_logs.saturating_sub(n);
         for (block, e) in events {
@@ -241,8 +247,11 @@ impl OrderBook {
                 }
             }
         }
-        self.base_cursor = to;
-        Ok(n)
+        self.base_cursor = reached.max(self.base_cursor);
+        match part.error {
+            Some(e) => Err(e.context(format!("Base stopped answering at block {}", reached + 1))),
+            None => Ok(n),
+        }
     }
 
     /// Scan midstate blocks for announcement burns. Fragments of one
@@ -266,6 +275,7 @@ impl OrderBook {
                     self.asks.push(Ask { announcement: m, height, live_units: live });
                 }
                 Announcement::Taker(t) => self.taker_locks.push((height, t)),
+                Announcement::Fill(f) => self.fills.push((height, f)),
             }
         }
         self.mds_cursor = to;

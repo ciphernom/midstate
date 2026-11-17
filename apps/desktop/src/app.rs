@@ -233,23 +233,10 @@ pub struct App {
     pub dex_cfg: Option<DexConfigView>,
     /// What walletd currently holds, so edits have a baseline to differ from.
     pub dex_cfg_saved: Option<DexConfigView>,
-    pub dex_tab: usize,
     pub dex_syncing: bool,
     pub dex_last_sync: f64,
     pub dex_last_poll: f64,
     // Guided swap
-    pub swap_side: usize,
-    pub swap_rail: usize,
-    pub swap_mds: String,
-    pub swap_eth: String,
-    pub swap_peer: String,
-    pub swap_hours: String,
-    pub swap_mds_unit: usize,
-    pub swap_eth_unit: usize,
-    pub swap_unit: Option<usize>,
-    /// Channel identity of the chosen order's maker, for the readiness check.
-    pub swap_maker_pk: String,
-    pub swap_quote: Option<SwapQuoteView>,
     pub my_orders: Vec<MyOrderView>,
     pub swaps: Vec<SwapView>,
     pub my_bids: Vec<MyBidView>,
@@ -258,12 +245,6 @@ pub struct App {
     pub bid_wei: String,
     pub bid_hours: String,
     pub bid_bond: String,
-    pub ask_mds: String,
-    pub ask_wei: String,
-    pub ask_life: String,
-    pub ask_notice: String,
-    pub ask_mds_unit: usize,
-    pub ask_eth_unit: usize,
     pub own_phrase: bool,
     pub chan_tab: ChanTab,
     pub verify_input: String,
@@ -373,9 +354,23 @@ pub struct App {
     pub mwb_node_last_poll: f64,
 
     // MDS <-> MDW (Trade tab, midwimble market)
-    /// 0: MDS <-> ETH on Base (shown only with MIDSTATE_ETH_MARKET=1);
-    /// 1: MDS <-> MDW on midwimble.
+    /// 0: MDS <-> ETH on Base; 1: MDS <-> MDW on midwimble.
     pub market: usize,
+    // MDS <-> ETH (Trade tab)
+    pub eth_market: Option<EthMarketView>,
+    /// 0 buy, 1 sell, 2 my trades.
+    pub eth_tab: usize,
+    /// The sell order whose buy form is open.
+    pub eth_buy: Option<String>,
+    pub eth_buy_amount: String,
+    /// The buy order whose sell confirmation is open.
+    pub eth_fill: Option<String>,
+    pub eth_sell_mds: String,
+    pub eth_sell_price: String,
+    pub eth_sell_min: String,
+    pub eth_sell_hours: String,
+    pub eth_notice: String,
+    pub eth_last_poll: f64,
     pub mwb_tab: usize,
     pub mwb_account: Option<MwbAccountView>,
     pub mwb_book: Vec<MwbBookEntryView>,
@@ -534,21 +529,9 @@ impl App {
             book: None,
             dex_cfg: None,
             dex_cfg_saved: None,
-            dex_tab: 0,
             dex_syncing: false,
             dex_last_sync: -1.0,
             dex_last_poll: 0.0,
-            swap_side: 0,
-            swap_rail: 0,
-            swap_mds: String::new(),
-            swap_eth: String::new(),
-            swap_peer: String::new(),
-            swap_hours: "1".into(),
-            swap_mds_unit: 0,
-            swap_eth_unit: 0,
-            swap_unit: None,
-            swap_maker_pk: String::new(),
-            swap_quote: None,
             my_orders: Vec::new(),
             swaps: Vec::new(),
             my_bids: Vec::new(),
@@ -557,12 +540,6 @@ impl App {
             bid_wei: String::new(),
             bid_hours: "24".into(),
             bid_bond: "0".into(),
-            ask_mds: String::new(),
-            ask_wei: String::new(),
-            ask_life: "4320".into(),
-            ask_notice: String::new(),
-            ask_mds_unit: 0,
-            ask_eth_unit: 0,
             own_phrase: false,
             chan_tab: ChanTab::List,
             verify_input: String::new(),
@@ -639,7 +616,18 @@ impl App {
             mwb_rescan_h: String::new(),
             mwb_history_last_poll: 0.0,
             mwb_node_last_poll: 0.0,
-            market: 1,
+            market: 0,
+            eth_market: None,
+            eth_tab: 0,
+            eth_buy: None,
+            eth_buy_amount: String::new(),
+            eth_fill: None,
+            eth_sell_mds: String::new(),
+            eth_sell_price: String::new(),
+            eth_sell_min: String::new(),
+            eth_sell_hours: "24".into(),
+            eth_notice: String::new(),
+            eth_last_poll: 0.0,
             mwb_tab: 0,
             mwb_account: None,
             mwb_book: Vec::new(),
@@ -1039,19 +1027,12 @@ impl App {
                 self.busy = false;
                 self.go(ctx, Action::LoadHub);
             }
-            Msg::AskPlaced(g) => {
+            Msg::EthMarket(v) => self.eth_market = Some(v),
+            Msg::EthDone(m) => {
                 self.busy = false;
-                self.ask_mds.clear();
-                self.ask_wei.clear();
-                self.ask_notice = format!(
-                    "Order {} submitted. It is not offered to anyone until the reveal is \
-                     mined — the coins and the announcement are in that same transaction. \
-                     Follow it on the Send tab.",
-                    crate::theme::short_hex(&g, 6)
-                );
-                self.go(ctx, Action::LoadMyOrders);
-                self.go(ctx, Action::LoadSends);
-                self.dex_last_sync = -1.0;
+                self.eth_notice = m;
+                self.eth_sell_mds.clear();
+                self.go(ctx, Action::LoadEthMarket);
             }
             Msg::MyOrders(v) => self.my_orders = v,
             Msg::Swaps(v) => self.swaps = v,
@@ -1061,7 +1042,7 @@ impl App {
                 self.busy = false;
                 self.bid_mds.clear();
                 self.bid_wei.clear();
-                self.ask_notice = format!(
+                self.eth_notice = format!(
                     "Buy order escrowed ({}). It becomes fillable once the transaction is \
                      mined and the contract assigns it an id.",
                     crate::theme::short_hex(&tx, 8)
@@ -1070,28 +1051,14 @@ impl App {
             }
             Msg::BidCancelled(m) => {
                 self.busy = false;
-                self.ask_notice = m;
+                self.eth_notice = m;
                 self.go(ctx, Action::LoadMyBids);
-            }
-            Msg::SwapStarted(tx) => {
-                self.busy = false;
-                self.ask_notice = format!(
-                    "Escrow sent ({}). Your ETH is locked against the seller's hash — the wallet \
-                     now watches for their claim and collects your MDS automatically.",
-                    crate::theme::short_hex(&tx, 8)
-                );
-                self.go(ctx, Action::LoadSwaps);
-                self.dex_tab = 3;
             }
             Msg::OrderReclaimed(m) => {
                 self.busy = false;
-                self.ask_notice = m;
+                self.eth_notice = m;
                 self.go(ctx, Action::LoadMyOrders);
                 self.go(ctx, Action::LoadSends);
-            }
-            Msg::SwapQuote(q) => {
-                self.busy = false;
-                self.swap_quote = Some(q);
             }
             Msg::HistoryRepaired(m) => {
                 self.busy = false;
@@ -1099,7 +1066,13 @@ impl App {
                 self.go(ctx, Action::LoadHistory);
             }
             Msg::EvmAccount(v) => self.evm = Some(v),
-            Msg::OrderBook(v) => self.book = Some(v),
+            Msg::OrderBook(v) => {
+                // Still catching up: read on at once rather than in a minute.
+                if v.behind > 0 && !self.dex_syncing {
+                    self.dex_last_sync = -1.0;
+                }
+                self.book = Some(v);
+            }
             Msg::OrderBookSynced => {
                 self.dex_syncing = false;
                 self.go(ctx, Action::LoadOrderBook);
@@ -1455,7 +1428,11 @@ impl eframe::App for App {
             // without this your own newly published order never shows up.
             // Base is read only while its market is on screen; with it hidden
             // the wallet makes no calls to Base at all.
-            let eth = views::trade::eth_market() && self.market == 0;
+            let eth = self.market == 0;
+            if eth && t - self.eth_last_poll > 3.0 {
+                self.eth_last_poll = t;
+                self.go(ctx, Action::LoadEthMarket);
+            }
             if eth && !self.dex_syncing && (self.dex_last_sync < 0.0 || t - self.dex_last_sync > 60.0) {
                 self.dex_last_sync = t;
                 self.dex_syncing = true;

@@ -24,6 +24,8 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 #[path = "service_mwb.rs"]
 mod mwb_glue;
+#[path = "service_eth.rs"]
+mod eth_glue;
 use mwb_glue::MwbLive;
 #[path = "service_mining.rs"]
 mod mining_glue;
@@ -144,15 +146,13 @@ enum Cmd {
     RepairHistory(oneshot::Sender<Result<String>>),
     RequestChannel { peer: String, capacity: u64, resp: oneshot::Sender<Result<()>> },
     Hubs(oneshot::Sender<Vec<HubAdView>>),
-    PlaceAsk {
-        mds_amount: u64,
-        wei_amount: String,
-        lifetime_blocks: u64,
-        resp: oneshot::Sender<Result<String>>,
-    },
+    EthSell { mds: u64, wei_per_gmds: String, min: u64, life: u64, resp: oneshot::Sender<Result<String>> },
+    EthCancelSell { id: String, resp: oneshot::Sender<Result<()>> },
+    EthBuy { order_id: String, mds: u64, resp: oneshot::Sender<Result<String>> },
+    EthFillBid { bid_id: String, resp: oneshot::Sender<Result<String>> },
+    EthMarket(oneshot::Sender<EthMarketView>),
     MyOrders(oneshot::Sender<Vec<MyOrderView>>),
     ReclaimOrder { group_id: String, resp: oneshot::Sender<Result<String>> },
-    TakeAsk { group_id: String, unit: usize, resp: oneshot::Sender<Result<String>> },
     PlaceBid {
         mds_amount: u64,
         wei: String,
@@ -471,25 +471,29 @@ impl WalletdHandle {
     }
     /// Publish a sell order: lock MDS behind limit-order covenants and
     /// announce them on-chain, in a single transaction.
-    pub async fn place_ask(
-        &self,
-        mds_amount: u64,
-        wei_amount: String,
-        lifetime_blocks: u64,
-    ) -> Result<String> {
-        ask!(self, PlaceAsk {
-            mds_amount: mds_amount,
-            wei_amount: wei_amount,
-            lifetime_blocks: lifetime_blocks
-        })
+    /// Puts MDS up for sale for ETH on Base. Nothing is locked until a
+    /// buyer asks; each buyer then gets a lock only it can claim.
+    pub async fn eth_sell(&self, mds: u64, wei_per_gmds: String, min: u64, life: u64) -> Result<String> {
+        ask!(self, EthSell { mds: mds, wei_per_gmds: wei_per_gmds, min: min, life: life })
+    }
+    pub async fn eth_cancel_sell(&self, id: String) -> Result<()> {
+        ask!(self, EthCancelSell { id: id })
+    }
+    /// Buys `mds` units from a sell order heard on the bus.
+    pub async fn eth_buy(&self, order_id: String, mds: u64) -> Result<String> {
+        ask!(self, EthBuy { order_id: order_id, mds: mds })
+    }
+    /// Sells into a resting buy order on Base.
+    pub async fn eth_fill_bid(&self, bid_id: String) -> Result<String> {
+        ask!(self, EthFillBid { bid_id: bid_id })
+    }
+    pub async fn eth_market(&self) -> Result<EthMarketView> {
+        Ok(ask!(self, EthMarket))
     }
     pub async fn my_orders(&self) -> Result<Vec<MyOrderView>> {
         Ok(ask!(self, MyOrders))
     }
     /// Take one unit of a published sell order: escrow ETH against its hash.
-    pub async fn take_ask(&self, group_id: String, unit: usize) -> Result<String> {
-        ask!(self, TakeAsk { group_id: group_id, unit: unit })
-    }
     /// Escrow ETH as a resting buy order for MDS.
     pub async fn place_bid(
         &self,
@@ -780,6 +784,7 @@ pub fn spawn(
         dex_window: 200_000,
         dex_start_block: 0,
         dex_error: None,
+        dex_head: 0,
         ledger: Ledger::default(),
         swaps: SwapBook::default(),
         bonds: BondBook::default(),
@@ -799,6 +804,7 @@ pub fn spawn(
         mwb_node: mwb_node.map(|n| n.handle),
         merge: None,
         mwb: MwbLive::default(),
+        eth: Default::default(),
         mwb_last_mds_tip: 0,
     };
     tokio::spawn(svc.run(rx));
@@ -867,6 +873,8 @@ struct Service {
     dex_window: u64,
     dex_start_block: u64,
     dex_error: Option<String>,
+    /// Base's safe head at the last book sync.
+    dex_head: u64,
     /// Remembers what coins were worth, so history stays truthful after they move.
     ledger: Ledger,
     /// Live cross-chain swaps. Persisted, because the gap between the two legs
@@ -905,6 +913,9 @@ struct Service {
     mwb: MwbLive,
     /// Midstate's tip at the last tick, for views that need no await.
     mwb_last_mds_tip: u64,
+    /// MDS <-> ETH trading: the journal (mirrored in wallet.dat while
+    /// unlocked), the heard book, and what has been read off Base.
+    eth: eth_glue::EthLive,
 }
 
 impl Service {
@@ -974,6 +985,7 @@ impl Service {
                 self.bonds = BondBook::default();
                 self.plans_unload();
                 self.mwb_unload();
+                self.eth_unload();
                 // The bond's secret leaves with the wallet: the local pool
                 // mines midstate alone until it is unlocked again.
                 self.refresh_merge_bond();
@@ -1184,15 +1196,23 @@ impl Service {
             Cmd::RequestAddress { peer, resp } => {
                 let _ = resp.send(self.request_address(&peer).await);
             }
-            Cmd::PlaceAsk { mds_amount, wei_amount, lifetime_blocks, resp } => {
-                let r = self.place_ask(mds_amount, &wei_amount, lifetime_blocks).await;
-                let _ = resp.send(r);
+            Cmd::EthSell { mds, wei_per_gmds, min, life, resp } => {
+                let _ = resp.send(self.eth_sell(mds, &wei_per_gmds, min, life).await);
+            }
+            Cmd::EthCancelSell { id, resp } => {
+                let _ = resp.send(self.eth_cancel_sell(&id));
+            }
+            Cmd::EthBuy { order_id, mds, resp } => {
+                let _ = resp.send(self.eth_buy(&order_id, mds).await);
+            }
+            Cmd::EthFillBid { bid_id, resp } => {
+                let _ = resp.send(self.eth_fill_bid(&bid_id).await);
+            }
+            Cmd::EthMarket(resp) => {
+                let _ = resp.send(self.eth_market().await);
             }
             Cmd::MyOrders(resp) => {
                 let _ = resp.send(self.my_orders());
-            }
-            Cmd::TakeAsk { group_id, unit, resp } => {
-                let _ = resp.send(self.take_ask(&group_id, unit).await);
             }
             Cmd::PlaceBid { mds_amount, wei, ttl_secs, fill_bond, resp } => {
                 let r = self.place_bid(mds_amount, &wei, ttl_secs, &fill_bond).await;
@@ -1455,6 +1475,7 @@ impl Service {
         self.plans_unload();
         self.wallet = Some(wallet);
         self.mwb_load();
+        self.eth_load();
         // Fresh wallet: nothing historical can belong to it — start scanning
         // from the current tip instead of genesis.
         self.scan_pos = self.node.get_state().await.height;
@@ -1530,6 +1551,7 @@ impl Service {
         self.mss_checked = wallet.mss_keys().len() as u64;
         self.wallet = Some(wallet);
         self.mwb_load();
+        self.eth_load();
         self.restore = Some(rs);
         self.sync_wots_hold();
         self.bonds = BondBook::load(&self.wallet_path).0;
@@ -1573,6 +1595,7 @@ impl Service {
         self.names_load();
         self.plans_load();
         self.mwb_load();
+        self.eth_load();
         // Mining that ran through the lock signs MDW blocks again.
         self.refresh_merge_bond();
         self.resume_pendings().await;
@@ -5508,7 +5531,10 @@ impl Service {
                 safe.saturating_sub(self.dex_window)
             };
         }
-        self.dex.sync_base(&client, safe).await?;
+        // At most 40,000 blocks (20 reads) per call, so the actor answers
+        // other requests between them; the view asks again until caught up.
+        self.dex_head = safe;
+        self.dex.sync_base(&client, safe.min(self.dex.base_cursor + 40_000)).await?;
 
         let height = self.node.get_state().await.height;
         if self.dex.mds_cursor == 0 {
@@ -5614,6 +5640,7 @@ impl Service {
             bids,
             asks,
             base_cursor: self.dex.base_cursor,
+            behind: self.dex_head.saturating_sub(self.dex.base_cursor),
             mds_cursor: self.dex.mds_cursor,
             last_error: self.dex_error.clone(),
             bids_created: st.bids_created,
@@ -5923,174 +5950,6 @@ impl Service {
 
     // ── Placing orders ──────────────────────────────────────────────────
 
-    /// Publish a sell order.
-    ///
-    /// Everything happens in ONE transaction, and that is the point: the coins
-    /// funding the order and the MDXA announcement describing it are committed
-    /// together. A buyer who sees the announcement can therefore verify the
-    /// backing coins exist in the same block, and the maker cannot advertise
-    /// liquidity that was never funded.
-    ///
-    /// The order is split into power-of-two units, each with its own secret and
-    /// its own price share, so a buyer can take part of it without the maker
-    /// having to re-post the remainder.
-    async fn place_ask(
-        &mut self,
-        mds_amount: u64,
-        wei_s: &str,
-        lifetime_blocks: u64,
-    ) -> Result<String> {
-        if self.wallet.is_none() {
-            bail!("wallet is locked");
-        }
-        if self.node.is_syncing() {
-            bail!("node is still syncing — an order placed against a stale coin set would fail");
-        }
-        self.ensure_restore_done()?;
-        let wei_total: u128 = wei_s.parse().unwrap_or(0);
-        if mds_amount == 0 || wei_total == 0 {
-            bail!("both the MDS amount and the asking price must be greater than zero");
-        }
-
-        // Every unit must be individually claimable, because every unit is
-        // claimed by its own transaction paying its own fee. Refuse rather
-        // than quietly trim: an order for an amount the maker did not choose
-        // is not the order they asked for, and narrowing a plan to make it fit
-        // is exactly what this module refuses to do everywhere else.
-        //
-        // MIN_SWAP_UNIT is a power of two, so this single remainder test is
-        // equivalent to checking every denomination `decompose_value` will
-        // produce — the low bits it would set are precisely the remainder.
-        if mds_amount < swap::MIN_SWAP_UNIT {
-            bail!(
-                "the smallest order that can be settled is {} units — below that the buyer's \
-                 claim transaction would cost more than the unit is worth",
-                swap::MIN_SWAP_UNIT
-            );
-        }
-        if mds_amount % swap::MIN_SWAP_UNIT != 0 {
-            let down = mds_amount - (mds_amount % swap::MIN_SWAP_UNIT);
-            let up = down + swap::MIN_SWAP_UNIT;
-            bail!(
-                "an order of {mds_amount} splits into units smaller than the {} unit minimum, \
-                 and those units could never be claimed by whoever bought them. Try {down} or \
-                 {up} instead.",
-                swap::MIN_SWAP_UNIT
-            );
-        }
-        let lifetime = lifetime_blocks.clamp(240, 100_000);
-
-        let evm_addr = self
-            .wallet
-            .as_ref()
-            .and_then(|w| w.data.evm_secret)
-            .and_then(|s| crate::evm::EvmKey::from_secret(&s).ok())
-            .map(|k| k.address)
-            .ok_or_else(|| {
-                anyhow!("this wallet has no Base account, so buyers would have nowhere to pay")
-            })?;
-
-        self.verify_mss_indices().await?;
-        let state = self.node.get_state().await;
-        let timeout_height = state.height + lifetime;
-        let refund_pk = self.ensure_identity()?;
-
-        // Split into power-of-two units, pricing each in proportion to size so
-        // a partial fill costs the same per unit as the whole order.
-        let denoms = midstate::core::decompose_value(mds_amount);
-        if denoms.len() > 32 {
-            bail!("that amount splits into {} units — too many for one order", denoms.len());
-        }
-        let mut units = Vec::with_capacity(denoms.len());
-        let mut outputs: Vec<midstate::core::OutputData> = Vec::new();
-        let mut secrets: Vec<(String, String)> = Vec::new();
-        let mut unit_prices: Vec<(u64, String)> = Vec::new();
-        let mut allocated: u128 = 0;
-
-        for (i, value) in denoms.iter().enumerate() {
-            let secret: [u8; 32] = rand::random();
-            let secret_hash = qb::hash_bytes(&secret);
-            let salt: [u8; 32] = rand::random();
-
-            // Last unit absorbs the rounding remainder so the parts sum exactly.
-            let wei_amount = if i + 1 == denoms.len() {
-                wei_total - allocated
-            } else {
-                let share = wei_total * (*value as u128) / (mds_amount as u128);
-                allocated += share;
-                share
-            };
-
-            let script = midstate::core::script::compile_limit_order_covenant(
-                &secret_hash,
-                *value,
-                timeout_height,
-                &refund_pk,
-            );
-            let address = midstate::core::types::hash(&script);
-            outputs.push(midstate::core::OutputData::Standard { address, value: *value, salt });
-            secrets.push((hex::encode(secret_hash), hex::encode(secret)));
-            unit_prices.push((*value, wei_amount.to_string()));
-            units.push(midstate::core::dex::AnnUnit {
-                secret_hash,
-                salt,
-                value: *value,
-                wei_amount,
-            });
-        }
-
-        let group_id: [u8; 6] = rand::random();
-        let ann = midstate::core::dex::MakerAnnouncement {
-            maker_evm_addr: evm_addr,
-            maker_mds_pk: refund_pk,
-            timeout_height,
-            group_id,
-            units,
-        };
-        // A self-contained announcement cannot fit one burn, so it rides as
-        // fragments — all in this same transaction, landing in one block.
-        for frag in midstate::core::dex::fragment(&ann.encode()?, &group_id)? {
-            outputs.push(midstate::core::OutputData::DataBurn { payload: frag, value_burned: 0 });
-        }
-
-        let in_flight = self.in_flight_inputs();
-        let w = self.wallet.as_mut().unwrap();
-        let live = w.spendable_now(&state, &in_flight);
-        let plan = sendplan::plan_fixed_outputs(w, &live, outputs)?;
-        let (commitment, _salt) =
-            w.prepare_commit(&plan.input_coin_ids, &plan.outputs, plan.change_seeds, false, false)?;
-        w.save()?;
-
-        // Secrets are the only thing that cannot be rebuilt from the chain:
-        // without them the maker can neither be paid nor reclaim early.
-        self.book.orders.push(channels::MyOrder {
-            group_id: hex::encode(group_id),
-            commitment: hex::encode(commitment),
-            mds_amount,
-            wei_amount: wei_total.to_string(),
-            timeout_height,
-            created_height: state.height,
-            secrets,
-            unit_prices,
-        });
-        self.book.save(&self.wallet_path);
-
-        self.sends.insert(
-            commitment,
-            SendMeta {
-                stage: SendStage::Committing,
-                detail: "publishing sell order — solving commit proof-of-work".into(),
-                amount: mds_amount,
-                fee: plan.fee,
-                to: "sell order".into(),
-                updated_at: now_secs(),
-            },
-        );
-        self.set_stage(commitment, SendStage::Committing, "publishing sell order");
-        self.broadcast_commit(commitment).await?;
-        Ok(hex::encode(group_id))
-    }
-
     fn my_orders(&self) -> Vec<MyOrderView> {
         self.book
             .orders
@@ -6242,149 +6101,6 @@ impl Service {
 
     // ── Taking an order ─────────────────────────────────────────────────
 
-    /// Escrow ETH against one unit of a published sell order.
-    ///
-    /// This is the taker's only irreversible-ish act, and it is deliberately
-    /// the *second* commitment in the swap: the maker's MDS is already locked
-    /// and verifiable on-chain before any ETH moves. If the maker then goes
-    /// quiet, the escrow refunds itself after `eth_deadline`.
-    async fn take_ask(&mut self, group_id: &str, unit: usize) -> Result<String> {
-        if self.wallet.is_none() {
-            bail!("wallet is locked");
-        }
-        if self.node.is_syncing() {
-            bail!("node is still syncing — the order's backing coins cannot be verified yet");
-        }
-
-        let ask = self
-            .dex
-            .asks
-            .iter()
-            .find(|a| hex::encode(a.announcement.group_id) == group_id)
-            .cloned()
-            .ok_or_else(|| anyhow!("that order is not in the current book — rescan and retry"))?;
-        let idx = *ask
-            .live_units
-            .get(unit)
-            .ok_or_else(|| anyhow!("that unit is no longer available"))?;
-        let u = ask
-            .announcement
-            .units
-            .get(idx)
-            .ok_or_else(|| anyhow!("malformed order"))?
-            .clone();
-
-        // Never escrow against a unit we could not subsequently claim.
-        //
-        // This duplicates the check `place_ask` makes, and the duplication is
-        // the point: that check constrains only orders *we* publish, while
-        // this one runs against an announcement written by a stranger. Once
-        // the ETH is locked and the maker claims it, the preimage is public
-        // and there is no refund branch left — an unclaimable unit at that
-        // stage is a total loss, and the maker keeps both legs.
-        if !swap::unit_is_tradeable(u.value) {
-            bail!(
-                "that unit is only {} units — below the {} minimum needed to cover the claim \
-                 transaction. Taking it would escrow ETH for MDS that could never be collected.",
-                u.value,
-                swap::MIN_SWAP_UNIT
-            );
-        }
-
-        let state = self.node.get_state().await;
-        let now = now_secs();
-
-        // The maker's coins must still be there. An order whose backing has
-        // been spent is not an order.
-        let addr = midstate::core::dex::limit_order_address(
-            &u.secret_hash,
-            u.value,
-            ask.announcement.timeout_height,
-            &ask.announcement.maker_mds_pk,
-        );
-        let coin = midstate::core::compute_coin_id(&addr, u.value, &u.salt);
-        if !state.coins.contains(&coin) {
-            bail!("that unit has already been taken");
-        }
-
-        // Deadlines: the ETH escrow must expire well before the MDS lock, so
-        // that after the maker reveals we still have time to sweep.
-        let mds_secs_left = swap::blocks_to_secs_pessimistic(
-            ask.announcement.timeout_height.saturating_sub(state.height),
-        );
-        if mds_secs_left <= swap::SETTLE_MARGIN_SECS * 2 {
-            bail!(
-                "that order expires too soon to swap against safely — it would leave under \
-                 {} minutes to settle",
-                swap::SETTLE_MARGIN_SECS / 60
-            );
-        }
-        let eth_refund = (mds_secs_left - swap::SETTLE_MARGIN_SECS).clamp(600, 604_800);
-        swap::check_ordering(now + eth_refund, now + mds_secs_left)?;
-
-        let key = self.evm_key()?;
-        let client = BaseClient::new(self.dex_cfg.clone())?;
-
-        // Record BEFORE broadcasting. A crash between the two must leave a
-        // swap the watcher will investigate, not ETH nobody is tracking.
-        let id = hex::encode(&rand::random::<[u8; 8]>());
-        self.swaps.swaps.push(Swap {
-            id: id.clone(),
-            role: crate::swapbook::Role::Taker,
-            secret_hash: hex::encode(u.secret_hash),
-            preimage: None,
-            mds_value: u.value,
-            wei: u.wei_amount.to_string(),
-            group_id: group_id.to_string(),
-            max_claim: u.value,
-            mds_timeout_height: ask.announcement.timeout_height,
-            refund_pk: hex::encode(ask.announcement.maker_mds_pk),
-            salt: hex::encode(u.salt),
-            counterparty_evm: crate::evm::to_checksum_address(&ask.announcement.maker_evm_addr),
-            eth_deadline: now + eth_refund,
-            sweep_dest: None,
-            covenant_hex: None,
-            phase: Phase::LockingEth { tx: String::new() },
-            created: now,
-            updated: now,
-            sweep_retry_at: 0,
-            sweep_attempts: 0,
-        });
-        self.swaps.save(&self.wallet_path);
-
-        let tx = client
-            .lock(
-                &key,
-                u.secret_hash,
-                ask.announcement.maker_evm_addr,
-                eth_refund,
-                u.wei_amount,
-            )
-            .await;
-        match tx {
-            Ok(h) => {
-                if let Some(s) = self.swaps.find_mut(&id) {
-                    s.phase = Phase::LockingEth { tx: hex::encode(h) };
-                    s.updated = now;
-                }
-                self.swaps.save(&self.wallet_path);
-                self.ch_notice(format!(
-                    "Escrowed {} wei for {} MDS. Waiting for the seller to claim it, which is \
-                     what releases your coins.",
-                    u.wei_amount, u.value
-                ));
-                Ok(hex::encode(h))
-            }
-            Err(e) => {
-                if let Some(s) = self.swaps.find_mut(&id) {
-                    s.phase = Phase::Failed { reason: format!("{e:#}") };
-                }
-                self.swaps.save(&self.wallet_path);
-                Err(e)
-            }
-        }
-    }
-
     fn evm_key(&self) -> Result<crate::evm::EvmKey> {
         let secret = self
             .wallet
@@ -6459,7 +6175,10 @@ impl Service {
         // acquire the first swap it was waiting for.
         let watching = self.swaps.swaps.iter().any(|s| s.active());
         let selling = !self.book.orders.is_empty();
-        if !watching && !selling {
+        // Buy orders need it as much: a new bid learns its id here, and a
+        // fill of one is found and claimed here.
+        let bidding = self.book.bids.iter().any(|b| !b.cancelled);
+        if !watching && !selling && !bidding {
             return Ok(());
         }
         let now = now_secs();
@@ -6600,6 +6319,18 @@ impl Service {
                     continue;
                 }
 
+                // Claiming publishes our secret. Do it only while a seller holds
+                // the reservation with time to collect: otherwise a stranger
+                // could reserve and collect with it, and the seller who locked
+                // would be left with nothing.
+                match client.get_bid(parse_hex32(&bid.bid_id)?).await {
+                    Ok(Some(b)) if b.filler != [0; 20] && b.fill_deadline >= now + swap::SETTLE_MARGIN_SECS / 2 => {}
+                    Ok(_) => continue,
+                    Err(e) => {
+                        tracing::warn!("reading a buy order before claiming its fill: {e:#}");
+                        continue;
+                    }
+                }
                 // Enough time to claim before the seller can reclaim?
                 if t.timeout_height <= height + 3 {
                     self.ch_notice(
@@ -6652,12 +6383,20 @@ impl Service {
         if self.swaps.base_cursor == 0 {
             self.swaps.base_cursor = safe.saturating_sub(5_000);
         }
+        // The cursor moves only as far as the read got: a range Base would
+        // not serve is read again next tick, never skipped. Skipping one is
+        // how a buyer misses the claim that carries its secret.
         let events = if safe > self.swaps.base_cursor {
             let from = self.swaps.base_cursor + 1;
-            let got = client.scan_events(from, safe).await.unwrap_or_default();
-            self.swaps.base_cursor = safe;
-            self.swaps.touch();
-            got
+            let part = client.scan(from, safe.min(from + 20_000)).await;
+            if let Some(e) = &part.error {
+                tracing::warn!("swap watcher stopped reading Base at block {}: {e:#}", part.reached + 1);
+            }
+            if part.reached > self.swaps.base_cursor {
+                self.swaps.base_cursor = part.reached;
+                self.swaps.touch();
+            }
+            part.events
         } else {
             Vec::new()
         };
@@ -6665,7 +6404,7 @@ impl Service {
         for (_, ev) in &events {
             match ev {
                 // Maker: someone escrowed ETH against one of our order hashes.
-                crate::base::Event::Locked { swap_id, beneficiary, amount, hashlock, timeout, .. } => {
+                crate::base::Event::Locked { beneficiary, amount, hashlock, timeout, .. } => {
                     let hh = hex::encode(hashlock);
                     let mine = self.book.orders.iter().find_map(|o| {
                         o.secrets
@@ -6673,94 +6412,47 @@ impl Service {
                             .position(|(h, _)| *h == hh)
                             .map(|i| (o.clone(), o.secrets[i].1.clone(), i))
                     });
-                    let Some((order, secret, unit_ix)) = mine else { continue };
+                    let Some((order, _secret, _unit_ix)) = mine else { continue };
                     if *beneficiary != key.address {
                         continue; // escrowed to someone else
                     }
-                    if self.swaps.by_hash_mut(&hh).is_some() {
-                        continue; // already tracking
-                    }
-                    // Only claim if the money and the clock are both right.
-                    // Claiming publishes our secret, so an underpaid lock must
-                    // never be taken — it would release that unit for less.
-                    //
-                    // The comparison is against THIS unit's price. Units are
-                    // power-of-two sized and priced proportionally, so an
-                    // order-wide average would reject every small unit.
-                    let (unit_mds, expected) = match order.unit_prices.get(unit_ix) {
-                        Some((m, w)) => (*m, w.parse::<u128>().unwrap_or(u128::MAX)),
-                        None => {
-                            // Orders published before per-unit prices were kept
-                            // locally. The announcement on-chain is
-                            // authoritative and carries the real per-unit price,
-                            // so read it from there rather than falling back to
-                            // an order-wide average — an average rejects every
-                            // unit smaller than the mean, which for a
-                            // power-of-two split is most of them.
-                            let from_chain = self
-                                .dex
-                                .asks
-                                .iter()
-                                .find(|a| hex::encode(a.announcement.group_id) == order.group_id)
-                                .and_then(|a| {
-                                    a.announcement
-                                        .units
-                                        .iter()
-                                        .find(|u| hex::encode(u.secret_hash) == hh)
-                                        .map(|u| (u.value, u.wei_amount))
-                                });
-                            match from_chain {
-                                Some((v, w)) => (v, w),
-                                None => (
-                                    0,
-                                    order.wei_amount.parse::<u128>().unwrap_or(u128::MAX)
-                                        / order.secrets.len().max(1) as u128,
-                                ),
-                            }
-                        }
-                    };
-                    if *amount < expected {
+                    // Sell orders of this kind are no longer filled. Their lock
+                    // pays whoever shows the secret, so once a claim here made
+                    // it public, anyone could beat the buyer to the MDS. Left
+                    // unclaimed, the buyer's ETH simply refunds.
+                    if self.swaps.by_hash_mut(&hh).is_none() {
                         self.ch_notice(format!(
-                            "Ignored an underpaid escrow: {} wei offered for a unit priced at \
-                             {} wei.",
-                            amount, expected
+                            "Someone paid {amount} wei toward your old sell order {}. Old sell orders can no longer \
+                             be filled safely, so their ETH is left to refund to them. Reclaim the order when it \
+                             expires at height {}, and post a new one.",
+                            &order.group_id[..8.min(order.group_id.len())],
+                            order.timeout_height
                         ));
-                        continue;
+                        self.swaps.swaps.push(Swap {
+                            id: hex::encode(&rand::random::<[u8; 8]>()),
+                            role: crate::swapbook::Role::Maker,
+                            secret_hash: hh.clone(),
+                            preimage: None,
+                            mds_value: 0,
+                            wei: amount.to_string(),
+                            group_id: order.group_id.clone(),
+                            max_claim: 0,
+                            mds_timeout_height: order.timeout_height,
+                            refund_pk: String::new(),
+                            salt: String::new(),
+                            counterparty_evm: String::new(),
+                            eth_deadline: *timeout,
+                            sweep_dest: None,
+                            covenant_hex: None,
+                            phase: Phase::Failed { reason: "old sell orders are not filled; the buyer's ETH refunds to them".into() },
+                            created: now,
+                            updated: now,
+                            sweep_retry_at: 0,
+                            sweep_attempts: 0,
+                        });
+                        self.swaps.touch();
                     }
-                    if now + swap::SETTLE_MARGIN_SECS / 2 > *timeout {
-                        self.ch_notice(
-                            "Ignored an escrow that expires too soon to claim safely.".into(),
-                        );
-                        continue;
-                    }
-
-                    self.swaps.swaps.push(Swap {
-                        id: hex::encode(&rand::random::<[u8; 8]>()),
-                        role: crate::swapbook::Role::Maker,
-                        secret_hash: hh.clone(),
-                        preimage: Some(secret.clone()),
-                        mds_value: unit_mds,
-                        wei: amount.to_string(),
-                        group_id: order.group_id.clone(),
-                        max_claim: 0,
-                        mds_timeout_height: order.timeout_height,
-                        refund_pk: String::new(),
-                        salt: String::new(),
-                        counterparty_evm: String::new(),
-                        eth_deadline: *timeout,
-                        sweep_dest: None,
-                        covenant_hex: None,
-                        phase: Phase::ClaimingEth { swap_id: hex::encode(swap_id), tx: String::new() },
-                        created: now,
-                        updated: now,
-                        sweep_retry_at: 0,
-                        sweep_attempts: 0,
-                    });
-                    self.swaps.save(&self.wallet_path);
-                    self.ch_notice(format!(
-                        "Someone escrowed {} wei for {} MDS of your order — claiming it now.",
-                        amount, unit_mds
-                    ));
+                    continue;
                 }
                 // Taker: the maker claimed, which published the preimage.
                 crate::base::Event::Claimed { swap_id, preimage, .. } => {
@@ -6950,6 +6642,17 @@ impl Service {
                     self.swaps.touch();
                     let _ = self.events.send(WalletEvent::WalletChanged);
                     self.ch_notice(format!("Swap complete — {} MDS collected.", sw.mds_value));
+                } else if tip.saturating_sub(sent_height) >= 3
+                    && self.build_sweep(&sw).is_ok_and(|(ins, _, _, _)| ins.iter().any(|i| !state.coins.contains(&i.coin_id())))
+                {
+                    // The coin is gone and our outputs never came: someone else
+                    // spent it first. Retrying cannot help; say so.
+                    if let Some(s) = self.swaps.find_mut(&sw.id) {
+                        s.phase = Phase::Failed { reason: "the MDS was taken by someone else before our claim landed".into() };
+                        s.updated = now;
+                    }
+                    self.swaps.touch();
+                    self.ch_notice(format!("A swap's {} MDS was taken by someone else before our claim landed.", sw.mds_value));
                 } else if tip.saturating_sub(sent_height) >= 3 {
                     // Still nothing after a few blocks: rebroadcast rather than
                     // wait indefinitely on a transaction that may have been
@@ -6977,6 +6680,10 @@ impl Service {
             .collect();
         for (id, swap_id) in to_refund {
             let Ok(sid) = parse_hex32(&swap_id) else { continue };
+            // A swap the watcher already recovered this way waits for its sweep.
+            if self.swaps.swaps.iter().any(|s| s.id == id && s.preimage.is_some()) {
+                continue;
+            }
             match client.refund(&key, sid).await {
                 Ok(h) => {
                     if let Some(s) = self.swaps.find_mut(&id) {
@@ -6987,6 +6694,38 @@ impl Service {
                     self.ch_notice(
                         "The seller did not claim in time — your ETH has been refunded.".into(),
                     );
+                }
+                Err(e) if format!("{e:#}").contains("settled") => {
+                    // Claimed after all, and the event never reached us (the
+                    // claim is where the secret is), or refunded by an
+                    // earlier attempt of ours. Only the swap's own events
+                    // say which, read from when the swap began; silence
+                    // proves nothing, so it is asked again later.
+                    if !self.eth.lookup_due(sid, now) {
+                        continue;
+                    }
+                    let created = self.swaps.swaps.iter().find(|s| s.id == id).map_or(now, |s| s.created);
+                    // Base makes a block every 2 seconds; a day's slack.
+                    let from = head.saturating_sub(now.saturating_sub(created) / 2 + 43_200);
+                    match client.find_settlement(sid, from, head).await {
+                        Ok(Some(crate::base::Settlement::Claimed(pre))) => {
+                            if let Some(s) = self.swaps.find_mut(&id) {
+                                s.preimage = Some(hex::encode(pre));
+                                s.phase = Phase::SweepingMds { preimage: hex::encode(pre), commitment: String::new() };
+                                s.updated = now;
+                            }
+                            self.swaps.touch();
+                            self.ch_notice("The seller did claim your ETH; collecting your MDS now.".into());
+                        }
+                        Ok(Some(crate::base::Settlement::Refunded)) => {
+                            if let Some(s) = self.swaps.find_mut(&id) {
+                                s.phase = Phase::Done { note: "the escrow was refunded".into() };
+                            }
+                            self.swaps.touch();
+                        }
+                        Ok(None) => tracing::warn!("swap {id} is settled on Base, but neither its claim nor its refund was found yet"),
+                        Err(e) => tracing::warn!("looking up how a settled swap ended: {e:#}"),
+                    }
                 }
                 Err(e) => tracing::warn!("refund failed, will retry: {e:#}"),
             }
@@ -7324,6 +7063,7 @@ impl Service {
         if let Err(e) = self.tick_swaps(status.height).await {
             tracing::warn!("swap tick: {e:#}");
         }
+        self.tick_eth(status.height).await;
         note_slow("the ETH swap tick", t);
         let tip = status.height;
         let t = Instant::now();

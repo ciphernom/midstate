@@ -94,12 +94,26 @@ impl BaseClient {
         hex_u64(&self.call("eth_blockNumber", json!([])).await?)
     }
 
+    /// The latest block: its number and its timestamp, the clock the
+    /// contract's deadlines are judged by.
+    pub async fn head(&self) -> Result<(u64, u64)> {
+        let b = self.call("eth_getBlockByNumber", json!(["latest", false])).await?;
+        let n = hex_u64(b.get("number").ok_or_else(|| anyhow!("the latest block has no number"))?)?;
+        let t = hex_u64(b.get("timestamp").ok_or_else(|| anyhow!("the latest block has no timestamp"))?)?;
+        Ok((n, t))
+    }
+
     pub async fn balance(&self, addr: &[u8; 20]) -> Result<u128> {
         hex_u128(
             &self
                 .call("eth_getBalance", json!([to_checksum_address(addr), "latest"]))
                 .await?,
         )
+    }
+
+    /// Transactions from `addr` already mined: a nonce below it is used.
+    pub async fn nonce_mined(&self, addr: &[u8; 20]) -> Result<u64> {
+        hex_u64(&self.call("eth_getTransactionCount", json!([to_checksum_address(addr), "latest"])).await?)
     }
 
     pub async fn nonce(&self, addr: &[u8; 20]) -> Result<u64> {
@@ -162,12 +176,15 @@ impl BaseClient {
     }
 
     /// Build, sign and broadcast a contract call. Returns the transaction hash.
-    pub async fn send(
-        &self,
-        key: &EvmKey,
-        value: u128,
-        data: Vec<u8>,
-    ) -> Result<[u8; 32]> {
+    pub async fn send(&self, key: &EvmKey, value: u128, data: Vec<u8>) -> Result<[u8; 32]> {
+        let t = self.sign_call(key, value, data).await?;
+        self.broadcast(&t.raw).await?;
+        Ok(t.hash)
+    }
+
+    /// Build and sign a contract call without sending it, so its hash can be
+    /// written down first: a send whose answer is lost is then still found.
+    pub async fn sign_call(&self, key: &EvmKey, value: u128, data: Vec<u8>) -> Result<Signed> {
         let onchain_id = self.chain_id().await?;
         if onchain_id != self.cfg.chain_id {
             bail!(
@@ -200,14 +217,40 @@ impl BaseClient {
             data,
         };
         let raw = tx.sign(key)?;
-        let v = self
-            .call(
-                "eth_sendRawTransaction",
-                json!([format!("0x{}", hex::encode(&raw))]),
-            )
-            .await?;
-        let h = hex_bytes(&v)?;
-        h.try_into().map_err(|_| anyhow!("node returned a malformed transaction hash"))
+        Ok(Signed { hash: keccak256(&raw), raw, nonce })
+    }
+
+    /// Sends a signed transaction. Sending one the node already holds, or
+    /// has mined, is harmless.
+    pub async fn broadcast(&self, raw: &[u8]) -> Result<()> {
+        match self.call("eth_sendRawTransaction", json!([format!("0x{}", hex::encode(raw))])).await {
+            Ok(_) => Ok(()),
+            Err(e) if format!("{e:#}").to_lowercase().contains("already known") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Replaces the unmined transaction `raw` with an empty one to ourselves
+    /// at its nonce, priced above it, so the original can never be mined.
+    pub async fn cancel(&self, key: &EvmKey, raw: &[u8]) -> Result<[u8; 32]> {
+        let (nonce, tip0, max0) = tx_fees(raw).ok_or_else(|| anyhow!("not a transaction this wallet signed"))?;
+        let (tip, max_fee) = self.fees().await?;
+        // Nodes replace a pending transaction only for more on both fees.
+        let tip = tip.max(tip0 + tip0 / 8 + 1);
+        let max_fee = max_fee.max(max0 + max0 / 8 + 1).max(tip);
+        let tx = TxRequest {
+            chain_id: self.cfg.chain_id,
+            nonce,
+            max_priority_fee: tip,
+            max_fee,
+            gas_limit: 21_000,
+            to: key.address,
+            value: 0,
+            data: Vec::new(),
+        };
+        let raw = tx.sign(key)?;
+        self.broadcast(&raw).await?;
+        Ok(keccak256(&raw))
     }
 
     /// Poll for a receipt. `None` while still pending.
@@ -234,13 +277,23 @@ impl BaseClient {
 
     /// Fetch contract logs in a height range, optionally filtered by topic0.
     pub async fn logs(&self, from: u64, to: u64, topic0: Option<[u8; 32]>) -> Result<Vec<Log>> {
+        self.logs_where(from, to, &[topic0]).await
+    }
+
+    /// Contract logs in a height range whose topics match `topics`
+    /// position by position (`None` matches anything).
+    pub async fn logs_where(&self, from: u64, to: u64, topics: &[Option<[u8; 32]>]) -> Result<Vec<Log>> {
         let mut filter = json!({
             "fromBlock": format!("0x{from:x}"),
             "toBlock": format!("0x{to:x}"),
             "address": to_checksum_address(&self.contract),
         });
-        if let Some(t) = topic0 {
-            filter["topics"] = json!([format!("0x{}", hex::encode(t))]);
+        if topics.iter().any(Option::is_some) {
+            let t: Vec<Value> = topics
+                .iter()
+                .map(|t| t.map_or(Value::Null, |t| json!(format!("0x{}", hex::encode(t)))))
+                .collect();
+            filter["topics"] = json!(t);
         }
         let v = self.call("eth_getLogs", json!([filter])).await?;
         let arr = v.as_array().ok_or_else(|| anyhow!("eth_getLogs did not return a list"))?;
@@ -257,18 +310,7 @@ impl BaseClient {
         refund_delay: u64,
         wei: u128,
     ) -> Result<[u8; 32]> {
-        if !(600..=604_800).contains(&refund_delay) {
-            bail!("the contract requires a refund delay between 10 minutes and 7 days");
-        }
-        let data = encode_call(
-            "lock(bytes32,address,uint256)",
-            &[
-                Word::Bytes32(hashlock),
-                Word::Address(beneficiary),
-                Word::U256(refund_delay as u128),
-            ],
-        );
-        self.send(key, wei, data).await
+        self.send(key, wei, lock_call(hashlock, beneficiary, refund_delay)?).await
     }
 
     pub async fn claim(&self, key: &EvmKey, swap_id: [u8; 32], preimage: [u8; 32]) -> Result<[u8; 32]> {
@@ -321,11 +363,7 @@ impl BaseClient {
         fill_window_secs: u64,
         bond: u128,
     ) -> Result<[u8; 32]> {
-        let data = encode_call(
-            "reserveBid(bytes32,uint256)",
-            &[Word::Bytes32(bid_id), Word::U256(fill_window_secs as u128)],
-        );
-        self.send(key, bond, data).await
+        self.send(key, bond, reserve_call(bid_id, fill_window_secs)).await
     }
 
     pub async fn claim_bid(&self, key: &EvmKey, bid_id: [u8; 32], preimage: [u8; 32]) -> Result<[u8; 32]> {
@@ -351,22 +389,90 @@ impl BaseClient {
     /// Same scan, but also reports how many raw logs the contract emitted.
     /// A large gap between raw and decoded means an event signature is wrong,
     /// which otherwise looks exactly like "there is no activity".
+    ///
+    /// All or nothing: an error if any part of the range could not be read.
+    /// Callers that keep a cursor should use [`BaseClient::scan`], which keeps
+    /// what it got through.
     pub async fn scan_events_counted(&self, from: u64, to: u64) -> Result<(Vec<(u64, Event)>, usize)> {
-        let mut out = Vec::new();
-        let mut raw = 0usize;
-        // Public endpoints cap the range, so walk it in chunks.
+        let part = self.scan(from, to).await;
+        if let Some(e) = part.error {
+            return Err(e);
+        }
+        Ok((part.events, part.raw))
+    }
+
+    /// Reads the contract's events from `from` to `to`, in order, in ranges
+    /// of at most [`LOG_SPAN`] blocks. A range that fails is halved and
+    /// retried, down to [`LOG_SPAN_MIN`]; one that fails even then ends the
+    /// scan there, and `reached` says how far it got. Nothing past `reached`
+    /// is in `events`, so a caller that resumes from `reached + 1` never
+    /// skips a block it could not read.
+    pub async fn scan(&self, from: u64, to: u64) -> ScanPart {
+        let mut part = ScanPart { events: Vec::new(), raw: 0, reached: from.saturating_sub(1), error: None };
         let mut cursor = from;
+        let mut span = LOG_SPAN;
         while cursor <= to {
-            let end = (cursor + 9_999).min(to);
-            for l in self.logs(cursor, end, None).await? {
-                raw += 1;
-                if let Some(e) = decode_event(&l) {
-                    out.push((l.block, e));
+            let end = cursor.saturating_add(span - 1).min(to);
+            match self.logs(cursor, end, None).await {
+                Ok(logs) => {
+                    for l in logs {
+                        part.raw += 1;
+                        if let Some(e) = decode_event(&l) {
+                            part.events.push((l.block, e));
+                        }
+                    }
+                    part.reached = end;
+                    cursor = end + 1;
+                    span = (span * 2).min(LOG_SPAN);
+                }
+                Err(_) if span > LOG_SPAN_MIN => span /= 2,
+                Err(e) => {
+                    part.error = Some(e);
+                    break;
                 }
             }
-            cursor = end + 1;
         }
-        Ok((out, raw))
+        part
+    }
+
+    /// The secret a claim of `swap_id` published, looked for from `from` to
+    /// `to`. `None` proves nothing: see [`BaseClient::find_settlement`].
+    pub async fn find_claim(&self, swap_id: [u8; 32], from: u64, to: u64) -> Result<Option<[u8; 32]>> {
+        Ok(match self.find_settlement(swap_id, from, to).await? {
+            Some(Settlement::Claimed(p)) => Some(p),
+            _ => None,
+        })
+    }
+
+    /// How `swap_id` ended, looked for from `from` to `to` by the swap's own
+    /// topic: its claim, with the secret, or its refund. For a wallet whose
+    /// call was refused as "settled" and that missed the event. `None` if
+    /// neither is in the range, which says nothing about which happened.
+    pub async fn find_settlement(&self, swap_id: [u8; 32], from: u64, to: u64) -> Result<Option<Settlement>> {
+        let topics = [None, Some(swap_id)];
+        let mut cursor = from;
+        let mut span = LOG_SPAN;
+        while cursor <= to {
+            let end = cursor.saturating_add(span - 1).min(to);
+            match self.logs_where(cursor, end, &topics).await {
+                Ok(logs) => {
+                    for l in logs {
+                        match decode_event(&l) {
+                            Some(Event::Claimed { swap_id: id, preimage, .. }) if id == swap_id => {
+                                return Ok(Some(Settlement::Claimed(preimage)));
+                            }
+                            Some(Event::Refunded { swap_id: id }) if id == swap_id => return Ok(Some(Settlement::Refunded)),
+                            _ => {}
+                        }
+                    }
+                    cursor = end + 1;
+                    span = (span * 2).min(LOG_SPAN);
+                }
+                Err(_) if span > LOG_SPAN_MIN => span /= 2,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(None)
     }
 
     /// Read a swap back from contract storage.
@@ -391,6 +497,67 @@ impl BaseClient {
             settled: word_bool(&w[5]),
         }))
     }
+
+    /// Read a bid back from contract storage: who reserved it, and until when.
+    pub async fn get_bid(&self, bid_id: [u8; 32]) -> Result<Option<BidState>> {
+        let out = self
+            .eth_call(&encode_call("bids(bytes32)", &[Word::Bytes32(bid_id)]))
+            .await?;
+        let w = words(&out);
+        if w.len() < 10 {
+            return Ok(None);
+        }
+        let amount = word_u128(&w[2]);
+        if amount == 0 {
+            return Ok(None);
+        }
+        Ok(Some(BidState {
+            maker: word_address(&w[0]),
+            filler: word_address(&w[1]),
+            amount,
+            fill_bond: word_u128(&w[3]),
+            mds_amount: word_u64(&w[4]),
+            expiry: word_u64(&w[5]),
+            fill_deadline: word_u64(&w[6]),
+            hashlock: w[7],
+            maker_mds_addr: w[8],
+            settled: word_bool(&w[9]),
+        }))
+    }
+}
+
+/// Widest block range asked of the RPC in one `eth_getLogs`. Base's
+/// documentation asks for under 2,000 blocks for reliable results; public
+/// endpoints refuse or time out on wider ones.
+pub const LOG_SPAN: u64 = 2_000;
+/// A failing range is halved down to this before a scan stops for the tick.
+pub const LOG_SPAN_MIN: u64 = 125;
+
+/// How far a [`BaseClient::scan`] got.
+pub struct ScanPart {
+    /// Events up to and including `reached`, in chain order.
+    pub events: Vec<(u64, Event)>,
+    pub raw: usize,
+    /// The last block read. Below the requested end when a range kept
+    /// failing: resume from `reached + 1`.
+    pub reached: u64,
+    pub error: Option<anyhow::Error>,
+}
+
+/// A bid as the contract holds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BidState {
+    pub maker: [u8; 20],
+    /// Zero while unreserved.
+    pub filler: [u8; 20],
+    pub amount: u128,
+    pub fill_bond: u128,
+    pub mds_amount: u64,
+    pub expiry: u64,
+    pub fill_deadline: u64,
+    pub hashlock: [u8; 32],
+    pub maker_mds_addr: [u8; 32],
+    pub settled: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -559,6 +726,72 @@ pub fn decode_event(log: &Log) -> Option<Event> {
     None
 }
 
+/// A transaction signed and not yet sent.
+#[derive(Clone, Debug)]
+pub struct Signed {
+    pub raw: Vec<u8>,
+    pub hash: [u8; 32],
+    pub nonce: u64,
+}
+
+/// How a swap on the contract ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Settlement {
+    Claimed([u8; 32]),
+    Refunded,
+}
+
+/// The call data of `lock()`.
+pub fn lock_call(hashlock: [u8; 32], beneficiary: [u8; 20], refund_delay: u64) -> Result<Vec<u8>> {
+    if !(600..=604_800).contains(&refund_delay) {
+        bail!("the contract requires a refund delay between 10 minutes and 7 days");
+    }
+    Ok(encode_call(
+        "lock(bytes32,address,uint256)",
+        &[Word::Bytes32(hashlock), Word::Address(beneficiary), Word::U256(refund_delay as u128)],
+    ))
+}
+
+/// The call data of `reserveBid()`.
+pub fn reserve_call(bid_id: [u8; 32], fill_window_secs: u64) -> Vec<u8> {
+    encode_call("reserveBid(bytes32,uint256)", &[Word::Bytes32(bid_id), Word::U256(fill_window_secs as u128)])
+}
+
+/// `(nonce, max_priority_fee, max_fee)` of a signed type-2 transaction.
+pub fn tx_fees(raw: &[u8]) -> Option<(u64, u128, u128)> {
+    // An RLP item's header: its length and its payload's.
+    fn head(b: &[u8]) -> Option<(usize, usize, bool)> {
+        let be = |n: usize| -> Option<usize> {
+            let bytes = b.get(1..1 + n)?;
+            (n <= 8).then(|| bytes.iter().fold(0usize, |a, &x| a << 8 | x as usize))
+        };
+        let p = *b.first()?;
+        Some(match p {
+            0x00..=0x7f => (0, 1, false),
+            0x80..=0xb7 => (1, (p - 0x80) as usize, false),
+            0xb8..=0xbf => ((p - 0xb6) as usize, be((p - 0xb7) as usize)?, false),
+            0xc0..=0xf7 => (1, (p - 0xc0) as usize, true),
+            0xf8..=0xff => ((p - 0xf6) as usize, be((p - 0xf7) as usize)?, true),
+        })
+    }
+    let (&ty, rest) = raw.split_first()?;
+    let (h, n, list) = head(rest)?;
+    if ty != 0x02 || !list {
+        return None;
+    }
+    let mut body = rest.get(h..h + n)?;
+    let mut ints = [0u128; 4]; // chain id, nonce, tip, max fee
+    for v in &mut ints {
+        let (h, n, list) = head(body)?;
+        if list || n > 16 {
+            return None;
+        }
+        *v = body.get(h..h + n)?.iter().fold(0u128, |a, &x| a << 8 | x as u128);
+        body = body.get(h + n..)?;
+    }
+    Some((u64::try_from(ints[1]).ok()?, ints[2], ints[3]))
+}
+
 /// Pull our own swap id out of the receipt for a `lock()` call.
 pub fn locked_swap_id(logs: &[Log]) -> Option<[u8; 32]> {
     logs.iter().find_map(|l| match decode_event(l) {
@@ -612,6 +845,18 @@ pub fn check_ordering(reveal_deadline: u64, act_deadline: u64, margin_secs: u64)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_signed_transaction_gives_back_its_nonce_and_fees() {
+        let key = EvmKey::from_secret(&[7; 32]).unwrap();
+        for (nonce, tip, max_fee, data) in [(0u64, 0u128, 1u128, vec![]), (1, 127, 128, vec![1; 3]), (300, 1_000_000, 70_000_000_000, vec![9; 600])] {
+            let tx = TxRequest { chain_id: 8453, nonce, max_priority_fee: tip, max_fee, gas_limit: 90_000, to: [3; 20], value: 5, data };
+            let raw = tx.sign(&key).unwrap();
+            assert_eq!(tx_fees(&raw), Some((nonce, tip, max_fee)));
+            assert_eq!(keccak256(&raw), tx.hash(&key).unwrap());
+        }
+        assert_eq!(tx_fees(&[0x01, 0xc0]), None);
+    }
 
     #[test]
     fn ordering_rule_is_symmetric() {

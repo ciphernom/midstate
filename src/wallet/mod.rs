@@ -164,6 +164,13 @@ pub struct WalletData {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mwb_state: Option<serde_json::Value>,
 
+    /// walletd's MDS <-> ETH trading journal, opaque here (walletd
+    /// `eth_trade::EthStore`): sell orders, and swaps with their secrets and
+    /// one-time keys. In this file so a lock and the journal entry naming it
+    /// reach the disk in one write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eth_state: Option<serde_json::Value>,
+
     // ── Pruning Licenses (Phase 1) ────────────────────────────────────────
     /// Plaintext metadata for licenses this wallet owns.
     /// Stored as Vec of (coin_id, metadata) tuples.
@@ -189,6 +196,7 @@ impl WalletData {
             evm_secret: None,
             mwb_keys: None,
             mwb_state: None,
+            eth_state: None,
             license_metadata: Vec::new(),
         }
     }

@@ -65,10 +65,13 @@ pub enum Action {
     SetHub { cfg: HubView },
     RotateIdentity,
     RequestAddress { peer: String },
-    PlaceAsk { mds_amount: u64, wei_amount: String, lifetime_blocks: u64 },
     LoadMyOrders,
     ReclaimOrder { group_id: String },
-    TakeAsk { group_id: String, unit: usize },
+    LoadEthMarket,
+    EthSell { mds: u64, wei_per_gmds: String, min: u64, life: u64 },
+    EthCancelSell { id: String },
+    EthBuy { order_id: String, mds: u64 },
+    EthFillBid { bid_id: String },
     LoadSwaps,
     PlaceBid { mds_amount: u64, wei: String, ttl_secs: u64, fill_bond: String },
     CancelBid { bid_id: String },
@@ -76,14 +79,6 @@ pub enum Action {
     LoadHubs,
     RequestChannel { peer: String, capacity: u64 },
     RepairHistory,
-    SwapQuote {
-        side: String,
-        rail: String,
-        mds_amount: u64,
-        wei_amount: String,
-        peer_mds_pk: String,
-        eth_refund_secs: u64,
-    },
     LoadEvmAccount,
     LoadOrderBook,
     SyncOrderBook,
@@ -181,11 +176,10 @@ pub enum Msg {
     IdentityRotated(String),
     AddressRequested,
     HistoryRepaired(String),
-    SwapQuote(SwapQuoteView),
-    AskPlaced(String),
+    EthMarket(EthMarketView),
+    EthDone(String),
     MyOrders(Vec<MyOrderView>),
     OrderReclaimed(String),
-    SwapStarted(String),
     Swaps(Vec<SwapView>),
     BidPlaced(String),
     BidCancelled(String),
@@ -517,19 +511,25 @@ fn perform(
             Action::RequestAddress { peer } => {
                 run!("request address", h.request_address(peer), |_| Msg::AddressRequested)
             }
-            Action::SwapQuote { side, rail, mds_amount, wei_amount, peer_mds_pk, eth_refund_secs } => {
-                run!(
-                    "swap quote",
-                    h.swap_quote(side, rail, mds_amount, wei_amount, peer_mds_pk, eth_refund_secs),
-                    Msg::SwapQuote
-                )
-            }
-            Action::PlaceAsk { mds_amount, wei_amount, lifetime_blocks } => {
-                run!("place order", h.place_ask(mds_amount, wei_amount, lifetime_blocks), Msg::AskPlaced)
-            }
             Action::LoadMyOrders => run!("my orders", h.my_orders(), Msg::MyOrders),
-            Action::TakeAsk { group_id, unit } => {
-                run!("take order", h.take_ask(group_id, unit), Msg::SwapStarted)
+            Action::LoadEthMarket => run!("ETH market", h.eth_market(), Msg::EthMarket),
+            Action::EthSell { mds, wei_per_gmds, min, life } => {
+                run!("post sell order", h.eth_sell(mds, wei_per_gmds, min, life), |_| Msg::EthDone(
+                    "Sell order posted. Buyers see it while this app is open; each sale locks only what that buyer asked for.".into()
+                ))
+            }
+            Action::EthCancelSell { id } => {
+                run!("cancel sell order", h.eth_cancel_sell(id), |_| Msg::EthDone("Sell order cancelled. Sales already under way finish.".into()))
+            }
+            Action::EthBuy { order_id, mds } => {
+                run!("buy", h.eth_buy(order_id, mds), |_| Msg::EthDone(
+                    "Asked the seller. Their wallet locks the MDS for you; yours pays only after checking it on chain.".into()
+                ))
+            }
+            Action::EthFillBid { bid_id } => {
+                run!("sell into buy order", h.eth_fill_bid(bid_id), |_| Msg::EthDone(
+                    "Reserving the buy order on Base; your MDS is locked for that buyer once the reservation is in.".into()
+                ))
             }
             Action::LoadSwaps => run!("swaps", h.swaps(), Msg::Swaps),
             Action::PlaceBid { mds_amount, wei, ttl_secs, fill_bond } => {
