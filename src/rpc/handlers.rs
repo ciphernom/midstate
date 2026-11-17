@@ -2227,6 +2227,137 @@ pub async fn get_richlist(
 
 /// `GET /richlist/:address` — one address's balance and rank, from the index.
 /// Takes the 72-character checksummed form or the raw 64.
+/// One row of an address's history, as the explorer lists it.
+#[derive(serde::Serialize)]
+pub struct HistoryRowView {
+    pub height: u64,
+    /// Position in the block, or null for the block reward.
+    pub tx: Option<u32>,
+    pub received: u64,
+    pub sent: u64,
+    pub timestamp: u64,
+}
+
+#[derive(serde::Serialize)]
+pub struct AddressHistoryResponse {
+    pub address: String,
+    /// Unspent value and coins now.
+    pub balance: u64,
+    pub coins: u64,
+    /// Transactions the address has taken part in, all told.
+    pub tx_count: u64,
+    pub rows: Vec<HistoryRowView>,
+    /// Pass back as `before` for the next page; absent on the last.
+    pub next: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct HistoryQuery {
+    /// `height:tx` of the last row already shown.
+    pub before: Option<String>,
+    pub limit: Option<usize>,
+}
+
+/// GET /address/:address/history — an address's transactions, newest first,
+/// from the opt-in index (`--rich-list`). 503 while it is off or building:
+/// the explorer then falls back to searching recent blocks.
+pub async fn get_address_history(
+    State(node): State<AppState>,
+    axum::extract::Path(address): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<HistoryQuery>,
+) -> Response {
+    let addr = match crate::core::types::parse_address_flexible(address.trim()) {
+        Ok(a) => a,
+        Err(e) => return ErrorResponse { error: e }.into_response(),
+    };
+    let meta = match balance_index::meta(node.storage.db()) {
+        Ok(m) => m,
+        Err(e) => return ErrorResponse { error: e.to_string() }.into_response(),
+    };
+    let index = index_status(&node, meta.as_ref());
+    if index.status != "ready" {
+        return json_unavailable(index);
+    }
+    let before = q.before.as_deref().and_then(|b| {
+        let (h, t) = b.split_once(':')?;
+        Some((h.parse::<u64>().ok()?, if t == "cb" { balance_index::COINBASE_TX } else { t.parse::<u32>().ok()? }))
+    });
+    let limit = q.limit.unwrap_or(25).clamp(1, 100);
+    let (rows, tx_count) = match balance_index::history(node.storage.db(), &addr, before, limit) {
+        Ok(r) => r,
+        Err(e) => return ErrorResponse { error: e.to_string() }.into_response(),
+    };
+    let (balance, coins) = match balance_index::holder(node.storage.db(), &addr, 0, |_| false) {
+        Ok(Some((h, _, _))) => (h.balance, h.coins),
+        _ => (0, 0),
+    };
+    let next = (rows.len() == limit).then(|| {
+        let r = rows.last().unwrap();
+        if r.tx == balance_index::COINBASE_TX { format!("{}:cb", r.height) } else { format!("{}:{}", r.height, r.tx) }
+    });
+    Json(AddressHistoryResponse {
+        address: crate::core::types::encode_address_with_checksum(&addr),
+        balance,
+        coins,
+        tx_count,
+        rows: rows
+            .into_iter()
+            .map(|r| HistoryRowView {
+                height: r.height,
+                tx: (r.tx != balance_index::COINBASE_TX).then_some(r.tx),
+                received: r.received,
+                sent: r.sent,
+                timestamp: r.timestamp,
+            })
+            .collect(),
+        next,
+    })
+    .into_response()
+}
+
+#[derive(serde::Serialize)]
+pub struct TxLocation {
+    pub height: u64,
+    pub tx: u32,
+}
+
+#[derive(serde::Serialize)]
+pub struct TxLookupResponse {
+    /// The block whose commit sealed it.
+    pub sealed: Option<TxLocation>,
+    /// The block where it ran.
+    pub revealed: Option<TxLocation>,
+}
+
+/// GET /tx/:id — where a transaction sits, by its id (the commitment both
+/// phases share), from the opt-in index. 404 when the index knows no such
+/// id; 503 while the index is off or building.
+pub async fn get_tx(
+    State(node): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let Some(id) = hex::decode(id.trim().trim_start_matches("0x")).ok().and_then(|b| <[u8; 32]>::try_from(b).ok()) else {
+        return ErrorResponse { error: "a transaction id is 64 hex characters".into() }.into_response();
+    };
+    let meta = match balance_index::meta(node.storage.db()) {
+        Ok(m) => m,
+        Err(e) => return ErrorResponse { error: e.to_string() }.into_response(),
+    };
+    let index = index_status(&node, meta.as_ref());
+    if index.status != "ready" {
+        return json_unavailable(index);
+    }
+    match balance_index::find_tx(node.storage.db(), &id) {
+        Ok((None, None)) => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "no transaction with that id" }))).into_response(),
+        Ok((s, r)) => Json(TxLookupResponse {
+            sealed: s.map(|(height, tx)| TxLocation { height, tx }),
+            revealed: r.map(|(height, tx)| TxLocation { height, tx }),
+        })
+        .into_response(),
+        Err(e) => ErrorResponse { error: e.to_string() }.into_response(),
+    }
+}
+
 pub async fn get_richlist_address(
     State(node): State<AppState>,
     axum::extract::Path(address): axum::extract::Path<String>,

@@ -74,8 +74,25 @@ pub const RANK: TableDefinition<&[u8; 40], ()> = TableDefinition::new("balance_r
 /// Watermark and totals. See [`Meta`].
 pub const META: TableDefinition<&str, &[u8]> = TableDefinition::new("balance_meta");
 
+/// `address ‖ height (BE) ‖ tx (BE) → received ‖ sent ‖ timestamp` (LE): one
+/// row per transaction an address took part in, newest last, so an
+/// address's history is one range read from its end. `tx` is the
+/// transaction's position in its block, `u32::MAX` for the block reward.
+pub const HIST: TableDefinition<&[u8; 44], &[u8; 24]> = TableDefinition::new("balance_history");
+
+/// `address → rows in` [`HIST`]: the address's transaction count.
+pub const HIST_COUNT: TableDefinition<&[u8; 32], u64> = TableDefinition::new("balance_history_count");
+
+/// `kind ‖ commitment → height (BE) ‖ tx (BE)`, where a transaction sits by
+/// its id: kind 0 is the commit that sealed it, 1 the reveal that ran it.
+pub const TXS: TableDefinition<&[u8; 33], &[u8; 12]> = TableDefinition::new("balance_txs");
+
+/// The block reward's place in [`HIST`].
+pub const COINBASE_TX: u32 = u32::MAX;
+
 /// Bump to force every node to rebuild on upgrade.
-const VERSION: u64 = 1;
+/// 2: address history and transaction ids.
+const VERSION: u64 = 2;
 
 /// How long one backfill transaction may hold the database's write lock. The
 /// node's own block writes wait behind it, so keep it short.
@@ -247,11 +264,97 @@ impl Meta {
 
 // ── Applying and unapplying blocks ──────────────────────────────────────────
 
-/// The three data tables, open for writing inside one transaction.
+/// The data tables, open for writing inside one transaction.
 struct Writer<'t> {
     coins: Table<'t, &'static [u8; 32], &'static [u8; 40]>,
     addrs: Table<'t, &'static [u8; 32], &'static [u8; 16]>,
     rank: Table<'t, &'static [u8; 40], ()>,
+    hist: Table<'t, &'static [u8; 44], &'static [u8; 24]>,
+    hist_count: Table<'t, &'static [u8; 32], u64>,
+    txs: Table<'t, &'static [u8; 33], &'static [u8; 12]>,
+}
+
+fn hist_key(address: &[u8; 32], height: u64, tx: u32) -> [u8; 44] {
+    let mut k = [0u8; 44];
+    k[..32].copy_from_slice(address);
+    k[32..40].copy_from_slice(&height.to_be_bytes());
+    k[40..].copy_from_slice(&tx.to_be_bytes());
+    k
+}
+
+fn pack_row(received: u64, sent: u64, timestamp: u64) -> [u8; 24] {
+    let mut v = [0u8; 24];
+    v[..8].copy_from_slice(&received.to_le_bytes());
+    v[8..16].copy_from_slice(&sent.to_le_bytes());
+    v[16..].copy_from_slice(&timestamp.to_le_bytes());
+    v
+}
+
+fn tx_key(kind: u8, commitment: &[u8; 32]) -> [u8; 33] {
+    let mut k = [0u8; 33];
+    k[0] = kind;
+    k[1..].copy_from_slice(commitment);
+    k
+}
+
+fn tx_pos(height: u64, tx: u32) -> [u8; 12] {
+    let mut v = [0u8; 12];
+    v[..8].copy_from_slice(&height.to_be_bytes());
+    v[8..].copy_from_slice(&tx.to_be_bytes());
+    v
+}
+
+/// What each transaction of a block did to each address it touched:
+/// `(tx, address, received, sent)`, in block order, the reward last.
+fn flows(batch: &Batch) -> Vec<(u32, [u8; 32], u64, u64)> {
+    let mut out: Vec<(u32, [u8; 32], u64, u64)> = Vec::new();
+    let add = |out: &mut Vec<(u32, [u8; 32], u64, u64)>, tx: u32, a: [u8; 32], r: u64, s: u64| {
+        if r == 0 && s == 0 {
+            return;
+        }
+        match out.iter_mut().rev().take_while(|f| f.0 == tx).find(|f| f.1 == a) {
+            Some(f) => {
+                f.2 = f.2.saturating_add(r);
+                f.3 = f.3.saturating_add(s);
+            }
+            None => out.push((tx, a, r, s)),
+        }
+    };
+    for (i, tx) in batch.transactions.iter().enumerate() {
+        let (inputs, outputs) = match tx {
+            Transaction::Commit { .. } => continue,
+            Transaction::Reveal { inputs, outputs, .. } | Transaction::Consolidate { inputs, outputs, .. } => (inputs, outputs),
+        };
+        for input in inputs {
+            add(&mut out, i as u32, input.predicate.address(), 0, input.value);
+        }
+        for o in outputs {
+            if let OutputData::Standard { address, value, .. } = o {
+                add(&mut out, i as u32, *address, *value, 0);
+            }
+        }
+    }
+    for cb in &batch.coinbase {
+        add(&mut out, COINBASE_TX, cb.address, cb.value, 0);
+    }
+    out
+}
+
+/// Every transaction id in a block: `(kind, commitment, tx)`.
+fn tx_ids(batch: &Batch) -> Vec<(u8, [u8; 32], u32)> {
+    batch
+        .transactions
+        .iter()
+        .enumerate()
+        .map(|(i, tx)| match tx {
+            Transaction::Commit { commitment, .. } => (0, *commitment, i as u32),
+            Transaction::Reveal { inputs, outputs, salt, .. } | Transaction::Consolidate { inputs, outputs, salt, .. } => {
+                let ins: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
+                let outs: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
+                (1, crate::core::types::compute_commitment(&ins, &outs, salt), i as u32)
+            }
+        })
+        .collect()
 }
 
 impl<'t> Writer<'t> {
@@ -260,7 +363,49 @@ impl<'t> Writer<'t> {
             coins: txn.open_table(COINS)?,
             addrs: txn.open_table(ADDRS)?,
             rank: txn.open_table(RANK)?,
+            hist: txn.open_table(HIST)?,
+            hist_count: txn.open_table(HIST_COUNT)?,
+            txs: txn.open_table(TXS)?,
         })
+    }
+
+    /// Records the block's history rows and transaction ids.
+    fn index_history(&mut self, height: u64, batch: &Batch) -> Result<()> {
+        for (tx, address, received, sent) in flows(batch) {
+            let key = hist_key(&address, height, tx);
+            let fresh = self.hist.insert(&key, &pack_row(received, sent, batch.timestamp))?.is_none();
+            if fresh {
+                let n = self.hist_count.get(&address)?.map(|g| g.value()).unwrap_or(0);
+                self.hist_count.insert(&address, n + 1)?;
+            }
+        }
+        for (kind, c, tx) in tx_ids(batch) {
+            self.txs.insert(&tx_key(kind, &c), &tx_pos(height, tx))?;
+        }
+        Ok(())
+    }
+
+    /// Exactly undoes [`Writer::index_history`] for the same block.
+    fn unindex_history(&mut self, height: u64, batch: &Batch) -> Result<()> {
+        for (tx, address, _, _) in flows(batch) {
+            if self.hist.remove(&hist_key(&address, height, tx))?.is_some() {
+                let n = self.hist_count.get(&address)?.map(|g| g.value()).unwrap_or(0);
+                if n <= 1 {
+                    self.hist_count.remove(&address)?;
+                } else {
+                    self.hist_count.insert(&address, n - 1)?;
+                }
+            }
+        }
+        for (kind, c, tx) in tx_ids(batch) {
+            // Only this block's entry: the same commitment may sit elsewhere
+            // (a commit and its reveal share it under different kinds).
+            let key = tx_key(kind, &c);
+            if self.txs.get(&key)?.is_some_and(|g| *g.value() == tx_pos(height, tx)) {
+                self.txs.remove(&key)?;
+            }
+        }
+        Ok(())
     }
 
     /// Move `address` from `before` to `after` = (balance, coins), keeping
@@ -458,6 +603,7 @@ fn rewind(txn: &WriteTransaction, m: &mut Meta, to: u64) -> Result<()> {
             return Ok(());
         };
         w.unapply(m, &old)?;
+        w.unindex_history(h, &old)?;
         m.next = h;
         // A block's prev_header_hash is its parent's extension.final_hash.
         m.tip_hash = old.prev_header_hash;
@@ -470,6 +616,9 @@ fn wipe(txn: &WriteTransaction, m: &mut Meta) -> Result<()> {
     txn.delete_table(COINS)?;
     txn.delete_table(ADDRS)?;
     txn.delete_table(RANK)?;
+    txn.delete_table(HIST)?;
+    txn.delete_table(HIST_COUNT)?;
+    txn.delete_table(TXS)?;
     Writer::open(txn)?; // recreate them empty
     *m = Meta {
         version: VERSION,
@@ -560,7 +709,9 @@ impl BalanceIndex {
             rewind(txn, &mut m, height)?;
         }
         if !m.stale && height == m.next {
-            Writer::open(txn)?.apply(&mut m, batch)?;
+            let mut w = Writer::open(txn)?;
+            w.apply(&mut m, batch)?;
+            w.index_history(height, batch)?;
             m.next = height + 1;
             m.tip_hash = batch.extension.final_hash;
             m.missing = 0;
@@ -736,6 +887,7 @@ impl BalanceIndex {
                     break;
                 };
                 w.apply(&mut m, &batch)?;
+                w.index_history(h, &batch)?;
                 m.next = h + 1;
                 m.tip_hash = batch.extension.final_hash;
                 if started.elapsed() >= STEP_BUDGET || m.next - first >= STEP_MAX_BLOCKS {
@@ -891,6 +1043,74 @@ pub fn holder(
     )))
 }
 
+// ── History and transaction ids ─────────────────────────────────────────────
+
+/// One transaction an address took part in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryRow {
+    pub height: u64,
+    /// Position in the block; [`COINBASE_TX`] for the block reward.
+    pub tx: u32,
+    pub received: u64,
+    pub sent: u64,
+    pub timestamp: u64,
+}
+
+/// An address's transactions, newest first: at most `limit` of them before
+/// `before` (height, tx), and how many it has in all. One range read from
+/// the end of the address's rows: O(log n + limit).
+pub fn history(db: &Database, address: &[u8; 32], before: Option<(u64, u32)>, limit: usize) -> Result<(Vec<HistoryRow>, u64)> {
+    let txn = db.begin_read()?;
+    let count = match txn.open_table(HIST_COUNT) {
+        Ok(t) => t.get(address)?.map(|g| g.value()).unwrap_or(0),
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok((Vec::new(), 0)),
+        Err(e) => return Err(e.into()),
+    };
+    let hist = txn.open_table(HIST)?;
+    let lo = hist_key(address, 0, 0);
+    let hi = match before {
+        Some((h, t)) => hist_key(address, h, t),
+        None => {
+            let mut k = [0xffu8; 44];
+            k[..32].copy_from_slice(address);
+            k
+        }
+    };
+    let mut rows = Vec::with_capacity(limit.min(1_000));
+    for item in hist.range::<&[u8; 44]>(&lo..&hi)?.rev().take(limit) {
+        let (k, v) = item?;
+        let (k, v) = (k.value(), v.value());
+        rows.push(HistoryRow {
+            height: u64::from_be_bytes(k[32..40].try_into().unwrap()),
+            tx: u32::from_be_bytes(k[40..].try_into().unwrap()),
+            received: u64::from_le_bytes(v[..8].try_into().unwrap()),
+            sent: u64::from_le_bytes(v[8..16].try_into().unwrap()),
+            timestamp: u64::from_le_bytes(v[16..].try_into().unwrap()),
+        });
+    }
+    // A boundary the range itself excludes: the end key for "no before" is
+    // all 0xff, which no real row reaches.
+    Ok((rows, count))
+}
+
+/// Where the transaction with this id was sealed (its commit) and where it
+/// ran (its reveal), each as (height, tx). O(1).
+pub fn find_tx(db: &Database, commitment: &[u8; 32]) -> Result<(Option<(u64, u32)>, Option<(u64, u32)>)> {
+    let txn = db.begin_read()?;
+    let t = match txn.open_table(TXS) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok((None, None)),
+        Err(e) => return Err(e.into()),
+    };
+    let at = |kind| -> Result<Option<(u64, u32)>> {
+        Ok(t.get(&tx_key(kind, commitment))?.map(|g| {
+            let v = g.value();
+            (u64::from_be_bytes(v[..8].try_into().unwrap()), u32::from_be_bytes(v[8..].try_into().unwrap()))
+        }))
+    };
+    Ok((at(0)?, at(1)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1004,6 +1224,9 @@ mod tests {
         coins: BTreeMap<[u8; 32], ([u8; 32], u64)>,
         addrs: BTreeMap<[u8; 32], (u64, u64)>,
         rank: Vec<(u64, [u8; 32])>,
+        hist: Vec<([u8; 44], [u8; 24])>,
+        hist_count: Vec<([u8; 32], u64)>,
+        txs: Vec<([u8; 33], [u8; 12])>,
         meta: Meta,
     }
 
@@ -1014,7 +1237,22 @@ mod tests {
         let rank = txn.open_table(RANK).unwrap();
         let mut meta = Meta::read(&txn.open_table(META).unwrap()).unwrap();
         meta.chain_len = 0; // a hook's view of the chain, not index content
+        let hist = txn.open_table(HIST).unwrap();
+        let hist_count = txn.open_table(HIST_COUNT).unwrap();
+        let txs = txn.open_table(TXS).unwrap();
         Dump {
+            hist: hist.iter().unwrap().map(|e| {
+                let (k, v) = e.unwrap();
+                (*k.value(), *v.value())
+            }).collect(),
+            hist_count: hist_count.iter().unwrap().map(|e| {
+                let (k, v) = e.unwrap();
+                (*k.value(), v.value())
+            }).collect(),
+            txs: txs.iter().unwrap().map(|e| {
+                let (k, v) = e.unwrap();
+                (*k.value(), *v.value())
+            }).collect(),
             coins: coins
                 .iter()
                 .unwrap()
@@ -1147,6 +1385,47 @@ mod tests {
     }
 
     // ── Tests ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn history_lists_an_addresses_transactions_newest_first() {
+        let (chain, _) = base_chain();
+        let dir = tempfile::tempdir().unwrap();
+        let (db, bs) = store(dir.path());
+        bs.balances().enable(&db, 0).unwrap();
+        save_all(&db, &bs, 0, &chain);
+
+        // Address 1: rewarded 8 at height 1, then spent it, 2 coming back.
+        let (rows, n) = history(&db, &addr(1), None, 10).unwrap();
+        assert_eq!(n, 2);
+        let got: Vec<(u64, u32, u64, u64)> = rows.iter().map(|r| (r.height, r.tx, r.received, r.sent)).collect();
+        assert_eq!(got, vec![(2, 0, 2, 8), (1, COINBASE_TX, 8, 0)]);
+        assert_eq!(rows[0].timestamp, chain[2].timestamp);
+        // Paging: the next page starts below the last row shown.
+        let (page, _) = history(&db, &addr(1), Some((2, 0)), 10).unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!((page[0].height, page[0].tx), (1, COINBASE_TX));
+        let (page, _) = history(&db, &addr(1), None, 1).unwrap();
+        assert_eq!((page[0].height, page[0].tx), (2, 0));
+        // Address 3 was only ever paid; address 2 received once.
+        assert_eq!(history(&db, &addr(3), None, 10).unwrap().1, 2);
+        assert_eq!(history(&db, &addr(2), None, 10).unwrap().0[0].received, 4);
+        assert_eq!(history(&db, &addr(8), None, 10).unwrap(), (vec![], 0));
+
+        // The reveal is found by its id.
+        let Transaction::Reveal { inputs, outputs, salt, .. } = &chain[2].transactions[0] else { panic!() };
+        let ins: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
+        let outs: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
+        let id = crate::core::types::compute_commitment(&ins, &outs, salt);
+        assert_eq!(find_tx(&db, &id).unwrap(), (None, Some((2, 0))));
+        assert_eq!(find_tx(&db, &[7; 32]).unwrap(), (None, None));
+
+        // Truncating the block takes its rows and id with it.
+        let extra = block(&chain[2].extension.final_hash, 0, vec![], &[Coin { owner: 4, value: 16, tag: 40 }]);
+        save_all(&db, &bs, 3, &[extra]);
+        bs.truncate(2).unwrap(); // deletes heights 2 and 3
+        assert_eq!(history(&db, &addr(1), None, 10).unwrap().1, 1);
+        assert_eq!(find_tx(&db, &id).unwrap(), (None, None));
+    }
 
     #[test]
     fn applies_spends_burns_and_coinbase() {

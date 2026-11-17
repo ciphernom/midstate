@@ -1,102 +1,315 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="dark">
+<html lang="en" data-theme="light">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>MIDSTATE // EXPLORER</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Midstate Explorer</title>
+<meta name="description" content="Blocks, transactions, addresses and .mds names on the Midstate chain.">
 <script>
-(function(){try{var t=localStorage.getItem('midstate-theme');if(t)document.documentElement.setAttribute('data-theme',t);}catch(e){}})();
-function toggleTheme(){var d=document.documentElement,n=d.getAttribute('data-theme')==='light'?'dark':'light';d.setAttribute('data-theme',n);try{localStorage.setItem('midstate-theme',n);}catch(e){}}
+(function(){try{var t=localStorage.getItem('midstate-theme');if(!t&&window.matchMedia&&matchMedia('(prefers-color-scheme: dark)').matches)t='dark';if(t)document.documentElement.setAttribute('data-theme',t);}catch(e){}})();
+function toggleTheme(){var d=document.documentElement,n=d.getAttribute('data-theme')==='dark'?'light':'dark';d.setAttribute('data-theme',n);try{localStorage.setItem('midstate-theme',n);}catch(e){}}
 </script>
-<link rel="stylesheet" href="/midstate.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+:root, [data-theme="light"] {
+  --bg: #f5f5f4; --card: #ffffff; --raised: #fafaf9; --line: #e4e4e2; --line2: #efefed;
+  --ink: #111111; --text: #2b2b2b; --muted: #6b6b6b; --faint: #a3a3a3;
+  --link: #111111; --hover: #f0f0ee; --code: #f4f4f2;
+  --in: #0f7b45; --in-bg: #e5f4ec; --out: #a15c07; --out-bg: #fbf0df;
+  --rew: #5b4bb7; --rew-bg: #eeebfa; --seal: #2f5f9e; --seal-bg: #e7eef8; --bad: #b42318; --bad-bg: #fdecea;
+  --shadow: 0 1px 0 rgba(0,0,0,.02);
+}
+[data-theme="dark"] {
+  --bg: #0a0a0a; --card: #121212; --raised: #161616; --line: #262626; --line2: #1d1d1d;
+  --ink: #f5f5f5; --text: #d4d4d4; --muted: #9a9a9a; --faint: #5f5f5f;
+  --link: #f5f5f5; --hover: #1b1b1b; --code: #181818;
+  --in: #5fd39a; --in-bg: #0f2a1c; --out: #f0b35b; --out-bg: #2c1f0b;
+  --rew: #b3a6ff; --rew-bg: #211c3a; --seal: #8db5ec; --seal-bg: #122033; --bad: #ff8a80; --bad-bg: #2d1210;
+  --shadow: none;
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-underline-offset: 2px; }
+.mono, .hash, code, .num { font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace; }
+.wrap { max-width: 1240px; margin: 0 auto; padding: 0 16px; }
+button { font: inherit; color: inherit; }
+.dim { color: var(--muted); }
+.faint { color: var(--faint); }
+
+/* ── Header ── */
+.top { background: var(--card); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 20; }
+.top-row { display: flex; align-items: center; gap: 18px; height: 56px; }
+.brand { display: flex; align-items: center; gap: 9px; font-weight: 700; letter-spacing: .02em; color: var(--ink); white-space: nowrap; }
+.brand:hover { text-decoration: none; }
+.brand .mark { width: 22px; height: 22px; border: 2px solid var(--ink); display: grid; place-items: center; font-size: 11px; }
+.brand small { font-weight: 500; color: var(--muted); letter-spacing: 0; }
+.nav { display: flex; gap: 2px; margin-left: 8px; }
+.nav a { padding: 7px 11px; color: var(--muted); font-weight: 500; }
+.nav a:hover { color: var(--ink); text-decoration: none; background: var(--hover); }
+.nav a.on { color: var(--ink); box-shadow: inset 0 -2px 0 var(--ink); }
+.tools { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+.live { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--muted); white-space: nowrap; }
+.live i { width: 7px; height: 7px; border-radius: 50%; background: var(--in); box-shadow: 0 0 0 3px var(--in-bg); }
+.live.off i { background: var(--bad); box-shadow: 0 0 0 3px var(--bad-bg); }
+.icon-btn { background: none; border: 1px solid var(--line); width: 34px; height: 34px; display: grid; place-items: center; cursor: pointer; color: var(--text); }
+.icon-btn:hover { background: var(--hover); }
+.icon-btn svg { width: 16px; height: 16px; }
+.menu-btn { display: none; }
+.search-row { padding: 10px 16px 12px; }
+.search { display: flex; border: 1px solid var(--line); background: var(--card); }
+.search:focus-within { border-color: var(--ink); }
+.search input { flex: 1; min-width: 0; border: 0; background: transparent; color: var(--ink); padding: 11px 12px; font: 14px 'Inter', system-ui, sans-serif; outline: none; }
+.search button { border: 0; border-left: 1px solid var(--line); background: var(--ink); color: var(--card); padding: 0 16px; cursor: pointer; font-weight: 600; display: flex; align-items: center; gap: 6px; }
+.search button svg { width: 15px; height: 15px; }
+@media (max-width: 640px) { .search button .lbl { display: none; } }
+
+/* ── Layout ── */
+main { padding-top: 18px; padding-bottom: 40px; min-height: 60vh; }
+.page-h { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin: 4px 0 14px; }
+.page-h h1 { font-size: 20px; margin: 0; color: var(--ink); font-weight: 600; letter-spacing: -.01em; }
+.page-h .sub { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+.card { background: var(--card); border: 1px solid var(--line); box-shadow: var(--shadow); margin-bottom: 16px; min-width: 0; }
+.card-h { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.card-h h2 { font-size: 14px; margin: 0; color: var(--ink); font-weight: 600; }
+.card-h .more { margin-left: auto; font-size: 13px; }
+.card-b { padding: 4px 16px 12px; }
+.card-b.pad { padding: 14px 16px; }
+.card-f { padding: 10px 16px; border-top: 1px solid var(--line); text-align: center; font-size: 13px; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.grid2 > .card { margin-bottom: 0; }
+.stack > * + * { margin-top: 16px; }
+
+/* ── Stats ── */
+.stats { display: grid; grid-template-columns: repeat(4, 1fr); border: 1px solid var(--line); background: var(--card); margin-bottom: 16px; }
+.stat { padding: 14px 16px; border-right: 1px solid var(--line2); border-bottom: 1px solid var(--line2); min-width: 0; }
+.stat:nth-child(4n) { border-right: 0; }
+.stat .k { font-size: 11.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; display: flex; align-items: center; gap: 6px; }
+.stat .v { font-size: 18px; color: var(--ink); font-weight: 600; margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.stat .s { font-size: 12px; color: var(--muted); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.stat a.v { display: block; }
+
+/* ── Key/value overview ── */
+.kv { display: block; }
+.kv-row { display: grid; grid-template-columns: 230px minmax(0, 1fr); gap: 16px; padding: 11px 0; border-bottom: 1px solid var(--line2); align-items: start; }
+.kv-row:last-child { border-bottom: 0; }
+.kv-k { color: var(--muted); display: flex; align-items: center; gap: 6px; }
+.kv-v { color: var(--text); min-width: 0; overflow-wrap: anywhere; }
+.kv-v .big { font-size: 16px; color: var(--ink); font-weight: 600; }
+.sep { height: 0; border-top: 1px solid var(--line); margin: 4px 0; }
+
+/* ── Tables ── */
+.tbl { width: 100%; border-collapse: collapse; }
+.tbl th { text-align: left; font-size: 11.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-weight: 600; padding: 10px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.tbl td { padding: 11px 10px; border-bottom: 1px solid var(--line2); vertical-align: middle; }
+.tbl tr:last-child td { border-bottom: 0; }
+.tbl tbody tr:hover td { background: var(--hover); }
+.tbl .r { text-align: right; }
+.tbl td.wrap { overflow-wrap: anywhere; }
+
+/* ── Lists (latest blocks / transactions) ── */
+.li { display: grid; grid-template-columns: 44px minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 12px 0; border-bottom: 1px solid var(--line2); }
+.li:last-child { border-bottom: 0; }
+.li .ico { width: 44px; height: 44px; border: 1px solid var(--line); display: grid; place-items: center; color: var(--muted); background: var(--raised); }
+.li .ico svg { width: 18px; height: 18px; }
+.li .t1 { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.li .t2 { font-size: 12.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.li .end { text-align: right; white-space: nowrap; }
+
+/* ── Bits ── */
+.hash { font-size: 13px; }
+.copy { background: none; border: 0; cursor: pointer; color: var(--faint); padding: 2px 4px; vertical-align: middle; }
+.copy:hover { color: var(--ink); }
+.copy svg { width: 14px; height: 14px; }
+.badge { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; padding: 2px 7px; border: 1px solid var(--line); color: var(--muted); background: var(--raised); white-space: nowrap; }
+.badge.in { color: var(--in); background: var(--in-bg); border-color: transparent; }
+.badge.out { color: var(--out); background: var(--out-bg); border-color: transparent; }
+.badge.rew { color: var(--rew); background: var(--rew-bg); border-color: transparent; }
+.badge.seal { color: var(--seal); background: var(--seal-bg); border-color: transparent; }
+.badge.ok { color: var(--in); background: var(--in-bg); border-color: transparent; }
+.badge.bad { color: var(--bad); background: var(--bad-bg); border-color: transparent; }
+.badge svg { width: 12px; height: 12px; }
+.amt b { font-weight: 600; color: var(--ink); }
+.amt i { font-style: normal; color: var(--muted); margin-left: 3px; font-size: .9em; }
+.ic { width: 1em; height: 1em; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: square; vertical-align: -0.12em; }
+.idc { vertical-align: middle; margin-right: 6px; flex: 0 0 auto; }
+.idc .idc-bg { fill: var(--raised); }
+.idc g, .idc rect:not(.idc-bg) { fill: hsl(var(--h), 55%, 45%); }
+[data-theme="dark"] .idc g, [data-theme="dark"] .idc rect:not(.idc-bg) { fill: hsl(var(--h), 60%, 62%); }
+.idc-none { display: inline-block; vertical-align: middle; margin-right: 6px; background: var(--raised); border: 1px solid var(--line); }
+.who { display: inline-flex; align-items: center; min-width: 0; max-width: 100%; }
+.who a { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.arrow { color: var(--faint); margin: 0 6px; }
+.help { display: inline-grid; place-items: center; width: 15px; height: 15px; border: 1px solid var(--line); color: var(--faint); font-size: 10px; cursor: help; position: relative; flex: 0 0 auto; }
+.help:hover, .help:focus { color: var(--ink); border-color: var(--ink); outline: none; }
+.help:hover::after, .help:focus::after { content: attr(data-tip); position: absolute; left: 50%; bottom: calc(100% + 8px); transform: translateX(-50%); width: max-content; max-width: 280px; background: var(--ink); color: var(--card); font-size: 12px; line-height: 1.45; padding: 8px 10px; z-index: 30; white-space: normal; text-transform: none; letter-spacing: 0; font-weight: 400; }
+.btn { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line); background: var(--card); padding: 7px 12px; cursor: pointer; color: var(--ink); font-size: 13px; font-weight: 500; }
+.btn:hover { background: var(--hover); text-decoration: none; }
+.btn[disabled] { opacity: .5; cursor: default; }
+.btn.primary { background: var(--ink); color: var(--card); border-color: var(--ink); }
+.pager { display: flex; gap: 8px; align-items: center; justify-content: flex-end; padding: 10px 16px; border-top: 1px solid var(--line); font-size: 13px; color: var(--muted); }
+.tabs { display: flex; gap: 0; border-bottom: 1px solid var(--line); padding: 0 8px; overflow-x: auto; }
+.tabs a { padding: 11px 12px; color: var(--muted); font-weight: 500; white-space: nowrap; cursor: pointer; }
+.tabs a.on { color: var(--ink); box-shadow: inset 0 -2px 0 var(--ink); }
+.tabs a:hover { text-decoration: none; color: var(--ink); }
+.note { border: 1px solid var(--line); background: var(--raised); padding: 12px 14px; color: var(--text); font-size: 13px; margin: 10px 0; }
+.note b { color: var(--ink); }
+.empty { padding: 26px 0; text-align: center; color: var(--muted); }
+.loading { padding: 40px 0; text-align: center; color: var(--muted); }
+.spin { display: inline-block; width: 16px; height: 16px; border: 2px solid var(--line); border-top-color: var(--ink); border-radius: 50%; animation: sp .8s linear infinite; vertical-align: -3px; margin-right: 8px; }
+@keyframes sp { to { transform: rotate(360deg); } }
+.pow { height: 3px; background: var(--line); margin: 10px auto 0; max-width: 240px; overflow: hidden; }
+.pow i { display: block; height: 100%; width: 0; background: var(--ink); transition: width .2s; }
+.flow { display: grid; grid-template-columns: minmax(0, 1fr) 28px minmax(0, 1fr); gap: 10px; align-items: start; }
+.flow .side h3 { font-size: 11.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 8px; font-weight: 600; }
+.flow .mid { display: grid; place-items: center; color: var(--faint); padding-top: 30px; }
+.coinrow { display: flex; align-items: center; gap: 10px; padding: 9px 10px; border: 1px solid var(--line2); background: var(--raised); margin-bottom: 6px; min-width: 0; }
+.coinrow .who { flex: 1; min-width: 0; }
+.coinrow .amt { white-space: nowrap; }
+.coinrow .st { font-size: 11px; }
+details.more-d { border-top: 1px solid var(--line2); }
+details.more-d > summary { cursor: pointer; padding: 11px 0; color: var(--muted); list-style: none; }
+details.more-d > summary::-webkit-details-marker { display: none; }
+details.more-d > summary::before { content: '+ '; }
+details.more-d[open] > summary::before { content: '− '; }
+.script-header { font-size: 11px; color: var(--muted); margin: 8px 0 4px; letter-spacing: .05em; }
+.script-disasm { font: 12px/1.6 'JetBrains Mono', ui-monospace, monospace; background: var(--code); border: 1px solid var(--line2); padding: 10px; overflow-x: auto; white-space: pre; }
+.learn h3 { color: var(--ink); font-size: 15px; margin: 18px 0 6px; }
+.learn p { margin: 6px 0; }
+.hero { padding: 6px 0 14px; }
+.hero h1 { font-size: 22px; margin: 0 0 4px; color: var(--ink); letter-spacing: -.01em; }
+.hero p { margin: 0; color: var(--muted); }
+.callout { display: flex; gap: 14px; align-items: flex-start; }
+.callout .mark { width: 32px; height: 32px; border: 1px solid var(--line); display: grid; place-items: center; flex: 0 0 auto; }
+/* Links inside sentences look like links. */
+.callout a, .note a, .foot a, .learn a, .empty a, .card-b.pad p a, .kv-v a.lnk { text-decoration: underline; text-decoration-color: var(--faint); text-underline-offset: 3px; }
+.callout a:hover, .note a:hover, .foot a:hover, .learn a:hover { text-decoration-color: var(--ink); }
+.addr-full { font-size: 14px; overflow-wrap: anywhere; word-break: break-all; }
+.only-narrow { display: none; }
+.grp { border: 1px solid var(--line2); background: var(--raised); margin-bottom: 6px; }
+.grp > summary, .grp > .grp-row { display: flex; align-items: center; gap: 10px; padding: 9px 10px; min-width: 0; cursor: pointer; list-style: none; }
+.grp > .grp-row { cursor: default; }
+.grp > summary::-webkit-details-marker { display: none; }
+.grp > summary .who, .grp > .grp-row .who { flex: 1; min-width: 0; }
+.grp .n { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.grp .amt { white-space: nowrap; }
+.grp .chev { color: var(--faint); transition: transform .15s; }
+.grp[open] .chev { transform: rotate(90deg); }
+.grp .coins { padding: 0 10px 8px 34px; }
+.grp .coin { display: flex; justify-content: space-between; gap: 10px; padding: 4px 0; border-top: 1px dashed var(--line2); font-size: 13px; }
+.grp .coin:first-child { border-top: 0; }
+.li.h { grid-template-columns: 54px minmax(0, 1fr) auto; }
+.dir { width: 54px; height: 30px; display: grid; place-items: center; font-size: 10px; font-weight: 700; letter-spacing: .03em; }
+.dir.in { color: var(--in); background: var(--in-bg); } .dir.out { color: var(--out); background: var(--out-bg); }
+.dir.rew { color: var(--rew); background: var(--rew-bg); } .dir.self { color: var(--muted); background: var(--raised); border: 1px solid var(--line); }
+.pos { color: var(--in); } .neg { color: var(--out); }
+.foot { color: var(--faint); font-size: 12px; padding: 18px 16px 30px; border-top: 1px solid var(--line); display: flex; gap: 14px; flex-wrap: wrap; }
+#toast { position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%); background: var(--ink); color: var(--card); padding: 9px 14px; font-size: 13px; opacity: 0; pointer-events: none; transition: opacity .2s; max-width: calc(100vw - 32px); z-index: 40; }
+#toast.on { opacity: 1; }
+
+/* ── Narrow screens (an iPhone SE is 375 points wide) ── */
+@media (max-width: 1000px) {
+  .grid2 { grid-template-columns: 1fr; }
+  .stats { grid-template-columns: repeat(2, 1fr); }
+  .stat:nth-child(4n) { border-right: 1px solid var(--line2); }
+  .stat:nth-child(2n) { border-right: 0; }
+}
+@media (max-width: 860px) {
+  .nav { display: none; position: absolute; top: 56px; left: 0; right: 0; background: var(--card); border-bottom: 1px solid var(--line); flex-direction: column; padding: 6px 8px 10px; margin: 0; }
+  .nav.open { display: flex; }
+  .nav a { padding: 11px 10px; }
+  .nav a.on { box-shadow: inset 2px 0 0 var(--ink); }
+  .menu-btn { display: grid; }
+}
+@media (max-width: 640px) {
+  .wrap { padding: 0 12px; }
+  .search-row { padding: 8px 12px 10px; }
+  .top-row { gap: 10px; }
+  .brand small { display: none; }
+  .live .lbl { display: none; }
+  main { padding-top: 12px; }
+  .kv-row { grid-template-columns: 1fr; gap: 3px; padding: 10px 0; }
+  .kv-k { font-size: 12.5px; }
+  .card-h { padding: 11px 12px; }
+  .card-b { padding: 2px 12px 10px; }
+  .card-b.pad { padding: 12px; }
+  .stat { padding: 11px 12px; }
+  .stat .v { font-size: 16px; }
+  .flow { grid-template-columns: 1fr; }
+  .flow .mid { padding: 0; transform: rotate(90deg); height: 18px; }
+  /* Tables become one card per row, each cell labelled. */
+  .tbl thead { display: none; }
+  .tbl, .tbl tbody, .tbl tr, .tbl td { display: block; width: 100%; }
+  .tbl tr { padding: 10px 0; border-bottom: 1px solid var(--line2); }
+  .tbl tr:last-child { border-bottom: 0; }
+  .tbl tbody tr:hover td { background: none; }
+  .tbl td { border: 0; padding: 3px 0; display: flex; justify-content: space-between; gap: 12px; text-align: right; min-width: 0; }
+  .tbl td::before { content: attr(data-l); color: var(--muted); font-size: 12px; text-align: left; flex: 0 0 auto; padding-top: 1px; }
+  .tbl td.r { text-align: right; }
+  .tbl td > * { min-width: 0; }
+  .tbl td .who { justify-content: flex-end; }
+  .li { grid-template-columns: 36px minmax(0, 1fr) auto; gap: 10px; }
+  .li .ico { width: 36px; height: 36px; }
+  .help:hover::after, .help:focus::after { left: auto; right: -8px; transform: none; max-width: 240px; }
+  .stat .s { white-space: normal; }
+  .li .t2 { white-space: normal; }
+  .li .t2 .nw { white-space: nowrap; display: inline-flex; align-items: center; max-width: 100%; }
+  .only-wide { display: none; }
+  .li.h { grid-template-columns: 50px minmax(0, 1fr) auto; }
+  .dir { width: 50px; font-size: 9.5px; }
+  /* A coin group: who and how much on the first line, its badges below. */
+  .grp > summary, .grp > .grp-row { flex-wrap: wrap; row-gap: 5px; }
+  .grp > summary .who, .grp > .grp-row .who { flex: 1 1 55%; }
+  .grp .amt, .grp .chev, .grp .copy { order: 2; }
+  .grp .badge, .grp .st, .grp .n { order: 3; }
+  .grp .st:empty { display: none; }
+  .grp .coins { padding-left: 12px; }
+  .only-narrow { display: block; }
+  .page-h h1 { font-size: 18px; }
+}
+</style>
 </head>
-<body class="page-explorer">
-
-<div class="hdr">
-    <div class="hdr-left">
-        <h1><a class="home-link" onclick="goHome()" title="Latest block">MIDSTATE<span style="color:var(--accent);">.</span>EXPLORER</a></h1>
-        <div class="explorer-tabs" id="tabs">
-            <a class="tab-link active" data-tab="explorer" onclick="switchTab('explorer')">BLOCKS</a>
-            <a class="tab-link" data-tab="mempool" onclick="switchTab('mempool')">MEMPOOL</a>
-            <a class="tab-link" data-tab="analytics" onclick="switchTab('analytics')">ANALYTICS</a>
-            <a class="tab-link" data-tab="supply" onclick="switchTab('supply')">SUPPLY</a>
-        </div>
+<body>
+<header class="top">
+  <div class="wrap top-row">
+    <a class="brand" href="?" title="Home"><span class="mark">M</span>MIDSTATE <small>Explorer</small></a>
+    <nav class="nav" id="nav">
+      <a href="?" data-page="home">Home</a>
+      <a href="?q=blocks" data-page="blocks">Blocks</a>
+      <a href="?q=transactions" data-page="txs">Transactions</a>
+      <a href="?q=mempool" data-page="mempool">Pending</a>
+      <a href="?q=supply" data-page="supply">Supply</a>
+      <a href="?q=learn" data-page="learn">New to Midstate?</a>
+    </nav>
+    <div class="tools">
+      <a class="live off" id="live" href="?" title="Latest block"><i></i><span class="lbl">Block</span><span id="live-h" class="mono">—</span></a>
+      <button class="icon-btn" onclick="toggleTheme()" title="Light or dark" aria-label="Toggle theme"><svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2.5M12 19.5V22M2 12h2.5M19.5 12H22M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M4.9 19.1l1.8-1.8M17.3 6.7l1.8-1.8"/></svg></button>
+      <button class="icon-btn menu-btn" onclick="toggleMenu()" aria-label="Menu"><svg class="ic" viewBox="0 0 24 24"><path d="M3 6h18M3 12h18M3 18h18"/></svg></button>
     </div>
-    <div class="hdr-center">
-        <div class="search-bar">
-            <span id="ic-search"></span>
-            <input type="text" id="top-search" placeholder="block, address, name.mds, coin id…" spellcheck="false" autocomplete="off" onkeydown="if(event.key === 'Enter') handleTopSearch()">
-            <button class="btn" onclick="handleTopSearch()" title="Search">⏎</button>
-        </div>
-    </div>
-    <div class="hdr-right">
-        <a class="live-stat" onclick="goHome()" title="Latest block"><span class="live-dot" id="live-dot"></span><span id="ic-height"></span><span class="val" id="h-height">-</span></a>
-        <a class="live-stat" onclick="switchTab('mempool')" title="Waiting for the next block"><span id="ic-mempool"></span><span class="val" id="h-mempool">-</span></a>
-        <span class="live-stat" title="New coins per block"><span id="ic-reward"></span><span class="val" id="h-reward">-</span></span>
-        <button id="theme-toggle" class="btn theme-toggle" onclick="toggleTheme()" title="Toggle light / dark" aria-label="Toggle theme"><svg class="icon-sun" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg><svg class="icon-moon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg></button>
-    </div>
-</div>
-
-<div class="layout">
-    <div class="sidebar">
-        <div class="sidebar-section">
-            <div class="title">Network</div>
-            <div class="metric" title="Coins that exist right now (unspent)"><span class="k" data-ic="coin">coins</span><span class="v" id="s-coins">-</span></div>
-            <div class="metric" title="Circulating supply"><span class="k" data-ic="layers">supply</span><a class="v" id="s-supply" onclick="switchTab('supply')">-</a></div>
-            <div class="metric" title="Sealed, waiting to be revealed"><span class="k" data-ic="lock">sealed</span><span class="v" id="s-commits">-</span></div>
-            <div class="metric" title="Confirmations until a block is final"><span class="k" data-ic="check">final at</span><span class="v" id="s-safe">-</span></div>
-            <div class="metric" title="Connected peers"><span class="k" data-ic="peers">peers</span><span class="v" id="s-peers">-</span></div>
-        </div>
-        <div class="sidebar-section" style="padding-bottom:4px;">
-            <div class="title">Blocks</div>
-        </div>
-        <div class="batch-list" id="batch-list"></div>
-    </div>
-
-    <div class="main-panel" id="main-view"></div>
-</div>
-
-<div class="terminal collapsed" id="terminal">
-    <div class="term-bar" onclick="toggleTerminal()" title="Activity log"><span class="term-last" id="term-last"></span><span id="term-caret">▴</span></div>
-    <div class="term-log" id="term-log"></div>
-    <div class="term-input-row">
-        <span class="prompt">▸</span>
-        <input type="text" id="cmd-input" placeholder="height, address, name.mds, coin id, commitment, mempool, decompile <hex>" autocomplete="off" spellcheck="false">
-    </div>
-</div>
-
+  </div>
+  <div class="wrap search-row">
+    <form class="search" onsubmit="return submitSearch(event)" role="search">
+      <input id="q" type="search" placeholder="Search by address, transaction id, block, coin id or name.mds" spellcheck="false" autocomplete="off" autocapitalize="off" enterkeyhint="search" aria-label="Search">
+      <button type="submit" aria-label="Search"><svg class="ic" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-5-5"/></svg><span class="lbl">Search</span></button>
+    </form>
+  </div>
+</header>
+<main class="wrap" id="view"><div class="loading"><span class="spin"></span>Connecting to the node…</div></main>
+<footer class="wrap foot">
+  <span>Served by this Midstate node. Everything here is read from its copy of the chain.</span>
+  <a href="?q=learn">How Midstate differs from Ethereum and Solana</a>
+  <a href="?q=api">API</a>
+</footer>
+<div id="toast" role="status"></div>
 <script>
 let tipHeight = 0;
-let activeBatch = null;      // the block the sidebar highlights
-let activeAddress = null;
-let activeQuery = null;      // the hash searched for; outlined wherever it appears
-let currentFocus = null;     // a coin to outline in a single-transaction view
-
-// blockCache stores {txCount, cbCount} keyed by height, populated when blocks are loaded
-const blockCache = {};
-
-let currentTab = 'explorer';
-let lastMempoolData = null;
 let lastState = null;
-// Mempool cards the user has opened (or fully unfolded), keyed by first
-// input coin id so the state survives the 3s poll re-render.
-const mpExpanded = new Set();
-const mpUnfolded = new Set();
-// One-shot flag: scroll the mempool view to the search match on next render.
-let mpScrollPending = false;
-// What the main panel shows: 'block' | 'tx' | 'coin' | 'address' | 'mempool' |
-// 'analytics' | 'supply' | 'search' | 'message'. Guards the mempool renderer's
-// skip-identical logic against stale snapshots.
-let mainViewContent = 'welcome';
-let lastMempoolHtml = '';
-let lastBatchListHtml = '';
 // Bumped on every navigation. A view that awaits (a block fetch, a proof of
-// work) checks it afterwards and gives up if the user has moved on, so a slow
-// answer can never paint over the page they are now looking at.
+// work) checks it afterwards and gives up if the reader has moved on.
 let routeSeq = 0;
-
 const $ = id => document.getElementById(id);
-const mainView = () => $('main-view');
 const sum = a => a.reduce((s, x) => s + (Number(x) || 0), 0);
 const nowSecs = () => Math.floor(Date.now() / 1000);
 
@@ -686,27 +899,6 @@ function escHtml(s) {
     return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
-const LOG_COLORS = { e: 'var(--c-used)', w: 'var(--c-fee)', i: 'var(--text-muted)', s: 'var(--c-new)' };
-function log(msg, color) {
-    const el = document.createElement('div');
-    el.className = 'term-line';
-    el.style.color = LOG_COLORS[color] || color || 'var(--text-muted)';
-    const ts = new Date().toLocaleTimeString('en-US',{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'});
-    el.textContent = `[${ts}] ${msg}`;
-    const box = $('term-log');
-    box.appendChild(el);
-    box.scrollTop = box.scrollHeight;
-    const last = $('term-last');
-    if (last) last.textContent = msg;
-}
-
-function toggleTerminal() {
-    const t = $('terminal');
-    const closed = t.classList.toggle('collapsed');
-    $('term-caret').textContent = closed ? '▴' : '▾';
-    if (!closed) { const box = $('term-log'); box.scrollTop = box.scrollHeight; $('cmd-input').focus(); }
-}
-
 function copyToClipboard(text, btnEl) {
     if (!text) return;
     const done = () => {
@@ -1001,392 +1193,6 @@ function identicon(addrHex, size) {
     return svg;
 }
 
-function addrChip(addrHex) {
-    if (!addrHex) return `<span class="addr" title="Address not reported by this node">${identicon(null)}<span class="dim">?</span></span>`;
-    const full = checksummed(addrHex);
-    const q = activeQuery === addrHex ? ' is-q' : '';
-    return `<a class="addr${q}" onclick="event.stopPropagation(); go('${full}')" title="${full}">${identicon(addrHex)}<span>${full.slice(0, 6)}…${full.slice(-4)}</span></a>`;
-}
-
-// ── Coins ───────────────────────────────────────────────────────────────
-// A coin is drawn as what it is: one round token with a face value. Filled
-// green while it exists, hollow red once spent; a bigger coin has a bigger dot.
-const coinStatus = new Map();   // coin id -> 'alive' | 'spent'
-
-function dotSize(v) { return v > 0 ? (5 + Math.min(1, Math.log2(v) / 40) * 5).toFixed(1) : '5'; }
-
-function coinTitle(c, side, st) {
-    const what = side === 'in' ? 'spent here' : { alive: 'unspent', spent: 'spent later', pending: 'pending' }[st] || '';
-    return (c.value != null ? Number(c.value).toLocaleString('en') + ' MDS' : 'coin') + (what ? ' · ' + what : '');
-}
-
-function coinTok(c, side, ctx) {
-    ctx = ctx || {};
-    if (c.kind === 'state') {
-        const nav = c.coinId && !ctx.pending ? `onclick="event.stopPropagation(); go('${c.coinId}')"` : '';
-        return `<a class="coin state" ${nav} title="State thread: data, no value">${ic('diamond')}</a>`;
-    }
-    const st = side === 'in' ? 'spent' : ctx.pending ? 'pending' : (coinStatus.get(c.coinId) || 'unknown');
-    const [n, u] = c.value == null ? ['?', ''] : unitParts(c.value);
-    const focus = c.coinId && (c.coinId === activeQuery || c.coinId === ctx.focus) ? ' focus' : '';
-    const nav = c.coinId && st !== 'pending' ? `onclick="event.stopPropagation(); go('${c.coinId}')"` : '';
-    return `<a class="coin ${side} st-${st}${focus}" data-coin="${c.coinId || ''}" ${nav} title="${coinTitle(c, side, st)}"><i class="dot" style="--d:${dotSize(c.value)}px"></i><b>${n}</b><small>${u}</small></a>`;
-}
-
-/** Biggest coin first. Up to twelve coins as tokens; beyond that repeated
- *  face values collapse into one stack each (×N), so a merge of a thousand
- *  coins still fits on a line. */
-function coinsHtml(coins, side, ctx) {
-    const byValue = (a, b) => (b.value ?? -1) - (a.value ?? -1);
-    coins = coins.slice().sort(byValue);
-    if (coins.length <= 12) return `<span class="frow-coins">${coins.map(c => coinTok(c, side, ctx)).join('')}</span>`;
-    const q = c => c.coinId && (c.coinId === activeQuery || c.coinId === ctx.focus);
-    const by = new Map();
-    for (const c of coins) {
-        const k = q(c) ? 'q' + c.coinId : c.kind === 'state' ? -1 : (c.value ?? -2);
-        if (!by.has(k)) by.set(k, []);
-        by.get(k).push(c);
-    }
-    const parts = [...by.entries()].map(([k, cs]) => {
-        if (cs.length === 1) return coinTok(cs[0], side, ctx);
-        if (k === -1) return `<span class="coin state stack" title="${cs.length} state threads">${ic('diamond')}<em>×${cs.length}</em></span>`;
-        const [n, u] = k < 0 ? ['?', ''] : unitParts(k);
-        return `<span class="coin stack" title="${cs.length} coins of ${k < 0 ? '?' : k.toLocaleString('en') + ' MDS'}"><i class="dot" style="--d:${dotSize(k)}px"></i><b>${n}</b><small>${u}</small><em>×${cs.length}</em></span>`;
-    });
-    return `<span class="frow-coins">${parts.join('')}</span>`;
-}
-
-async function checkCoins(ids) {
-    const todo = [...new Set(ids)].filter(id => id && !coinStatus.has(id));
-    for (let i = 0; i < todo.length; i += 8) {
-        await Promise.all(todo.slice(i, i + 8).map(async id => {
-            try {
-                const r = await fetch('/coin/' + id);
-                if (r.ok) coinStatus.set(id, (await r.json()).exists ? 'alive' : 'spent');
-            } catch (_) {}
-        }));
-    }
-}
-
-function applyCoinStatuses(root) {
-    root.querySelectorAll('.coin.out.st-unknown[data-coin]').forEach(el => {
-        const s = coinStatus.get(el.dataset.coin);
-        if (!s) return;
-        el.classList.replace('st-unknown', 'st-' + s);
-        el.title = el.title.replace(/ · .*$/, '') + (s === 'alive' ? ' · unspent' : ' · spent later');
-    });
-}
-
-/** Ask the node which created coins still exist, eight at a time, painting
- *  each batch of answers as it arrives. */
-async function refreshCoinStatuses(root) {
-    const ids = [...new Set([...root.querySelectorAll('.coin.out.st-unknown[data-coin]')].map(e => e.dataset.coin))]
-        .filter(id => id && !coinStatus.has(id));
-    applyCoinStatuses(root);
-    for (let i = 0; i < ids.length; i += 8) {
-        await checkCoins(ids.slice(i, i + 8));
-        applyCoinStatuses(root);
-    }
-}
-
-// ── The flow: coins in ═ribbons═▌═ribbons═ coins out ────────────────────
-// Rows group a transaction's coins by owner. Ribbons are drawn after layout,
-// from each row's real position, with a width proportional to its value.
-const MAX_ROWS = 6;
-const txReg = new Map();   // card key -> { t, ctx }, so a card can redraw itself
-
-function buildRows(t, side, ctx) {
-    const items = side === 'in' ? t.ins : t.outs;
-    const groups = new Map(), rows = [], specials = [];
-    for (const it of items) {
-        if (it.kind === 'src') { specials.push({ type: 'src', src: it.src, value: it.value }); continue; }
-        if (it.kind === 'burn') { specials.push({ type: 'burn', value: it.value, item: it }); continue; }
-        const k = it.addr || ('?' + (it.coinId || rows.length));
-        let r = groups.get(k);
-        if (!r) { r = { type: 'addr', addr: it.addr, coins: [], value: 0 }; groups.set(k, r); rows.push(r); }
-        r.coins.push(it);
-        r.value += it.value || 0;
-    }
-    const focus = ctx.focus || activeQuery;
-    const hit = r => focus && (r.addr === focus || r.coins.some(c => c.coinId === focus));
-    rows.sort((a, b) => (hit(b) - hit(a)) || (b.value - a.value) || (b.coins.length - a.coins.length));
-    let out = rows;
-    if (!ctx.all && out.length > MAX_ROWS) {
-        const rest = out.slice(MAX_ROWS - 1);
-        out = out.slice(0, MAX_ROWS - 1).concat([{
-            type: 'more', n: rest.length, value: sum(rest.map(r => r.value)), coins: sum(rest.map(r => r.coins.length)),
-            unknown: rest.some(r => r.coins.some(c => c.kind === 'coin' && c.value == null)),
-        }]);
-    }
-    if (side === 'in') return specials.concat(out);
-    out = out.concat(specials);
-    if (t.fee > 0) out.push({ type: 'fee', value: t.fee });
-    return out;
-}
-
-function ribbonKind(r, side) {
-    if (r.type === 'src' || r.type === 'fee' || r.type === 'burn') return r.type;
-    if (r.type === 'addr' && r.coins.every(c => c.kind === 'state')) return 'state';
-    return side;
-}
-
-function rowHtml(r, side, i, ctx) {
-    let who = '', what = '';
-    if (r.type === 'addr') {
-        who = addrChip(r.addr);
-        if (side === 'in' && r.coins.some(c => c.bytecode && !c.std)) {
-            who += `<span class="badge-ic contract" title="Locked by a contract script">${ic('code')}</span>`;
-        }
-        what = coinsHtml(r.coins, side, ctx);
-    } else if (r.type === 'more') {
-        who = `<a class="fmore" onclick="event.stopPropagation(); unfold('${ctx.key}')" title="${r.coins} more coins, ${r.n} more owners">+${r.n}${ic('more')}</a>`;
-        what = `<span class="famt">${r.unknown ? '?' : fmtAmt(r.value)}</span>`;
-    } else if (r.type === 'fee') {
-        who = `<span class="fspecial fee" title="Fee, paid to the miner">${ic('pick')}</span>`;
-        what = `<span class="famt fee">${fmtAmt(r.value)}</span>`;
-    } else if (r.type === 'burn') {
-        const txt = readableText(bytesOf(r.item.payload || ''));
-        who = `<span class="fspecial burn" title="Burned: unspendable forever">${ic('flame')}${txt
-            ? `<span class="burn-msg">${escHtml(txt)}</span>`
-            : (r.item.payload ? `<span class="hx">${r.item.payload.slice(0, 16)}…</span>` : '')}</span>`;
-        what = r.value > 0 ? `<span class="famt burn">${fmtAmt(r.value)}</span>` : '';
-    } else if (r.type === 'src') {
-        who = r.src === 'new'
-            ? `<span class="fspecial src" title="New coins: the block reward">${ic('spark')}</span>`
-            : `<span class="fspecial src" title="Fees from this block's transfers">${ic('transfer')}</span>`;
-        what = `<span class="famt fee">${fmtAmt(r.value)}</span>`;
-    }
-    const inner = side === 'in' ? who + what : what + who;
-    const known = r.type === 'more' ? !r.unknown : !(Array.isArray(r.coins) && r.coins.some(c => c.kind === 'coin' && c.value == null));
-    return `<div class="frow ${r.type}" data-fi="${side}${i}" data-v="${known ? r.value || 0 : ''}" data-k="${ribbonKind(r, side)}">${inner}</div>`;
-}
-
-function txHeadHtml(t, ctx) {
-    const created = t.outs.filter(o => o.kind !== 'burn');
-    const burned = sum(t.outs.filter(o => o.kind === 'burn').map(o => o.value));
-    const onlyBurn = t.kind !== 'coinbase' && !created.some(o => o.value > 0) && t.outs.some(o => o.kind === 'burn');
-    const kind = t.kind === 'coinbase' ? 'coinbase' : t.kind === 'consolidate' ? 'consolidate' : t.mix ? 'mix' : onlyBurn ? 'burn' : 'reveal';
-    const [icon, label, title] = {
-        coinbase:    ['pick',     'MINING REWARD', 'New coins for the miner, plus the fees'],
-        consolidate: ['merge',    'MERGE',         'Many coins of one address merged into fewer'],
-        mix:         ['mix',      'MIX',           'Equal coins in, equal coins out'],
-        burn:        ['flame',    'BURN',          'Coins destroyed, with a message'],
-        reveal:      ['transfer', 'TRANSFER',      'Coins in, new coins out'],
-    }[kind];
-    const moved = kind === 'burn' ? burned : sum(created.map(o => o.value));
-    const unknown = created.some(o => o.kind === 'coin' && o.value == null);
-    const badges = [];
-    if (t.outs.some(o => o.kind === 'burn')) badges.push(`<span class="burn" title="Burns coins">${ic('flame')}</span>`);
-    if (t.outs.some(o => o.kind === 'state') || t.ins.some(i => i.kind === 'state')) badges.push(`<span class="state" title="Carries a state thread">${ic('diamond')}</span>`);
-    if (t.ins.some(i => i.bytecode && !i.std)) badges.push(`<span class="contract" title="Spends a contract">${ic('code')}</span>`);
-    const io = t.kind === 'coinbase'
-        ? `<span class="txc-io" title="${created.length} new coins"><i class="dot alive"></i>${created.length}</span>`
-        : `<span class="txc-io" title="${t.ins.length} coins in, ${created.length} coins out"><i class="dot used"></i>${t.ins.length} → <i class="dot alive"></i>${created.length}</span>`;
-    const right = [];
-    if (t.fee > 0) right.push(`<span class="txc-fee" title="Fee, paid to the miner">${ic('pick')}${fmtAmtText(t.fee)}</span>`);
-    if (ctx.pending && t.rate != null) right.push(`<span class="txc-rate" title="Fee per KB: its place in the queue">${Number(t.rate).toLocaleString('en')}/KB</span>`);
-    if (ctx.pending && t.age != null) right.push(`<span class="mp-dim mp-age" title="Waiting">${fmtAge(t.age)}</span>`);
-    if (!ctx.standalone && !ctx.pending && t.height != null) {
-        right.push(`<a class="txc-open" onclick="event.stopPropagation(); openTx(${t.height}, '${t.index}')" title="Open on its own">${ic('open')}</a>`);
-    }
-    return `<div class="txc-hdr" title="${title}">
-        <span class="txc-caret">${ctx.open ? '▾' : '▸'}</span>
-        <span class="txc-kind ${kind}">${ic(icon)}${label}</span>
-        <span class="txc-amt">${unknown ? '<span class="amt"><b>?</b></span>' : fmtAmt(moved)}</span>
-        ${io}
-        ${badges.length ? `<span class="txc-badges">${badges.join('')}</span>` : ''}
-        <span class="txc-right">${right.join('')}</span>
-    </div>`;
-}
-
-function txBodyHtml(t, ctx) {
-    const ins = buildRows(t, 'in', ctx), outs = buildRows(t, 'out', ctx);
-    let h = `<div class="flow">
-        <div class="fin">${ins.map((r, i) => rowHtml(r, 'in', i, ctx)).join('')}</div>
-        <div class="fmid"><svg aria-hidden="true" preserveAspectRatio="none"></svg></div>
-        <div class="fout">${outs.map((r, i) => rowHtml(r, 'out', i, ctx)).join('')}</div>
-    </div>`;
-    if (t.inscription) h += `<div class="inscr">${ic('quote')}<span>${escHtml(t.inscription)}</span></div>`;
-    return h + txFootHtml(t, ctx);
-}
-
-function txFootHtml(t, ctx) {
-    const parts = [];
-    if (t.commitment) {
-        const id = ctx.pending
-            ? `<span>${shortHex(t.commitment)}</span>`
-            : `<a onclick="event.stopPropagation(); go('${t.commitment}')">${shortHex(t.commitment)}</a>`;
-        parts.push(`<span class="txid" title="Commitment: sealed in phase 1, it identifies this transaction">${ic('lock')}${id}</span>`);
-        if (ctx.sealedHere) parts.push(`<span class="seal-pair" title="${ctx.pending ? 'Its seal is waiting too' : 'Sealed and revealed in this same block'}">${ic('link')}</span>`);
-    }
-    parts.push(`<button class="lnk" onclick="event.stopPropagation(); toggleTxDetails('${ctx.key}', this)">${ic('hash')}details</button>`);
-    return `<div class="txc-foot">${parts.join('')}<div class="txc-details" hidden></div></div>`;
-}
-
-function txCardHtml(t, ctx) {
-    txReg.set(ctx.key, { t, ctx });
-    return `<div class="tcard${ctx.open ? '' : ' closed'}${ctx.match ? ' mp-match' : ''}" data-key="${ctx.key}">${txHeadHtml(t, ctx)}<div class="txc-body">${ctx.open ? txBodyHtml(t, ctx) : ''}</div></div>`;
-}
-
-function cardEl(key) {
-    return [...document.querySelectorAll('#main-view .tcard')].find(el => el.dataset.key === key) || null;
-}
-
-function toggleCard(card) {
-    if (!card) return;
-    const key = card.dataset.key, reg = txReg.get(key);
-    const open = card.classList.contains('closed');
-    card.classList.toggle('closed', !open);
-    const caret = card.querySelector('.txc-caret');
-    if (caret) caret.textContent = open ? '▾' : '▸';
-    if (key && key.startsWith('mp:')) { if (open) mpExpanded.add(key.slice(3)); else mpExpanded.delete(key.slice(3)); }
-    if (open && reg) {
-        reg.ctx.open = true;
-        const body = card.querySelector('.txc-body');
-        if (!body.firstElementChild) body.innerHTML = txBodyHtml(reg.t, reg.ctx);
-        afterRender(card);
-    }
-}
-
-function unfold(key) {
-    const reg = txReg.get(key), card = cardEl(key);
-    if (!reg || !card) return;
-    reg.ctx.all = true;
-    if (key.startsWith('mp:')) mpUnfolded.add(key.slice(3));
-    card.querySelector('.txc-body').innerHTML = txBodyHtml(reg.t, reg.ctx);
-    afterRender(card);
-}
-
-function focusTx(key) {
-    const card = cardEl(key);
-    if (!card) return;
-    if (card.classList.contains('closed')) toggleCard(card);
-    card.scrollIntoView({ block: 'center' });
-    document.querySelectorAll('#main-view .tcard.flash').forEach(el => el.classList.remove('flash'));
-    card.classList.add('flash');
-}
-
-function toggleTxDetails(key, btn) {
-    const reg = txReg.get(key);
-    const box = btn && btn.parentElement.querySelector('.txc-details');
-    if (!reg || !box) return;
-    if (!box.hidden) { box.hidden = true; return; }
-    if (!box.innerHTML) box.innerHTML = txDetailsHtml(reg.t);
-    box.hidden = false;
-}
-
-/** Everything the flow leaves out: full ids, salts, scripts. */
-function txDetailsHtml(t) {
-    const row = (k, v) => `<tr><th>${k}</th><td>${v}</td></tr>`;
-    const link = h => h ? `<a onclick="go('${h}')">${h}</a>` : '<span class="dim">—</span>';
-    const addrLink = a => { const f = checksummed(a); return `<a onclick="go('${f}')">${f}</a>`; };
-    let h = '<table class="dtab">';
-    if (t.commitment) h += row('commitment', t.pending ? t.commitment : link(t.commitment));
-    if (t.salt) h += row('salt', t.salt);
-    const CAP = 200;
-    const capNote = (n, what) => n > CAP ? `<tr class="dsep"><th colspan="2">+ ${(n - CAP).toLocaleString('en')} more ${what}</th></tr>` : '';
-    t.ins.slice(0, CAP).forEach((i, n) => {
-        if (i.kind === 'src') return;
-        h += `<tr class="dsep"><th colspan="2">${i.kind === 'state' ? ic('diamond') : '<i class="dot used"></i>'} in ${n}</th></tr>`;
-        h += row('coin', link(i.coinId));
-        if (i.value != null) h += row('value', `${Number(i.value).toLocaleString('en')} MDS`);
-        if (i.addr) h += row('address', addrLink(i.addr));
-        if (i.salt) h += row('salt', i.salt);
-        if (i.stateCommitment) h += row('state', i.stateCommitment);
-        if (i.bytecode) h += row('script', i.std ? `P2PK · key ${i.bytecode.slice(6, 70)}` : renderScriptDisasm(i.bytecode));
-    });
-    h += capNote(t.ins.length, 'inputs');
-    t.outs.slice(0, CAP).forEach((o, n) => {
-        const mark = o.kind === 'burn' ? ic('flame') : o.kind === 'state' ? ic('diamond') : '<i class="dot alive"></i>';
-        h += `<tr class="dsep"><th colspan="2">${mark} out ${n}</th></tr>`;
-        if (o.kind === 'burn') {
-            h += row('burned', `${Number(o.value).toLocaleString('en')} MDS`);
-            h += row('payload', (o.payload || '') + (o.payloadLen * 2 > (o.payload || '').length ? '…' : ''));
-            const txt = readableText(bytesOf(o.payload || ''));
-            if (txt) h += row('text', escHtml(txt));
-            return;
-        }
-        h += row('coin', t.pending ? (o.coinId || '—') : link(o.coinId));
-        if (o.kind === 'coin' && o.value != null) h += row('value', `${Number(o.value).toLocaleString('en')} MDS`);
-        if (o.addr) h += row('address', addrLink(o.addr));
-        if (o.salt) h += row('salt', o.salt);
-        if (o.stateCommitment) h += row('state', o.stateCommitment);
-        if (o.text && o.text.some(Boolean)) h += row('text', escHtml(o.text.filter(Boolean).join(' ')));
-    });
-    h += capNote(t.outs.length, 'outputs');
-    return h + '</table>';
-}
-
-function ribbonPath(x0, y0, x1, y1, t) {
-    const mx = ((x0 + x1) / 2).toFixed(1), h = t / 2;
-    const f = v => v.toFixed(1);
-    return `M${f(x0)},${f(y0 - h)}C${mx},${f(y0 - h)} ${mx},${f(y1 - h)} ${f(x1)},${f(y1 - h)}L${f(x1)},${f(y1 + h)}C${mx},${f(y1 + h)} ${mx},${f(y0 + h)} ${f(x0)},${f(y0 + h)}Z`;
-}
-
-/** Ribbons from each row to a central bar, stacked there in row order, each
- *  as thick as its share of the value. One scale serves both sides, chosen so
- *  the fattest ribbon still fits its row — widths stay honest proportions
- *  (only a 2px floor keeps dust visible). */
-function drawFlow(flow) {
-    const mid = flow.querySelector('.fmid');
-    const svg = mid && mid.querySelector('svg');
-    if (!svg) return;
-    const mr = mid.getBoundingClientRect();
-    if (mr.width < 20 || mr.height < 8 || getComputedStyle(svg).display === 'none') { svg.innerHTML = ''; return; }
-    const W = mr.width, H = mr.height;
-    const rows = sel => [...flow.querySelectorAll(sel)].map(el => {
-        const b = el.getBoundingClientRect();
-        return { y: b.top + b.height / 2 - mr.top, h: b.height, v: el.dataset.v === '' ? null : +el.dataset.v || 0, fi: el.dataset.fi, k: el.dataset.k };
-    });
-    const L = rows('.fin > .frow'), R = rows('.fout > .frow');
-    const total = Math.max(sum(L.map(r => r.v)), sum(R.map(r => r.v)), 1);
-    let band = Math.max(8, Math.min(H * 0.6, 140));
-    for (const r of L.concat(R)) if (r.v > 0) band = Math.min(band, r.h * 0.85 * total / r.v);
-    // Without every value, proportions would lie: draw even ribbons instead.
-    const even = L.concat(R).some(r => r.v === null);
-    const thick = r => even ? 3 : Math.max(2, r.v / total * band);
-    L.forEach(r => { r.t = thick(r); });
-    R.forEach(r => { r.t = thick(r); });
-    const sL = sum(L.map(r => r.t)), sR = sum(R.map(r => r.t));
-    const nx0 = W / 2 - 2, nx1 = W / 2 + 2;
-    let paths = '';
-    let y = H / 2 - sL / 2;
-    for (const r of L) { paths += `<path class="rb ${r.k}" data-fi="${r.fi}" d="${ribbonPath(0, r.y, nx0, y + r.t / 2, r.t)}"/>`; y += r.t; }
-    y = H / 2 - sR / 2;
-    for (const r of R) { paths += `<path class="rb ${r.k}" data-fi="${r.fi}" d="${ribbonPath(nx1, y + r.t / 2, W, r.y, r.t)}"/>`; y += r.t; }
-    const node = Math.max(sL, sR);
-    paths += `<rect class="rb-node" x="${nx0.toFixed(1)}" y="${(H / 2 - node / 2).toFixed(1)}" width="4" height="${node.toFixed(1)}"/>`;
-    svg.setAttribute('viewBox', `0 0 ${W.toFixed(1)} ${H.toFixed(1)}`);
-    svg.innerHTML = paths;
-}
-
-function drawFlows(root) {
-    if (!root) return;
-    root.querySelectorAll('.flow').forEach(f => {
-        const card = f.closest('.tcard');
-        if (!card || !card.classList.contains('closed')) drawFlow(f);
-    });
-}
-
-function afterRender(root) {
-    drawFlows(root);
-    refreshCoinStatuses(root);
-}
-
-// ── Loading and message states ──────────────────────────────────────────
-function loadingHtml(pow) {
-    return `<div class="empty-state">${ic('hourglass')}${pow
-        ? '<div class="pow-bar" title="Proof of work: the node asks for a little, to stop abuse"><i id="pow-fill"></i></div>' : ''}</div>`;
-}
-
-function showMessage(icon, text, seq, sub) {
-    if (seq != null && seq !== routeSeq) return;
-    mainViewContent = 'message';
-    mainView().innerHTML = `<div class="empty-state">${ic(icon)}<div>${escHtml(text)}</div>${sub ? `<div class="es-sub">${escHtml(sub)}</div>` : ''}</div>`;
-}
-
-// ── Data ────────────────────────────────────────────────────────────────
-// Blocks deeper than a few confirmations do not change, so keep them.
 const batchCache = new Map();
 async function getBatch(h) {
     const c = batchCache.get(h);
@@ -1605,940 +1411,7 @@ function renderScriptDisasm(bytecode) {
   `;
 }
 
-function fieldHtml(label, value, link) {
-    const v = escHtml(value);
-    return `<div class="field"><div class="lbl">${label}</div><div class="hex">${link ? `<a onclick="${link}" title="${v}">${v}</a>` : v}</div></div>`;
-}
-
-async function showRawBlock(height, btnEl) {
-    const mv = mainView();
-    const origText = btnEl.textContent;
-    btnEl.textContent = 'Loading…';
-    try {
-        const res = await fetch(`/batch/${height}`);
-        const data = await res.json();
-        mainViewContent = 'raw';
-        mv.innerHTML = `
-            <div class="crumb"><a onclick="go('${height}')">${ic('left')}${ic('cube')}${fmtInt(height)}</a><span class="dim">›</span><span>raw JSON</span></div>
-            <div style="background:var(--code-bg); border:1px solid var(--border); padding:12px; overflow:auto; max-height:70vh;">
-                <pre style="margin:0; font-size:10px; line-height:1.4; color:var(--text-bright); white-space:pre-wrap;">${escHtml(JSON.stringify(data, null, 2))}</pre>
-            </div>
-            <div style="margin-top:12px; color:var(--text-faint); font-size:10px;">Witnesses are stripped server-side for bandwidth.</div>`;
-        mv.scrollTop = 0;
-    } catch(e) {
-        log(`Raw fetch error: ${e.message}`, 'e');
-        btnEl.textContent = origText;
-    }
-}
-
-// ── Navigation ──────────────────────────────────────────────────────────
-// Every page has a URL, so the back button works and any view can be shared:
-//   ?q=<height | address | coin id | hash | mempool | richlist>   ?tx=<height>.<index|cb>
-function parseLocation() {
-    const p = new URLSearchParams(window.location.search);
-    if (p.get('tx')) return { tx: p.get('tx') };
-    let q = p.get('q') || p.get('query');
-    // `/?123` and `/?richlist` work too.
-    if (!q && window.location.search.length > 1 && !window.location.search.includes('=')) q = window.location.search.substring(1);
-    if (q) return { q: decodeURIComponent(q).replace(/\/$/, '') };
-    return {};
-}
-
-function urlFor(s) {
-    if (s.tx) return '?tx=' + s.tx;
-    if (s.q) return /^(mempool|richlist|analytics)$/.test(s.q) ? '?' + s.q : '?q=' + encodeURIComponent(s.q);
-    return window.location.pathname;
-}
-
-function navigate(s) {
-    const url = urlFor(s);
-    if (url === window.location.search || (url === window.location.pathname && !window.location.search)) history.replaceState(s, '', url);
-    else history.pushState(s, '', url);
-    route(s);
-}
-function go(q) { q = String(q).trim(); if (/^[0-9][0-9,]*$/.test(q)) q = q.replace(/,/g, ''); navigate({ q }); }
-function openTx(h, i, focus) { navigate(focus ? { tx: `${h}.${i}`, f: focus } : { tx: `${h}.${i}` }); }
-function goHome() { navigate({}); }
-window.addEventListener('popstate', e => route(e.state || parseLocation()));
-
-async function route(s) {
-    s = s || {};
-    const seq = ++routeSeq;
-    currentFocus = s.f || null;
-    activeQuery = null;
-    if (s.tx) {
-        activeQuery = s.f || null;
-        const [hs, is] = String(s.tx).split('.');
-        return loadTx(parseInt(String(hs).replace(/,/g, ''), 10), is === 'cb' ? 'cb' : parseInt(is, 10), seq);
-    }
-    if (s.q) return execQuery(s.q, seq);
-    if (!lastState) return showMessage('alert', 'node not reachable', seq);
-    return loadBlock(tipHeight, seq);
-}
-
-async function execQuery(cmd, seq) {
-    cmd = String(cmd).trim();
-    const lc = cmd.toLowerCase();
-    if (lc === 'mempool') return showTab('mempool');
-    if (/^(supply|rich ?list|holders)$/.test(lc)) return showTab('supply');
-    if (lc === 'analytics' || lc === 'charts') return showTab('analytics');
-    if (/^[0-9][0-9,]*$/.test(cmd)) return loadBlock(parseInt(cmd.replace(/,/g, ''), 10), seq);
-    if (/^[0-9a-f]{72}$/.test(lc)) return loadAddress(lc, seq);
-    if (/^[0-9a-f]{64}$/.test(lc)) return resolveHash(lc, seq);
-    if (/^[a-z0-9-]+\.mds$/.test(lc)) return loadName(lc, seq);
-    if (lc.startsWith('decompile ')) {
-        const hex = cmd.split(/\s+/)[1] || '';
-        if (hex.length > 10) {
-            mainViewContent = 'decompile';
-            mainView().innerHTML = `<div class="block-hdr"><h2>SCRIPT DECOMPILE</h2></div>${renderScriptDisasm(hex)}`;
-            return;
-        }
-    }
-    showMessage('search', 'a block number, an address or a coin id', seq);
-}
-
-function execCmd(cmd) {
-    cmd = String(cmd || '').trim();
-    $('cmd-input').value = '';
-    if (!cmd) return;
-    log(`> ${cmd}`, 'var(--text-max)');
-    go(cmd);
-}
-
-function handleTopSearch() {
-    const input = $('top-search');
-    const val = input.value.trim();
-    if (!val) return;
-    input.value = '';
-    input.blur();
-    execCmd(val);
-}
-
-// Update currentTab + the tab bar WITHOUT rendering. A view claims its tab, so
-// the next poll can't think we're on 'mempool' and repaint it over the view.
-function setActiveTab(tab) {
-    currentTab = tab;
-    document.querySelectorAll('.tab-link').forEach(el => el.classList.toggle('active', el.dataset.tab === tab));
-}
-
-function switchTab(tab) {
-    if (tab === 'explorer') { if (activeBatch != null) go(String(activeBatch)); else goHome(); return; }
-    navigate({ q: tab === 'supply' ? 'richlist' : tab });
-}
-
-function showTab(tab) {
-    setActiveTab(tab);
-    activeBatch = null;
-    renderBatchList();
-    if (tab === 'mempool') { mainViewContent = 'mempool-entering'; renderMempoolView(); }
-    else if (tab === 'analytics') renderAnalyticsView();
-    else if (tab === 'supply') showSupplyView();
-}
-
-/** A 64-hex query could be a coin, an address, a commitment or a block hash.
- *  One proof-of-work search says which, and we open the page that fits. */
-async function resolveHash(q, seq) {
-    activeQuery = q;
-    setActiveTab('explorer');
-    mainViewContent = 'search';
-    activeBatch = null;
-    renderBatchList();
-    mainView().innerHTML = loadingHtml(true);
-    log(`Searching for ${shortHex(q)}…`);
-    const mp = findInMempool(q);
-    let results;
-    try { results = await cachedSearch(q); }
-    catch (e) {
-        if (seq !== routeSeq) return;
-        if (mp) return showMempoolHit(mp);
-        log(`Search error: ${e.message}`, 'e');
-        return showMessage('alert', e.message, seq);
-    }
-    if (seq !== routeSeq) return;
-    const has = (...types) => results.some(r => types.includes(r.result_type));
-    if (has('output_coin_id', 'coinbase_coin_id', 'input_coin_id')) return showCoin(q, results, seq);
-    if (has('output_address', 'coinbase_address', 'input_address')) return loadAddress(q, seq, results);
-    const first = results[0];
-    if (first) {
-        log(`Found ${results.length} result(s)`, 's');
-        if (first.tx_index != null && first.result_type !== 'block_hash') return loadTx(first.height, first.tx_index, seq);
-        return loadBlock(first.height, seq);
-    }
-    if (mp) return showMempoolHit(mp);
-    // A coin whose birth is older than the search window still exists.
-    try {
-        const r = await fetch('/coin/' + q);
-        if (r.ok && (await r.json()).exists) return showCoin(q, [], seq);
-    } catch (_) {}
-    showMessage('search', 'nothing found', seq, 'searched the last 5,000 blocks and the mempool');
-}
-
-function showMempoolHit(mp) {
-    log(`In mempool: ${mp.desc}`, 's');
-    if (mp.id) mpExpanded.add(mp.id);
-    mpScrollPending = true;
-    history.replaceState({ q: 'mempool' }, '', '?mempool');
-    showTab('mempool');
-}
-
-// ── Block view ──────────────────────────────────────────────────────────
-function finalityHtml(h, st) {
-    if (!st) return '';
-    const conf = Math.max(0, st.height - h), need = st.safe_depth;
-    // safe_depth == u64::MAX (SAFE_DEPTH_UNATTAINABLE): the node cannot reach
-    // its finality target at any depth. Never call anything final then.
-    if (!(need < Number.MAX_SAFE_INTEGER)) {
-        return `<span class="fin-m warn" title="Finality is unattainable at the node's confidence; ${conf} confirmations">${ic('alert')}${conf.toLocaleString('en')}</span>`;
-    }
-    if (conf >= need) return `<span class="fin-m ok" title="${conf.toLocaleString('en')} confirmations">${ic('check')}final</span>`;
-    const meter = need <= 24
-        ? `<span class="fin-boxes">${Array.from({ length: need }, (_, i) => `<i${i < conf ? ' class="on"' : ''}></i>`).join('')}</span>`
-        : `<span class="fin-bar"><i style="width:${(conf / need * 100).toFixed(0)}%"></i></span>`;
-    return `<span class="fin-m" title="${conf} of ${need} confirmations">${meter}${conf}/${need}</span>`;
-}
-
-function blockHeadHtml(h, b, st, n, created, spent) {
-    const when = new Date(b.timestamp * 1000).toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' UTC');
-    const prev = h > 0
-        ? `<a class="bh-arrow" onclick="go('${h - 1}')" title="Block ${fmtInt(h - 1)}">${ic('left')}</a>`
-        : `<span class="bh-arrow off">${ic('left')}</span>`;
-    const next = h < tipHeight
-        ? `<a class="bh-arrow" onclick="go('${h + 1}')" title="Block ${fmtInt(h + 1)}">${ic('right')}</a>`
-        : `<span class="bh-arrow off">${ic('right')}</span>`;
-    return `<div class="bh">${prev}
-        <div class="bh-mid">
-            <div class="bh-title">${ic('cube')}<span class="bh-word">BLOCK</span><span class="bh-num">${fmtInt(h)}</span></div>
-            <div class="bh-sub"><span title="${when}">${ic('clock')}${fmtAgo(b.timestamp)}</span>${finalityHtml(h, st)}</div>
-        </div>${next}</div>
-        <div class="bstats">
-            <div class="bstat" title="Transfers">${ic('transfer')}<b>${fmtInt(n.transfers.length)}</b></div>
-            <div class="bstat" title="Coins created"><i class="dot alive"></i><b>${created ? '+' : ''}${fmtInt(created)}</b></div>
-            <div class="bstat" title="Coins spent"><i class="dot used"></i><b>${spent ? '−' : ''}${fmtInt(spent)}</b></div>
-            <div class="bstat sealed" title="Sealed (phase 1 of commit / reveal)">${ic('lock')}<b>${fmtInt(n.commits.length)}</b></div>
-            <div class="bstat reward" title="Paid to the miner: new coins plus fees">${ic('pick')}${fmtAmt(n.cb.totalOut)}</div>
-        </div>`;
-}
-
-function sealsHtml(n, h) {
-    const chips = n.commits.map(c => {
-        const pair = n.byCommitment.get(c.commitment);
-        const q = activeQuery === c.commitment ? ' is-q' : '';
-        return pair
-            ? `<a class="seal${q}" onclick="focusTx('${h}:${pair.index}')" title="Sealed here, and revealed in this block too">${ic('lock')}<span>${c.commitment.slice(0, 8)}</span>${ic('link')}</a>`
-            : `<a class="seal${q}" onclick="openTx(${h}, '${c.index}')" title="Sealed here; it opens in a later block">${ic('lock')}<span>${c.commitment.slice(0, 8)}</span></a>`;
-    }).join('');
-    return `<div class="sec-title">${ic('lock')}sealed <span>${n.commits.length}</span></div><div class="seal-grid">${chips}</div>`;
-}
-
-function blockDetailsHtml(h, b) {
-    const hash = toHex(b.extension.final_hash);
-    return `<details class="bdetails"><summary>${ic('hash')}block internals</summary>
-        <div class="meta-grid">
-            ${fieldHtml('Block Hash', hash, `go('${hash}')`)}
-            ${fieldHtml('Parent midstate', toHex(b.prev_midstate), h > 0 ? `go('${h - 1}')` : '')}
-            ${fieldHtml('State Root', toHex(b.state_root), `go('${toHex(b.state_root)}')`)}
-            ${fieldHtml('Target', toHex(b.target))}
-            ${fieldHtml('Timestamp', new Date(b.timestamp * 1000).toISOString())}
-            ${fieldHtml('Nonce', String(b.extension.nonce))}
-        </div>
-        <div class="block-toolbar">
-            <button class="btn" onclick="showRawBlock(${h}, this)">Raw JSON</button>
-            <button class="btn" onclick="copyToClipboard('${hash}', this)">Copy Block Hash</button>
-        </div>
-    </details>`;
-}
-
-async function loadBlock(h, seq, opts) {
-    seq = seq || ++routeSeq;
-    opts = opts || {};
-    if (!Number.isFinite(h) || h < 0) return showMessage('alert', 'not a block number', seq);
-    setActiveTab('explorer');
-    mainViewContent = 'block';
-    activeBatch = h;
-    activeAddress = null;
-    renderBatchList();
-    const mv = mainView();
-    mv.innerHTML = loadingHtml();
-
-    let b, st;
-    try { [b, st] = await Promise.all([getBatch(h), getState()]); }
-    catch (e) { showMessage('alert', e.message, seq); return; }
-    if (seq !== routeSeq) return;
-
-    blockCache[h] = { txCount: b.transactions.length, cbCount: b.coinbase.length };
-    const n = normBlock(b, h);
-    const created = n.cb.outs.length + sum(n.transfers.map(t => t.outs.filter(o => o.kind !== 'burn').length));
-    const spent = sum(n.transfers.map(t => t.ins.length));
-
-    txReg.clear();
-    let html = blockHeadHtml(h, b, st, n, created, spent);
-    html += txCardHtml(n.cb, { key: `${h}:cb`, open: true });
-    // Open every card in an ordinary block; in a busy one, only those that
-    // touch what was searched for.
-    const openAll = n.transfers.length <= 8;
-    for (const t of n.transfers) {
-        html += txCardHtml(t, { key: `${h}:${t.index}`, open: openAll || txTouches(t, activeQuery), sealedHere: n.sealedHere.has(t.commitment) });
-    }
-    if (n.commits.length) html += sealsHtml(n, h);
-    html += blockDetailsHtml(h, b);
-
-    mv.innerHTML = html;
-    mv.scrollTop = 0;
-    afterRender(mv);
-    renderBatchList();
-    if (opts.focusKey) focusTx(opts.focusKey);
-    else if (activeQuery) {
-        const el = mv.querySelector('.coin.focus, .addr.is-q, .seal.is-q');
-        if (el) el.scrollIntoView({ block: 'center' });
-    }
-}
-
-// ── One transaction ─────────────────────────────────────────────────────
-async function loadTx(h, idx, seq) {
-    setActiveTab('explorer');
-    mainViewContent = 'tx';
-    activeBatch = h;
-    activeAddress = null;
-    renderBatchList();
-    const mv = mainView();
-    mv.innerHTML = loadingHtml();
-
-    let b, st;
-    try { [b, st] = await Promise.all([getBatch(h), getState()]); }
-    catch (e) { showMessage('alert', e.message, seq); return; }
-    if (seq !== routeSeq) return;
-
-    const n = normBlock(b, h);
-    const t = idx === 'cb' ? n.cb : n.all[idx];
-    if (!t) return showMessage('search', 'no such transaction', seq);
-
-    txReg.clear();
-    const what = t.kind === 'commit' ? `${ic('lock')}sealed #${idx}`
-        : t.kind === 'coinbase' ? `${ic('pick')}reward`
-        : `${ic('transfer')}#${idx}`;
-    const when = new Date(b.timestamp * 1000).toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' UTC');
-    let html = `<div class="crumb">
-        <a onclick="go('${h}')" title="The whole block">${ic('left')}${ic('cube')}${fmtInt(h)}</a><span class="dim">›</span><span class="crumb-kind">${what}</span>
-        <span class="crumb-meta"><span title="${when}">${ic('clock')}${fmtAgo(b.timestamp)}</span>${finalityHtml(h, st)}</span>
-    </div>`;
-    if (t.kind === 'commit') html += sealCardHtml(t);
-    else {
-        // Both phases at a glance: where it was sealed, and here, where it opened.
-        if (t.commitment) {
-            html += `<div class="phases">
-                <span class="phase" title="Phase 1: sealed">${ic('lock')}<span id="phase-seal"><span class="dim">…</span></span></span>
-                <span class="phase-arrow">${ic('right')}</span>
-                <span class="phase here" title="Phase 2: revealed">${ic('unlock')}${ic('cube')}${fmtInt(h)} #${idx}</span>
-            </div>`;
-        }
-        html += txCardHtml(t, { key: `${h}:${idx}`, open: true, all: true, standalone: true, focus: currentFocus, sealedHere: n.sealedHere.has(t.commitment) });
-    }
-
-    mv.innerHTML = html;
-    mv.scrollTop = 0;
-    afterRender(mv);
-    if (t.kind === 'commit') findRevealFor(t, h, seq);
-    else if (t.commitment) findSealFor(t, h, seq);
-    else if (currentFocus) { const el = mv.querySelector('.coin.focus'); if (el) el.scrollIntoView({ block: 'center' }); }
-}
-
-function sealCardHtml(t) {
-    return `<div class="seal-card">
-        <div class="seal-big">${ic('lock')}</div>
-        <div class="seal-main">
-            <div class="ah-label">${ic('lock')}SEALED</div>
-            <div class="hx">${t.commitment}</div>
-            <div class="seal-next" id="seal-next">${ic('search')}<span class="dim">…</span></div>
-        </div>
-    </div>`;
-}
-
-/** Where a commitment was opened: the same block, the mempool, or one of the
- *  next blocks (walked forward client-side; the search index has no entry for
- *  a reveal's computed commitment). */
-async function findRevealFor(t, h, seq) {
-    const show = html => { const el = $('seal-next'); if (seq === routeSeq && el) el.innerHTML = html; };
-    const inMempool = (lastMempoolData && lastMempoolData.transactions || [])
-        .some(x => x.tx_type !== 'commit' && x.commitment === t.commitment);
-    const limit = Math.min(tipHeight, h + 60);
-    for (let hh = h; hh <= limit; hh++) {
-        if (seq !== routeSeq) return;
-        let b;
-        try { b = await getBatch(hh); } catch (_) { break; }
-        const r = normBlock(b, hh).byCommitment.get(t.commitment);
-        if (r) {
-            return show(`${ic('unlock')}<a onclick="openTx(${hh}, '${r.index}')" title="${hh === h ? 'Revealed in the same block' : 'Revealed ' + (hh - h) + ' block(s) later'}">${ic('cube')}${fmtInt(hh)} #${r.index}</a>`);
-        }
-        if (hh === h && inMempool) return show(`${ic('unlock')}<a onclick="switchTab('mempool')">${ic('hourglass')}mempool</a>`);
-        show(`${ic('search')}<span class="dim">${fmtInt(hh)}…</span>`);
-    }
-    if (inMempool) return show(`${ic('unlock')}<a onclick="switchTab('mempool')">${ic('hourglass')}mempool</a>`);
-    show(`${ic('hourglass')}<span class="dim">not revealed by ${fmtInt(limit)}</span>`);
-}
-
-/** Where a reveal was sealed: commits usually land a block or two before
- *  their reveal (or in the same block), so walk back a little; past that,
- *  offer the proof-of-work search, which reaches 5,000 blocks. */
-async function findSealFor(t, h, seq) {
-    const show = html => { const el = $('phase-seal'); if (seq === routeSeq && el) el.innerHTML = html; };
-    for (let hh = h; hh >= Math.max(0, h - 20); hh--) {
-        if (seq !== routeSeq) return;
-        let b;
-        try { b = await getBatch(hh); } catch (_) { break; }
-        const c = normBlock(b, hh).commits.find(x => x.commitment === t.commitment);
-        if (c) return show(`<a onclick="openTx(${hh}, '${c.index}')" title="${hh === h ? 'Sealed in the same block' : 'Sealed ' + (h - hh) + ' block(s) earlier'}">${ic('cube')}${fmtInt(hh)} #${c.index}</a>`);
-    }
-    show(`<a onclick="go('${t.commitment}')" title="Search further back">${ic('search')}${shortHex(t.commitment)}</a>`);
-}
-
-// ── One coin's life ─────────────────────────────────────────────────────
-// The whole UTXO model in one picture: a coin is created by one transaction
-// and destroyed by another. Both ends are links; both transactions follow.
-async function showCoin(q, results, seq) {
-    setActiveTab('explorer');
-    mainViewContent = 'coin';
-    activeBatch = null;
-    activeQuery = q;
-    currentFocus = q;
-    renderBatchList();
-    const born = results.find(r => r.result_type === 'output_coin_id' || r.result_type === 'coinbase_coin_id');
-    const died = results.find(r => r.result_type === 'input_coin_id');
-
-    let alive = null, bb = null, db = null, maturesAt = null;
-    try {
-        [alive, bb, db] = await Promise.all([
-            fetch('/coin/' + q).then(r => r.ok ? r.json() : null).then(d => {
-                // Set while the coin is a mining reward still maturing.
-                if (d && d.matures_at != null) maturesAt = d.matures_at;
-                return d ? d.exists : null;
-            }).catch(() => null),
-            born ? getBatch(born.height) : null,
-            died ? getBatch(died.height) : null,
-        ]);
-    } catch (e) { showMessage('alert', e.message, seq); return; }
-    if (seq !== routeSeq) return;
-    if (alive != null) coinStatus.set(q, alive ? 'alive' : 'spent');
-
-    let bornT = null, diedT = null, coin = null;
-    if (bb) {
-        const n = normBlock(bb, born.height);
-        bornT = born.result_type === 'coinbase_coin_id' ? n.cb : (n.all[born.tx_index] || null);
-        coin = bornT ? bornT.outs.find(o => o.coinId === q) || null : null;
-    }
-    if (db) {
-        diedT = normBlock(db, died.height).all[died.tx_index] || null;
-        if (!coin && diedT) coin = diedT.ins.find(i => i.coinId === q) || null;
-    }
-    const value = coin ? coin.value : parseInt((/value (\d+)/.exec((born || died || {}).detail || '') || [])[1], 10);
-    const spending = !died && pendingSpendOf(q);
-
-    const bornEnd = born
-        ? `<span class="life-tag born">${ic(born.result_type === 'coinbase_coin_id' ? 'pick' : 'spark')}created</span>
-           <a onclick="openTx(${born.height}, '${born.tx_index == null ? 'cb' : born.tx_index}', '${q}')">${ic('cube')}${fmtInt(born.height)}</a>
-           <span class="dim">${bb ? fmtAgo(bb.timestamp) : ''}</span>`
-        : `<span class="life-tag born">${ic('spark')}created</span><span class="dim">over 5,000 blocks ago</span>`;
-    let line, deathEnd;
-    if (died) {
-        line = 'dead';
-        deathEnd = `<span class="life-tag died">${ic('x')}spent</span>
-           <a onclick="openTx(${died.height}, '${died.tx_index}', '${q}')">${ic('cube')}${fmtInt(died.height)}</a>
-           <span class="dim">${db ? fmtAgo(db.timestamp) : ''}</span>`;
-    } else if (spending) {
-        line = 'pending';
-        deathEnd = `<span class="life-tag pending">${ic('hourglass')}being spent</span><a onclick="switchTab('mempool')">mempool</a>`;
-    } else if (alive && maturesAt != null) {
-        line = '';
-        deathEnd = `<span class="life-tag pending">${ic('hourglass')}maturing</span><span class="dim">spendable from ${fmtInt(maturesAt)}</span>`;
-    } else if (alive) {
-        line = '';
-        deathEnd = `<span class="life-tag alive"><i class="dot alive"></i>exists</span><span class="dim">now</span>`;
-    } else {
-        line = 'dead';
-        deathEnd = `<span class="life-tag died">${ic('x')}spent</span><span class="dim">—</span>`;
-    }
-
-    const [vn, vu] = Number.isFinite(value) ? unitParts(value) : ['?', ''];
-    const st = alive ? 'alive' : 'spent';
-    const isState = coin && coin.kind === 'state';
-    txReg.clear();
-    let html = `<div class="coinh">
-        ${isState ? `<span class="coin big state">${ic('diamond')}</span>`
-            : `<span class="coin big out st-${st}" title="${Number.isFinite(value) ? value.toLocaleString('en') + ' MDS' : ''}"><i class="dot" style="--d:${Number.isFinite(value) ? (dotSize(value) * 1.7).toFixed(1) : 9}px"></i><b>${vn}</b><small>${vu}</small></span>`}
-        ${coin && coin.addr ? addrChip(coin.addr) : ''}
-        <span class="hx" title="Coin id ${q}">${ic('hash')} ${shortHex(q)}</span>
-        <button class="icon-btn" onclick="copyToClipboard('${q}', this)" title="Copy coin id">${ic('copy')}</button>
-    </div>
-    <div class="life"><div class="life-end">${bornEnd}</div><div class="life-line ${line}"></div><div class="life-end right">${deathEnd}</div></div>`;
-    if (bornT) html += `<div class="sec-title">${ic('spark')}created</div>` + txCardHtml(bornT, { key: 'born', open: true, focus: q, sealedHere: false });
-    if (diedT) html += `<div class="sec-title">${ic('x')}spent</div>` + txCardHtml(diedT, { key: 'died', open: true, focus: q, sealedHere: false });
-    const mv = mainView();
-    mv.innerHTML = html;
-    mv.scrollTop = 0;
-    afterRender(mv);
-    log(`Coin ${shortHex(q)}: ${died ? 'spent' : alive ? 'unspent' : 'unknown'}`, 's');
-}
-
-// ── Address view ────────────────────────────────────────────────────────
-const addrView = { addr: null, name: null, coins: [], from: null, to: null, results: null, indexed: null, scanning: false };
-
-/** MSN-1: a name opens the address its records pay, with the records. */
-async function loadName(name, seq) {
-    let res, body;
-    try {
-        res = await fetch(`/name/${encodeURIComponent(name)}`);
-        body = await res.json();
-    } catch (e) {
-        return showMessage('alert', 'node not reachable', seq);
-    }
-    if (seq !== routeSeq) return;
-    if (!res.ok) return showMessage('search', `${name}: ${body.error || 'not found'}`, seq);
-    if (!body.pays) {
-        const why = body.lapsed ? 'lapsed: anyone may claim it' : 'takes no MDS payment now';
-        return showMessage('search', `${body.name}: ${why}`, seq, body.records.map(r => `${r.type} ${r.value}`).join(' · '));
-    }
-    return loadAddress(body.pays, seq, null, body);
-}
-
-function nameRecordsHtml(n) {
-    const left = r => r.signatures_left != null ? ` · ${fmtInt(r.signatures_left)} signatures left` : '';
-    const rows = n.records.map(r => `<div style="font-family:monospace;font-size:12px"><span class="dim">${escHtml(r.type)}</span> ${escHtml(r.value)}${left(r)}</div>`).join('');
-    const d = n.deal;
-    const deal = !d ? '' : d.kind === 'sale' ? ` · for sale at ${fmtAmtText(d.price)}`
-        : d.kind === 'rent' ? ` · for rent at ${fmtAmtText(d.price)} per ${fmtInt(d.span)} blocks`
-        : ` · rented out until block ${fmtInt(d.until)}`;
-    return `<div style="margin:8px 0"><div class="dim">${escHtml(n.name)} · ${escHtml(n.tier)} · held by ${shortHex(n.owner)} since block ${fmtInt(n.since)}, to block ${fmtInt(n.expires)}${deal}</div>${rows}</div>`;
-}
-
-async function loadAddress(input, seq, prefetched, name) {
-    let addr = String(input).toLowerCase();
-    if (addr.length === 72) {
-        const check = validateAddressChecksum(addr);
-        if (!check.valid) return showMessage('alert', check.reason, seq, 'the address may contain a typo');
-        addr = check.canonical;
-    }
-    if (!/^[0-9a-f]{64}$/.test(addr)) return showMessage('alert', 'not an address', seq);
-
-    setActiveTab('explorer');
-    mainViewContent = 'address';
-    activeAddress = addr;
-    activeQuery = addr;
-    activeBatch = null;
-    renderBatchList();
-    Object.assign(addrView, { addr, name: name || null, coins: [], from: null, to: null, results: prefetched || null, indexed: null, scanning: true });
-    const mv = mainView();
-    mv.innerHTML = addressHtml();
-    mv.scrollTop = 0;
-
-    // The rich-list index, when this node keeps one, knows the full-history
-    // balance instantly. The scan below covers only the last 5,000 blocks.
-    const indexedP = fetch(`/richlist/${addr}`).then(r => r.ok ? r.json() : null).catch(() => null);
-    try {
-        const results = prefetched || await cachedSearch(addr);
-        if (seq !== routeSeq) return;
-        addrView.results = results;
-        addrView.indexed = await indexedP;
-        mv.innerHTML = addressHtml();
-
-        const st = await getState();
-        const tip = st ? st.height : tipHeight + 1;
-        const from = Math.max(0, tip - 5000);
-        // /scan returns every coin the address RECEIVED in the range, spent or
-        // not; whether each still exists is a separate question for /coin.
-        const coins = await scanRange(addr, from, tip);
-        if (seq !== routeSeq) return;
-        await checkCoins(coins.map(c => c.coin_id));
-        if (seq !== routeSeq) return;
-        Object.assign(addrView, { coins, from, to: tip, scanning: false });
-        mv.innerHTML = addressHtml();
-        log(`Address ${shortHex(addr)}: ${coins.length} coin(s) received in the last 5,000 blocks`, 's');
-    } catch (e) {
-        if (seq !== routeSeq) return;
-        log(`Address load error: ${e.message}`, 'e');
-        showMessage('alert', e.message, seq);
-    }
-}
-
-function addressActivity(s) {
-    const m = new Map();
-    const entry = (h, i) => {
-        const k = `${h}:${i}`;
-        if (!m.has(k)) m.set(k, { h, i, inV: 0, outV: 0, cb: false });
-        return m.get(k);
-    };
-    for (const r of s.results || []) {
-        if (!['output_address', 'coinbase_address', 'input_address'].includes(r.result_type)) continue;
-        const a = entry(r.height, r.tx_index == null ? 'cb' : r.tx_index);
-        const v = parseInt((/value (\d+)/.exec(r.detail || '') || [])[1] || '0', 10);
-        if (r.result_type === 'input_address') a.outV += v; else a.inV += v;
-        if (r.result_type === 'coinbase_address') a.cb = true;
-    }
-    // Coins the scan found at heights the search did not report (older ranges,
-    // or past its 50-result cap): received, transaction unknown.
-    const seen = new Set([...m.values()].filter(a => a.inV > 0).map(a => a.h));
-    for (const c of s.coins) {
-        if (seen.has(c.height)) continue;
-        entry(c.height, '?').inV += c.value;
-    }
-    return [...m.values()].sort((a, b) => b.h - a.h);
-}
-
-function actHtml(a) {
-    const net = a.inV - a.outV;
-    const cls = a.cb ? 'cb' : net >= 0 ? 'in' : 'out';
-    const icon = a.cb ? 'pick' : net >= 0 ? 'down' : 'up';
-    const open = a.i === '?' ? `go('${a.h}')` : `openTx(${a.h}, '${a.i}', '${addrView.addr}')`;
-    return `<div class="act ${cls}" onclick="${open}" title="${a.cb ? 'Mining reward' : net >= 0 ? 'Received' : 'Sent'}">
-        <span class="act-ic">${ic(icon)}</span>
-        <span class="act-amt">${net >= 0 ? '+' : '−'}${fmtAmtText(Math.abs(net))}</span>
-        <span class="act-where">${ic('cube')}${fmtInt(a.h)}${a.i === 'cb' || a.i === '?' ? '' : ` <span class="dim">#${a.i}</span>`}</span>
-        <span class="act-age">${approxAge(a.h)}</span>
-    </div>`;
-}
-
-function purseHtml(coins) {
-    coins = coins.slice().sort((a, b) => b.value - a.value);
-    if (coins.length <= 24) return coins.map(c => coinTok({ kind: 'coin', value: c.value, coinId: c.coin_id }, 'out', {})).join('');
-    const by = new Map();
-    for (const c of coins) { if (!by.has(c.value)) by.set(c.value, []); by.get(c.value).push(c); }
-    return [...by.entries()].map(([v, cs]) => {
-        if (cs.length === 1) return coinTok({ kind: 'coin', value: v, coinId: cs[0].coin_id }, 'out', {});
-        const [n, u] = unitParts(v);
-        return `<span class="coin stack st-alive" title="${cs.length} × ${v.toLocaleString('en')} MDS"><i class="dot" style="--d:${dotSize(v)}px"></i><b>${n}</b><small>${u}</small><em>×${cs.length}</em></span>`;
-    }).join('');
-}
-
-function addressHtml() {
-    const s = addrView, full = checksummed(s.addr), ix = s.indexed;
-    const alive = s.coins.filter(c => coinStatus.get(c.coin_id) === 'alive');
-    const bal = ix ? ix.balance : (s.scanning ? null : sum(alive.map(c => c.value)));
-    const nCoins = ix ? ix.coins : (s.scanning ? null : alive.length);
-    const span = s.to != null ? s.to - s.from : 5000;
-    let h = `<div class="ah">${identicon(s.addr, 50)}<div class="ah-main">
-            <div class="ah-label">${ic('wallet')}ADDRESS${s.name ? ` · ${escHtml(s.name.name)}` : ''}</div>
-            <div class="ah-addr"><span>${full}</span><button class="icon-btn" onclick="copyToClipboard('${full}', this)" title="Copy">${ic('copy')}</button></div>
-        </div></div>
-        ${s.name ? nameRecordsHtml(s.name) : ''}
-        <div class="ah-bal">${bal == null ? '<span class="dim">…</span>' : fmtAmt(bal)}</div>
-        <div class="chips">
-            ${nCoins != null ? `<span class="chip" title="Coins it holds"><i class="dot alive"></i>${fmtInt(nCoins)}</span>` : ''}
-            ${ix && ix.rank ? `<span class="chip" title="Rank among holders">#${fmtInt(ix.rank)}</span><span class="chip" title="Share of the supply">${fmtShare(ix.share)}</span>` : ''}
-            ${!ix && !s.scanning ? `<span class="chip" title="Balance of the last ${fmtInt(span)} blocks only">${ic('clock')}${fmtInt(span)} blocks</span>` : ''}
-        </div>`;
-
-    h += `<div class="sec-title">${ic('coins')}holds ${alive.length ? `<span>${fmtInt(alive.length)}</span>` : ''}</div>`;
-    if (s.scanning) h += `<div class="purse">${s.results == null ? `<span class="dim">${ic('hourglass')}</span>` : '<div class="pow-bar" title="Proof of work"><i id="pow-fill"></i></div>'}</div>`;
-    else h += `<div class="purse">${alive.length ? purseHtml(alive) : `<span class="dim">${ic('coins')} none in the last ${fmtInt(span)} blocks</span>`}</div>`;
-
-    const acts = s.results == null ? [] : addressActivity(s);
-    h += `<div class="sec-title">${ic('activity')}activity ${acts.length ? `<span>${fmtInt(acts.length)}</span>` : ''}</div>`;
-    if (s.results == null) h += `<div class="acts"><div class="empty-state" style="padding:20px">${ic('hourglass')}<div class="pow-bar" title="Proof of work"><i id="pow-fill"></i></div></div></div>`;
-    else h += `<div class="acts">${acts.length ? acts.map(actHtml).join('') : `<div class="empty-state" style="padding:20px">${ic('activity')}<div class="es-sub">none in the last 5,000 blocks</div></div>`}</div>`;
-
-    if (!s.scanning && s.from > 0) {
-        h += `<div class="addr-foot"><button class="btn" onclick="scanOlder(this)">${ic('search')} older blocks</button><span>${fmtInt(s.from)} – ${fmtInt(s.to)}</span></div>`;
-    }
-    return h;
-}
-
-/** Scan the 5,000 blocks before what has been scanned, and add what it finds. */
-async function scanOlder(btn) {
-    const s = addrView;
-    if (!s.addr || !s.from) return;
-    const seq = routeSeq, addr = s.addr, to = s.from, from = Math.max(0, to - 5000);
-    btn.disabled = true;
-    btn.innerHTML = `${ic('hourglass')}<span class="pow-bar"><i id="pow-fill"></i></span>`;
-    log(`Solving proof-of-work to scan blocks ${from}–${to}...`, 'i');
-    try {
-        const coins = await scanRange(addr, from, to);
-        await checkCoins(coins.map(c => c.coin_id));
-        if (seq !== routeSeq || addrView.addr !== addr) return;
-        s.coins = coins.concat(s.coins);
-        s.from = from;
-        mainView().innerHTML = addressHtml();
-        log(`Scanned ${fmtInt(from)}–${fmtInt(to)}: ${coins.length} more coin(s)`, 's');
-    } catch (e) {
-        log(`Deeper scan error: ${e.message}`, 'e');
-        btn.disabled = false;
-        btn.innerHTML = `${ic('search')} older blocks`;
-    }
-}
-
-// ── Polling ─────────────────────────────────────────────────────────────
-async function poll() {
-    try {
-        const [sRes, mRes, pRes] = await Promise.all([
-            fetch('/state'), fetch('/mempool'), fetch('/peers')
-        ]);
-        const state = await sRes.json();
-        const mempool = await mRes.json();
-        const peers = await pRes.json();
-
-        const prevTip = tipHeight;
-        // state.height is the next block to be mined; the highest confirmed batch is height-1
-        tipHeight = Math.max(0, state.height - 1);
-
-        $('h-height').textContent = fmtInt(tipHeight);
-        $('h-mempool').textContent = fmtInt(mempool.size);
-        $('h-reward').textContent = fmtAmtText(state.block_reward);
-        $('s-coins').textContent = fmtInt(state.num_coins);
-        $('s-commits').textContent = fmtInt(state.num_commitments);
-        $('s-safe').textContent = state.safe_depth < Number.MAX_SAFE_INTEGER ? fmtInt(state.safe_depth) : '∞';
-        $('s-peers').textContent = peers.peers.length;
-        $('live-dot').classList.remove('off');
-        $('live-dot').title = state.is_syncing ? 'syncing' : 'live';
-
-        lastMempoolData = mempool;
-        lastState = state;
-
-        if (tipHeight !== prevTip) {
-            if (prevTip > 0 && tipHeight > prevTip) log(`New block ${fmtInt(tipHeight)}`, 'var(--text-max)');
-            // A coin that existed a block ago may not now.
-            for (const [k, v] of coinStatus) if (v === 'alive') coinStatus.delete(k);
-            if (prevTip > 0) loadRecentStats();
-        }
-
-        renderBatchList();
-        if (currentTab === 'mempool' && (mainViewContent === 'mempool' || mainViewContent === 'mempool-entering')) renderMempoolView();
-        if (supplyDue()) {
-            const onTab = currentTab === 'supply';
-            loadSupply(onTab).then(() => { if (onTab && currentTab === 'supply') paintSupplyView(); });
-        }
-    } catch(e) {
-        $('live-dot').classList.add('off');
-        $('live-dot').title = 'node not reachable';
-    }
-}
-
-/** The sidebar: the next block (what the mempool holds), then the chain, each
- *  row with how busy the block was and how long ago. */
-function renderBatchList() {
-    const el = $('batch-list');
-    if (!el) return;
-    const now = nowSecs();
-    const start = Math.max(0, tipHeight - 40);
-    let maxTx = 1;
-    for (let i = tipHeight; i >= start; i--) {
-        const s = recentStats.get(i), c = blockCache[i];
-        maxTx = Math.max(maxTx, s ? s.txc : (c ? c.txCount : 0));
-    }
-    let html = '';
-    if (lastMempoolData) {
-        const pend = lastMempoolData.size || 0;
-        const act = currentTab === 'mempool' ? ' active' : '';
-        html += `<div class="batch-item next${act}" onclick="switchTab('mempool')" title="Waiting for the next block: ${pend}">
-            <span class="num">${ic('hourglass')}next</span><span class="bl-bar"><i style="width:${Math.min(100, pend / maxTx * 100).toFixed(0)}%"></i></span><span class="txc">${fmtInt(pend)}</span></div>`;
-    }
-    for (let i = tipHeight; i >= start; i--) {
-        const s = recentStats.get(i), c = blockCache[i];
-        const txc = s ? s.txc : (c ? c.txCount : null);
-        const pct = txc == null ? 0 : Math.max(txc ? 4 : 0, txc / maxTx * 100);
-        const age = s ? fmtAge(Math.max(0, now - s.ts)) : '';
-        const cls = (i === activeBatch && currentTab === 'explorer') ? ' active' : '';
-        html += `<div class="batch-item${cls}" onclick="go('${i}')" title="${txc != null ? txc + ' transactions' : ''}">
-            <span class="num">${fmtInt(i)}</span><span class="bl-bar"><i style="width:${pct.toFixed(0)}%"></i></span><span class="txc">${age}</span></div>`;
-    }
-    // Re-assigning innerHTML resets the sidebar's scroll position, so only
-    // repaint when the list actually changed — and keep the scroll when it did.
-    if (html === lastBatchListHtml) return;
-    lastBatchListHtml = html;
-    const prevScroll = el.scrollTop;
-    el.innerHTML = html;
-    el.scrollTop = prevScroll;
-}
-
-// ── Mempool ─────────────────────────────────────────────────────────────
-// Two queues, each sorted by its TRUE priority key — the order the mempool
-// evicts from: sealed commits by achieved proof of work, transfers by fee per KB.
-
-function mpTxId(t) { return (t.ins[0] && t.ins[0].coinId) || t.commitment || ''; }
-
-// Look for a query in the live mempool snapshot. Returns a description and,
-// for transfers, the card id to open — or null when nothing pends.
-function findInMempool(q) {
-    const txs = lastMempoolData ? lastMempoolData.transactions || [] : [];
-    for (const raw of txs) {
-        const t = normMempoolTx(raw);
-        if (t.kind === 'commit') { if (t.commitment === q) return { desc: 'sealed, waiting for a block', id: null }; continue; }
-        // A reveal's top-level commitment IS its phase-1 seal. (An input's own
-        // `commitment` is a state thread's data commitment — a different thing.)
-        if (t.commitment === q) return { desc: 'transfer waiting for a block', id: mpTxId(t) };
-        if (t.ins.some(i => i.coinId === q)) return { desc: 'coin being spent', id: mpTxId(t) };
-        if (t.outs.some(o => o.coinId === q)) return { desc: 'coin being created', id: mpTxId(t) };
-        if (t.ins.some(i => i.addr === q) || t.outs.some(o => o.addr === q)) return { desc: 'address in a waiting transfer', id: mpTxId(t) };
-    }
-    return null;
-}
-
-function pendingSpendOf(coinId) {
-    return (lastMempoolData && lastMempoolData.transactions || [])
-        .some(t => (t.input_coins || []).includes(coinId) || (t.inputs || []).some(i => i.coin_id === coinId));
-}
-
-function mpFocusCommit(c) {
-    activeQuery = c;
-    const pair = (lastMempoolData && lastMempoolData.transactions || []).map(normMempoolTx)
-        .find(t => t.kind !== 'commit' && t.commitment === c);
-    if (pair) mpExpanded.add(mpTxId(pair));
-    mpScrollPending = true;
-    renderMempoolView();
-}
-
-function renderMempoolView() {
-    const mv = mainView();
-    const data = lastMempoolData;
-    if (!data) { mv.innerHTML = loadingHtml(); return; }
-
-    const txs = (data.transactions || []).map(normMempoolTx);
-    const commits = txs.filter(t => t.kind === 'commit').sort((a, b) => (b.pow ?? -1) - (a.pow ?? -1));
-    const reveals = txs.filter(t => t.kind !== 'commit').sort((a, b) => (b.rate ?? b.fee ?? 0) - (a.rate ?? a.fee ?? 0));
-    const reqPow = lastState ? lastState.required_pow : null;
-    const revealSet = new Set(reveals.map(r => r.commitment).filter(Boolean));
-    const commitSet = new Set(commits.map(c => c.commitment));
-    const totalFees = sum(reveals.map(r => r.fee));
-    const totalBytes = sum(reveals.map(r => r.size || 0));
-    txReg.clear();
-
-    let html = `<div class="mempool-split">`;
-
-    // ── Phase 1: sealed commitments (priority = proof of work) ──
-    html += `<div class="mp-col"><div class="mp-col-hdr">${ic('lock')}SEALED · ${commits.length}${reqPow != null ? ` · ≥ ${reqPow} BITS` : ''}</div><div class="mp-col-body">`;
-    if (commits.length === 0) html += `<div class="empty-state" style="padding:24px 8px">${ic('lock')}<div class="es-sub">empty</div></div>`;
-    const CCAP = 200;
-    commits.slice(0, CCAP).forEach(c => {
-        const strength = reqPow != null && c.pow != null ? Math.max(0.08, Math.min(1, (c.pow - reqPow + 2) / 10)) : 0.5;
-        const paired = revealSet.has(c.commitment);
-        const hl = c.commitment === activeQuery ? ' mp-match' : '';
-        html += `<div class="mp-row${hl}" onclick="mpFocusCommit('${c.commitment}')" title="${c.commitment}">
-            <span class="mp-hash">${ic('lock')}${shortHex(c.commitment)}</span>
-            <span class="mp-row-right"><span class="mp-dim mp-age" title="Waiting">${fmtAge(c.age)}</span>${paired ? `<span class="mp-flag" title="Its reveal is waiting too">${ic('link')}</span>` : ''}<span class="pow-meter" title="${c.pow ?? '?'} bits of proof of work${reqPow != null ? ` (≥ ${reqPow} required)` : ''}"><i style="width:${(strength * 100).toFixed(0)}%"></i></span></span>
-        </div>`;
-    });
-    if (commits.length > CCAP) html += `<div class="mp-note">+ ${commits.length - CCAP} more, weakest last</div>`;
-    html += `</div></div>`;
-
-    // ── Phase 2: transfers (priority = fee per byte) ──
-    const sizeStat = totalBytes > 0 ? ` · ${(totalBytes / 1024).toFixed(1)} KB` : '';
-    html += `<div class="mp-col wide"><div class="mp-col-hdr">${ic('transfer')}TRANSFERS · ${reveals.length}${reveals.length ? ` · ${ic('pick')}${fmtAmtText(totalFees)}${sizeStat}` : ''}</div><div class="mp-col-body">`;
-    if (reveals.length === 0) {
-        html += `<div class="empty-state" style="padding:24px 8px">${ic('transfer')}<div class="es-sub">empty</div></div>`;
-    } else {
-        const rates = reveals.map(x => x.rate).filter(v => v != null).sort((a, b) => a - b);
-        if (rates.length >= 2) {
-            const med = rates[Math.floor(rates.length / 2)];
-            html += `<div class="mp-ladder" title="Fee per KB already waiting: pay more to go first">fee /KB · top ${rates[rates.length - 1]} · median ${med} · low ${rates[0]}</div>`;
-        }
-        const RCAP = 100;
-        reveals.slice(0, RCAP).forEach(r => {
-            const id = mpTxId(r);
-            const match = txTouches(r, activeQuery);
-            html += txCardHtml(r, { key: 'mp:' + id, pending: true, open: mpExpanded.has(id), all: mpUnfolded.has(id), match, sealedHere: commitSet.has(r.commitment) });
-        });
-        if (reveals.length > RCAP) html += `<div class="mp-note">+ ${reveals.length - RCAP} more, cheapest per byte last</div>`;
-    }
-    html += `</div></div></div>`;
-
-    // ── Disruption-free update ──
-    // Re-assigning innerHTML rebuilds both scroll containers from scratch,
-    // yanking the reader back to the top every poll. Three tiers instead:
-    //   1. Identical repaint            -> skip entirely.
-    //   2. Only the age chips ticked    -> patch their text in the live DOM.
-    //   3. Genuine structural change    -> repaint, then restore scroll.
-    const stripAges = h => h.replace(/(<span class="mp-dim mp-age"[^>]*>)[^<]*(<\/span>)/g, '$1$2');
-    if (mainViewContent === 'mempool' && html === lastMempoolHtml) {
-        // Nothing changed.
-    } else if (mainViewContent === 'mempool' && stripAges(html) === stripAges(lastMempoolHtml)) {
-        const newAges = [...html.matchAll(/class="mp-dim mp-age"[^>]*>([^<]*)</g)].map(m => m[1]);
-        mv.querySelectorAll('.mp-age').forEach((el, i) => {
-            if (newAges[i] != null) el.textContent = newAges[i];
-        });
-        lastMempoolHtml = html;
-    } else {
-        const prevMain = mv.scrollTop;
-        const prevCols = Array.from(mv.querySelectorAll('.mp-col-body')).map(el => el.scrollTop);
-        mv.innerHTML = html;
-        lastMempoolHtml = html;
-        mv.scrollTop = prevMain;
-        mv.querySelectorAll('.mp-col-body').forEach((el, i) => {
-            if (prevCols[i] != null) el.scrollTop = prevCols[i];
-        });
-        drawFlows(mv);
-    }
-    mainViewContent = 'mempool';
-
-    if (mpScrollPending) {
-        mpScrollPending = false;
-        const m = mv.querySelector('.mp-match');
-        if (m && m.scrollIntoView) m.scrollIntoView({ block: 'center' });
-    }
-}
-
-// Renders the Analytics Charts
-async function renderAnalyticsView() {
-    const mv = document.getElementById('main-view');
-    mainViewContent = 'analytics';
-    mv.innerHTML = `<div style="padding:20px; color:var(--text-faint);">Loading analytics...</div>`;
-    try {
-        const res = await fetch('/stats/history');
-        const data = await res.json();
-        const blocks = data.blocks.reverse();
-        if (blocks.length === 0) return;
-
-        const totalTxs = blocks.reduce((s, b) => s + b.tx_count, 0);
-        const maxTxs = Math.max(...blocks.map(b => b.tx_count), 1);
-        
-        let avgTime = 0;
-        if (blocks.length > 1) {
-            const elapsed = blocks[blocks.length-1].timestamp - blocks[0].timestamp;
-            avgTime = (elapsed / (blocks.length - 1)).toFixed(1);
-        }
-
-        let html = `<div class="block-hdr"><h2>CHAIN DYNAMICS (Last ${blocks.length} Blocks)</h2></div>`;
-        
-        html += `<div class="stat-grid">
-            <div class="stat-box"><div class="lbl">TOTAL TXs</div><div class="val">${totalTxs}</div></div>
-            <div class="stat-box"><div class="lbl">AVG BLOCK TIME</div><div class="val">${avgTime}s</div></div>
-            <div class="stat-box"><div class="lbl">PEAK TX/BLOCK</div><div class="val">${maxTxs}</div></div>
-        </div>`;
-
-        // Bar Chart (Tx Count)
-        let txBars = '';
-        blocks.forEach(b => {
-            const hPct = (b.tx_count / maxTxs) * 100;
-            txBars += `<div class="bar" style="height:${Math.max(hPct, 1)}%;" title="Block ${b.height}: ${b.tx_count} txs"></div>`;
-        });
-        html += `<div class="chart-container">
-            <div class="chart-title">Transaction Throughput</div>
-            <div class="bar-chart">${txBars}</div>
-        </div>`;
-
-        // Bar Chart (Block Times)
-        let timeBars = '';
-        let blockTimes = blocks.map((b, i) => i === 0 ? 60 : Math.max(0, b.timestamp - blocks[i-1].timestamp));
-        let maxTime = Math.max(...blockTimes, 120);
-
-        blockTimes.forEach((t, i) => {
-            const hPct = Math.min((t / maxTime) * 100, 100);
-            let color = t > 180 ? 'var(--warn-accent)' : 'var(--border-bright)';
-            timeBars += `<div class="bar" style="height:${Math.max(hPct, 1)}%; background:${color};" title="Block ${blocks[i].height}: ${t} seconds"></div>`;
-        });
-        html += `<div class="chart-container">
-            <div class="chart-title">Block Times (Seconds)</div>
-            <div class="bar-chart">${timeBars}</div>
-        </div>`;
-
-        if (currentTab === 'analytics') mv.innerHTML = html;
-    } catch(e) { if (currentTab === 'analytics') mv.innerHTML = `<div style="color:var(--red);padding:20px;">Error: ${e.message}</div>`; }
-}
-
-// ── Supply & rich list ──────────────────────────────────────────────────
-// Figures come from the node's rich-list index (--rich-list), via /supply and
-// /richlist. Amounts are base MDS; 1 gMDS = 2^30 MDS. Every amount the chain
-// can hold is below 2^53, so plain Numbers are exact.
 const MDS_PER_GMDS = 1073741824;
-let lastSupply = null;
-let lastRichList = null;
-let supplyFetched = { tip: -1, at: 0 };
-let lastSupplyHtml = '';
 
 function fmtInt(n) { return Number(n).toLocaleString('en'); }
 
@@ -2566,244 +1439,948 @@ function fmtDuration(blocks) {
     return hours >= 2 ? `~${Math.round(hours)} hours` : `~${blocks} min`;
 }
 
-// Is it time to refetch? On every new block, and every 10s while the index builds.
-function supplyDue() {
-    const s = lastSupply;
-    const building = s && (s.index.status === 'building' || s.index.status === 'rebuilding');
-    return supplyFetched.tip !== tipHeight || (building && Date.now() - supplyFetched.at > 10000);
+// ════════════════════════════════════════════════════════════════════════
+//  The explorer: pages, routing, polling. The chain math, BLAKE3, the
+//  proof-of-work search and the script decompiler above are unchanged.
+// ════════════════════════════════════════════════════════════════════════
+
+let page = 'home';
+let lastPeers = 0;
+let lastMempoolData = null;
+let homeTimer = null;
+const coinStatus = new Map();   // coin id -> 'alive' | 'spent'
+
+/** Which of these coins still exist, eight questions at a time. */
+async function checkCoins(ids) {
+    const todo = [...new Set(ids)].filter(id => id && !coinStatus.has(id));
+    for (let i = 0; i < todo.length; i += 8) {
+        await Promise.all(todo.slice(i, i + 8).map(async id => {
+            try {
+                const r = await fetch('/coin/' + id);
+                if (r.ok) coinStatus.set(id, (await r.json()).exists ? 'alive' : 'spent');
+            } catch (_) {}
+        }));
+    }
 }
 
-async function loadSupply(withRichList) {
-    supplyFetched = { tip: tipHeight, at: Date.now() };
+function toast(msg) {
+    const t = $('toast');
+    t.textContent = msg;
+    t.classList.add('on');
+    clearTimeout(toast.h);
+    toast.h = setTimeout(() => t.classList.remove('on'), 2400);
+}
+function log(msg, kind) {
+    if (kind === 'e') console.warn(msg); else console.debug(msg);
+}
+function toggleMenu() { $('nav').classList.toggle('open'); }
+function view() { return $('view'); }
+function setNav(p) {
+    page = p;
+    document.querySelectorAll('#nav a').forEach(a => a.classList.toggle('on', a.dataset.page === p));
+    $('nav').classList.remove('open');
+}
+/** loadRecentStats() calls this when fresh block times arrive. */
+function renderBatchList() { if (page === 'home') paintHome(); }
+
+// ── Small builders ──────────────────────────────────────────────────────
+
+const short = (h, n = 6) => !h ? '' : h.length <= n * 2 + 1 ? h : `${h.slice(0, n)}…${h.slice(-n)}`;
+const utc = ts => new Date(ts * 1000).toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' UTC');
+const ago = ts => `<span title="${utc(ts)}">${fmtAgo(ts)}</span>`;
+const href = {
+    block: h => `?q=${h}`,
+    tx: (h, i) => `?tx=${h}.${i}`,
+    q: q => `?q=${encodeURIComponent(q)}`,
+};
+function help(text) { return `<span class="help" tabindex="0" data-tip="${escHtml(text)}">?</span>`; }
+function copyBtn(text) { return `<button class="copy" onclick="copyToClipboard('${escHtml(text)}', this)" title="Copy" aria-label="Copy">${ic('copy')}</button>`; }
+function badge(cls, text, icon) { return `<span class="badge ${cls}">${icon ? ic(icon) : ''}${text}</span>`; }
+function card(title, body, extra) {
+    return `<section class="card"><div class="card-h"><h2>${title}</h2>${extra || ''}</div>${body}</section>`;
+}
+function kv(rows) {
+    return `<div class="kv">${rows.filter(Boolean).map(([k, v, tip]) =>
+        `<div class="kv-row"><div class="kv-k">${k}${tip ? help(tip) : ''}</div><div class="kv-v">${v}</div></div>`).join('')}</div>`;
+}
+function table(cols, rows, empty) {
+    if (!rows.length) return `<div class="empty">${empty || 'Nothing here yet.'}</div>`;
+    const head = cols.map(c => `<th${c.r ? ' class="r"' : ''}>${c.t}</th>`).join('');
+    const body = rows.map(r => `<tr>${r.map((cell, i) =>
+        `<td data-l="${escHtml(cols[i].t)}"${cols[i].r ? ' class="r"' : ''}>${cell}</td>`).join('')}</tr>`).join('');
+    return `<table class="tbl"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+}
+/** An address: its picture, and a link to it. */
+function who(addr, n = 6, label) {
+    if (!addr) return '<span class="faint">—</span>';
+    const full = checksummed(addr);
+    return `<span class="who">${identicon(addr, 16)}<a class="hash" href="${href.q(full)}" title="${full}">${label ? escHtml(label) : short(full, n)}</a></span>`;
+}
+function txLink(t, n = 6) {
+    if (t.kind === 'coinbase') return `<a href="${href.tx(t.height, 'cb')}">Reward <span class="dim">#${fmtInt(t.height)}</span></a>`;
+    return `<a class="hash" href="${href.tx(t.height, t.index)}" title="${t.commitment}">${short(t.commitment, n)}</a>`;
+}
+function loading(text) { return `<div class="loading"><span class="spin"></span>${text || 'Loading…'}</div>`; }
+function powBar() { return `<div class="pow" title="A small proof of work keeps this node from being flooded with searches"><i id="pow-fill"></i></div>`; }
+function message(title, sub) {
+    view().innerHTML = `<div class="page-h"><h1>${escHtml(title)}</h1></div>
+        <section class="card"><div class="card-b pad">${sub || ''}<p><a href="?">Back to the latest blocks</a></p></div></section>`;
+}
+function stale(seq) { return seq !== routeSeq; }
+
+/** What a transaction moved, the way an account chain would say it: who
+ *  paid, who was paid (change back to a sender is not a payment), how much. */
+function summary(t) {
+    const coinsOut = t.outs.filter(o => o.kind === 'coin');
+    if (t.kind === 'coinbase') {
+        return { type: 'Reward', from: [], to: [...new Set(coinsOut.map(o => o.addr))], value: t.totalOut };
+    }
+    const senders = [...new Set(t.ins.filter(i => i.addr).map(i => i.addr))];
+    const pays = coinsOut.filter(o => !senders.includes(o.addr));
+    const to = [...new Set((pays.length ? pays : coinsOut).map(o => o.addr))];
+    const type = t.mix ? 'Mix' : t.kind === 'consolidate' ? 'Consolidate' : !pays.length ? (t.outs.some(o => o.kind === 'burn') ? 'Data' : 'Self') : 'Transfer';
+    return { type, from: senders, to, value: pays.length ? sum(pays.map(o => o.value)) : sum(coinsOut.map(o => o.value)) };
+}
+function many(list, n) {
+    if (!list.length) return '<span class="faint">—</span>';
+    return who(list[0], n) + (list.length > 1 ? ` <span class="dim">+${list.length - 1}</span>` : '');
+}
+/** Transactions as two-line rows: what a phone shows instead of a table. */
+function txList(txs, opts) {
+    opts = opts || {};
+    if (!txs.length) return `<div class="empty">${opts.empty || 'No transactions.'}</div>`;
+    return txs.map(t => {
+        const s = summary(t);
+        const when = t.ts ? ` · ${ago(t.ts)}` : '';
+        const where = opts.block ? `<a class="mono" href="${href.block(t.height)}">#${fmtInt(t.height)}</a>${when} · ` : (t.ts ? `${ago(t.ts)} · ` : '');
+        return `<div class="li"><span class="ico">${ic(s.type === 'Reward' ? 'pick' : 'transfer')}</span>
+            <div><div class="t1">${txLink(t)} ${s.type !== 'Transfer' ? typeBadge(s.type) : ''}</div>
+            <div class="t2">${where}<span class="nw">${many(s.from, 4)}</span> <span class="nw"><span class="arrow">→</span>${many(s.to, 4)}</span></div></div>
+            <div class="end">${fmtAmt(s.value)}${t.fee != null && t.kind !== 'coinbase' ? `<div class="t2">fee ${fmtAmtText(t.fee)}</div>` : ''}</div></div>`;
+    }).join('');
+}
+/** A table where there is room, two-line rows where there is not. */
+function dual(tableHtml, listHtml) {
+    return `<div class="only-wide">${tableHtml}</div><div class="only-narrow">${listHtml}</div>`;
+}
+
+/** Coins grouped by owner: one row per address with its total, opening to
+ *  the coins themselves. Power-of-two coins make a single payment many
+ *  coins; the reader wants to know who got how much. */
+function coinGroups(items, side, senders) {
+    if (!items.length) return '<div class="empty">None</div>';
+    const rows = [];
+    const groups = new Map();
+    for (const c of items) {
+        if (c.kind === 'coin' && c.addr) {
+            if (!groups.has(c.addr)) { groups.set(c.addr, []); rows.push({ addr: c.addr }); }
+            groups.get(c.addr).push(c);
+        } else rows.push({ one: c });
+    }
+    return rows.map(r => {
+        if (r.one) return coinRows([r.one], side);
+        const cs = groups.get(r.addr);
+        const total = sum(cs.map(c => c.value));
+        const change = side === 'out' && senders && senders.includes(r.addr);
+        const tag = change ? badge('', 'Change') : '';
+        const coins = cs.map(c => `<div class="coin"${c.coinId ? ` data-coin="${c.coinId}"` : ''}><a class="hash" href="${href.q(c.coinId || '')}" title="${c.coinId || ''}">${short(c.coinId || '', 6)}</a><span class="st">${side === 'out' ? coinBadge(c.coinId) : ''}</span><span>${fmtAmt(c.value)}</span></div>`).join('');
+        if (cs.length === 1) {
+            return `<div class="grp"><div class="grp-row"${cs[0].coinId ? ` data-coin="${cs[0].coinId}"` : ''}>${who(r.addr, 6)}${tag}<span class="st">${side === 'out' ? coinBadge(cs[0].coinId) : ''}</span><span class="amt">${fmtAmt(total)}</span><a class="copy" href="${href.q(cs[0].coinId || '')}" title="The coin">${ic('coins')}</a></div></div>`;
+        }
+        return `<details class="grp"><summary>${who(r.addr, 6)}${tag}<span class="n">${cs.length} coins</span><span class="amt">${fmtAmt(total)}</span><span class="chev">${ic('right')}</span></summary><div class="coins">${coins}</div></details>`;
+    }).join('');
+}
+function coinBadge(id) {
+    const st = id && coinStatus.get(id);
+    return st === 'alive' ? badge('ok', 'Unspent') : st === 'spent' ? badge('', 'Spent') : '';
+}
+
+function typeBadge(type) {
+    const cls = { Reward: 'rew', Transfer: '', Mix: 'seal', Consolidate: '', Self: '', Data: '' }[type] || '';
+    return badge(cls, type);
+}
+function confirmations(h) {
+    const st = lastState;
+    if (!st) return '';
+    const conf = Math.max(0, st.height - h);
+    const need = st.safe_depth;
+    const fin = need < Number.MAX_SAFE_INTEGER && conf >= need;
+    return `${fin ? badge('ok', 'Final', 'check') : badge('', `${fmtInt(conf)} of ${fmtInt(need)}`)} <span class="dim">${fmtInt(conf)} confirmation${conf === 1 ? '' : 's'}</span>`;
+}
+
+// ── Routing ─────────────────────────────────────────────────────────────
+// Links are real URLs (?q=…, ?tx=height.index), so they open in new tabs
+// and old links from wallets keep working; same-tab clicks route in place.
+
+function parseLocation(search) {
+    const p = new URLSearchParams(search == null ? window.location.search : search);
+    if (p.get('tx')) return { tx: p.get('tx') };
+    let q = p.get('q') || p.get('query');
+    const s = search == null ? window.location.search : search;
+    if (!q && s.length > 1 && !s.includes('=')) q = s.substring(1);
+    if (q) return { q: decodeURIComponent(q).replace(/\/$/, ''), before: p.get('before') || null };
+    return {};
+}
+function urlFor(s) {
+    if (s.tx) return '?tx=' + encodeURIComponent(s.tx);
+    if (s.q) return '?q=' + encodeURIComponent(s.q) + (s.before ? '&before=' + encodeURIComponent(s.before) : '');
+    return window.location.pathname;
+}
+function navigate(s, replace) {
+    const url = urlFor(s);
+    if (replace) history.replaceState(s, '', url); else history.pushState(s, '', url);
+    window.scrollTo(0, 0);
+    route(s);
+}
+function go(q) { q = String(q).trim(); if (/^[0-9][0-9,]*$/.test(q)) q = q.replace(/,/g, ''); navigate({ q }); }
+function openTx(h, i) { navigate({ tx: `${h}.${i}` }); }
+window.addEventListener('popstate', e => route(e.state || parseLocation()));
+document.addEventListener('click', e => {
+    const a = e.target.closest('a[href^="?"]');
+    if (!a || e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || a.target) return;
+    e.preventDefault();
+    navigate(parseLocation(a.getAttribute('href')));
+});
+
+function submitSearch(e) {
+    e.preventDefault();
+    const input = $('q');
+    const v = input.value.trim();
+    if (!v) return false;
+    input.value = '';
+    input.blur();
+    go(v);
+    return false;
+}
+
+async function route(s) {
+    s = s || {};
+    const seq = ++routeSeq;
+    clearInterval(homeTimer);
+    if (s.tx) {
+        const [hs, is] = String(s.tx).split('.');
+        setNav('txs');
+        return showTx(parseInt(String(hs).replace(/,/g, ''), 10), is === 'cb' ? 'cb' : parseInt(is, 10), seq);
+    }
+    if (s.q) return query(s.q, s.before, seq);
+    setNav('home');
+    return showHome(seq);
+}
+
+async function query(q, before, seq) {
+    const lc = q.toLowerCase().replace(/^0x/, '');
+    if (lc === 'blocks') { setNav('blocks'); return showBlocks(before ? parseInt(before, 10) : null, seq); }
+    if (/^(transactions|txs|txns)$/.test(lc)) { setNav('txs'); return showTxs(seq); }
+    if (/^(mempool|pending)$/.test(lc)) { setNav('mempool'); return showMempool(seq); }
+    if (/^(supply|rich ?list|holders|richlist)$/.test(lc)) { setNav('supply'); return showSupply(seq); }
+    if (/^(learn|help|about)$/.test(lc)) { setNav('learn'); return showLearn(); }
+    if (lc === 'api') { setNav(''); return showApi(); }
+    setNav('');
+    if (/^[0-9][0-9,]*$/.test(q)) return showBlock(parseInt(q.replace(/,/g, ''), 10), seq);
+    if (/^[0-9a-f]{72}$/.test(lc)) {
+        const c = validateAddressChecksum(lc);
+        if (!c.valid) return message('That address has a typo', `<p>${escHtml(c.reason)}. The last eight characters are a checksum of the rest, so a mistyped address never matches.</p>`);
+        return showAddress(c.canonical, before, seq);
+    }
+    if (/^[0-9a-f]{64}$/.test(lc)) return resolveHash(lc, seq);
+    if (/^[a-z0-9-]+\.mds$/.test(lc)) return showName(lc, seq);
+    if (lc.startsWith('decompile ')) {
+        const hex = q.split(/\s+/)[1] || '';
+        view().innerHTML = `<div class="page-h"><h1>Script</h1></div>${card('Decompiled', `<div class="card-b pad">${renderScriptDisasm(hex)}</div>`)}`;
+        return;
+    }
+    message('Nothing matched', `<p>Search for a block number, an address (72 characters), a transaction id or coin id (64), or a name such as <span class="mono">nick.mds</span>.</p>`);
+}
+
+/** A 64-hex string can be a transaction id, a coin, an address or a block
+ *  hash. The transaction index answers the first at once; otherwise one
+ *  proof-of-work search says which. */
+async function resolveHash(q, seq) {
+    view().innerHTML = loading('Looking it up…');
+    try {
+        const r = await fetch('/tx/' + q);
+        if (r.ok) {
+            const t = await r.json();
+            if (stale(seq)) return;
+            if (t.revealed) return showTx(t.revealed.height, t.revealed.tx, seq);
+            if (t.sealed) return showTx(t.sealed.height, t.sealed.tx, seq);
+        }
+    } catch (_) {}
+    const mp = findInMempool(q);
+    view().innerHTML = loading('Searching recent blocks…') + powBar();
+    let results;
+    try { results = await cachedSearch(q); }
+    catch (e) {
+        if (stale(seq)) return;
+        if (mp) return showPendingTx(mp);
+        return message('Search failed', `<p>${escHtml(e.message)}</p>`);
+    }
+    if (stale(seq)) return;
+    const has = (...types) => results.some(r => types.includes(r.result_type));
+    if (has('output_coin_id', 'coinbase_coin_id', 'input_coin_id')) return showCoin(q, results, seq);
+    if (has('output_address', 'coinbase_address', 'input_address')) return showAddress(q, null, seq, results);
+    const seal = results.find(r => r.result_type === 'commitment');
+    if (seal) {
+        // A transaction id: the search finds its seal; show the reveal.
+        view().innerHTML = loading('Found its seal; finding where it ran…');
+        const r = await walkForReveal(q, seal.height, seq);
+        if (stale(seq)) return;
+        return r ? showTx(r.height, r.tx, seq) : showTx(seal.height, seal.tx_index, seq);
+    }
+    const first = results[0];
+    if (first) {
+        if (first.tx_index != null && first.result_type !== 'block_hash') return showTx(first.height, first.tx_index, seq);
+        return showBlock(first.height, seq);
+    }
+    if (mp) return showPendingTx(mp);
+    try {
+        const r = await fetch('/coin/' + q);
+        if (r.ok && (await r.json()).exists) return showCoin(q, [], seq);
+    } catch (_) {}
+    message('Nothing found', '<p>Nothing in the last 5,000 blocks or in the pending pool matches that.</p>');
+}
+
+// ── Home ────────────────────────────────────────────────────────────────
+
+let homeBlocks = [];   // [{h, b, n}] newest first
+let homeTxs = [];      // normalised transfers, newest first
+
+async function showHome(seq) {
+    view().innerHTML = homeHtml();
+    await refreshHome(seq);
+    homeTimer = setInterval(() => { if (page === 'home') refreshHome(routeSeq); }, 8000);
+}
+
+async function refreshHome(seq) {
+    if (!tipHeight) await poll();
+    const want = [];
+    for (let h = tipHeight; h >= 0 && want.length < 8; h--) want.push(h);
+    const got = await Promise.all(want.map(h => getBatch(h).then(b => ({ h, b, n: normBlock(b, h) })).catch(() => null)));
+    if (stale(seq)) return;
+    homeBlocks = got.filter(Boolean);
+    // Latest transfers: walk back until there are eight, at most 60 blocks.
+    const txs = [];
+    for (const x of homeBlocks) for (const t of x.n.transfers.slice().reverse()) txs.push(Object.assign(t, { ts: x.b.timestamp }));
+    for (let h = (homeBlocks.at(-1)?.h ?? tipHeight) - 1; txs.length < 8 && h >= 0 && h > tipHeight - 60; h--) {
+        try {
+            const b = await getBatch(h), n = normBlock(b, h);
+            for (const t of n.transfers.slice().reverse()) txs.push(Object.assign(t, { ts: b.timestamp }));
+        } catch (_) { break; }
+        if (stale(seq)) return;
+    }
+    homeTxs = txs.slice(0, 8);
+    paintHome();
+}
+
+function avgBlockTime() {
+    const s = [...recentStats.entries()].sort((a, b) => b[0] - a[0]).slice(0, 60);
+    if (s.length < 2) return null;
+    return (s[0][1].ts - s[s.length - 1][1].ts) / (s[0][0] - s[s.length - 1][0]);
+}
+
+function statsHtml() {
+    const st = lastState, sp = lastSupply;
+    const bt = avgBlockTime();
+    const stat = (k, v, s, link, tip) => `<div class="stat"><div class="k">${k}${tip ? help(tip) : ''}</div>${link ? `<a class="v" href="${link}">${v}</a>` : `<div class="v">${v}</div>`}<div class="s">${s || '&nbsp;'}</div></div>`;
+    const circ = sp && sp.circulating_supply != null ? `${fmtG(sp.circulating_supply, 0)} gMDS` : '—';
+    return `<div class="stats">
+        ${stat('Latest block', st ? fmtInt(tipHeight) : '—', bt ? `about ${Math.round(bt)} s apart` : '', href.block(tipHeight))}
+        ${stat('Circulating supply', circ, sp ? `of ${fmtG(sp.max_supply, 0)} gMDS max` : '', '?q=supply')}
+        ${stat('Unspent coins', st ? fmtInt(st.num_coins) : '—', 'what Ethereum would call balances', null, 'Midstate keeps coins, not account balances. An address owns the coins sent to it until it spends them.')}
+        ${stat('Pending', lastMempoolData ? fmtInt(lastMempoolData.size) : '—', 'waiting for a block', '?q=mempool')}
+        ${stat('Block reward', st ? fmtAmtText(st.block_reward) : '—', 'new coins per block')}
+        ${stat('Final after', st && st.safe_depth < Number.MAX_SAFE_INTEGER ? `${fmtInt(st.safe_depth)} blocks` : '—', 'the depth this node treats as settled', null, 'Like confirmations on Bitcoin. Midstate has no checkpoint votes; a block is settled once enough work is built on it.')}
+        ${stat('Sealed', st ? fmtInt(st.num_commitments) : '—', 'committed, not yet revealed', null, 'Every Midstate transaction is first sealed (a hash that hides it), then revealed. This is what stops front-running.')}
+        ${stat('Peers', fmtInt(lastPeers), 'nodes this one talks to')}
+    </div>`;
+}
+
+function homeHtml() {
+    return `<div class="hero"><h1>Midstate blockchain explorer</h1><p>Blocks, transactions, addresses and <span class="mono">.mds</span> names, live from this node.</p></div>
+        <div id="home-stats">${statsHtml()}</div>
+        <div class="grid2">
+            <section class="card"><div class="card-h"><h2>Latest blocks</h2><a class="more" href="?q=blocks">View all</a></div><div class="card-b" id="home-blocks">${loading()}</div></section>
+            <section class="card"><div class="card-h"><h2>Latest transactions</h2><a class="more" href="?q=transactions">View all</a></div><div class="card-b" id="home-txs">${loading()}</div></section>
+        </div>
+        <section class="card" style="margin-top:16px"><div class="card-b pad callout"><span class="mark">${ic('spark')}</span><div>
+            <b>Coming from Ethereum, Solana or Base?</b> A few things work differently here: coins instead of balances, two-step
+            transactions that cannot be front-run, fees paid in MDS with no gas auction, post-quantum keys, and <span class="mono">.mds</span> names.
+            <a href="?q=learn">Midstate in two minutes</a></div></div></section>`;
+}
+
+function paintHome() {
+    const s = $('home-stats');
+    if (!s) return;
+    s.innerHTML = statsHtml();
+    const bl = $('home-blocks'), tl = $('home-txs');
+    if (bl && homeBlocks.length) bl.innerHTML = homeBlocks.map(({ h, b, n }) => {
+        const payees = [...new Set(n.cb.outs.map(o => o.addr))];
+        return `<div class="li"><span class="ico">${ic('cube')}</span>
+            <div><div class="t1"><a href="${href.block(h)}" class="mono">${fmtInt(h)}</a> <span class="dim">· ${ago(b.timestamp)}</span></div>
+            <div class="t2">Mined by ${many(payees, 5)} · ${fmtInt(n.transfers.length)} txn${n.transfers.length === 1 ? '' : 's'}</div></div>
+            <div class="end">${fmtAmt(n.cb.totalOut)}</div></div>`;
+    }).join('');
+    if (tl && homeBlocks.length) tl.innerHTML = homeTxs.length ? homeTxs.map(t => {
+        const s = summary(t);
+        return `<div class="li"><span class="ico">${ic('transfer')}</span>
+            <div><div class="t1">${txLink(t)} <span class="dim">· ${ago(t.ts)}</span></div>
+            <div class="t2"><span class="nw">From&nbsp;${many(s.from, 4)}</span> <span class="nw"><span class="arrow">→</span>${many(s.to, 4)}</span></div></div>
+            <div class="end">${fmtAmt(s.value)}</div></div>`;
+    }).join('') : `<div class="empty">No transfers in the last 60 blocks.</div>`;
+}
+
+// ── Blocks ──────────────────────────────────────────────────────────────
+
+async function showBlocks(top, seq) {
+    if (!tipHeight) await poll();
+    top = top == null || !(top <= tipHeight) ? tipHeight : top;
+    view().innerHTML = `<div class="page-h"><h1>Blocks</h1><span class="sub">newest first</span></div>${loading()}`;
+    const hs = [];
+    for (let h = top; h >= 0 && hs.length < 25; h--) hs.push(h);
+    const got = await Promise.all(hs.map(h => getBatch(h).then(b => ({ h, b, n: normBlock(b, h) })).catch(() => null)));
+    if (stale(seq)) return;
+    const rows = got.filter(Boolean).map(({ h, b, n }) => [
+        `<a class="mono" href="${href.block(h)}">${fmtInt(h)}</a>`,
+        ago(b.timestamp),
+        `${fmtInt(n.transfers.length)}${n.commits.length ? ` <span class="dim">· ${fmtInt(n.commits.length)} sealed</span>` : ''}`,
+        many([...new Set(n.cb.outs.map(o => o.addr))], 5),
+        fmtAmt(n.fees),
+        fmtAmt(n.cb.totalOut),
+    ]);
+    const older = top - 25 >= 0 ? `<a class="btn" href="?q=blocks&before=${top - 25}">Older ${ic('right')}</a>` : '';
+    const newer = top < tipHeight ? `<a class="btn" href="?q=blocks${top + 25 < tipHeight ? `&before=${top + 25}` : ''}">${ic('left')} Newer</a>` : '';
+    view().innerHTML = `<div class="page-h"><h1>Blocks</h1><span class="sub">${fmtInt(top)} and below</span></div>
+        <section class="card"><div class="card-b">${table([{ t: 'Block' }, { t: 'Age' }, { t: 'Txns' }, { t: 'Mined by' }, { t: 'Fees', r: 1 }, { t: 'Reward', r: 1 }], rows)}</div>
+        <div class="pager">${newer}${older}</div></section>`;
+}
+
+async function showBlock(h, seq) {
+    if (!tipHeight) await poll();
+    view().innerHTML = loading(`Block ${fmtInt(h)}…`);
+    let b;
+    try { b = await getBatch(h); } catch (e) { return message(`No block ${fmtInt(h)}`, `<p>${escHtml(e.message)}</p>`); }
+    if (stale(seq)) return;
+    const n = normBlock(b, h);
+    const hash = toHex(b.extension.final_hash);
+    const payees = [...new Set(n.cb.outs.map(o => o.addr))];
+    const nav = `${h > 0 ? `<a class="btn" href="${href.block(h - 1)}" title="Previous block">${ic('left')}</a>` : ''}${h < tipHeight ? `<a class="btn" href="${href.block(h + 1)}" title="Next block">${ic('right')}</a>` : ''}`;
+    const overview = kv([
+        ['Block height', `<span class="big mono">${fmtInt(h)}</span> ${nav}`],
+        ['Status', confirmations(h), 'How deep the block is under newer ones. Past the node\'s settle depth it is final.'],
+        ['Timestamp', `${fmtAgo(b.timestamp)} <span class="dim">(${utc(b.timestamp)})</span>`],
+        ['Transactions', `<b>${fmtInt(n.transfers.length)}</b> transaction${n.transfers.length === 1 ? '' : 's'} run here${n.commits.length ? `, and <b>${fmtInt(n.commits.length)}</b> sealed for later` : ''}`, 'A Midstate transaction is sealed in one block (only its hash), then revealed and run in a later one.'],
+        ['Mined by', payees.length ? payees.map(a => who(a, 10)).join('<br>') : '<span class="faint">—</span>'],
+        ['Block reward', `${fmtAmt(n.cb.totalOut)} <span class="dim">= ${fmtAmtText(n.cb.totalOut - n.fees)} new + ${fmtAmtText(n.fees)} fees</span>`],
+        n.cb.inscription ? ['Inscription', `<span class="mono">${escHtml(n.cb.inscription)}</span>`] : null,
+    ]);
+    const more = kv([
+        ['Block hash', `<span class="hash">${hash}</span>${copyBtn(hash)}`],
+        ['Parent midstate', `<span class="hash">${toHex(b.prev_midstate)}</span>`],
+        ['State root', `<span class="hash">${toHex(b.state_root)}</span>${copyBtn(toHex(b.state_root))}`, 'Root of the sparse Merkle tree of every unspent coin after this block.'],
+        ['Target', `<span class="hash">${toHex(b.target)}</span>`, 'The sequential proof of work must come in under this.'],
+        ['Nonce', `<span class="mono">${escHtml(String(b.extension.nonce))}</span>`],
+    ]);
+    const txRows = n.transfers.map(t => {
+        const s = summary(t);
+        return [txLink(t), typeBadge(s.type), many(s.from, 5), many(s.to, 5), fmtAmt(s.value), fmtAmt(t.fee)];
+    });
+    const seals = n.commits.map(c => {
+        const runsHere = n.byCommitment.get(c.commitment);
+        return [`<a class="hash" href="${runsHere ? href.tx(h, runsHere.index) : href.q(c.commitment)}" title="${c.commitment}">${short(c.commitment, 8)}</a>`,
+            runsHere ? badge('ok', 'Revealed here too') : badge('seal', 'Revealed later', 'lock')];
+    });
+    view().innerHTML = `<div class="page-h"><h1>Block <span class="mono">#${fmtInt(h)}</span></h1></div>
+        ${card('Overview', `<div class="card-b">${overview}<details class="more-d"><summary>More details</summary>${more}</details></div>`)}
+        ${card(`Transactions <span class="dim">(${fmtInt(n.transfers.length)})</span>`, `<div class="card-b">${dual(table(
+            [{ t: 'Transaction' }, { t: 'Type' }, { t: 'From' }, { t: 'To' }, { t: 'Value', r: 1 }, { t: 'Fee', r: 1 }], txRows, 'No transactions ran in this block.'),
+            txList(n.transfers, { empty: 'No transactions ran in this block.' }))}</div>`)}
+        ${seals.length ? card(`Sealed <span class="dim">(${fmtInt(seals.length)})</span>`, `<div class="card-b">${table([{ t: 'Transaction id' }, { t: 'Reveal' }], seals)}</div>`) : ''}
+        ${card('Block reward', `<div class="card-b pad">${coinGroups(n.cb.outs, 'out')}</div>`, `<a class="more" href="${href.tx(h, 'cb')}">As a transaction</a>`)}`;
+}
+
+// ── Transactions ────────────────────────────────────────────────────────
+
+async function showTxs(seq) {
+    if (!tipHeight) await poll();
+    view().innerHTML = `<div class="page-h"><h1>Transactions</h1><span class="sub">latest first</span></div>${loading()}`;
+    const txs = [];
+    for (let h = tipHeight; h >= 0 && h > tipHeight - 150 && txs.length < 50; h--) {
+        let b;
+        try { b = await getBatch(h); } catch (_) { break; }
+        if (stale(seq)) return;
+        const n = normBlock(b, h);
+        for (const t of n.transfers.slice().reverse()) txs.push(Object.assign(t, { ts: b.timestamp }));
+    }
+    const rows = txs.slice(0, 50).map(t => {
+        const s = summary(t);
+        return [txLink(t), typeBadge(s.type), `<a class="mono" href="${href.block(t.height)}">${fmtInt(t.height)}</a>`, ago(t.ts), many(s.from, 5), many(s.to, 5), fmtAmt(s.value), fmtAmt(t.fee)];
+    });
+    const pending = lastMempoolData ? lastMempoolData.size : 0;
+    view().innerHTML = `<div class="page-h"><h1>Transactions</h1><span class="sub">the last ${fmtInt(Math.min(150, tipHeight + 1))} blocks${pending ? ` · <a href="?q=mempool">${fmtInt(pending)} pending</a>` : ''}</span></div>
+        <section class="card"><div class="card-b">${dual(table([{ t: 'Transaction' }, { t: 'Type' }, { t: 'Block' }, { t: 'Age' }, { t: 'From' }, { t: 'To' }, { t: 'Value', r: 1 }, { t: 'Fee', r: 1 }], rows, 'No transfers in the last 150 blocks.'),
+            txList(txs.slice(0, 50), { block: true, empty: 'No transfers in the last 150 blocks.' }))}</div></section>`;
+}
+
+function coinRows(items, side, focus) {
+    if (!items.length) return '<div class="empty">None</div>';
+    return items.map(c => {
+        if (c.kind === 'src') return `<div class="coinrow"><span class="who">${badge('rew', c.src === 'new' ? 'New coins' : 'Fees')}</span><span class="amt">${fmtAmt(c.value)}</span></div>`;
+        if (c.kind === 'burn') {
+            const text = readableText(bytesOf(c.payload || ''));
+            return `<div class="coinrow"><span class="who">${badge('', 'Data')} <span class="dim mono" style="margin-left:8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${text ? escHtml(text) : `${fmtInt(c.payloadLen || 0)} bytes`}</span></span>${c.value ? `<span class="amt">${fmtAmt(c.value)} burned</span>` : ''}</div>`;
+        }
+        const st = side === 'out' && c.coinId ? (coinStatus.get(c.coinId) === 'alive' ? badge('ok', 'Unspent') : coinStatus.get(c.coinId) === 'spent' ? badge('', 'Spent') : '') : '';
+        const isState = c.kind === 'state';
+        return `<div class="coinrow"${c.coinId ? ` data-coin="${c.coinId}"` : ''}>${who(c.addr, 6)}<span class="st">${st}</span>
+            <span class="amt">${isState ? badge('seal', 'State') : fmtAmt(c.value)}</span>
+            ${c.coinId ? `<a class="copy" href="${href.q(c.coinId)}" title="Coin ${c.coinId}">${ic('coins')}</a>` : ''}</div>`;
+    }).join('');
+}
+
+async function showTx(h, idx, seq) {
+    if (!tipHeight) await poll();
+    view().innerHTML = loading('Transaction…');
+    let b;
+    try { b = await getBatch(h); } catch (e) { return message('No such transaction', `<p>${escHtml(e.message)}</p>`); }
+    if (stale(seq)) return;
+    const n = normBlock(b, h);
+    const t = idx === 'cb' ? n.cb : n.all[idx];
+    if (!t) return message('No such transaction', `<p>Block ${fmtInt(h)} has no transaction ${escHtml(String(idx))}.</p>`);
+    if (t.kind === 'commit') return showSeal(t, h, b, seq);
+    const s = summary(t);
+    const id = t.commitment;
+    const overview = kv([
+        id ? ['Transaction id', `<span class="hash">${id}</span>${copyBtn(id)}`, 'The hash both phases share: the seal commits to it, the reveal proves it. Search for it like a transaction hash.'] : ['Transaction', 'Block reward'],
+        ['Status', badge('ok', 'Success', 'check'), 'A reveal only lands if every script it runs passes; there are no failed transactions on chain.'],
+        ['Block', `<a class="mono" href="${href.block(h)}">${fmtInt(h)}</a> &nbsp;${confirmations(h)}`],
+        ['Timestamp', `${fmtAgo(b.timestamp)} <span class="dim">(${utc(b.timestamp)})</span>`],
+        id ? ['Sealed', `<span id="sealed-in"><span class="dim">looking…</span></span>`, 'Phase one: the hash went into an earlier block, hiding the details until the reveal. Nobody could front-run it.'] : null,
+        ['Type', typeBadge(s.type)],
+        ['From', s.from.length ? s.from.map(a => who(a, 10)).join('<br>') : badge('rew', 'Block reward')],
+        ['To', s.to.length ? s.to.map(a => who(a, 10)).join('<br>') : '<span class="faint">—</span>'],
+        ['Value', `<span class="big">${fmtAmt(s.value)}</span>`, 'What went to someone other than the sender. Coins coming back to a sender are change.'],
+        t.kind !== 'coinbase' ? ['Fee', fmtAmt(t.fee), 'Paid in MDS to the miner. No gas: a fee covers the transaction\'s size.'] : null,
+    ]);
+    const flow = `<div class="card-b pad"><div class="flow">
+        <div class="side"><h3>In · ${t.ins.length} coin${t.ins.length === 1 ? '' : 's'}</h3>${coinGroups(t.ins, 'in')}</div>
+        <div class="mid">${ic('right')}</div>
+        <div class="side"><h3>Out · ${t.outs.length} coin${t.outs.length === 1 ? '' : 's'}</h3>${coinGroups(t.outs, 'out', s.from)}</div>
+    </div></div>`;
+    const scripts = t.ins.filter(i => i.bytecode).map((i, k) => `<details class="more-d"><summary>Input ${k + 1} script <span class="dim">· ${i.std ? 'standard key' : 'custom script'}</span></summary>${renderScriptDisasm(i.bytecode)}</details>`).join('');
+    view().innerHTML = `<div class="page-h"><h1>Transaction details</h1>${id ? `<span class="sub mono">${short(id, 10)}</span>` : ''}</div>
+        ${card('Overview', `<div class="card-b">${overview}</div>`)}
+        ${card('Coins', flow, help('Midstate is a coin chain like Bitcoin: a transaction spends whole coins and makes new ones. Every coin is a power of two, like banknotes.'))}
+        ${scripts ? card('Scripts', `<div class="card-b">${scripts}</div>`) : ''}`;
+    // Which outputs still exist.
+    const ids = t.outs.map(o => o.coinId).filter(Boolean);
+    checkCoins(ids).then(() => {
+        if (stale(seq)) return;
+        document.querySelectorAll('[data-coin] .st').forEach(el => {
+            const id = el.parentElement.dataset.coin;
+            if (!t.outs.some(o => o.coinId === id)) return;
+            el.innerHTML = coinBadge(id);
+        });
+    });
+    if (id) findSeal(id, h, n, seq);
+}
+
+/** Without the index: a reveal usually follows its seal within a block or
+ *  two, so look forward from the seal (at most 60 blocks). */
+async function walkForReveal(id, from, seq, limit = 60) {
+    for (let hh = from; hh <= Math.min(tipHeight, from + limit); hh++) {
+        if (stale(seq)) return null;
+        let b;
+        try { b = await getBatch(hh); } catch (_) { break; }
+        const r = normBlock(b, hh).byCommitment.get(id);
+        if (r) return { height: hh, tx: r.index };
+    }
+    return null;
+}
+/** …and a seal usually sits a block or two before its reveal. */
+async function walkForSeal(id, from, seq, limit = 20) {
+    for (let hh = from; hh >= Math.max(0, from - limit); hh--) {
+        if (stale(seq)) return null;
+        let b;
+        try { b = await getBatch(hh); } catch (_) { break; }
+        if (normBlock(b, hh).sealedHere.has(id)) return hh;
+    }
+    return null;
+}
+
+/** Where a transaction was sealed: the index knows at once; otherwise the
+ *  blocks just before usually hold it, and failing that a search does. */
+async function findSeal(id, h, n, seq) {
+    const put = html => { const el = $('sealed-in'); if (el && !stale(seq)) el.innerHTML = html; };
+    if (n.sealedHere.has(id)) return put(`in this block too, <a class="mono" href="${href.block(h)}">${fmtInt(h)}</a>`);
+    try {
+        const r = await fetch('/tx/' + id);
+        if (r.ok) {
+            const x = await r.json();
+            if (x.sealed) return put(`in block <a class="mono" href="${href.block(x.sealed.height)}">${fmtInt(x.sealed.height)}</a> <span class="dim">(${fmtInt(h - x.sealed.height)} block${h - x.sealed.height === 1 ? '' : 's'} earlier)</span>`);
+        }
+    } catch (_) {}
+    put('<span class="dim">looking in the blocks before…</span>');
+    const at = await walkForSeal(id, h - 1, seq);
+    if (stale(seq)) return;
+    if (at != null) return put(`in block <a class="mono" href="${href.block(at)}">${fmtInt(at)}</a> <span class="dim">(${fmtInt(h - at)} block${h - at === 1 ? '' : 's'} earlier)</span>`);
+    put(`in an earlier block <button class="btn" onclick="searchSeal('${id}', ${h})">Find it</button>`);
+}
+
+async function searchSeal(id, h) {
+    const seq = routeSeq;
+    const el = $('sealed-in');
+    if (el) el.innerHTML = `<span class="dim">searching…</span>${powBar()}`;
+    try {
+        const results = await cachedSearch(id);
+        if (stale(seq)) return;
+        const c = results.find(r => r.result_type === 'commitment' && r.height <= h) || results.find(r => r.height < h);
+        el.innerHTML = c ? `in block <a class="mono" href="${href.block(c.height)}">${fmtInt(c.height)}</a>` : '<span class="dim">not in the last 5,000 blocks</span>';
+    } catch (e) { if (el) el.textContent = e.message; }
+}
+
+function showSeal(c, h, b, seq) {
+    view().innerHTML = `<div class="page-h"><h1>Sealed transaction</h1></div>
+        ${card('Overview', `<div class="card-b">${kv([
+            ['Transaction id', `<span class="hash">${c.commitment}</span>${copyBtn(c.commitment)}`],
+            ['Status', badge('seal', 'Sealed', 'lock'), 'Phase one of two. The block holds only this hash; what it spends and pays stays hidden until the reveal.'],
+            ['Block', `<a class="mono" href="${href.block(h)}">${fmtInt(h)}</a> &nbsp;${confirmations(h)}`],
+            ['Timestamp', `${fmtAgo(b.timestamp)} <span class="dim">(${utc(b.timestamp)})</span>`],
+            ['Revealed', `<span id="revealed-in"><span class="dim">looking…</span></span>`],
+        ])}</div>`)}`;
+    (async () => {
+        const put = html => { const el = $('revealed-in'); if (el && !stale(seq)) el.innerHTML = html; };
+        const n = normBlock(b, h);
+        const here = n.byCommitment.get(c.commitment);
+        if (here) return put(`in this block, <a href="${href.tx(h, here.index)}">see the transaction</a>`);
+        try {
+            const r = await fetch('/tx/' + c.commitment);
+            if (r.ok) {
+                const x = await r.json();
+                if (x.revealed) return put(`in block <a class="mono" href="${href.block(x.revealed.height)}">${fmtInt(x.revealed.height)}</a>, <a href="${href.tx(x.revealed.height, x.revealed.tx)}">see the transaction</a>`);
+                return put('<span class="dim">not yet: a seal stays valid for 1,000 blocks</span>');
+            }
+        } catch (_) {}
+        put('<span class="dim">looking in the blocks after…</span>');
+        const r = await walkForReveal(c.commitment, h, seq);
+        if (r) return put(`in block <a class="mono" href="${href.block(r.height)}">${fmtInt(r.height)}</a>, <a href="${href.tx(r.height, r.tx)}">see the transaction</a>`);
+        const mp = findInMempool(c.commitment);
+        put(mp ? 'waiting in the pending pool' : '<span class="dim">not in the 60 blocks after its seal</span>');
+    })();
+}
+
+// ── Addresses ───────────────────────────────────────────────────────────
+
+async function showAddress(addr, before, seq, prefetched, name) {
+    const full = checksummed(addr);
+    const head = `<div class="page-h" style="align-items:center">${identicon(addr, 28)}<h1>${name ? escHtml(name.name) : 'Address'}</h1>${name ? '<span class="sub">pays this address</span>' : ''}</div>
+        <section class="card"><div class="card-b pad"><span class="hash addr-full">${full}</span>${copyBtn(full)}
+        <div class="dim" style="font-size:12.5px;margin-top:6px">The last eight characters are a checksum. Every Midstate address is the hash of a script, usually a post-quantum signing key.</div></div></section>
+        ${name ? nameCard(name) : ''}`;
+    view().innerHTML = head + loading('Reading its history…');
+    // The node's address index, when it keeps one, has the full history.
+    let r = null;
+    try { r = await fetch(`/address/${addr}/history?limit=25${before ? `&before=${encodeURIComponent(before)}` : ''}`); } catch (_) {}
+    if (stale(seq)) return;
+    if (r && r.ok) {
+        const d = await r.json();
+        if (stale(seq)) return;
+        const list = d.rows.map(row => historyRow(row.height, row.tx == null ? 'cb' : row.tx, row.received, row.sent, ago(row.timestamp)));
+        const pager = (before || d.next) ? `<div class="pager">${before ? `<a class="btn" href="${href.q(full)}">${ic('left')} Newest</a>` : ''}${d.next ? `<a class="btn" href="${href.q(full)}&before=${encodeURIComponent(d.next)}">Older ${ic('right')}</a>` : ''}</div>` : '';
+        view().innerHTML = head + `<div class="stats">
+                <div class="stat"><div class="k">Balance</div><div class="v">${fmtAmtText(d.balance)}</div><div class="s">${fmtInt(d.balance)} MDS</div></div>
+                <div class="stat"><div class="k">Coins held${help('The unspent coins this address owns. Its balance is their sum.')}</div><div class="v">${fmtInt(d.coins)}</div><div class="s">&nbsp;</div></div>
+                <div class="stat"><div class="k">Transactions</div><div class="v">${fmtInt(d.tx_count)}</div><div class="s">all time</div></div>
+                <div class="stat"><div class="k">Last active</div><div class="v">${d.rows[0] ? fmtAgo(d.rows[0].timestamp) : '—'}</div><div class="s">${d.rows[0] ? `block ${fmtInt(d.rows[0].height)}` : '&nbsp;'}</div></div>
+            </div>
+            ${card(`Transactions <span class="dim">(${fmtInt(d.tx_count)})</span>`, `<div class="card-b">${list.join('') || '<div class="empty">No transactions yet.</div>'}</div>${pager}`)}`;
+        return;
+    }
+    // No index here: the last 5,000 blocks, found by a proof-of-work search.
+    view().innerHTML = head + `<div class="note">This node does not keep the address index, so this covers the last 5,000 blocks. Nodes started with <code>--rich-list</code> show every transaction instantly.</div>` + loading('Searching recent blocks…') + powBar();
+    try {
+        const indexedP = fetch(`/richlist/${addr}`).then(x => x.ok ? x.json() : null).catch(() => null);
+        const results = prefetched || await cachedSearch(addr);
+        if (stale(seq)) return;
+        const st = await getState();
+        const tip = st ? st.height : tipHeight + 1, from = Math.max(0, tip - 5000);
+        const coins = await scanRange(addr, from, tip);
+        if (stale(seq)) return;
+        await checkCoins(coins.map(c => c.coin_id));
+        if (stale(seq)) return;
+        const indexed = await indexedP;
+        const alive = coins.filter(c => coinStatus.get(c.coin_id) === 'alive');
+        const acts = new Map();
+        for (const x of results) {
+            if (!['output_address', 'coinbase_address', 'input_address'].includes(x.result_type)) continue;
+            const k = `${x.height}:${x.tx_index == null ? 'cb' : x.tx_index}`;
+            const a = acts.get(k) || { h: x.height, i: x.tx_index == null ? 'cb' : x.tx_index, inV: 0, outV: 0 };
+            const v = parseInt((/value (\d+)/.exec(x.detail || '') || [])[1] || '0', 10);
+            if (x.result_type === 'input_address') a.outV += v; else a.inV += v;
+            acts.set(k, a);
+        }
+        const list = [...acts.values()].sort((a, b) => b.h - a.h);
+        const rows = list.map(a => historyRow(a.h, a.i, a.inV, a.outV, approxAge(a.h)));
+        const bal = indexed ? indexed.balance : sum(alive.map(c => c.value));
+        view().innerHTML = head + `<div class="note">This node does not keep the address index, so the history covers the last 5,000 blocks${indexed ? '' : ', and so does the balance'}. Nodes started with <code>--rich-list</code> show every transaction instantly.</div>
+            <div class="stats">
+                <div class="stat"><div class="k">Balance${indexed ? '' : ' (recent)'}</div><div class="v">${fmtAmtText(bal)}</div><div class="s">${fmtInt(bal)} MDS</div></div>
+                <div class="stat"><div class="k">Coins held</div><div class="v">${fmtInt(indexed ? indexed.coins : alive.length)}</div><div class="s">&nbsp;</div></div>
+                <div class="stat"><div class="k">Transactions</div><div class="v">${fmtInt(list.length)}</div><div class="s">last 5,000 blocks</div></div>
+                <div class="stat"><div class="k">Rank</div><div class="v">${indexed && indexed.rank ? '#' + fmtInt(indexed.rank) : '—'}</div><div class="s">${indexed && indexed.rank ? fmtShare(indexed.share) + ' of supply' : '&nbsp;'}</div></div>
+            </div>
+            ${card('Transactions', `<div class="card-b">${rows.join('') || '<div class="empty">None in the last 5,000 blocks.</div>'}</div>`)}`;
+    } catch (e) {
+        if (!stale(seq)) message('Could not read this address', `<p>${escHtml(e.message)}</p>`);
+    }
+}
+
+/** One transaction in an address's history: how the address's balance
+ *  changed. A payment spends whole coins and takes change back, so what
+ *  moved is the net: below zero is Out (fee included), above is In. This is
+ *  how explorers of coin chains show it, and it never misstates a balance. */
+function historyRow(h, i, received, sent, when) {
+    const cb = i === 'cb';
+    const net = received - sent;
+    const kind = cb ? 'rew' : net > 0 ? 'in' : net < 0 ? 'out' : 'self';
+    const word = { rew: 'Reward', self: 'Self', in: 'In', out: 'Out' }[kind];
+    const amount = cb ? received : Math.abs(net);
+    const sign = kind === 'out' ? '−' : kind === 'self' ? '' : '+';
+    return `<div class="li h"><span class="dir ${kind}">${word.toUpperCase()}</span>
+        <div><div class="t1"><a href="${href.tx(h, i)}">${cb ? 'Block reward' : `Transaction <span class="mono">${fmtInt(h)}.${i}</span>`}</a></div>
+        <div class="t2">Block <a class="mono" href="${href.block(h)}">${fmtInt(h)}</a> · ${when}</div></div>
+        <div class="end"><span class="${kind === 'out' ? 'neg' : kind === 'self' ? '' : 'pos'}">${sign}${fmtAmt(amount)}</span></div></div>`;
+}
+
+// ── Names ───────────────────────────────────────────────────────────────
+
+function nameCard(n) {
+    const d = n.deal;
+    const deal = !d ? '' : d.kind === 'sale' ? `for sale at ${fmtAmtText(d.price)}` : d.kind === 'rent' ? `for rent at ${fmtAmtText(d.price)} per ${fmtInt(d.span)} blocks` : `rented out until block ${fmtInt(d.until)}`;
+    const recs = (n.records || []).map(r => [escHtml(r.type), `<span class="hash">${escHtml(r.value)}</span>${r.signatures_left != null ? ` <span class="dim">· ${fmtInt(r.signatures_left)} signatures left</span>` : ''}`]);
+    return card(`<span class="mono">${escHtml(n.name)}</span>`, `<div class="card-b">${kv([
+        ['Tier', badge(n.tier === 'platinum' || n.tier === 'gold' ? 'rew' : '', escHtml(n.tier || ''))],
+        ['Owner', `<span class="hash">${short(n.owner || '', 8)}</span>`, 'The control key: it updates the records and renews the name. It is separate from the addresses the name pays.'],
+        ['Registered', `block ${fmtInt(n.since)} to block ${fmtInt(n.expires)}${n.lapsed ? ` ${badge('bad', 'Lapsed')}` : ''}`],
+        deal ? ['Market', escHtml(deal)] : null,
+        n.pays ? ['Pays', who(n.pays, 10), 'Send to the name and wallets pay this address: the first record that takes a payment.'] : null,
+    ])}${recs.length ? `<details class="more-d" open><summary>Records (${recs.length})</summary>${kv(recs)}</details>` : ''}</div>`, help('Like ENS on Ethereum: a readable name that points at addresses and other records.'));
+}
+
+async function showName(name, seq) {
+    view().innerHTML = loading(`Looking up ${escHtml(name)}…`);
+    let res, body;
+    try { res = await fetch(`/name/${encodeURIComponent(name)}`); body = await res.json(); }
+    catch (_) { return message('Node not reachable'); }
+    if (stale(seq)) return;
+    if (!res.ok) return message(`${name} is not registered`, `<p>${escHtml(body.error || '')}</p><p>Names are registered from the desktop wallet's Names tab.</p>`);
+    if (body.pays) return showAddress(body.pays, null, seq, null, body);
+    view().innerHTML = `<div class="page-h"><h1>Name</h1></div>${nameCard(body)}`;
+}
+
+// ── Coins ───────────────────────────────────────────────────────────────
+
+async function showCoin(id, results, seq) {
+    await checkCoins([id]);
+    if (stale(seq)) return;
+    const st = coinStatus.get(id);
+    const made = results.find(r => r.result_type === 'output_coin_id' || r.result_type === 'coinbase_coin_id');
+    const spent = results.find(r => r.result_type === 'input_coin_id');
+    let value = null, owner = null;
+    if (made) {
+        try {
+            const b = await getBatch(made.height), n = normBlock(b, made.height);
+            const t = made.tx_index == null ? n.cb : n.all[made.tx_index];
+            const o = t && t.outs.find(o => o.coinId === id);
+            if (o) { value = o.value; owner = o.addr; }
+        } catch (_) {}
+    }
+    if (stale(seq)) return;
+    const at = r => r ? `<a href="${href.tx(r.height, r.tx_index == null ? 'cb' : r.tx_index)}">block ${fmtInt(r.height)}${r.tx_index == null ? ', reward' : `, transaction ${r.tx_index}`}</a>` : '<span class="dim">not in the last 5,000 blocks</span>';
+    view().innerHTML = `<div class="page-h"><h1>Coin</h1></div>${card('Overview', `<div class="card-b">${kv([
+        ['Coin id', `<span class="hash">${id}</span>${copyBtn(id)}`, 'Like a banknote\'s serial number: the hash of its owner, value and a random salt.'],
+        ['Status', st === 'alive' ? badge('ok', 'Unspent') : st === 'spent' ? badge('', 'Spent') : '<span class="dim">unknown</span>'],
+        value != null ? ['Value', fmtAmt(value)] : null,
+        owner ? ['Owner', who(owner, 10)] : null,
+        ['Created in', at(made)],
+        ['Spent in', st === 'alive' ? '<span class="dim">not spent</span>' : at(spent)],
+    ])}</div>`)}`;
+}
+
+// ── Pending ─────────────────────────────────────────────────────────────
+
+function findInMempool(q) {
+    const txs = (lastMempoolData && lastMempoolData.transactions) || [];
+    for (const raw of txs) {
+        const t = normMempoolTx(raw);
+        if (t.commitment === q || txTouches(t, q)) return t;
+    }
+    return null;
+}
+
+function showPendingTx(t) {
+    view().innerHTML = `<div class="page-h"><h1>Pending transaction</h1></div>${card('Overview', `<div class="card-b">${kv([
+        ['Transaction id', `<span class="hash">${t.commitment}</span>${copyBtn(t.commitment)}`],
+        ['Status', badge('out', t.kind === 'commit' ? 'Sealed, waiting for a block' : 'Waiting for a block')],
+        t.fee != null && t.kind !== 'commit' ? ['Fee', fmtAmt(t.fee)] : null,
+        t.age != null ? ['Waiting', fmtAge(t.age)] : null,
+    ])}</div>`)}${t.kind === 'commit' ? '' : card('Coins', `<div class="card-b pad"><div class="flow"><div class="side"><h3>In</h3>${coinGroups(t.ins, 'in')}</div><div class="mid">${ic('right')}</div><div class="side"><h3>Out</h3>${coinGroups(t.outs, 'out', summary(t).from)}</div></div></div>`)}`;
+}
+
+async function showMempool(seq) {
+    await poll();
+    if (stale(seq)) return;
+    paintMempool();
+}
+
+function paintMempool() {
+    const txs = ((lastMempoolData && lastMempoolData.transactions) || []).map(normMempoolTx);
+    const reveals = txs.filter(t => t.kind !== 'commit'), seals = txs.filter(t => t.kind === 'commit');
+    const rRows = reveals.map(t => {
+        const s = summary(t);
+        return [`<span class="hash" title="${t.commitment}">${short(t.commitment, 6)}</span>`, many(s.from, 5), many(s.to, 5), fmtAmt(s.value), t.fee != null ? fmtAmt(t.fee) : '—', t.age != null ? fmtAge(t.age) : '—'];
+    });
+    const sRows = seals.map(t => [`<span class="hash" title="${t.commitment}">${short(t.commitment, 8)}</span>`, t.pow != null ? `${t.pow} bits` : '—', t.age != null ? fmtAge(t.age) : '—']);
+    view().innerHTML = `<div class="page-h"><h1>Pending</h1><span class="sub">waiting for the next block · refreshes on its own</span></div>
+        ${card(`Transactions <span class="dim">(${fmtInt(reveals.length)})</span>`, `<div class="card-b">${table([{ t: 'Transaction' }, { t: 'From' }, { t: 'To' }, { t: 'Value', r: 1 }, { t: 'Fee', r: 1 }, { t: 'Waiting', r: 1 }], rRows, 'No reveals waiting.')}</div>`)}
+        ${card(`Seals <span class="dim">(${fmtInt(seals.length)})</span>`, `<div class="card-b">${table([{ t: 'Transaction id' }, { t: 'Proof of work', r: 1 }, { t: 'Waiting', r: 1 }], sRows, 'No seals waiting.')}</div>`, help('Phase one of a transaction: just its hash, with a small proof of work instead of a fee. What it spends stays hidden until it is revealed.'))}`;
+}
+
+// ── Supply ──────────────────────────────────────────────────────────────
+
+let lastSupply = null;
+let lastRichList = null;
+
+async function loadSupplyQuiet() {
     try {
         const r = await fetch('/supply');
         if (r.ok) lastSupply = await r.json();
-    } catch (e) { /* keep the last figures */ }
-    if (withRichList && lastSupply && lastSupply.index.status === 'ready') {
-        try {
-            const r = await fetch('/richlist?limit=100');
-            lastRichList = r.ok ? await r.json() : null;
-        } catch (e) { /* keep the last list */ }
-    }
-    renderSupplyMetric();
+    } catch (_) {}
 }
 
-function renderSupplyMetric() {
-    const el = document.getElementById('s-supply');
+async function showSupply(seq) {
+    view().innerHTML = loading('Reading the supply…');
+    await loadSupplyQuiet();
     const s = lastSupply;
-    if (!el || !s) return;
-    if (s.circulating_supply != null) {
-        el.textContent = fmtG(s.circulating_supply, 0) + ' gMDS';
-        el.title = `${fmtInt(s.circulating_supply)} MDS at block ${fmtInt(s.height)}`;
-    } else {
-        el.textContent = s.index.status === 'disabled' ? 'index off' : s.index.status;
-        el.title = s.index.detail || '';
+    if (!s) return message('Supply unavailable', '<p>The node did not answer.</p>');
+    lastRichList = null;
+    if (s.index && s.index.status === 'ready') {
+        try { const r = await fetch('/richlist?limit=100'); if (r.ok) lastRichList = await r.json(); } catch (_) {}
     }
-}
-
-async function showSupplyView() {
-    mainViewContent = 'supply';
-    lastSupplyHtml = '';
-    if (lastSupply) paintSupplyView();
-    else document.getElementById('main-view').innerHTML =
-        `<div style="padding:20px; color:var(--text-faint);">Loading supply…</div>`;
-    await loadSupply(true);
-    if (currentTab === 'supply') paintSupplyView();
-}
-
-function paintSupplyView() {
-    const s = lastSupply;
-    if (!s || currentTab !== 'supply') return;
-    const mv = document.getElementById('main-view');
-    const ix = s.index;
-    const ready = ix.status === 'ready';
-    const origin = window.location.origin;
-    const circ = s.circulating_supply;
-
-    let html = `<div class="block-hdr"><h2>SUPPLY</h2>
-        <span class="supply-asof">block ${fmtInt(s.height)} · index ${escHtml(ix.status)}</span></div>`;
-
-    const box = (lbl, val, sub) =>
-        `<div class="stat-box"><div class="lbl">${lbl}</div><div class="val">${val}</div><div class="sub">${sub}</div></div>`;
-    html += `<div class="stat-grid">`;
-    html += circ != null
-        ? box('Circulating', fmtG(circ), `gMDS · ${fmtInt(circ)} MDS`)
-        : box('Circulating', '—', ix.status === 'disabled' ? 'needs the rich-list index' : `index ${escHtml(ix.status)}`);
-    html += box('Max supply', fmtG(s.max_supply, 0), `gMDS · ${fmtInt(s.max_supply)} MDS`);
-    html += box('Issued', fmtG(s.issued), `gMDS · ${(s.issued / s.max_supply * 100).toFixed(2)}% of max`);
-    html += s.burned != null
-        ? box('Burned', fmtG(s.burned), `gMDS · genesis ${fmtGShort(s.burned_genesis)} + data burns ${fmtGShort(s.burned_data)}`)
-        : box('Burned', fmtG(s.burned_genesis), 'gMDS genesis · data burns need the index');
-    html += `</div>`;
-
-    const pct = Math.min(100, s.issued / s.max_supply * 100);
-    html += `<div class="supply-bar" title="${pct.toFixed(2)}% of the scheduled supply issued"><div style="width:${pct.toFixed(3)}%"></div></div>`;
-
+    if (stale(seq)) return;
+    const ix = s.index || {};
+    const stat = (k, v, sub) => `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div><div class="s">${sub}</div></div>`;
     const facts = [['Block reward', `${fmtGShort(s.block_reward)} gMDS`]];
     if (s.next_halving_height != null) {
         const left = s.next_halving_height - (s.height + 1);
         facts.push(['Next halving', `block ${fmtInt(s.next_halving_height)} · in ${fmtInt(left)} blocks (${fmtDuration(left)})`]);
     }
-    facts.push(['Tail emission', `${s.tail_emission.per_block} MDS per block from block ${fmtInt(s.tail_emission.from_height)}`]);
-    if (s.unspent_coins != null) facts.push(['Unspent coins', fmtInt(s.unspent_coins)]);
+    if (s.tail_emission) facts.push(['Tail emission', `${s.tail_emission.per_block} MDS per block from block ${fmtInt(s.tail_emission.from_height)}`]);
     if (s.holders != null) facts.push(['Holders', fmtInt(s.holders)]);
-    if (s.verified != null) facts.push(['Supply check', s.verified
-        ? '✓ unspent coins add up to issued − burned'
-        : '✗ unspent coins do not add up to issued − burned']);
-    html += `<div class="meta-grid">` + facts.map(([k, v]) =>
-        `<div class="field"><div class="lbl">${k}</div><div class="hex supply-fact">${v}</div></div>`).join('') + `</div>`;
-
-    if (!ready) {
-        let note;
-        if (ix.status === 'disabled') {
-            note = `Circulating supply and the rich list come from the rich-list index, which this node does not keep.
-                Start it with <code>--rich-list</code> (or <code>rich_list = true</code> in config.toml) on an archival node;
-                it builds from genesis in the background.`;
-        } else if (ix.status === 'building' && ix.chain_blocks > 0) {
-            const p = ix.indexed_blocks / ix.chain_blocks * 100;
-            note = `Building the rich-list index: block ${fmtInt(ix.indexed_blocks)} of ${fmtInt(ix.chain_blocks)} (${p.toFixed(1)}%).
-                Circulating supply and the top 100 appear when it finishes.`;
-        } else {
-            note = escHtml(ix.detail || `The rich-list index is ${ix.status}.`);
-        }
-        html += `<div class="supply-note">${note}</div>`;
-    }
-
-    const rl = ready ? lastRichList : null;
-    if (rl) {
-        html += `<div class="supply-title">Top ${rl.entries.length} holders
-            <span class="dim">· ${fmtInt(rl.holders)} holders · top 10 hold ${fmtShare(rl.top_10_share)} · top 100 hold ${fmtShare(rl.top_100_share)}</span></div>`;
-        html += `<table class="rich-table"><thead><tr>
-            <th>#</th><th>Address</th><th class="num">gMDS</th><th class="num wide">MDS</th><th class="num">Share</th><th class="num wide">Coins</th>
-            </tr></thead><tbody>`;
-        for (const e of rl.entries) {
-            const a = escHtml(e.address);
-            html += `<tr>
-                <td class="rank">${e.rank}</td>
-                <td><a onclick="go('${a}')" title="${a}"><span class="addr-long">${a.substring(0, 20)}…${a.substring(60)}</span><span class="addr-short">${a.substring(0, 8)}…${a.substring(66)}</span></a></td>
-                <td class="num">${fmtG(e.balance)}</td>
-                <td class="num wide">${fmtInt(e.balance)}</td>
-                <td class="num">${fmtShare(e.share)}</td>
-                <td class="num wide">${fmtInt(e.coins)}</td>
-            </tr>`;
-        }
-        html += `</tbody></table>`;
-        if (rl.excluded.length) {
-            const g = rl.excluded.reduce((t, x) => t + x.balance, 0);
-            html += `<div class="supply-dim-note">Not listed: ${rl.excluded.length} genesis outputs (${fmtGShort(g)} gMDS) paid to the
-                genesis inscription. No key can spend them, so supply counts them as burned.</div>`;
-        }
-    }
-
-    const ep = (label, path, value) => `<div class="api-row">
-        <span class="api-k">${label}</span><code>${escHtml(origin + path)}</code>
-        ${value != null ? `<span class="api-v">${value}</span>` : ''}
-        <button class="btn" onclick="copyToClipboard('${escHtml(origin + path)}', this)">Copy</button></div>`;
-    html += `<div class="supply-title">For listing sites</div><div class="api-box">`;
-    html += ep('Circulating supply', '/supply/circulating', circ != null ? circ : 'not ready');
-    html += ep('Total supply', '/supply/total', s.total_supply != null ? s.total_supply : 'not ready');
-    html += ep('Max supply', '/supply/max', s.max_supply);
-    html += ep('All figures (JSON)', '/supply', null);
-    html += ep('Rich list (JSON)', '/richlist?limit=100', null);
-    html += ep('Rich list page', '/?richlist', null);
-    html += `<div class="api-note">The three supply URLs answer with a bare number, in MDS: the unit MDS trades in
-        (1 gMDS = 2<sup>30</sup> MDS). There is no premine, treasury or team allocation, so circulating supply equals total
-        supply: everything issued, minus the burned genesis reward and value destroyed by data burns. Max supply is the
-        halving schedule's total; a tail of 1 MDS per block follows it.</div></div>`;
-
-    if (html === lastSupplyHtml) return;
-    lastSupplyHtml = html;
-    const top = mv.scrollTop;
-    mv.innerHTML = html;
-    mv.scrollTop = top;
+    if (s.unspent_coins != null) facts.push(['Unspent coins', fmtInt(s.unspent_coins)]);
+    if (s.verified != null) facts.push(['Supply check', s.verified ? badge('ok', 'Adds up', 'check') + ' <span class="dim">unspent coins equal issued minus burned</span>' : badge('bad', 'Does not add up')]);
+    let note = '';
+    if (ix.status === 'disabled') note = `<div class="note">Circulating supply, holders and the rich list come from the node's balance index. Start the node with <code>--rich-list</code> to keep it.</div>`;
+    else if (ix.status === 'building' && ix.chain_blocks) note = `<div class="note">Building the balance index: block ${fmtInt(ix.indexed_blocks)} of ${fmtInt(ix.chain_blocks)} (${(ix.indexed_blocks / ix.chain_blocks * 100).toFixed(1)}%).</div>`;
+    const rl = lastRichList;
+    const rich = rl ? card(`Top ${rl.entries.length} holders`, `<div class="card-b">${dual(table([{ t: 'Rank' }, { t: 'Address' }, { t: 'Balance', r: 1 }, { t: 'Share', r: 1 }, { t: 'Coins', r: 1 }],
+        rl.entries.map(e => [`<span class="mono">${e.rank}</span>`, who(e.address.slice(0, 64), 8), `${fmtG(e.balance)} gMDS`, fmtShare(e.share), fmtInt(e.coins)])),
+        rl.entries.map(e => `<div class="li h"><span class="dir self">#${e.rank}</span><div><div class="t1">${who(e.address.slice(0, 64), 6)}</div><div class="t2">${fmtInt(e.coins)} coins · ${fmtShare(e.share)}</div></div><div class="end">${fmtG(e.balance)} gMDS</div></div>`).join(''))}</div>`,
+        `<span class="dim" style="font-size:12.5px">top 10 hold ${fmtShare(rl.top_10_share)} · top 100 hold ${fmtShare(rl.top_100_share)}</span>`) : '';
+    view().innerHTML = `<div class="page-h"><h1>Supply</h1><span class="sub">at block ${fmtInt(s.height)}</span></div>
+        <div class="stats">
+            ${stat('Circulating', s.circulating_supply != null ? `${fmtG(s.circulating_supply)} gMDS` : '—', s.circulating_supply != null ? `${fmtInt(s.circulating_supply)} MDS` : 'needs the balance index')}
+            ${stat('Max supply', `${fmtG(s.max_supply, 0)} gMDS`, 'ever')}
+            ${stat('Issued', `${fmtG(s.issued)} gMDS`, `${(s.issued / s.max_supply * 100).toFixed(2)}% of max`)}
+            ${stat('Burned', `${fmtG(s.burned != null ? s.burned : s.burned_genesis)} gMDS`, s.burned != null ? 'genesis and data burns' : 'genesis')}
+        </div>${note}
+        ${card('Issuance', `<div class="card-b">${kv(facts)}</div>`)}${rich}`;
 }
 
-// ── Init ────────────────────────────────────────────────────────────────
+// ── Learn ───────────────────────────────────────────────────────────────
 
-document.querySelectorAll('[data-ic]').forEach(el => {
-    el.insertAdjacentHTML('afterbegin', el.dataset.ic === 'coin' ? '<i class="dot alive"></i>' : ic(el.dataset.ic));
-});
-$('ic-search').innerHTML = ic('search');
-$('ic-height').innerHTML = ic('cube');
-$('ic-mempool').innerHTML = ic('hourglass');
-$('ic-reward').innerHTML = ic('pick');
-
-$('cmd-input').addEventListener('keydown', function(e) {
-    if (e.key === 'Enter') execCmd(this.value);
-});
-
-log('Explorer ready. Type a height, address or coin id.', 'var(--text-muted)');
-
-const mainViewEl = mainView();
-// Clicking a transaction's header opens or closes it.
-mainViewEl.addEventListener('click', function(e) {
-    if (e.target.closest('a, button, summary, input')) return;
-    const hdr = e.target.closest('.txc-hdr');
-    if (hdr) toggleCard(hdr.closest('.tcard'));
-});
-// Hovering an owner (or its ribbon) lights up its path through the transaction.
-let hotFlow = null;
-function clearHot() {
-    if (!hotFlow) return;
-    hotFlow.classList.remove('hovering');
-    hotFlow.querySelectorAll('.hot').forEach(el => el.classList.remove('hot'));
-    hotFlow = null;
+function showLearn() {
+    const rows = [
+        ['Account balance', 'Coins', 'Like Bitcoin: an address owns coins (UTXOs). Its balance is the sum of the unspent ones. Each coin is a power of two, like a banknote.'],
+        ['Transaction hash', 'Transaction id', 'The commitment both phases share. Search for it the same way.'],
+        ['Mempool front-running, MEV', 'Commit, then reveal', 'A transaction is first sealed as a hash with a little proof of work, then revealed in a later block. Nobody sees what it does until it is too late to jump ahead of it.'],
+        ['Gas and gas price', 'A fee in MDS', 'Paid to the miner, set by the transaction\'s size. No gas auction, and scripts have no gas: they cannot loop.'],
+        ['Nonce', 'None needed', 'Each coin can be spent once, so there is nothing to order.'],
+        ['ECDSA / Ed25519 keys', 'Post-quantum keys', 'Hash-based signatures (WOTS, and MSS trees of them). A one-time key signs once; a reusable address holds a tree of them, and wallets track how many signatures are left.'],
+        ['0x… address', '72 hex characters', '64 characters of address and 8 of checksum. A typo fails the checksum instead of sending to nowhere.'],
+        ['Smart contracts', 'Scripts and covenants', 'Every address is the hash of a script. Covenants can require where coins go, which is how swaps, bonds and names work.'],
+        ['ENS / SNS', '.mds names', 'nick.mds points at addresses and other records. Payments to a name go to the first address it lists that can be paid.'],
+        ['Finality', 'Settle depth', 'Blocks become final once enough sequential proof of work is built on them. The explorer shows how deep each block is.'],
+        ['Bridged ETH', 'Atomic swaps', 'MDS trades for ETH on Base through hash-locked swaps in the desktop wallet: both sides are paid or both get their money back, with no bridge holding funds.'],
+    ];
+    view().innerHTML = `<div class="page-h"><h1>Midstate for Ethereum, Solana and Base users</h1></div>
+        ${card('The short version', `<div class="card-b">${dual(table([{ t: 'You know' }, { t: 'Here it is' }, { t: 'What changes' }], rows.map(([a, b, c]) => [`<b>${a}</b>`, b, `<span class="dim">${c}</span>`])),
+            rows.map(([a, b, c]) => `<div class="learn" style="padding:10px 0;border-bottom:1px solid var(--line2)"><div><b>${a}</b> <span class="arrow">→</span> ${b}</div><p class="dim" style="margin:4px 0 0">${c}</p></div>`).join(''))}</div>`)}
+        ${card('Reading a transaction', `<div class="card-b pad learn">
+            <p><b>From and To</b> are summaries. A transaction spends whole coins and makes new ones; coins coming back to the sender are change, so <b>Value</b> counts only what went to someone else.</p>
+            <p><b>Sealed</b> is the block where the transaction's hash went in. The details only appear when it is <b>revealed</b>, usually a block or two later.</p>
+            <p><b>Unspent / Spent</b> on a coin tells you whether the coin still exists. A spent coin's value has moved on in a later transaction.</p>
+            <p><b>Reward</b> transactions pay the miner of a block: new coins plus the block's fees.</p></div>`)}`;
 }
-mainViewEl.addEventListener('mouseover', function(e) {
-    const rb = e.target.closest('.rb');
-    const flow = e.target.closest('.flow');
-    const row = rb && flow ? flow.querySelector(`.frow[data-fi="${rb.dataset.fi}"]`) : e.target.closest('.frow');
-    if (!row || !flow) { clearHot(); return; }
-    if (hotFlow === flow && row.classList.contains('hot')) return;
-    clearHot();
-    hotFlow = flow;
-    flow.classList.add('hovering');
-    row.classList.add('hot');
-    flow.querySelectorAll(`.rb[data-fi="${row.dataset.fi}"]`).forEach(p => p.classList.add('hot'));
-});
-mainViewEl.addEventListener('mouseleave', clearHot);
 
-// Ribbons follow their rows when the layout changes width.
-let flowTimer = null;
-function scheduleFlows() { clearTimeout(flowTimer); flowTimer = setTimeout(() => drawFlows(mainView()), 60); }
-window.addEventListener('resize', scheduleFlows);
-if (window.ResizeObserver) new ResizeObserver(scheduleFlows).observe(mainViewEl);
-if (document.fonts && document.fonts.ready) document.fonts.ready.then(scheduleFlows);
+function showApi() {
+    const o = window.location.origin;
+    const rows = [
+        ['/state', 'tip, coin count, reward, settle depth'],
+        ['/batch/:height', 'a block, as JSON'],
+        ['/tx/:id', 'where a transaction was sealed and revealed (address index)'],
+        ['/address/:address/history?before=&limit=', 'an address\'s transactions, newest first (address index)'],
+        ['/richlist/:address', 'balance, coins and rank (address index)'],
+        ['/coin/:id', 'whether a coin exists'],
+        ['/name/:name', 'a .mds name and its records'],
+        ['/mempool', 'what is waiting'],
+        ['/supply, /supply/circulating', 'supply figures'],
+        ['/richlist?limit=', 'the largest holders'],
+    ];
+    view().innerHTML = `<div class="page-h"><h1>API</h1><span class="sub">plain JSON over HTTP from this node</span></div>
+        ${card('Endpoints', `<div class="card-b">${table([{ t: 'GET' }, { t: 'Returns' }], rows.map(([p, d]) => [`<code>${escHtml(o + p)}</code>`, d]))}</div>`)}`;
+}
 
-// "/" jumps to search; ← → step through blocks.
-document.addEventListener('keydown', function(e) {
-    const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement && document.activeElement.tagName);
-    if (typing || e.metaKey || e.ctrlKey || e.altKey) return;
-    if (e.key === '/') { e.preventDefault(); $('top-search').focus(); }
-    else if (mainViewContent === 'block' && activeBatch != null) {
-        if (e.key === 'ArrowLeft' && activeBatch > 0) go(String(activeBatch - 1));
-        else if (e.key === 'ArrowRight' && activeBatch < tipHeight) go(String(activeBatch + 1));
+// ── Polling ─────────────────────────────────────────────────────────────
+
+async function poll() {
+    try {
+        const [sRes, mRes, pRes] = await Promise.all([fetch('/state'), fetch('/mempool'), fetch('/peers')]);
+        const state = await sRes.json();
+        lastMempoolData = await mRes.json();
+        lastPeers = ((await pRes.json()).peers || []).length;
+        const prev = tipHeight;
+        tipHeight = Math.max(0, state.height - 1);
+        lastState = state;
+        $('live-h').textContent = fmtInt(tipHeight);
+        $('live').classList.remove('off');
+        $('live').title = state.is_syncing ? 'Syncing' : `Latest block ${fmtInt(tipHeight)}`;
+        if (tipHeight !== prev) {
+            for (const [k, v] of coinStatus) if (v === 'alive') coinStatus.delete(k);
+            if (prev > 0) loadRecentStats();
+            if (prev > 0 && page === 'home') refreshHome(routeSeq);
+        }
+        if (page === 'home') paintHome();
+        if (page === 'mempool' && !document.hidden) {
+            // Repaint in place without moving the reader.
+            const y = window.scrollY;
+            paintMempool();
+            window.scrollTo(0, y);
+        }
+    } catch (e) {
+        $('live').classList.add('off');
+        $('live').title = 'The node is not answering';
     }
-});
-
-// Visibility-aware polling: 3s while the tab is visible, 15s in the
-// background, and an immediate refresh the moment the tab regains focus.
-let pollTimer = null;
-function schedulePoll() {
-    clearTimeout(pollTimer);
-    pollTimer = setTimeout(async () => { await poll(); schedulePoll(); }, document.hidden ? 15000 : 3000);
 }
-document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) poll();
-    schedulePoll();
-});
 
-// Deep links: /?q=<height|hash|address>, /?<height>, /?richlist, /?tx=<h>.<i>.
-// With none, the latest block.
-(async function init() {
-    mainView().innerHTML = loadingHtml();
+async function init() {
+    if (window.innerWidth < 640) $('q').placeholder = 'Address, transaction, block or name';
     await poll();
     loadRecentStats();
-    schedulePoll();
-    const s = parseLocation();
-    history.replaceState(s, '', window.location.href);
-    route(s);
-})();
+    loadSupplyQuiet().then(() => { if (page === 'home') paintHome(); });
+    route(parseLocation());
+    setInterval(() => { if (!document.hidden) poll(); }, 5000);
+}
+init();
 </script>
 </body>
 </html>
