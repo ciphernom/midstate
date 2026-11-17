@@ -2258,6 +2258,57 @@ pub struct HistoryQuery {
     pub limit: Option<usize>,
 }
 
+#[derive(serde::Deserialize)]
+pub struct CoinsQuery {
+    limit: Option<usize>,
+}
+
+#[derive(serde::Serialize)]
+pub struct HeldCoinView {
+    coin_id: String,
+    value: u64,
+}
+
+#[derive(serde::Serialize)]
+pub struct AddressCoinsResponse {
+    address: String,
+    /// Every coin the address holds; `coins` lists the largest of them.
+    total: u64,
+    coins: Vec<HeldCoinView>,
+}
+
+/// GET /address/:address/coins?limit=N — the coins an address holds, largest
+/// first (at most 1,000). Needs the balance index (`--rich-list`); 503 until
+/// it is ready.
+pub async fn get_address_coins(
+    State(node): State<AppState>,
+    axum::extract::Path(address): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<CoinsQuery>,
+) -> Response {
+    let addr = match crate::core::types::parse_address_flexible(address.trim()) {
+        Ok(a) => a,
+        Err(e) => return ErrorResponse { error: e }.into_response(),
+    };
+    let meta = match balance_index::meta(node.storage.db()) {
+        Ok(m) => m,
+        Err(e) => return ErrorResponse { error: e.to_string() }.into_response(),
+    };
+    let index = index_status(&node, meta.as_ref());
+    if index.status != "ready" {
+        return json_unavailable(index);
+    }
+    let limit = q.limit.unwrap_or(100).clamp(1, 1_000);
+    match balance_index::held_coins(node.storage.db(), &addr, limit) {
+        Ok((coins, total)) => Json(AddressCoinsResponse {
+            address: crate::core::types::encode_address_with_checksum(&addr),
+            total,
+            coins: coins.into_iter().map(|(id, value)| HeldCoinView { coin_id: hex::encode(id), value }).collect(),
+        })
+        .into_response(),
+        Err(e) => ErrorResponse { error: e.to_string() }.into_response(),
+    }
+}
+
 /// GET /address/:address/history — an address's transactions, newest first,
 /// from the opt-in index (`--rich-list`). 503 while it is off or building:
 /// the explorer then falls back to searching recent blocks.

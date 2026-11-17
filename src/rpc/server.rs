@@ -226,6 +226,7 @@ impl RpcServer {
             .route("/richlist", get(get_richlist))
             .route("/richlist/:address", get(get_richlist_address))
             .route("/address/:address/history", get(get_address_history))
+            .route("/address/:address/coins", get(get_address_coins))
             .route("/tx/:id", get(get_tx))
             .route("/commit", post(commit_transaction))
             .route("/send", post(send_transaction))

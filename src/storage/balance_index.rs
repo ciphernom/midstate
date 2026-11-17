@@ -13,6 +13,8 @@
 //! * [`ADDRS`]: `address → balance ‖ coin count`, for every address holding any.
 //! * [`RANK`]:  `balance (big-endian) ‖ address → ()`, so the largest holders
 //!   are simply the last keys of the table.
+//! * [`HELD`]:  `address ‖ !value (big-endian) ‖ coin_id → ()`, the coins each
+//!   address holds, largest first.
 //! * [`META`]:  how far the index has got, and running totals — value held in
 //!   unspent coins, value destroyed by `DataBurn` outputs, number of holders.
 //!
@@ -87,12 +89,18 @@ pub const HIST_COUNT: TableDefinition<&[u8; 32], u64> = TableDefinition::new("ba
 /// its id: kind 0 is the commit that sealed it, 1 the reveal that ran it.
 pub const TXS: TableDefinition<&[u8; 33], &[u8; 12]> = TableDefinition::new("balance_txs");
 
+/// `address ‖ !value (BE) ‖ coin_id → ()`: the coins an address holds,
+/// largest first, so a page of them is one range read that stops at its
+/// limit, however many coins the address has.
+pub const HELD: TableDefinition<&[u8; 72], ()> = TableDefinition::new("balance_held");
+
 /// The block reward's place in [`HIST`].
 pub const COINBASE_TX: u32 = u32::MAX;
 
 /// Bump to force every node to rebuild on upgrade.
 /// 2: address history and transaction ids.
-const VERSION: u64 = 2;
+/// 3: the coins each address holds.
+const VERSION: u64 = 3;
 
 /// How long one backfill transaction may hold the database's write lock. The
 /// node's own block writes wait behind it, so keep it short.
@@ -272,6 +280,15 @@ struct Writer<'t> {
     hist: Table<'t, &'static [u8; 44], &'static [u8; 24]>,
     hist_count: Table<'t, &'static [u8; 32], u64>,
     txs: Table<'t, &'static [u8; 33], &'static [u8; 12]>,
+    held: Table<'t, &'static [u8; 72], ()>,
+}
+
+fn held_key(address: &[u8; 32], value: u64, coin_id: &[u8; 32]) -> [u8; 72] {
+    let mut k = [0u8; 72];
+    k[..32].copy_from_slice(address);
+    k[32..40].copy_from_slice(&(!value).to_be_bytes());
+    k[40..].copy_from_slice(coin_id);
+    k
 }
 
 fn hist_key(address: &[u8; 32], height: u64, tx: u32) -> [u8; 44] {
@@ -366,6 +383,7 @@ impl<'t> Writer<'t> {
             hist: txn.open_table(HIST)?,
             hist_count: txn.open_table(HIST_COUNT)?,
             txs: txn.open_table(TXS)?,
+            held: txn.open_table(HELD)?,
         })
     }
 
@@ -460,6 +478,7 @@ impl<'t> Writer<'t> {
             return Ok(());
         }
         self.coins.insert(coin_id, &pack_coin(address, value))?;
+        self.held.insert(&held_key(address, value, coin_id), ())?;
         let (balance, coins) = self.holder(address)?;
         let new_balance = balance.checked_add(value).unwrap_or_else(|| {
             m.anomalies += 1;
@@ -477,6 +496,7 @@ impl<'t> Writer<'t> {
         else {
             return Ok(false);
         };
+        self.held.remove(&held_key(&address, value, coin_id))?;
         let (balance, coins) = self.holder(&address)?;
         if coins == 0 || balance < value {
             m.anomalies += 1;
@@ -619,6 +639,7 @@ fn wipe(txn: &WriteTransaction, m: &mut Meta) -> Result<()> {
     txn.delete_table(HIST)?;
     txn.delete_table(HIST_COUNT)?;
     txn.delete_table(TXS)?;
+    txn.delete_table(HELD)?;
     Writer::open(txn)?; // recreate them empty
     *m = Meta {
         version: VERSION,
@@ -1093,6 +1114,33 @@ pub fn history(db: &Database, address: &[u8; 32], before: Option<(u64, u32)>, li
     Ok((rows, count))
 }
 
+/// The coins `address` holds, largest first, at most `limit` of them; and
+/// how many it holds in all. O(log n + limit).
+pub fn held_coins(db: &Database, address: &[u8; 32], limit: usize) -> Result<(Vec<([u8; 32], u64)>, u64)> {
+    let txn = db.begin_read()?;
+    let total = match txn.open_table(ADDRS) {
+        Ok(t) => t.get(address)?.map(|g| unpack_holder(g.value()).1).unwrap_or(0),
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok((Vec::new(), 0)),
+        Err(e) => return Err(e.into()),
+    };
+    let held = match txn.open_table(HELD) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok((Vec::new(), total)),
+        Err(e) => return Err(e.into()),
+    };
+    let lo = held_key(address, u64::MAX, &[0; 32]);
+    let hi = held_key(address, 0, &[0xff; 32]);
+    let mut coins = Vec::with_capacity(limit.min(1_000));
+    for item in held.range::<&[u8; 72]>(&lo..=&hi)?.take(limit) {
+        let (k, _) = item?;
+        let k = k.value();
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&k[40..]);
+        coins.push((id, !u64::from_be_bytes(k[32..40].try_into().unwrap())));
+    }
+    Ok((coins, total))
+}
+
 /// Where the transaction with this id was sealed (its commit) and where it
 /// ran (its reveal), each as (height, tx). O(1).
 pub fn find_tx(db: &Database, commitment: &[u8; 32]) -> Result<(Option<(u64, u32)>, Option<(u64, u32)>)> {
@@ -1227,6 +1275,7 @@ mod tests {
         hist: Vec<([u8; 44], [u8; 24])>,
         hist_count: Vec<([u8; 32], u64)>,
         txs: Vec<([u8; 33], [u8; 12])>,
+        held: Vec<[u8; 72]>,
         meta: Meta,
     }
 
@@ -1240,7 +1289,9 @@ mod tests {
         let hist = txn.open_table(HIST).unwrap();
         let hist_count = txn.open_table(HIST_COUNT).unwrap();
         let txs = txn.open_table(TXS).unwrap();
+        let held = txn.open_table(HELD).unwrap();
         Dump {
+            held: held.iter().unwrap().map(|e| *e.unwrap().0.value()).collect(),
             hist: hist.iter().unwrap().map(|e| {
                 let (k, v) = e.unwrap();
                 (*k.value(), *v.value())
@@ -1419,12 +1470,32 @@ mod tests {
         assert_eq!(find_tx(&db, &id).unwrap(), (None, Some((2, 0))));
         assert_eq!(find_tx(&db, &[7; 32]).unwrap(), (None, None));
 
-        // Truncating the block takes its rows and id with it.
+        // The coins an address holds, largest first, paged by a limit.
+        // Address 3: 8 from block 1's reward, 16 and 1 from block 2's.
+        let (held, n) = held_coins(&db, &addr(3), 10).unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(held.iter().map(|c| c.1).collect::<Vec<_>>(), vec![16, 8, 1]);
+        assert_eq!(held_coins(&db, &addr(3), 1).unwrap().0.iter().map(|c| c.1).collect::<Vec<_>>(), vec![16]);
+        assert_eq!(held_coins(&db, &addr(1), 10).unwrap().0.iter().map(|c| c.1).collect::<Vec<_>>(), vec![2]);
+        assert_eq!(held_coins(&db, &addr(8), 10).unwrap(), (vec![], 0));
+        // Every held coin is an unspent coin of that address, and back.
+        let d = dump(&db);
+        assert_eq!(d.held.len(), d.coins.len());
+        for k in &d.held {
+            let id: [u8; 32] = k[40..].try_into().unwrap();
+            let (owner, value) = d.coins[&id];
+            assert_eq!((&owner[..], !u64::from_be_bytes(k[32..40].try_into().unwrap())), (&k[..32], value));
+        }
+
+        // Truncating the block takes its rows, id and coins with it.
         let extra = block(&chain[2].extension.final_hash, 0, vec![], &[Coin { owner: 4, value: 16, tag: 40 }]);
         save_all(&db, &bs, 3, &[extra]);
         bs.truncate(2).unwrap(); // deletes heights 2 and 3
         assert_eq!(history(&db, &addr(1), None, 10).unwrap().1, 1);
         assert_eq!(find_tx(&db, &id).unwrap(), (None, None));
+        assert_eq!(held_coins(&db, &addr(1), 10).unwrap().0.iter().map(|c| c.1).collect::<Vec<_>>(), vec![8]);
+        assert_eq!(held_coins(&db, &addr(3), 10).unwrap().0.iter().map(|c| c.1).collect::<Vec<_>>(), vec![8]);
+        assert_eq!(held_coins(&db, &addr(4), 10).unwrap(), (vec![], 0));
     }
 
     #[test]
