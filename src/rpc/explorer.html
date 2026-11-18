@@ -2470,6 +2470,10 @@ function showSeal(c, h, b, seq) {
 // ── Addresses ───────────────────────────────────────────────────────────
 
 async function showAddress(addr, before, seq, prefetched, name) {
+    // Callers pass the bare address; a checksummed one is cut back to it, as
+    // the node's search and scan take only the 32 bytes.
+    addr = String(addr).toLowerCase().replace(/^0x/, '');
+    if (addr.length === 72) addr = addr.slice(0, 64);
     const full = checksummed(addr);
     const head = `<div class="page-h" style="align-items:center">${identicon(addr, 28)}<h1>${name ? escHtml(name.name) : 'Address'}</h1>${name ? '<span class="sub">pays this address</span>' : ''}</div>
         <section class="card"><div class="card-b pad"><span class="hash addr-full">${full}</span>${copyBtn(full)}
@@ -2591,7 +2595,11 @@ async function showName(name, seq) {
     catch (_) { return message('Node not reachable'); }
     if (stale(seq)) return;
     if (!res.ok) return message(`${name} is not registered`, `<p>${escHtml(body.error || '')}</p><p>Names are registered from the desktop wallet's Names tab.</p>`);
-    if (body.pays) return showAddress(body.pays, null, seq, null, body);
+    if (body.pays) {
+        // The node gives the checksummed form; the address is its first 64.
+        const c = validateAddressChecksum(String(body.pays).toLowerCase());
+        if (c.valid) return showAddress(c.canonical, null, seq, null, body);
+    }
     view().innerHTML = `<div class="page-h"><h1>Name</h1></div>${nameCard(body)}`;
 }
 
