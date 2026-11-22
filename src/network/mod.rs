@@ -3,7 +3,7 @@ pub mod light_protocol;
 pub mod amino;
 use light_protocol::{LightRequest, LightResponse, LIGHT_PROTOCOL, LIGHT_PUSH_PROTOCOL, LightNotification};
 
-pub use protocol::{Message, MidstateCodec, MIDSTATE_PROTOCOL, MAX_GETBATCHES_COUNT, MAX_GETHEADERS_COUNT};
+pub use protocol::{Message, MidstateCodec, MIDSTATE_PROTOCOL, SEALED_CHAT_PROTOCOL, MAX_GETBATCHES_COUNT, MAX_GETHEADERS_COUNT};
 
 use anyhow::Result;
 use futures::StreamExt;
@@ -269,6 +269,12 @@ impl LightGuard {
 
 
 
+/// Whether `msg` may go to a peer: anything may, except a chat carrying a
+/// sealed message to a peer not known to decode one.
+fn may_send(msg: &Message, peer_decodes_sealed: bool) -> bool {
+    peer_decodes_sealed || !msg.needs_sealed_chat()
+}
+
 // ── Behaviour ───────────────────────────────────────────────────────────────
 
 #[derive(NetworkBehaviour)]
@@ -430,6 +436,9 @@ pub struct MidstateNetwork {
      pending_dials: HashSet<PeerId>,
     /// Connected peers that have identified as Midstate nodes.
     identified: HashSet<PeerId>,
+    /// Identified peers that list [`SEALED_CHAT_PROTOCOL`]: the only ones a
+    /// chat carrying a sealed message is sent to.
+    sealed_chat_peers: HashSet<PeerId>,
     /// Events to hand out before the next swarm event.
     queued: std::collections::VecDeque<NetworkEvent>,
 }
@@ -495,8 +504,11 @@ impl MidstateNetwork {
                 let rr_config = RequestResponseConfig::default()
                     .with_request_timeout(Duration::from_secs(60));
 
+                // MIDSTATE_PROTOCOL first, so every stream still negotiates it;
+                // the second is listed only so identify tells peers this node
+                // decodes sealed chat messages (`SEALED_CHAT_PROTOCOL`).
                 let rr = request_response::Behaviour::new(
-                    [(MIDSTATE_PROTOCOL, ProtocolSupport::Full)],
+                    [(MIDSTATE_PROTOCOL, ProtocolSupport::Full), (SEALED_CHAT_PROTOCOL, ProtocolSupport::Full)],
                     rr_config,
                 );
                 // -------------------------------------------------
@@ -596,6 +608,7 @@ let autonat = autonat::Behaviour::new(
             static_banned_peers,
             pending_dials: HashSet::new(), 
             identified: HashSet::new(),
+            sealed_chat_peers: HashSet::new(),
             queued: std::collections::VecDeque::new(),
         };
 
@@ -787,9 +800,21 @@ let autonat = autonat::Behaviour::new(
         self.publish_to_phonebook();
     }
 
+    /// Sends `msg` to `peer`, unless it carries a sealed chat message and the
+    /// peer has not said it can decode one: a node that predates them would
+    /// fail the request, and a failed request to a sync peer aborts its sync
+    /// (`crate::chat` module docs). Every path out goes through here.
     pub fn send(&mut self, peer: PeerId, msg: Message) {
+        if !may_send(&msg, self.sealed_chat_peers.contains(&peer)) {
+            return;
+        }
         let req_id = self.swarm.behaviour_mut().rr.send_request(&peer, msg);
         self.pending_requests.insert(req_id, peer);
+    }
+
+    /// Peers known to decode sealed chat messages.
+    pub fn sealed_chat_peer_count(&self) -> usize {
+        self.sealed_chat_peers.len()
     }
 
     pub fn broadcast(&mut self, msg: Message) {
@@ -1382,6 +1407,12 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                         return NetworkEvent::ForeignPeer(peer_id);
                     }
 
+                    if info.protocols.iter().any(|p| *p == SEALED_CHAT_PROTOCOL) {
+                        self.sealed_chat_peers.insert(peer_id);
+                    } else {
+                        self.sealed_chat_peers.remove(&peer_id);
+                    }
+
                     for addr in &info.listen_addrs {
                         // SERVER-TO-SERVER WEBRTC LEAK FIX:
                         // Prevent Kademlia from learning and autonomously dialing WebRTC addresses.
@@ -1633,6 +1664,7 @@ pub async fn observe_honest_light_peer(&self, peer: PeerId) {
                     if num_established == 0 {
                         let was_connected = self.connected.remove(&peer_id).is_some();
                         let identified = self.identified.remove(&peer_id);
+                        self.sealed_chat_peers.remove(&peer_id);
                         // A peer we dialled that hung up before identifying.
                         if was_connected && !identified && cause.is_some() && endpoint.is_dialer() {
                             let addr = with_peer_id(endpoint.get_remote_address(), peer_id);
@@ -2162,5 +2194,78 @@ mod tests {
         driving.abort();
         foreigning.abort();
         refusing.abort();
+    }
+
+    /// A node from before sealed chat messages: the same request-response
+    /// protocol and identify, without the sealed-chat capability.
+    #[derive(libp2p::swarm::NetworkBehaviour)]
+    struct OldPeer {
+        rr: request_response::Behaviour<MidstateCodec>,
+        identify: identify::Behaviour,
+    }
+
+    /// A chat carrying a sealed message goes only to peers that list the
+    /// sealed-chat capability; everything else goes to every peer, as before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sealed_chats_go_only_to_peers_that_decode_them() {
+        use crate::chat::ChatAttachment;
+        let (mut node, node_addr) = listening_node(vec![]).await;
+
+        let (mut upgraded, _) = listening_node(vec![node_addr.clone()]).await;
+        let upgraded_id = upgraded.local_peer_id();
+        let driving = tokio::spawn(async move {
+            loop {
+                upgraded.next_event().await;
+            }
+        });
+
+        let mut old = libp2p::SwarmBuilder::with_new_identity()
+            .with_tokio()
+            .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)
+            .unwrap()
+            .with_behaviour(|key| OldPeer {
+                rr: request_response::Behaviour::new([(MIDSTATE_PROTOCOL, ProtocolSupport::Full)], RequestResponseConfig::default()),
+                identify: identify::Behaviour::new(identify::Config::new("/midstate/id/2.0.0".to_string(), key.public())),
+            })
+            .unwrap()
+            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+            .build();
+        let old_id = *old.local_peer_id();
+        old.dial(node_addr.clone()).unwrap();
+        let olding = tokio::spawn(async move {
+            loop {
+                old.select_next_some().await;
+            }
+        });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let mut seen = HashSet::new();
+        while !(seen.contains(&upgraded_id) && seen.contains(&old_id)) {
+            match tokio::time::timeout_at(deadline, node.next_event()).await.expect("both peers identify") {
+                NetworkEvent::PeerIdentified(peer, _) => {
+                    seen.insert(peer);
+                }
+                _ => {}
+            }
+        }
+        assert!(node.sealed_chat_peers.contains(&upgraded_id));
+        assert!(!node.sealed_chat_peers.contains(&old_id), "an old node lists no such capability");
+
+        let chat = |attachments| Message::ChatV2 { sender: node.local_peer_id().to_string(), timestamp: 1, nonce: 0, reply_to: None, words: vec![1], attachments };
+        let sealed = chat(vec![ChatAttachment::EncryptedMessage(vec![9; 100])]);
+        let plain = chat(vec![ChatAttachment::Address([1; 32])]);
+        let sent = |n: &MidstateNetwork, p: PeerId| n.pending_requests.values().filter(|x| **x == p).count();
+
+        node.send(old_id, sealed.clone());
+        assert_eq!(sent(&node, old_id), 0, "never to an old node");
+        node.send(old_id, plain.clone());
+        assert_eq!(sent(&node, old_id), 1, "plain chats as before");
+        node.send(upgraded_id, sealed.clone());
+        assert_eq!(sent(&node, upgraded_id), 1);
+        node.broadcast(sealed);
+        assert_eq!((sent(&node, old_id), sent(&node, upgraded_id)), (1, 2), "broadcast skips the old node too");
+
+        driving.abort();
+        olding.abort();
     }
 }

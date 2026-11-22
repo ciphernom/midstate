@@ -559,6 +559,15 @@ pub mod wire {
     /// negotiation and costs proof-of-work per message, which makes it a poor
     /// place to spam and a natural place to advertise.
     pub const CMD_HUB: u8 = 68;
+    /// Ask an identity for its full ML-KEM public key, to seal messages to
+    /// the name that lists it (MSN-1 `kem` record). Request id in the CoinId
+    /// attachment, the identity asked in the Address one. Wallets that
+    /// predate it ignore it, as they do any command they do not know.
+    pub const CMD_KEM_REQ: u8 = 69;
+    /// The reply: the key itself (800 bytes) in the Signature attachment. It
+    /// needs no signature: the requester checks it against the name's `kem`
+    /// record, which only the name's holder can set.
+    pub const CMD_KEM: u8 = 70;
     pub const CMD_OPEN: u8 = 110;
 
     /// OPEN payload: [ver][expiry u64][n u8][{value u64, salt 32}×n][sig0…]

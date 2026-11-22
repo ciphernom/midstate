@@ -51,6 +51,20 @@ pub enum Action {
     ChatSend { text: String },
     LoadChat,
     LoadChatDict,
+    /// Sealed messages to and from names.
+    LoadConversations,
+    SealedSend { to: String, text: String },
+    /// What of this wallet's a name can point at (its plans).
+    LoadNameTargets,
+    /// MSB-1: the Burns page, a burn, a document's hashes and notarizations,
+    /// and the inbox's bar for sealed messages.
+    LoadBurns,
+    Burn { req: BurnRequest },
+    HashDocument { path: String },
+    LookupNotary { hash: String },
+    SetInboxBar { bar: Option<f64> },
+    /// What backs a name being paid.
+    LoadPayeeBacking { name: String },
     LoadChannels,
     ChannelIdentity,
     ChannelOpen { peer: String, amount: u64, lifetime: u64 },
@@ -165,6 +179,15 @@ pub enum Msg {
     ChatSent,
     Chat(Vec<ChatView>),
     ChatDict(Vec<String>),
+    Conversations(Vec<ConversationView>),
+    SealedSent,
+    NameTargets(Vec<PayTargetView>),
+    Burns(BurnsView),
+    Burned(String),
+    DocumentHashed { path: String, size: u64, blake3: String, sha256: String },
+    Notary(NotaryView),
+    InboxBarSet,
+    PayeeBacking { name: String, backing: Option<BackingView> },
     Channels(Vec<ChannelView>),
     ChanIdentity(IdentityView),
     ChannelOpened(String),
@@ -295,6 +318,9 @@ impl Action {
             LoadMining => LoadMining,
             LoadChat => LoadChat,
             LoadChatDict => LoadChatDict,
+            LoadConversations => LoadConversations,
+            LoadNameTargets => LoadNameTargets,
+            LoadBurns => LoadBurns,
             LoadChannels => LoadChannels,
             LoadInvoices => LoadInvoices,
             LoadHub => LoadHub,
@@ -394,6 +420,26 @@ fn perform(
             Action::NameAct { name, act } => run!("name", h.name_action(name, act), |_| Msg::NameChanged),
             Action::TakeName { name, rent } => run!("take name", h.take_name(name, rent), |_| Msg::NameChanged),
             Action::FindName { name, years } => run!("find name", h.find_name(name, years), Msg::NameFound),
+            Action::LoadBurns => run!("burns", h.burns(), Msg::Burns),
+            Action::Burn { req } => run!("burn", h.burn(req), Msg::Burned),
+            Action::LookupNotary { hash } => run!("notary", h.notary(hash), Msg::Notary),
+            Action::SetInboxBar { bar } => run!("inbox", h.set_inbox_bar(bar), |_| Msg::InboxBarSet),
+            Action::LoadPayeeBacking { name } => {
+                let n = name.clone();
+                run!("payee backing", h.backing("name".into(), name), |backing| Msg::PayeeBacking { name: n, backing })
+            }
+            Action::HashDocument { path } => {
+                let p = path.clone();
+                let read = tokio::task::spawn_blocking(move || std::fs::read(&p)).await;
+                match read {
+                    Ok(Ok(bytes)) => {
+                        let (blake3, sha256) = midstate_walletd::document_hashes(&bytes);
+                        out(Msg::DocumentHashed { path, size: bytes.len() as u64, blake3, sha256 });
+                    }
+                    Ok(Err(e)) => out(Msg::Err { what: "document", err: format!("{path}: {e}") }),
+                    Err(e) => out(Msg::Err { what: "document", err: e.to_string() }),
+                }
+            }
             Action::LoadMarket => run!("market", h.name_market(), Msg::Market),
             Action::LoadNameDeals => run!("name deals", h.name_deals(), Msg::NameDeals),
             Action::WatchName { name, years, max_price } => {
@@ -476,6 +522,9 @@ fn perform(
                 run!("chat send", h.chat_send(text), |_| Msg::ChatSent)
             }
             Action::LoadChat => run!("chat", h.chat_history(), Msg::Chat),
+            Action::LoadConversations => run!("messages", h.conversations(), Msg::Conversations),
+            Action::SealedSend { to, text } => run!("sealed message", h.sealed_send(to, text), |_| Msg::SealedSent),
+            Action::LoadNameTargets => run!("name targets", h.name_targets(), Msg::NameTargets),
             Action::LoadChatDict => run!("chat", h.chat_dictionary(), Msg::ChatDict),
             Action::LoadChannels => run!("channels", h.channels(), Msg::Channels),
             Action::ChannelIdentity => {

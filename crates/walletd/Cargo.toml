@@ -33,6 +33,8 @@ midwimble = { git = "https://github.com/ciphernom/midwimble", default-features =
 axum = { version = "0.8", default-features = false, features = ["json", "tokio", "http1"] }
 # The swap link's Fiat-Shamir challenge reads BLAKE3's extendable output.
 blake3 = "1.5"
+# Notarizing a document under SHA-256 (MSB-1 `notary-sha256`).
+sha2 = "0.10"
 zeroize = "1"
 # Swap negotiation rides midstate's chat bus encrypted to the counterparty
 # (`mwb_wire`); midwimble already builds this AEAD for its wallet files.

@@ -17,7 +17,7 @@ use crate::mwb_trade::{
     MIN_ORDER_LIFE, REBROADCAST_BLOCKS,
 };
 use crate::mwb_wire::{
-    maker_session, parse, session_messages, Frame, KeyPair, Msg, Outgoing, Route, Side, To,
+    maker_session, parse, session_messages, Frame, KeyPair, Msg, NameClaim, Outgoing, Route, Side, To,
 };
 use crate::sendplan;
 use crate::api::SendStage;
@@ -64,6 +64,8 @@ pub(super) struct MwbLive {
     /// When each swap last pushed a transaction, by (swap, what): rebroadcast
     /// pacing only, so it need not survive a restart.
     pushed: HashMap<([u8; 32], u8), u64>,
+    /// Name claims heard, by order id (`mwb_wire::NameClaim`).
+    names: HashMap<[u8; 16], NameClaim>,
 }
 
 impl MwbLive {
@@ -539,16 +541,22 @@ impl Service {
             .book
             .values()
             .filter(|e| e.advert.expires > tip)
-            .map(|e| MwbBookEntryView {
-                order_id: hex::encode(e.advert.order_id),
-                side: side_name(e.advert.side).into(),
-                mds_amount: e.advert.mds_amount,
-                mdw_amount: e.advert.mdw_amount,
-                expires: e.advert.expires,
-                heard: e.heard,
-                mine: mine.contains(&e.advert.order_id),
+            .map(|e| {
+                let seller_name = self.mwb_verified_name(&e.advert.order_id, &e.advert.maker_key).unwrap_or_default();
+                MwbBookEntryView {
+                    order_id: hex::encode(e.advert.order_id),
+                    side: side_name(e.advert.side).into(),
+                    mds_amount: e.advert.mds_amount,
+                    mdw_amount: e.advert.mdw_amount,
+                    expires: e.advert.expires,
+                    heard: e.heard,
+                    mine: mine.contains(&e.advert.order_id),
+                    seller_backing: if seller_name.is_empty() { 0.0 } else { self.name_backing(&seller_name).map_or(0.0, |b| b.blocks) },
+                    seller_name,
+                }
             })
             .collect();
+        let own = self.mwb_own_name().map(|(n, _)| format!("{n}{}", midstate::core::names::SUFFIX)).unwrap_or_default();
         for o in self.mwb.store.orders.iter().filter(|o| o.takeable(tip)) {
             if !self.mwb.book.contains_key(&o.id) {
                 v.push(MwbBookEntryView {
@@ -559,10 +567,37 @@ impl Service {
                     expires: o.expires,
                     heard: o.last_advert,
                     mine: true,
+                    seller_backing: if own.is_empty() { 0.0 } else { self.name_backing(&own).map_or(0.0, |b| b.blocks) },
+                    seller_name: own.clone(),
                 });
             }
         }
         v
+    }
+
+    /// A name this wallet holds whose `mdw` record is this wallet's MDW
+    /// address, and the spend secret that proves it.
+    fn mwb_own_name(&self) -> Option<(String, curve25519_dalek::scalar::Scalar)> {
+        let keys = self.mwb.keys.as_ref()?;
+        let mine = keys.address().encode();
+        let spend = midwimble::core::mw::crypto::scalar_from_bytes(&keys.to_bytes()[1])?;
+        self.names.jobs.iter().filter(|j| j.status == "registered" && !j.renter).find_map(|j| {
+            let r = self.live_record(&format!("{}{}", j.name, midstate::core::names::SUFFIX)).ok()?;
+            r.records.iter().any(|x| matches!(x, midstate::core::names::Rec::Mdw(a) if *a == mine)).then(|| (j.name.clone(), spend))
+        })
+    }
+
+    /// The name to show for order `order_id` advertised under `maker_key`:
+    /// only when its claim was signed by the spend key of the address the
+    /// name's `mdw` record gives.
+    fn mwb_verified_name(&self, order_id: &[u8; 16], maker_key: &Point32) -> Option<String> {
+        let c = self.mwb.names.get(order_id).filter(|c| &c.maker_key == maker_key)?;
+        let r = self.live_record(&format!("{}{}", c.name, midstate::core::names::SUFFIX)).ok()?;
+        r.records
+            .iter()
+            .filter_map(|x| if let midstate::core::names::Rec::Mdw(a) = x { StealthAddress::decode(a).ok() } else { None })
+            .any(|a| c.signed_by(&a.spend))
+            .then(|| format!("{}{}", c.name, midstate::core::names::SUFFIX))
     }
 
     fn node_tip_cached(&self) -> u64 {
@@ -859,14 +894,22 @@ impl Service {
             return;
         }
         let mut out = Vec::new();
+        let mut adverts = Vec::new();
         for o in &mut self.mwb.store.orders {
             let due = o.last_advert == 0 || mds_tip >= o.last_advert + ADVERT_EVERY;
             // An order that cannot start yet (`check_side_open`) waits unannounced.
             if o.takeable(mds_tip) && due && check_side_open(o.side, mds_tip).is_ok() {
                 if let Ok(a) = o.advert() {
                     out.push(a.chat());
+                    adverts.push(a);
                     o.last_advert = mds_tip;
                 }
+            }
+        }
+        // With each advert, the name this wallet holds for its MDW account.
+        if let Some((name, spend)) = self.mwb_own_name() {
+            for a in &adverts {
+                out.push(NameClaim::sign(&spend, a.order_id, a.maker_key, &name).chat());
             }
         }
         self.mwb_send_chat(out);
@@ -880,6 +923,12 @@ impl Service {
             }
             let Some(frame) = parse(&m) else { continue };
             match frame {
+                Frame::Claim(c) => {
+                    if self.mwb.names.len() > 4_096 {
+                        self.mwb.names.clear();
+                    }
+                    self.mwb.names.insert(c.order_id, c);
+                }
                 Frame::Advert(a) => {
                     if self.mwb.store.orders.iter().any(|o| o.id == a.order_id) || a.expires <= mds_tip {
                         continue;

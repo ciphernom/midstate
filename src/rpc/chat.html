@@ -298,7 +298,10 @@ function toggleTheme(){var d=document.documentElement,n=d.getAttribute('data-the
 
                     const value = document.createElement('div');
                     value.className = 'msg-attachment-value';
-                    value.textContent = att.value;
+                    // Ciphertext for someone's wallet: nothing to read here.
+                    value.textContent = att.kind === 'encrypted_message'
+                        ? `sealed message, ${att.value.length / 2} bytes`
+                        : att.value;
                     chip.appendChild(value);
 
                     chip.addEventListener('click', () => {

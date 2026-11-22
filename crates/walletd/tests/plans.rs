@@ -266,3 +266,77 @@ fn a_stream_that_cannot_be_cancelled_cannot_be() {
     let r = chain.spend(&tranche_inputs(&s, &all[..1], false), s.collect_outputs(0, 1 << 33, rand::random::<[u8; 32]>), None);
     assert!(r.is_err(), "collected before it was due");
 }
+
+/// A name pointed at a plan has its payers pay the plan's address, with salts
+/// of their own: gifts. The owner's check-in carries them along with the
+/// plan's own coins, and once the owner goes quiet, a claim pays them to the
+/// heirs. Both through consensus.
+#[test]
+fn gifts_to_a_plans_address_move_with_its_check_ins_and_go_to_its_heirs() {
+    use midstate_walletd::plans::{as_gift, plan_addresses, PlanCoin};
+    let dir = TempDir::new().unwrap();
+    let mut owner = wallet(&dir, "owner.dat");
+    let mut payer = wallet(&dir, "payer.dat");
+    let mut ann = wallet(&dir, "ann.dat");
+    let mut chain = Chain::at(HEIGHT);
+    chain.give(&mut owner, 1 << 40);
+    chain.give(&mut payer, 1 << 40);
+    let ann_pk = tree(&mut ann);
+    let owner_pk = tree(&mut owner);
+    let plan = InheritancePlan {
+        owner_pk,
+        heirs: vec![Heir { pk: ann_pk, share: shares_from_bps(&[10_000]).unwrap()[0] }],
+        start: HEIGHT,
+        period: 30 * DAY,
+        secret: rand::random(),
+    };
+    plan.check().unwrap();
+    let k = plan.epoch_after(HEIGHT);
+    chain.fund(&mut owner, vec![plan.output(k, 0, 1 << 36)]);
+
+    // Someone pays the address a name points at: the plan's for deadline k.
+    let salt: [u8; 32] = rand::random();
+    let gift_value = 1u64 << 35;
+    chain.fund(&mut payer, vec![OutputData::Standard { address: plan.address(k), value: gift_value, salt }]);
+    let watched = plan_addresses(&plan, HEIGHT);
+    assert!(watched.iter().any(|(a, kk)| *a == plan.address(k) && *kk == k), "the scan watches it");
+    assert_eq!(as_gift(&plan, k, 1 << 36, plan.coin_salt(k, 0)), None, "the plan's own coin is not a gift");
+    let gift = as_gift(&plan, k, gift_value, salt).expect("a payer's salt");
+    assert!(chain.0.coins.contains(&gift.id(&plan)));
+    let mut coins = live_plan_coins(&plan, HEIGHT, chain.live());
+    assert_eq!(coins.len(), 1, "the secret alone does not find a gift");
+    coins.push(gift);
+
+    // The owner checks in: the gift moves with the plan's own coin, salted
+    // by the plan from then on.
+    chain.0.height = HEIGHT + 20 * DAY;
+    let inputs = owner_inputs(&plan, &coins);
+    let total: u64 = coins.iter().map(|c| c.value).sum();
+    let fee = fee_for(reveal_size(&inputs, midstate_walletd::bond::mss_sig_len(2), 64));
+    let to = plan.epoch_after(chain.0.height);
+    let keep = plan_denominations(total - fee);
+    let back = total - fee - keep.iter().sum::<u64>();
+    let mut outputs: Vec<OutputData> =
+        keep.iter().zip(free_indices(&coins, to, keep.len())).map(|(v, n)| plan.output(to, n, *v)).collect();
+    outputs.extend(to_plain(back));
+    chain.spend(&inputs, outputs, Some((&mut owner, owner_pk))).expect("a check-in that carries a gift");
+    assert!(!chain.0.coins.contains(&gift.id(&plan)));
+    let moved = live_plan_coins(&plan, chain.0.height, chain.live());
+    assert_eq!(moved.iter().map(|c| c.value).sum::<u64>(), keep.iter().sum::<u64>());
+
+    // Another gift, at the deadline the name moved on to; then silence. At
+    // the deadline anyone claims both kinds for the heir.
+    let salt: [u8; 32] = rand::random();
+    chain.fund(&mut payer, vec![OutputData::Standard { address: plan.address(to), value: gift_value, salt }]);
+    let late: PlanCoin = as_gift(&plan, to, gift_value, salt).unwrap();
+    let mut due = moved.clone();
+    due.push(late);
+    chain.0.height = plan.deadline(to);
+    let total: u64 = due.iter().map(|c| c.value).sum();
+    let tx = chain
+        .spend(&claim_inputs(&plan, &due), plan.claim_outputs(to, total, rand::random::<[u8; 32]>), None)
+        .expect("a claim that pays out a gift");
+    let paid = payouts_in(&tx, &[(plan.payout_tag(to, 0), ann_pk)], "test");
+    let unit = total / midstate::core::plans::SHARE_DENOM;
+    assert_eq!(paid.iter().map(|p| p.value).sum::<u64>(), unit * (midstate::core::plans::SHARE_DENOM - 1));
+}

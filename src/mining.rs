@@ -737,9 +737,25 @@ async fn session(
                         if let Ok(res) = http_client.get(format!("http://{}/api/proof?address={}&root={}", api_host, payout_address, claimed_root)).send().await {
                             if let Ok(proof_data) = res.json::<serde_json::Value>().await {
                                 if proof_data.get("error").is_none() {
-                                    let Ok(payout_bytes) = crate::core::types::parse_address_flexible(payout_address) else {
+                                    // A payout name's score is under its key; its coin
+                                    // goes to what the pool resolved it to this job.
+                                    let leaf_key = if crate::core::names::is_name(payout_address) {
+                                        crate::core::names::normalize(payout_address).ok().map(|n| crate::pool::name_key(&n))
+                                    } else {
+                                        crate::core::types::parse_address_flexible(payout_address).ok()
+                                    };
+                                    let Some(payout_bytes) = leaf_key else {
                                         tracing::error!("the payout address {} is not an address. fix it and the miner reconnects.", payout_address);
                                         break End::Refused;
+                                    };
+                                    let paid_at = if crate::core::names::is_name(payout_address) {
+                                        let at = proof_data["pays"].as_str().and_then(|h| hex::decode(h).ok()).and_then(|b| <[u8; 32]>::try_from(b).ok());
+                                        if let Some(at) = at {
+                                            tracing::info!("audit: {} is paid at {} this job", payout_address, crate::core::types::encode_address_with_checksum(&at));
+                                        }
+                                        at
+                                    } else {
+                                        Some(payout_bytes)
                                     };
                                     let score = proof_data["score"].as_u64().unwrap_or(0);
                                     let mut data = [0u8; 40];
@@ -768,7 +784,7 @@ async fn session(
                                         break End::Lost { worked };
                                     }
 
-                                    if score > 0 && !batch.coinbase.iter().any(|cb| cb.address == payout_bytes) {
+                                    if score > 0 && !paid_at.is_some_and(|at| batch.coinbase.iter().any(|cb| cb.address == at)) {
                                         tracing::error!("audit failed: omitted from payout array despite score of {}. disconnecting.", score);
                                         break End::Lost { worked };
                                     }

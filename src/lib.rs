@@ -24,6 +24,9 @@ pub mod metrics;
 // Wasm-safe: Pure data structures and PoW math used by the light client
 pub mod chat;
 
+// Wasm-safe: sealed chat messages between names (ML-KEM-512 + XChaCha20-Poly1305).
+pub mod sealed;
+
 #[cfg(not(target_arch = "wasm32"))]
 pub mod mining;
 

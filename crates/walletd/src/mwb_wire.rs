@@ -39,7 +39,7 @@ use curve25519_dalek::ristretto::RistrettoPoint;
 use curve25519_dalek::scalar::Scalar;
 use curve25519_dalek::traits::IsIdentity;
 use midstate::chat::{ChatAttachment, ChatMessage};
-use midwimble::core::mw::crypto::{compress, decompress, random_scalar, scalar_from_bytes, Point32, SchnorrSig};
+use midwimble::core::mw::crypto::{compress, decompress, random_scalar, scalar_from_bytes, schnorr_sign, schnorr_verify, Point32, SchnorrSig};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -53,6 +53,9 @@ pub const KIND_ADVERT: u8 = 34;
 pub const KIND_TAKE: u8 = 43;
 /// "trade": every later message of a session.
 pub const KIND_SESSION: u8 = 32;
+/// "who": the name an order's maker holds ([`NameClaim`]). Wallets that
+/// predate it skip it, as they skip any kind they do not know.
+pub const KIND_WHO: u8 = 91;
 
 pub const VERSION: u8 = 1;
 const ATTACHMENT_MAX: usize = 1_536;
@@ -150,6 +153,77 @@ impl Advert {
 
     pub fn chat(&self) -> (Vec<u8>, Vec<ChatAttachment>) {
         (vec![WORD_SWAP, WORD_MARK, KIND_ADVERT], vec![ChatAttachment::Signature(self.encode())])
+    }
+}
+
+// ── Names on orders ─────────────────────────────────────────────────────────
+
+/// "The maker of this order holds `name`.mds", signed by the spend key of
+/// the maker's MDW account. A taker shows the name only when the name's
+/// `mdw` record is an address with that spend key: the address the claim's
+/// signer receives at. An advert stays unauthenticated; only the name is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NameClaim {
+    pub order_id: [u8; 16],
+    /// The advert's session key, so a claim cannot move to another advert.
+    pub maker_key: Point32,
+    /// Canonical, without `.mds`.
+    pub name: String,
+    pub sig: SchnorrSig,
+}
+
+/// What a claim's spend key signs.
+pub fn claim_digest(order_id: &[u8; 16], maker_key: &Point32, name: &str) -> [u8; 32] {
+    let mut h = blake3::Hasher::new_derive_key("midstate mdw-market name-claim v1");
+    h.update(order_id);
+    h.update(maker_key);
+    h.update(name.as_bytes());
+    *h.finalize().as_bytes()
+}
+
+impl NameClaim {
+    /// A claim signed by the MDW spend secret `spend`.
+    pub fn sign(spend: &Scalar, order_id: [u8; 16], maker_key: Point32, name: &str) -> Self {
+        let sig = schnorr_sign(spend, &claim_digest(&order_id, &maker_key, name));
+        NameClaim { order_id, maker_key, name: name.to_string(), sig }
+    }
+
+    /// Whether the holder of `spend` (an MDW address's spend key) signed it.
+    pub fn signed_by(&self, spend: &Point32) -> bool {
+        schnorr_verify(spend, &claim_digest(&self.order_id, &self.maker_key, &self.name), &self.sig)
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![VERSION];
+        out.extend_from_slice(&self.order_id);
+        out.extend_from_slice(&self.maker_key);
+        out.push(self.name.len() as u8);
+        out.extend_from_slice(self.name.as_bytes());
+        out.extend_from_slice(&self.sig.e);
+        out.extend_from_slice(&self.sig.s);
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        if b.len() < 1 + 16 + 32 + 1 || b[0] != VERSION {
+            return None;
+        }
+        let n = b[49] as usize;
+        if n == 0 || n > midstate::core::names::MAX_NAME_LEN || b.len() != 50 + n + 64 {
+            return None;
+        }
+        let name = std::str::from_utf8(&b[50..50 + n]).ok()?.to_string();
+        // Only canonical names: the one form a name is shown and signed in.
+        if midstate::core::names::normalize(&name).ok()? != name {
+            return None;
+        }
+        let e: [u8; 32] = b[50 + n..82 + n].try_into().ok()?;
+        let s: [u8; 32] = b[82 + n..].try_into().ok()?;
+        Some(NameClaim { order_id: b[1..17].try_into().ok()?, maker_key: b[17..49].try_into().ok()?, name, sig: SchnorrSig { e, s } })
+    }
+
+    pub fn chat(&self) -> Outgoing {
+        (vec![WORD_SWAP, WORD_MARK, KIND_WHO], vec![ChatAttachment::Signature(self.encode())])
     }
 }
 
@@ -451,6 +525,7 @@ pub fn session_messages(session: &Session, to: To, seq: u8, msg: &Msg) -> Result
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Frame {
     Advert(Advert),
+    Claim(NameClaim),
     Take { order_id: [u8; 16], taker_key: Point32, index: u8, count: u8, chunk: Vec<u8> },
     Session { tag: [u8; 16], to: To, seq: u8, index: u8, count: u8, chunk: Vec<u8> },
 }
@@ -476,6 +551,7 @@ pub fn parse(m: &ChatMessage) -> Option<Frame> {
     };
     match m.words[2] {
         KIND_ADVERT => Advert::decode(&bytes).map(Frame::Advert),
+        KIND_WHO => NameClaim::decode(&bytes).map(Frame::Claim),
         KIND_TAKE if bytes.len() > TAKE_HEADER => {
             let (index, count, chunk) = fragment(1 + 16 + 32)?;
             Some(Frame::Take {
@@ -616,10 +692,38 @@ mod tests {
                         done = Some((route, s));
                     }
                 }
-                Frame::Advert(_) => unreachable!(),
+                Frame::Advert(_) | Frame::Claim(_) => unreachable!(),
             }
         }
         done
+    }
+
+    #[test]
+    fn a_name_claim_names_its_signer_and_nothing_else() {
+        let keys = midwimble::core::mw::stealth::WalletKeys::random();
+        let spend = scalar_from_bytes(&keys.to_bytes()[1]).unwrap();
+        let address = keys.address();
+        let maker_key = KeyPair::random().public;
+        let c = NameClaim::sign(&spend, [5; 16], maker_key, "nick");
+        // On the bus and back.
+        let (w, att) = c.chat();
+        let Some(Frame::Claim(back)) = parse(&chat(w, att)) else { panic!("a claim") };
+        assert_eq!(back, c);
+        // The name's mdw record is this address: its spend key signed.
+        assert!(c.signed_by(&address.spend));
+        assert!(!c.signed_by(&midwimble::core::mw::stealth::WalletKeys::random().address().spend));
+        // Moved to another order, advert or name, it no longer verifies.
+        assert!(!NameClaim { order_id: [6; 16], ..c.clone() }.signed_by(&address.spend));
+        assert!(!NameClaim { maker_key: KeyPair::random().public, ..c.clone() }.signed_by(&address.spend));
+        assert!(!NameClaim { name: "nicky".into(), ..c.clone() }.signed_by(&address.spend));
+        // Malformed: no name, or one too long.
+        let mut bad = c.encode();
+        bad[49] = 0;
+        assert_eq!(NameClaim::decode(&bad), None);
+        assert_eq!(NameClaim::decode(&c.encode()[..60]), None);
+        let mut upper = c.encode();
+        upper[50] = b'N';
+        assert_eq!(NameClaim::decode(&upper), None, "names travel in canonical form");
     }
 
     #[test]

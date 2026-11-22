@@ -14,6 +14,10 @@ pub struct WalletStatus {
     pub unlocked: bool,
     pub is_hd: bool,
     pub wallet_path: String,
+    /// The MSB-1 backing (blocks) a sealed message's sender needs to reach
+    /// the inbox; `None`: every message does.
+    #[serde(default)]
+    pub inbox_bar: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -77,16 +81,30 @@ pub struct NameView {
     /// Renew a year at a time when 60 days are left, burning the year's price.
     pub auto_renew: bool,
     pub records: Vec<NameRecordView>,
+    /// What kind of address `pays` is, when the records say: "single key",
+    /// "2-of-3 multisig", "vault (time-locked)", "inheritance plan (2 heirs)"…
+    /// or "script (kind not published)".
+    #[serde(default)]
+    pub pays_kind: String,
+    /// It takes sealed messages (a `kem` record).
+    #[serde(default)]
+    pub sealed: bool,
+    /// What has been burned to back it (MSB-1), if anything.
+    #[serde(default)]
+    pub backing: Option<BackingView>,
     /// What the records editor starts from.
     pub mdw: bool,
     pub identity: bool,
     pub evm: bool,
     pub text: String,
+    /// The address it points at instead of this wallet's own key, if any.
+    #[serde(default)]
+    pub pay_to: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NameRecordView {
-    /// mds-key, mds-address, mdw, evm, identity, text or other.
+    /// mds-key, mds-address, mdw, evm, identity, text, kem, script or other.
     pub kind: String,
     pub value: String,
 }
@@ -117,6 +135,20 @@ pub struct NameCard {
     pub fee: u64,
     pub tip: u64,
     pub records: Vec<NameRecordView>,
+    /// Where an MDS payment to it goes now, and what kind of address that is.
+    #[serde(default)]
+    pub pays: Option<String>,
+    #[serde(default)]
+    pub pays_kind: String,
+    /// Its wallet can be asked for a fresh address (an `identity` record).
+    #[serde(default)]
+    pub identity: bool,
+    /// It takes sealed messages (a `kem` record).
+    #[serde(default)]
+    pub sealed: bool,
+    /// What has been burned to back it (MSB-1), if anything.
+    #[serde(default)]
+    pub backing: Option<BackingView>,
 }
 
 /// A sale or rental that landed.
@@ -143,6 +175,49 @@ pub struct MarketView {
     pub expires: u64,
     /// This wallet's own offer.
     pub mine: bool,
+    /// Blocks of MSB-1 backing burned for it: it goes with the name.
+    #[serde(default)]
+    pub backing: f64,
+}
+
+/// A sealed conversation with a name.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConversationView {
+    /// The session's id (hex); empty while the first message waits for the
+    /// recipient's key.
+    pub id: String,
+    /// `nick.mds`, or empty for an anonymous opener.
+    pub peer: String,
+    /// The other side is who `peer` says: this wallet sealed to the key the
+    /// name publishes, or the opener's signed claim matched the registry.
+    pub verified: bool,
+    pub opened_by_me: bool,
+    pub lines: Vec<MessageLineView>,
+    /// Blocks of backing burned for `peer` (MSB-1), when verified.
+    #[serde(default)]
+    pub backing: f64,
+    /// Below the inbox's bar: a message request, not the inbox.
+    #[serde(default)]
+    pub request: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MessageLineView {
+    pub mine: bool,
+    pub text: String,
+    /// Unix seconds.
+    pub at: u64,
+}
+
+/// Something of this wallet's a name can point its payments at.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PayTargetView {
+    pub label: String,
+    /// Checksummed.
+    pub address: String,
+    /// Its script (hex), published with the name so others see its kind.
+    pub script: String,
+    pub kind: String,
 }
 
 /// A change to a name this wallet holds.
@@ -171,6 +246,17 @@ pub struct NameEdit {
     /// Its Base account.
     pub evm: bool,
     pub text: String,
+    /// Pay this address instead of this wallet's own key: a vault, a
+    /// multisig, a plan, a project's shared wallet. Empty: this wallet's key.
+    #[serde(default)]
+    pub pay_to: String,
+    /// The script behind `pay_to` (hex), published so anyone can see what
+    /// kind of address it is. Optional; it must hash to `pay_to`.
+    #[serde(default)]
+    pub script: String,
+    /// Take sealed messages: publish this wallet's KEM key hash.
+    #[serde(default)]
+    pub sealed: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -443,6 +529,9 @@ pub struct ChatView {
     /// Attachment count (payloads are protocol-level; qbolt channel messages
     /// will ride here later).
     pub attachments: usize,
+    /// It carries a sealed message: ciphertext for someone's wallet.
+    #[serde(default)]
+    pub sealed: bool,
 }
 
 /// Secret material for moving one coin between wallets. Anyone holding these
@@ -1018,6 +1107,10 @@ pub struct HubAdView {
     pub heard: u64,
     /// Whether we already have a channel to it — this part we know.
     pub connected: bool,
+    /// Blocks of backing burned for the hub's key (MSB-1): what its claims
+    /// cost it. Hubs are listed most-backed first.
+    #[serde(default)]
+    pub backing: f64,
 }
 
 // ── MDS <-> MDW ─────────────────────────────────────────────────────────────
@@ -1161,6 +1254,13 @@ pub struct MwbBookEntryView {
     /// Midstate height it was last heard at.
     pub heard: u64,
     pub mine: bool,
+    /// The maker's name: shown only when the claim was signed by the spend
+    /// key of the MDW address the name's `mdw` record gives.
+    #[serde(default)]
+    pub seller_name: String,
+    /// Blocks of MSB-1 backing behind that name.
+    #[serde(default)]
+    pub seller_backing: f64,
 }
 
 /// An order this wallet made.
@@ -1220,6 +1320,14 @@ pub struct EthAdvertView {
     pub wei_per_gmds: String,
     pub expires: u64,
     pub mine: bool,
+    /// The seller's name, shown only when the seller's account signed the
+    /// claim and the name's `evm` record is that account. Empty otherwise.
+    #[serde(default)]
+    pub seller_name: String,
+    /// Blocks of backing (MSB-1) burned for the seller's account and its
+    /// verified name, together.
+    #[serde(default)]
+    pub seller_backing: f64,
 }
 
 /// One of our sell orders.
@@ -1255,6 +1363,10 @@ pub struct EthSwapView {
     pub settled: bool,
     /// Who we trade with on Base, when known.
     pub counterparty: String,
+    /// Their name, when their account signed the claim and the name's `evm`
+    /// record is that account.
+    #[serde(default)]
+    pub counterparty_name: String,
     /// Unix time our ETH may be refunded (buys), or the reservation ends (fills).
     pub eth_deadline: u64,
     /// Midstate height the MDS lock may be taken back from.
@@ -1276,4 +1388,108 @@ pub struct EthMarketView {
     pub tip: u64,
     /// The last time Base could not be read, and why.
     pub base_error: Option<String>,
+}
+
+
+// ── Burns (MSB-1) ───────────────────────────────────────────────────────────
+
+/// What something has had burned to back it (MSB-1), now.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BackingView {
+    /// name, key, evm, pool, hub, notary or notary-sha256.
+    pub purpose: String,
+    /// The name, the 0x account, or hex.
+    pub subject: String,
+    /// Blocks of backing now: each burn weighs what it cost in block rewards,
+    /// halving every year since.
+    pub blocks: f64,
+    /// "1.5 days of issuance".
+    pub text: String,
+    /// "backed", "well backed" or "strongly backed"; empty below an hour of
+    /// issuance.
+    pub tier: String,
+    /// Units burned for it, all told, and in how many burns.
+    pub total: u64,
+    pub count: u64,
+    pub first: u64,
+    pub last: u64,
+    pub label: String,
+}
+
+/// A burn to make.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct BurnRequest {
+    pub purpose: String,
+    /// The name, key, address, 0x account or document hash.
+    pub subject: String,
+    /// Up to 43 bytes, kept on chain with the burn.
+    pub label: String,
+    /// Units to burn. Zero only for a notarization: the fee alone.
+    pub units: u64,
+}
+
+/// A recent MSB-1 burn on the chain.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RecentBurnView {
+    pub height: u64,
+    pub time: u64,
+    pub purpose: String,
+    pub subject: String,
+    pub value: u64,
+    /// Blocks it weighed when made.
+    pub blocks: f64,
+    pub label: String,
+}
+
+/// The Burns page: what this wallet's names and account have behind them,
+/// and what the chain burns against what it issues.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct BurnsView {
+    pub tip: u64,
+    /// One block's reward now: what a block of backing costs, in units.
+    pub reward: u64,
+    /// The node's burn index is current.
+    pub ready: bool,
+    /// Why not, when it is not.
+    pub note: String,
+    /// This wallet's names and Base account, with what backs each.
+    pub mine: Vec<BackingView>,
+    /// The last 365 days: issued, and burned (names, backing, the rest).
+    pub issued: u64,
+    pub burned: u64,
+    pub names_burned: u64,
+    pub backing_burned: u64,
+    pub other_burned: u64,
+    /// The halving year under way (1 from genesis), so far.
+    pub year: u64,
+    pub year_issued: u64,
+    pub year_burned: u64,
+    /// All the backing anyone holds, in blocks, and the share of each year's
+    /// issuance keeping it up burns.
+    pub held: f64,
+    pub upkeep_share: f64,
+    /// The most-backed names, pools and hubs.
+    pub top_names: Vec<BackingView>,
+    pub top_pools: Vec<BackingView>,
+    pub top_hubs: Vec<BackingView>,
+    pub recent: Vec<RecentBurnView>,
+}
+
+/// A document's notarizations: every burn made for its hash.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct NotaryView {
+    /// The hash looked up (hex).
+    pub hash: String,
+    /// Oldest first: the first is when the document is known to have existed.
+    pub marks: Vec<NotaryMark>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct NotaryMark {
+    /// notary (BLAKE3) or notary-sha256.
+    pub purpose: String,
+    pub height: u64,
+    pub time: u64,
+    pub value: u64,
+    pub label: String,
 }

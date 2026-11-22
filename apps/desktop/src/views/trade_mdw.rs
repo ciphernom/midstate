@@ -148,8 +148,8 @@ fn book(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
                 theme::hint(ui, "No orders heard on the bus right now.");
                 return;
             }
-            egui::Grid::new(format!("mwb_book_{side}")).num_columns(5).spacing([18.0, 7.0]).striped(true).show(ui, |ui| {
-                for h in ["Price", "MDS", "MDW", "Stands for", ""] {
+            egui::Grid::new(format!("mwb_book_{side}")).num_columns(6).spacing([18.0, 7.0]).striped(true).show(ui, |ui| {
+                for h in ["Price", "MDS", "MDW", "Maker", "Stands for", ""] {
                     ui.label(RichText::new(h.to_uppercase()).font(FontId::monospace(9.5)).color(theme::muted()));
                 }
                 ui.end_row();
@@ -157,6 +157,19 @@ fn book(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
                     ui.label(theme::mono(price(e.mds_amount, e.mdw_amount)).size(11.5).color(theme::ink()));
                     ui.label(theme::mono(compact_units(e.mds_amount)).size(11.5));
                     ui.label(theme::mono(mdw(e.mdw_amount)).size(11.5));
+                    // A name only when its MDW address's spend key signed for
+                    // this order; and what was burned to back that name.
+                    ui.horizontal(|ui| {
+                        if e.seller_name.is_empty() {
+                            ui.label(RichText::new("—").color(theme::faint()));
+                        } else {
+                            ui.label(RichText::new(&e.seller_name).strong().size(12.0))
+                                .on_hover_text("Signed for by the spend key of the MDW address this name's records give");
+                            if let Some(t) = midstate_walletd::burns::tier(e.seller_backing) {
+                                theme::badge(ui, t, theme::gold());
+                            }
+                        }
+                    });
                     ui.label(theme::mono(format!("{} blocks", e.expires.saturating_sub(tip))).size(11.0).color(theme::muted()));
                     if e.mine {
                         theme::badge(ui, "yours", theme::ink());

@@ -154,18 +154,75 @@ pub fn shares_from_bps(bps: &[u32]) -> Result<Vec<u32>> {
 
 // ── Finding coins ────────────────────────────────────────────────────────
 
-/// A coin of a plan: deadline, index, value.
+/// A coin of a plan: deadline, index, value. A plan's own coins have salts
+/// fixed by its secret; a *gift* — a payment someone else made to one of the
+/// plan's addresses, as a name pointed at the plan has payers do — carries
+/// the salt its payer chose, and no index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanCoin {
     pub k: u64,
     pub n: u32,
     pub value: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_hex32")]
+    pub salt: Option<[u8; 32]>,
 }
 
+/// A gift's index: past every index a plan's own coins use.
+pub const GIFT_INDEX: u32 = u32::MAX;
+
 impl PlanCoin {
-    pub fn id(&self, p: &InheritancePlan) -> [u8; 32] {
-        p.coin_id(self.k, self.n, self.value)
+    /// Coin `n` of deadline `k`, salted by the plan.
+    pub fn own(k: u64, n: u32, value: u64) -> Self {
+        PlanCoin { k, n, value, salt: None }
     }
+
+    /// A payment someone else made to the plan's address for deadline `k`.
+    pub fn gift(k: u64, value: u64, salt: [u8; 32]) -> Self {
+        PlanCoin { k, n: GIFT_INDEX, value, salt: Some(salt) }
+    }
+
+    pub fn is_gift(&self) -> bool {
+        self.salt.is_some()
+    }
+
+    pub fn id(&self, p: &InheritancePlan) -> [u8; 32] {
+        match self.salt {
+            Some(salt) => midstate::core::compute_coin_id(&p.address(self.k), self.value, &salt),
+            None => p.coin_id(self.k, self.n, self.value),
+        }
+    }
+
+    /// The input that spends it (either branch of the plan's script).
+    pub fn input(&self, p: &InheritancePlan) -> InputReveal {
+        let mut r = p.input(self.k, self.n, self.value);
+        if let Some(salt) = self.salt {
+            r.salt = salt;
+        }
+        r
+    }
+}
+
+/// A gift as the wallet keeps it: the coin, and the height of the block that
+/// paid it. A spent gift is forgotten a day after it was paid, not before:
+/// a reorganization that undid its block may yet bring it back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Gift {
+    pub coin: PlanCoin,
+    pub height: u64,
+}
+
+/// Blocks a spent gift is still kept for.
+pub const GIFT_KEEP: u64 = 1_440;
+
+/// Every address of `p` coins could sit at as of `height`, with its deadline.
+pub fn plan_addresses(p: &InheritancePlan, height: u64) -> Vec<([u8; 32], u64)> {
+    p.epochs_to(height).map(|k| (p.address(k), k)).collect()
+}
+
+/// A coin paid to `p`'s address for deadline `k`, as a gift: `None` if it is
+/// one of the plan's own coins (its salt is the plan's).
+pub fn as_gift(p: &InheritancePlan, k: u64, value: u64, salt: [u8; 32]) -> Option<PlanCoin> {
+    (0..MAX_PLAN_COINS).all(|n| p.coin_salt(k, n) != salt).then(|| PlanCoin::gift(k, value, salt))
 }
 
 /// Every coin of `p` on chain (`live` answers for a coin id) as of `height`.
@@ -178,7 +235,7 @@ pub fn live_plan_coins(p: &InheritancePlan, height: u64, live: impl Fn(&[u8; 32]
             for e in MIN_COIN_EXP..64 {
                 let value = 1u64 << e;
                 if live(&midstate::core::compute_coin_id(&address, value, &salt)) {
-                    found.push(PlanCoin { k, n, value });
+                    found.push(PlanCoin::own(k, n, value));
                 }
             }
         }
@@ -207,7 +264,8 @@ pub fn plan_denominations(amount: u64) -> Vec<u64> {
         .collect()
 }
 
-/// Indices free at deadline `k` of `p`, given the coins there.
+/// Indices free at deadline `k` of `p`, given the coins there. Gifts take
+/// none.
 pub fn free_indices(have: &[PlanCoin], k: u64, n: usize) -> Vec<u32> {
     (0..MAX_PLAN_COINS).filter(|i| !have.iter().any(|c| c.k == k && c.n == *i)).take(n).collect()
 }
@@ -362,7 +420,7 @@ pub fn resolve_fee(inputs: &[CovInput], sig_len: usize, extra_outputs: usize, va
 pub fn owner_inputs(p: &InheritancePlan, coins: &[PlanCoin]) -> Vec<CovInput> {
     coins
         .iter()
-        .map(|c| CovInput { reveal: p.input(c.k, c.n, c.value), opening: Opening::Signed(vec!["01".into()]) })
+        .map(|c| CovInput { reveal: c.input(p), opening: Opening::Signed(vec!["01".into()]) })
         .collect()
 }
 
@@ -370,7 +428,7 @@ pub fn owner_inputs(p: &InheritancePlan, coins: &[PlanCoin]) -> Vec<CovInput> {
 pub fn claim_inputs(p: &InheritancePlan, coins: &[PlanCoin]) -> Vec<CovInput> {
     coins
         .iter()
-        .map(|c| CovInput { reveal: p.input(c.k, c.n, c.value), opening: Opening::Fixed(vec!["00".into()]) })
+        .map(|c| CovInput { reveal: c.input(p), opening: Opening::Fixed(vec!["00".into()]) })
         .collect()
 }
 
@@ -509,6 +567,10 @@ pub struct PlanBook {
     /// kept, so coins that go while the wallet is closed are noticed.
     #[serde(default)]
     pub live: std::collections::HashMap<String, (u64, Vec<PlanCoin>)>,
+    /// Payments others made to a plan's addresses, by plan id: found by the
+    /// wallet's block scan (their salts are their payers'), kept until spent.
+    #[serde(default)]
+    pub gifts: std::collections::HashMap<String, Vec<Gift>>,
     /// The tip the chain was last looked at for (not saved).
     #[serde(skip)]
     pub ticked_at: u64,
@@ -703,11 +765,7 @@ mod tests {
         found.sort_by_key(|c| (c.k, c.n));
         assert_eq!(
             found,
-            vec![
-                PlanCoin { k: 1, n: 0, value: 1 << 30 },
-                PlanCoin { k, n: 0, value: 1 << 33 },
-                PlanCoin { k, n: 1, value: 1 << 27 }
-            ]
+            vec![PlanCoin::own(1, 0, 1 << 30), PlanCoin::own(k, 0, 1 << 33), PlanCoin::own(k, 1, 1 << 27)]
         );
         assert_eq!(free_indices(&found, k, 2), vec![2, 3]);
     }
@@ -721,12 +779,44 @@ mod tests {
             period: 30 * cp::DAY,
             secret: [9; 32],
         };
-        let coins = [PlanCoin { k: 1, n: 0, value: 1 << 33 }, PlanCoin { k: 1, n: 1, value: 1 << 30 }];
+        let coins = [PlanCoin::own(1, 0, 1 << 33), PlanCoin::own(1, 1, 1 << 30)];
         let inputs = owner_inputs(&plan, &coins);
         let sig_len = bond::mss_sig_len(KEY_HEIGHT);
         let (fee, denoms) = resolve_fee(&inputs, sig_len, 0, (1 << 33) + (1 << 30)).unwrap();
         assert_eq!(denoms.iter().sum::<u64>() + fee, (1 << 33) + (1 << 30));
         let bytes = reveal_size(&inputs, sig_len, denoms.len());
         assert!(fee * 1024 >= bytes * 10, "{fee} for {bytes} bytes");
+    }
+
+    #[test]
+    fn a_payment_to_a_plans_address_is_a_gift_the_plan_can_spend() {
+        let plan = InheritancePlan {
+            owner_pk: [1; 32],
+            heirs: vec![cp::Heir { pk: [2; 32], share: 65_535 }],
+            start: 400_000,
+            period: 30 * cp::DAY,
+            secret: [9; 32],
+        };
+        let tip = plan.start + 95 * cp::DAY;
+        let addrs = plan_addresses(&plan, tip);
+        assert_eq!(addrs.len() as u64, plan.epoch_after(tip));
+        let (address, k) = addrs[2];
+        assert_eq!(address, plan.address(k));
+        // The plan's own coin there is not a gift; a payer's salt is.
+        assert_eq!(as_gift(&plan, k, 1 << 30, plan.coin_salt(k, 3)), None);
+        let g = as_gift(&plan, k, 1 << 30, [7; 32]).unwrap();
+        assert!(g.is_gift());
+        assert_eq!(g.id(&plan), midstate::core::compute_coin_id(&address, 1 << 30, &[7; 32]));
+        // Either branch reveals that very coin, under the plan's script.
+        assert_eq!(owner_inputs(&plan, &[g])[0].reveal.coin_id(), g.id(&plan));
+        assert_eq!(claim_inputs(&plan, &[g])[0].reveal.coin_id(), g.id(&plan));
+        let own = PlanCoin::own(k, 0, 1 << 30);
+        assert_eq!(owner_inputs(&plan, &[own])[0].reveal.coin_id(), plan.coin_id(k, 0, 1 << 30));
+        // Gifts take no index, and survive the book's round trip.
+        assert_eq!(free_indices(&[g, own], k, 2), vec![1, 2]);
+        let back: Vec<PlanCoin> = serde_json::from_str(&serde_json::to_string(&vec![g, own]).unwrap()).unwrap();
+        assert_eq!(back, vec![g, own]);
+        let old: PlanCoin = serde_json::from_str(r#"{"k":3,"n":1,"value":8}"#).unwrap();
+        assert_eq!(old, PlanCoin::own(3, 1, 8));
     }
 }

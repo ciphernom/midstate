@@ -129,6 +129,16 @@ pub mod midwimble {
     }
 }
 
+/// Any amount for people, in gMDS: "2 gMDS", "0.1250 gMDS".
+pub fn gmds_text(units: u64) -> String {
+    let g = 1u64 << 30;
+    if units % g == 0 {
+        format!("{} gMDS", units / g)
+    } else {
+        format!("{:.4} gMDS", units as f64 / g as f64)
+    }
+}
+
 /// A bond size for people: whole gMDS (2^30 units) where it is that.
 pub fn gmds(units: u64) -> String {
     if units >= 1 << 30 && units % (1 << 30) == 0 {

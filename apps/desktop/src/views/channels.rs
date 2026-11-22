@@ -689,6 +689,12 @@ fn hub_directory(app: &mut App, ui: &mut Ui, ctx: &egui::Context, tip: u64) {
                             theme::badge(ui, "connected", theme::ink());
                         }
                         ui.label(theme::mono(short_hex(&h.pk, 10)).size(11.0).color(theme::muted()));
+                        // Its claims are free to make; its backing was not.
+                        if let Some(t) = midstate_walletd::burns::tier(h.backing) {
+                            theme::badge(ui, t, theme::gold());
+                        } else if h.backing > 0.0 {
+                            theme::hint(ui, &midstate_walletd::burns::blocks_text(h.backing));
+                        }
                         ui.label(
                             RichText::new(format!(
                                 "claims {} routable · {} fee per hop",

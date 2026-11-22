@@ -58,6 +58,24 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         } else if let (Some(true), Some(a)) = (app.addr_ok, &app.addr_resolved) {
             // A name: show where it pays now, before anything is sent.
             ui.label(RichText::new(format!("pays {}", theme::grouped_hash(a, 24))).monospace().size(11.0).color(theme::bright()));
+            // And what backs it: a lookalike name would have to burn as much.
+            let typed = app.send_to.trim().to_string();
+            match app.payee_backing.as_ref().filter(|(n, _)| *n == typed).map(|(_, b)| b.clone()) {
+                Some(Some(b)) if !b.tier.is_empty() => {
+                    ui.horizontal(|ui| {
+                        theme::badge(ui, &b.tier, theme::gold());
+                        theme::hint(ui, &format!("{} burned to back {typed}: {}", super::names::gmds(b.total), b.text));
+                    });
+                }
+                Some(b) => theme::hint(
+                    ui,
+                    &format!(
+                        "{typed} has {} behind it. Make sure it is the name you mean: a name anyone could have registered yesterday looks the same.",
+                        b.map_or("no backing".into(), |b| b.text)
+                    ),
+                ),
+                None => {}
+            }
         } else if app.addr_ok == Some(false) && !app.send_to.trim().is_empty() {
             // Could be a typo, or a one-time key that has already signed —
             // walletd says which, and they call for different responses.

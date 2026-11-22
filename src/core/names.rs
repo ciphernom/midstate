@@ -353,6 +353,14 @@ pub mod tag {
     pub const IDENTITY: u8 = 5;
     /// A line of UTF-8.
     pub const TEXT: u8 = 6;
+    // 7 is held for a Nostr public key (32 bytes x-only), not built yet.
+    /// `H(key)` of the name's ML-KEM-512 public key, for sealed messages. The
+    /// key (800 bytes) is too big for a record; the identity handshake hands
+    /// it over and the hash checks it.
+    pub const KEM: u8 = 8;
+    /// Part of the script behind an `MDS_ADDRESS`: the parts, in order, are
+    /// the script, so anyone can see what kind of address the name pays.
+    pub const SCRIPT: u8 = 9;
 }
 
 /// One record: encoded as `tag ‖ length (1 byte) ‖ value`, back to back.
@@ -364,6 +372,8 @@ pub enum Rec {
     Evm([u8; 20]),
     Identity([u8; 32]),
     Text(String),
+    Kem([u8; 32]),
+    Script(Vec<u8>),
     Other { tag: u8, value: Vec<u8> },
 }
 
@@ -380,6 +390,8 @@ impl Rec {
             Rec::Evm(a) => (tag::EVM, a.to_vec()),
             Rec::Identity(k) => (tag::IDENTITY, k.to_vec()),
             Rec::Text(s) => (tag::TEXT, s.as_bytes().to_vec()),
+            Rec::Kem(h) => (tag::KEM, h.to_vec()),
+            Rec::Script(b) => (tag::SCRIPT, b.clone()),
             Rec::Other { tag, value } => (*tag, value.clone()),
         }
     }
@@ -395,6 +407,8 @@ impl Rec {
             tag::EVM => v.try_into().ok().map(Rec::Evm),
             tag::IDENTITY => v.try_into().ok().map(Rec::Identity),
             tag::TEXT => text(v).map(Rec::Text),
+            tag::KEM => v.try_into().ok().map(Rec::Kem),
+            tag::SCRIPT if !v.is_empty() => Some(Rec::Script(v.to_vec())),
             _ => None,
         };
         known.unwrap_or(Rec::Other { tag, value: v.to_vec() })
@@ -409,6 +423,8 @@ impl Rec {
             Rec::Evm(a) => ("evm", format!("0x{}", hex::encode(a))),
             Rec::Identity(k) => ("identity", hex::encode(k)),
             Rec::Text(t) => ("text", t.clone()),
+            Rec::Kem(h) => ("kem", hex::encode(h)),
+            Rec::Script(b) => ("script", hex::encode(b)),
             Rec::Other { tag, value } => ("other", format!("{tag}:{}", hex::encode(value))),
         }
     }
@@ -462,6 +478,39 @@ pub fn parse(blob: &[u8]) -> Option<Vec<Rec>> {
 /// Where an MDS payment to a name goes: its first record that takes one.
 pub fn pays(recs: &[Rec], used: impl Fn(&[u8; 32]) -> u64) -> Option<[u8; 32]> {
     recs.iter().find_map(|r| r.pays(&used))
+}
+
+/// The script the records publish: their `script` parts, in order.
+pub fn published_script(recs: &[Rec]) -> Option<Vec<u8>> {
+    let s: Vec<u8> = recs.iter().filter_map(|r| if let Rec::Script(b) = r { Some(b.as_slice()) } else { None }).flatten().copied().collect();
+    (!s.is_empty()).then_some(s)
+}
+
+/// `script` records publishing `script`, in parts of at most 255 bytes.
+pub fn script_records(script: &[u8]) -> Vec<Rec> {
+    script.chunks(255).map(|c| Rec::Script(c.to_vec())).collect()
+}
+
+/// What kind of address `address` is, as far as the records show: an MSS key
+/// record's address is a key; an `mds-address` is whatever the published
+/// script makes, if the records publish the script that hashes to it.
+/// `None`: the records do not say.
+pub fn address_kind(recs: &[Rec], address: &[u8; 32]) -> Option<super::address_kind::AddressKind> {
+    if recs.iter().any(|r| matches!(r, Rec::MdsKey { key, .. } if &compute_address(key) == address)) {
+        return Some(super::address_kind::AddressKind::Key);
+    }
+    let script = published_script(recs)?;
+    (&hash(&script) == address).then(|| super::address_kind::classify(&script))
+}
+
+/// The hash of the name's ML-KEM public key, if it takes sealed messages.
+pub fn kem_hash(recs: &[Rec]) -> Option<[u8; 32]> {
+    recs.iter().find_map(|r| if let Rec::Kem(h) = r { Some(*h) } else { None })
+}
+
+/// The name's identity key, if it gives one.
+pub fn identity(recs: &[Rec]) -> Option<[u8; 32]> {
+    recs.iter().find_map(|r| if let Rec::Identity(k) = r { Some(*k) } else { None })
 }
 
 // ── The tree ────────────────────────────────────────────────────────────────
@@ -1341,6 +1390,14 @@ mod tests {
         assert_eq!(genesis_root(), Reg::genesis().root());
     }
 
+    /// Clients outside this crate (midwimble's resolver) pin the registry's
+    /// address and genesis root to check proofs against: they must not move.
+    #[test]
+    fn the_registry_address_and_genesis_root_are_pinned() {
+        assert_eq!(hex::encode(address()), "c71ab5f9589e9ef822e950cce14fa0e40952fc7103d6358b13427ed96b0b742e");
+        assert_eq!(hex::encode(genesis_root()), "4204a34119561ff0f7ef7c54b3e1879f3d689545921ee6f5a6827431ea40a0cd");
+    }
+
     #[test]
     fn premium_names_are_canonical_unique_and_dearer_than_their_length() {
         let p = premium();
@@ -1379,9 +1436,15 @@ mod tests {
             Rec::Evm([4; 20]),
             Rec::Identity([5; 32]),
             Rec::Text("héllo".into()),
+            Rec::Other { tag: 7, value: vec![6; 32] },
+            Rec::Kem([8; 32]),
+            Rec::Script(vec![1, 2, 3]),
             Rec::Other { tag: 99, value: vec![7, 7] },
         ];
         assert_eq!(parse(&encode(&all).unwrap()).unwrap(), all);
+        // Wrong lengths stay as they are, kept but not read.
+        assert_eq!(parse(&[tag::KEM, 2, 1, 2]).unwrap(), vec![Rec::Other { tag: tag::KEM, value: vec![1, 2] }]);
+        assert_eq!(parse(&[tag::SCRIPT, 0]).unwrap(), vec![Rec::Other { tag: tag::SCRIPT, value: vec![] }]);
         assert_eq!(parse(&[tag::EVM, 3, 1, 2]), None);
         assert_eq!(pays(&all, |_| 0), Some(compute_address(&[1; 32])));
         assert_eq!(pays(&all, |_| 1024 - SIGNATURES_KEPT + 1), Some([2; 32]));
@@ -1579,6 +1642,29 @@ mod tests {
         let mut own = reg.change(By::Owner, "ciphernom", &set([8; 32], 0, RESERVED_UNTIL));
         own.items[1] = sign(&seed_key, &c);
         assert!(run_with(H, reg.root(), &own, &[], &c), "its key takes it, free");
+    }
+
+    #[test]
+    fn records_say_what_kind_of_address_a_name_pays() {
+        use crate::core::address_kind::AddressKind;
+        use crate::core::script::compile_multisig_2of3;
+        let ms = compile_multisig_2of3(&[1; 32], &[2; 32], &[3; 32]);
+        let ms_addr = hash(&ms);
+        let mut recs = vec![Rec::MdsAddress(ms_addr), Rec::MdsKey { key: [4; 32], height: 10 }];
+        assert_eq!(address_kind(&recs, &ms_addr), None, "nothing published: the records do not say");
+        assert_eq!(address_kind(&recs, &compute_address(&[4; 32])), Some(AddressKind::Key));
+        recs.extend(script_records(&ms));
+        assert_eq!(address_kind(&recs, &ms_addr), Some(AddressKind::Multisig { m: 2, n: 3 }));
+        assert_eq!(address_kind(&recs, &[9; 32]), None, "a script that is not this address's");
+        // A plan's script runs past one record; its parts join back up.
+        let heirs = (0..6u8).map(|i| crate::core::plans::Heir { pk: [10 + i; 32], share: if i == 0 { 65_535 - 5 * 10_000 } else { 10_000 } }).collect();
+        let plan = crate::core::plans::InheritancePlan { owner_pk: [9; 32], heirs, start: 0, period: 52_560, secret: [1; 32] };
+        let script = plan.script(1);
+        assert!(script.len() > 255);
+        let recs: Vec<Rec> = [vec![Rec::MdsAddress(plan.address(1))], script_records(&script)].concat();
+        let blob = encode(&recs).unwrap();
+        assert_eq!(address_kind(&parse(&blob).unwrap(), &plan.address(1)), Some(AddressKind::Plan { heirs: 6 }));
+        assert_eq!(pays(&recs, |_| 0), Some(plan.address(1)), "paid as it is");
     }
 
     #[test]

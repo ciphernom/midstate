@@ -203,7 +203,7 @@ fn deliver(r: &mut Reassembler, out: &[Outgoing]) -> Vec<(Route, Vec<u8>)> {
         let (route, index, count, chunk) = match parse(&chat(o)).expect("a frame of ours") {
             Frame::Take { order_id, taker_key, index, count, chunk } => (Route::Take { order_id, taker_key }, index, count, chunk),
             Frame::Session { tag, to, seq, index, count, chunk } => (Route::Session { tag, to, seq }, index, count, chunk),
-            Frame::Advert(_) => continue,
+            Frame::Advert(_) | Frame::Claim(_) => continue,
         };
         if let Some(sealed) = r.add(route.clone(), index, count, chunk, 0) {
             whole.push((route, sealed));

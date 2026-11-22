@@ -144,19 +144,14 @@ pub fn plan_send(
 
 /// Like [`plan_send`], but the recipient outputs are supplied verbatim (used
 /// for channel funding, where the caller must know every output's salt).
-/// Change handling, the fee loop, and the shuffle are identical.
+/// Change handling, the fee loop, and the shuffle are identical. Every
+/// output's value is paid for, burns (`DataBurn`) included.
 pub fn plan_fixed_outputs(
     wallet: &mut Wallet,
     live_coins: &[[u8; 32]],
     recipient: Vec<OutputData>,
 ) -> Result<SendPlan> {
-    let amount: u64 = recipient
-        .iter()
-        .map(|o| match o {
-            OutputData::Standard { value, .. } => *value,
-            _ => 0,
-        })
-        .sum();
+    let amount: u64 = recipient.iter().map(|o| o.value()).fold(0u64, |a, v| a.saturating_add(v));
     if amount == 0 {
         bail!("amount must be greater than zero");
     }

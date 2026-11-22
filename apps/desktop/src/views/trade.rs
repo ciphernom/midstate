@@ -192,6 +192,21 @@ fn buy_view(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
                 ui.label(theme::mono(per_mds(&a.wei_per_gmds)).size(11.5).color(theme::ink()));
                 ui.label(theme::mono(gmds(a.mds)).size(11.5));
                 ui.horizontal(|ui| {
+                    // A name only when the seller's account signed it and the
+                    // name's Base record is that account; the account is what pays.
+                    if !a.seller_name.is_empty() {
+                        ui.label(RichText::new(&a.seller_name).strong().size(12.0))
+                            .on_hover_text(format!("{} signed for this name, and the name's Base account is {}", a.seller, a.seller));
+                    }
+                    // What the seller burned to back its account and name:
+                    // a cost a throwaway account would not carry.
+                    if let Some(t) = midstate_walletd::burns::tier(a.seller_backing) {
+                        theme::badge(ui, t, theme::gold());
+                    }
+                    if a.seller_backing > 0.0 {
+                        ui.label(RichText::new(midstate_walletd::burns::blocks_text(a.seller_backing)).size(10.5).color(theme::muted()))
+                            .on_hover_text("MDS burned to back this seller's Base account and name (MSB-1), in blocks of issuance, halving yearly");
+                    }
                     ui.label(theme::mono(short_hex(&a.seller, 8)).size(11.0).color(theme::muted()));
                     explorer_link(ui, "↗", basescan_address(&a.seller));
                 });
@@ -466,6 +481,9 @@ fn swap_row(ui: &mut Ui, s: &EthSwapView) {
         ui.label(theme::mono(eth(&s.wei)).size(11.5));
         if !s.counterparty.is_empty() {
             theme::hint(ui, "with");
+            if !s.counterparty_name.is_empty() {
+                ui.label(RichText::new(&s.counterparty_name).strong().size(12.0));
+            }
             ui.label(theme::mono(short_hex(&s.counterparty, 8)).size(11.0).color(theme::muted()));
         }
         if let Some(tx) = &s.base_tx {

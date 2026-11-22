@@ -35,11 +35,14 @@ pub struct BatchStore {
     balances: super::balance_index::BalanceIndex,
     /// The MSN-1 name registry, kept in step the same way. Always on.
     names: super::name_index::NameIndex,
+    /// Every burn, and MSB-1 backing by subject, kept in step the same way.
+    /// Always on.
+    burns: super::burn_index::BurnIndex,
 }
 
 impl BatchStore {
     pub fn new(db: Arc<Database>, legacy_fs_path: PathBuf) -> Result<Self> {
-        let store = Self { db, legacy_fs_path, balances: Default::default(), names: Default::default() };
+        let store = Self { db, legacy_fs_path, balances: Default::default(), names: Default::default(), burns: Default::default() };
         Ok(store)
     }
 
@@ -51,6 +54,11 @@ impl BatchStore {
     /// The name index's hooks and worker, shared by every clone of this store.
     pub fn names(&self) -> &super::name_index::NameIndex {
         &self.names
+    }
+
+    /// The burn index's hooks and worker, shared by every clone of this store.
+    pub fn burns(&self) -> &super::burn_index::BurnIndex {
+        &self.burns
     }
 
     
@@ -84,6 +92,7 @@ impl BatchStore {
         // reading them from the batch table in this same transaction.
         self.balances.on_truncate(&write_txn, new_tip_height)?;
         self.names.on_truncate(&write_txn, new_tip_height)?;
+        self.burns.on_truncate(&write_txn, new_tip_height)?;
         {
             let mut b = write_txn.open_table(super::BATCHES_TABLE)?;
             let mut h = write_txn.open_table(super::HEADERS_TABLE)?;
@@ -176,6 +185,7 @@ impl BatchStore {
         // old block before the new one replaces it.
         self.balances.on_save(write_txn, height, batch)?;
         self.names.on_save(write_txn, height, batch)?;
+        self.burns.on_save(write_txn, height, batch)?;
         {
             let mut b = write_txn.open_table(super::BATCHES_TABLE)?;
             let mut h = write_txn.open_table(super::HEADERS_TABLE)?;

@@ -1,5 +1,6 @@
 pub mod server;
 pub mod handlers;
+pub mod burns;
 pub mod types;
 pub mod pow_governor;
 pub mod axe;

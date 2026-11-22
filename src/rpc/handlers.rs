@@ -1144,14 +1144,25 @@ pub async fn get_name(
     match crate::storage::name_index::lookup(node.storage.db(), &name) {
         Ok(Some(r)) => {
             let used = |k: &[u8; 32]| node.storage.query_mss_leaf_index(k).unwrap_or(0);
+            // What kind of address a record pays: a key, or what the records'
+            // published script makes of an mds-address.
+            let kind = |a: &[u8; 32]| match names::address_kind(&r.records, a) {
+                Some(k) => serde_json::json!({ "kind": k, "label": k.label(), "published": true }),
+                None => serde_json::json!({ "kind": "unknown", "label": "script address (kind not published)", "published": false }),
+            };
             let records: Vec<_> = r
                 .records
                 .iter()
                 .map(|rec| {
-                    let (kind, value) = rec.describe();
-                    let mut v = serde_json::json!({ "type": kind, "value": value });
-                    if let names::Rec::MdsKey { key, height } = rec {
-                        v["signatures_left"] = (1u64 << *height).saturating_sub(used(key)).into();
+                    let (kind_name, value) = rec.describe();
+                    let mut v = serde_json::json!({ "type": kind_name, "value": value });
+                    match rec {
+                        names::Rec::MdsKey { key, height } => {
+                            v["signatures_left"] = (1u64 << *height).saturating_sub(used(key)).into();
+                            v["address_kind"] = kind(&crate::core::types::compute_address(key));
+                        }
+                        names::Rec::MdsAddress(a) => v["address_kind"] = kind(a),
+                        _ => {}
                     }
                     v
                 })
@@ -1164,15 +1175,44 @@ pub async fn get_name(
                 "since": r.since,
                 "expires": r.expires,
                 "lapsed": r.lapsed(),
+                "height": r.height,
                 "tier": names::TIERS[r.tier as usize],
                 "rate": names::RATES[r.tier as usize],
                 "deal": deal_json(&r.deal),
                 "pays": pays.map(|a| crate::core::types::encode_address_with_checksum(&a)),
+                "pays_kind": pays.map(|a| kind(&a)),
+                "identity": names::identity(&r.records).map(hex::encode),
+                "kem": names::kem_hash(&r.records).map(hex::encode),
+                "script": names::published_script(&r.records).map(hex::encode),
+                // MSB-1 backing burned for it (`GET /burns/name/:name`).
+                "backing": super::burns::name_backing(node.storage.db(), &r.name),
                 "records": records,
             }))
             .into_response()
         }
         Ok(None) => error(StatusCode::NOT_FOUND, "not registered".into()),
+        Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
+    }
+}
+
+/// `GET /name/:name/proof`: the name's leaf, what it commits to and its
+/// Merkle proof to the registry's current root, so a client can check what a
+/// node says of a name against the root instead of trusting the node's index.
+/// For a name never registered, the leaf is its predecessor's, whose `next`
+/// skips over the name's key. The root is the commitment of the coin `thread`
+/// names, at the registry's address `registry`; `GET /utxo_proof/:coin_id`
+/// shows that coin unspent under a block's state root.
+pub async fn get_name_proof(
+    State(node): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Response {
+    use crate::core::names;
+    let error = |code: StatusCode, e: String| (code, Json(serde_json::json!({ "error": e }))).into_response();
+    if let Err(e) = names::normalize(&name) {
+        return error(StatusCode::BAD_REQUEST, e.to_string());
+    }
+    match crate::storage::name_index::prove(node.storage.db(), &name) {
+        Ok(p) => Json(crate::storage::name_index::proof_json(&names::normalize(&name).unwrap_or_default(), &p)).into_response(),
         Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
     }
 }

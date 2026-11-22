@@ -8,8 +8,95 @@ use crate::bridge::Action;
 use crate::theme::{self, ago, short_hex};
 use eframe::egui::{self, FontId, RichText, TextEdit, Ui};
 
+/// Sealed messages to and from names: only the two wallets read them.
+fn sealed(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
+    theme::heading(ui, "Sealed messages");
+    theme::hint(
+        ui,
+        "To a name, sealed (post-quantum: ML-KEM) so only its wallet can read it. Nobody watching the \
+         network sees who it is for. Your first message to a name is signed as the name you hold, if \
+         its identity is this wallet's; after that the session's key does the work. A name takes \
+         them when its records carry a kem key.",
+    );
+    theme::panel_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.add(TextEdit::singleline(&mut app.sealed_to).hint_text("to: name.mds").desired_width(160.0));
+            ui.add(TextEdit::singleline(&mut app.sealed_text).hint_text("message").desired_width(ui.available_width() - 90.0));
+            let ok = !app.sealed_to.trim().is_empty() && !app.sealed_text.trim().is_empty() && app.sealed_text.len() <= 750;
+            if ui.add_enabled(ok && !app.sealed_busy, egui::Button::new(if app.sealed_busy { "Sealing…" } else { "Send" })).clicked() {
+                app.sealed_busy = true;
+                app.go(ctx, Action::SealedSend { to: app.sealed_to.trim().to_string(), text: app.sealed_text.trim().to_string() });
+            }
+        });
+        if app.sealed_text.len() > 750 {
+            theme::hint(ui, "At most 750 bytes a message.");
+        }
+        inbox_bar(app, ui, ctx);
+        let requests = app.conversations.iter().filter(|c| c.request).count();
+        if requests > 0 {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut app.show_requests, false, "Inbox");
+                ui.selectable_value(&mut app.show_requests, true, format!("Requests ({requests})"));
+            });
+        } else {
+            app.show_requests = false;
+        }
+        let shown: Vec<_> = app.conversations.iter().filter(|c| c.request == app.show_requests).cloned().collect();
+        if shown.is_empty() {
+            theme::hint(ui, if app.show_requests { "No message requests." } else { "No sealed messages yet." });
+        }
+        for c in shown {
+            ui.separator();
+            ui.horizontal(|ui| {
+                let who = if c.peer.is_empty() { "anonymous".to_string() } else { c.peer.clone() };
+                ui.label(RichText::new(&who).strong());
+                if c.verified {
+                    theme::badge(ui, "verified", theme::gold());
+                } else if !c.peer.is_empty() {
+                    theme::badge(ui, "unverified", theme::muted());
+                }
+                if let Some(t) = midstate_walletd::burns::tier(c.backing) {
+                    theme::badge(ui, t, theme::gold());
+                } else if c.verified && c.backing > 0.0 {
+                    theme::hint(ui, &midstate_walletd::burns::blocks_text(c.backing));
+                }
+                if !c.peer.is_empty() && ui.small_button("Reply").clicked() {
+                    app.sealed_to = c.peer.clone();
+                }
+            });
+            for l in c.lines.iter().rev().take(6).collect::<Vec<_>>().into_iter().rev() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(if l.mine { "you" } else { "them" }).font(FontId::monospace(10.5)).color(theme::faint()));
+                    ui.label(RichText::new(&l.text).color(theme::ink()));
+                    ui.label(RichText::new(ago(l.at)).size(11.0).color(theme::faint()));
+                });
+            }
+        }
+    });
+}
+
+/// Who reaches the inbox: everyone, or names backed at least so much. The
+/// rest wait under Requests, unread by default but never dropped.
+fn inbox_bar(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
+    let bar = app.status.as_ref().and_then(|s| s.inbox_bar);
+    ui.horizontal(|ui| {
+        theme::hint(ui, "Inbox:");
+        let choices: [(Option<f64>, &str); 4] =
+            [(None, "everyone"), (Some(0.0), "verified names"), (Some(60.0), "names backed an hour+"), (Some(1_440.0), "names backed a day+")];
+        for (v, label) in choices {
+            if ui.selectable_label(bar == v, label).on_hover_text("Backing is MDS burned for a name (the Burns page), counted in blocks of issuance").clicked() && bar != v {
+                app.go(ctx, Action::SetInboxBar { bar: v });
+                app.go(ctx, Action::LoadStatus);
+            }
+        }
+    });
+}
+
 pub fn show(app: &mut App, ui: &mut Ui) {
     let ctx = ui.ctx().clone();
+    sealed(app, ui, &ctx);
+    ui.add_space(10.0);
     theme::heading(ui, "Chat");
     theme::hint(
         ui,
@@ -41,7 +128,13 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                                     .color(theme::faint()),
                             );
                             ui.label(RichText::new(&m.text).color(theme::ink()));
-                            if m.attachments > 0 {
+                            if m.sealed {
+                                ui.label(
+                                    RichText::new("[sealed message]")
+                                        .font(FontId::monospace(10.0))
+                                        .color(theme::muted()),
+                                );
+                            } else if m.attachments > 0 {
                                 ui.label(
                                     RichText::new(format!("[{} attachment(s)]", m.attachments))
                                         .font(FontId::monospace(10.0))

@@ -98,6 +98,17 @@ impl EvmKey {
         to_checksum_address(&self.address)
     }
 
+    /// Signs `msg` as `personal_sign` does (EIP-191): `r ‖ s ‖ v`, v 27 or 28.
+    /// Any Ethereum tool can check it.
+    pub fn sign_message(&self, msg: &[u8]) -> Result<[u8; 65]> {
+        let (r, s, y) = self.sign_digest(&eip191_digest(msg))?;
+        let mut out = [0u8; 65];
+        out[..32].copy_from_slice(&r);
+        out[32..64].copy_from_slice(&s);
+        out[64] = 27 + y;
+        Ok(out)
+    }
+
     /// Sign a 32-byte digest, returning `(r, s, y_parity)`.
     fn sign_digest(&self, digest: &[u8; 32]) -> Result<([u8; 32], [u8; 32], u8)> {
         let (sig, rec): (Signature, RecoveryId) = self
@@ -108,6 +119,28 @@ impl EvmKey {
         let s: [u8; 32] = sig.s().to_bytes().into();
         Ok((r, s, rec.to_byte() & 1))
     }
+}
+
+/// EIP-191's digest of a message: `keccak256("\x19Ethereum Signed Message:\n" ‖ len ‖ msg)`.
+pub fn eip191_digest(msg: &[u8]) -> [u8; 32] {
+    let mut pre = format!("\x19Ethereum Signed Message:\n{}", msg.len()).into_bytes();
+    pre.extend_from_slice(msg);
+    keccak256(&pre)
+}
+
+/// The account whose key signed `msg` (EIP-191), if `sig` is a signature.
+pub fn recover_message(msg: &[u8], sig: &[u8; 65]) -> Option<[u8; 20]> {
+    let v = match sig[64] {
+        27 | 28 => sig[64] - 27,
+        0 | 1 => sig[64],
+        _ => return None,
+    };
+    let signature = Signature::from_slice(&sig[..64]).ok()?;
+    let rec = RecoveryId::from_byte(v)?;
+    let vk = k256::ecdsa::VerifyingKey::recover_from_prehash(&eip191_digest(msg), &signature, rec).ok()?;
+    let enc = vk.to_encoded_point(false);
+    let hash = keccak256(&enc.as_bytes()[1..]);
+    hash[12..].try_into().ok()
 }
 
 // ── RLP ─────────────────────────────────────────────────────────────────

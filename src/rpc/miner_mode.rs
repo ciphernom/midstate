@@ -777,7 +777,12 @@ async fn pool_view(d: &Dash, pool_url: &str, payout: &str) -> Option<serde_json:
         return cache.2.clone();
     }
     let url = format!("http://{api}/pool/stats");
-    let me = crate::core::types::parse_address_flexible(payout).ok();
+    // A payout name's shares are under its key at the pool.
+    let me = if crate::core::names::is_name(payout) {
+        crate::core::names::normalize(payout).ok().map(|n| crate::pool::name_key(&n))
+    } else {
+        crate::core::types::parse_address_flexible(payout).ok()
+    };
     let fresh = async {
         let v: serde_json::Value = d.http.get(&url).send().await.ok()?.json().await.ok()?;
         let mine = v["miners"].as_array().into_iter().flatten().find(|m| {
@@ -798,6 +803,8 @@ async fn pool_view(d: &Dash, pool_url: &str, payout: &str) -> Option<serde_json:
             "recent_blocks": v["recent_blocks"].as_array().map_or(0, Vec::len),
             "network_hashrate": v["network_hashrate"],
             "merged": merged,
+            // What the pool burned to back itself (MSB-1); null for none.
+            "backing": v["backing"],
         }))
     }
     .await;

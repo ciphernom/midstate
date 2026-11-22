@@ -16,6 +16,7 @@ pub enum Tab {
     Send,
     Receive,
     Names,
+    Burns,
     History,
     Coins,
     Chat,
@@ -28,11 +29,12 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub const ALL: [Tab; 13] = [
+    pub const ALL: [Tab; 14] = [
         Tab::Dashboard,
         Tab::Send,
         Tab::Receive,
         Tab::Names,
+        Tab::Burns,
         Tab::History,
         Tab::Coins,
         Tab::Chat,
@@ -49,6 +51,7 @@ impl Tab {
             Tab::Send => "Send",
             Tab::Receive => "Receive",
             Tab::Names => "Names",
+            Tab::Burns => "Burns",
             Tab::History => "History",
             Tab::Coins => "Coins",
             Tab::Chat => "Chat",
@@ -129,6 +132,19 @@ pub struct App {
     /// The name being given away, and to whom.
     pub name_give: Option<(String, String)>,
     pub names_last_poll: f64,
+    /// The Burns page (MSB-1): the chain's burn and this wallet's backing,
+    /// the burn being drafted, the document picked to notarize, and what is
+    /// known of it.
+    pub burns: Option<BurnsView>,
+    pub burns_last_poll: f64,
+    pub burn_form: crate::views::burns::BurnForm,
+    pub doc: Option<crate::views::burns::Doc>,
+    pub doc_path: String,
+    pub notary: Option<NotaryView>,
+    /// Sealed messages: show the requests rather than the inbox.
+    pub show_requests: bool,
+    /// What backs the name in the Send box (MSB-1), once asked.
+    pub payee_backing: Option<(String, Option<BackingView>)>,
     /// The name an offer is being made for, and its price (gMDS) and days.
     pub name_offer: Option<(String, bool, String, String)>,
     pub history: Vec<HistoryView>,
@@ -191,6 +207,13 @@ pub struct App {
     pub chat_input: String,
     pub chat_busy: bool,
     pub chat_last_poll: f64,
+    /// Sealed conversations, and the message being written.
+    pub conversations: Vec<ConversationView>,
+    pub sealed_to: String,
+    pub sealed_text: String,
+    pub sealed_busy: bool,
+    /// What a name can point at, of this wallet's (its plans).
+    pub name_targets: Vec<PayTargetView>,
 
     // Q-Bolt channels
     pub channels: Vec<ChannelView>,
@@ -485,6 +508,14 @@ impl App {
             watch_max: String::new(),
             name_give: None,
             names_last_poll: 0.0,
+            burns: None,
+            burns_last_poll: 0.0,
+            burn_form: Default::default(),
+            doc: None,
+            doc_path: String::new(),
+            notary: None,
+            show_requests: false,
+            payee_backing: None,
             name_offer: None,
             recv_label: String::new(),
             recv_mss: true,
@@ -501,6 +532,11 @@ impl App {
             chat_input: String::new(),
             chat_busy: false,
             chat_last_poll: 0.0,
+            conversations: Vec::new(),
+            sealed_to: String::new(),
+            sealed_text: String::new(),
+            sealed_busy: false,
+            name_targets: Vec::new(),
             channels: Vec::new(),
             chan_identity: None,
             chan_peer: String::new(),
@@ -921,10 +957,45 @@ impl App {
                 if addr == self.send_to.trim() {
                     self.addr_ok = Some(ok);
                     self.addr_reason = reason;
+                    if ok && resolved.is_some() {
+                        self.go(ctx, Action::LoadPayeeBacking { name: addr.clone() });
+                    }
                     self.addr_resolved = resolved;
                 }
             }
+            Msg::PayeeBacking { name, backing } => self.payee_backing = Some((name, backing)),
             Msg::Names(n) => self.names = n,
+            Msg::Burns(b) => self.burns = Some(b),
+            Msg::Burned(_) => {
+                self.busy = false;
+                self.burn_form.confirm = false;
+                self.toast(ctx, "Burn on its way: the Send tab follows it.".into());
+                self.go(ctx, Action::LoadBurns);
+                self.go(ctx, Action::LoadSends);
+                self.go(ctx, Action::LoadBalance);
+            }
+            Msg::DocumentHashed { path, size, blake3, sha256 } => {
+                self.notary = None;
+                self.go(ctx, Action::LookupNotary { hash: blake3.clone() });
+                self.doc = Some(crate::views::burns::Doc { path, size, blake3, sha256 });
+            }
+            Msg::Notary(n) => {
+                // A lookup for the document's other hash adds to what is known.
+                match self.notary.as_mut() {
+                    Some(old) if self.doc.as_ref().is_some_and(|d| d.sha256 == n.hash || d.blake3 == n.hash) && old.hash != n.hash => {
+                        old.marks.extend(n.marks);
+                        old.marks.sort_by_key(|m| m.height);
+                    }
+                    _ => {
+                        let sha = self.doc.as_ref().filter(|d| d.blake3 == n.hash).map(|d| d.sha256.clone());
+                        self.notary = Some(n);
+                        if let Some(sha) = sha {
+                            self.go(ctx, Action::LookupNotary { hash: sha });
+                        }
+                    }
+                }
+            }
+            Msg::InboxBarSet => self.go(ctx, Action::LoadConversations),
             Msg::NameFound(c) => self.name_card = Some(c),
             Msg::Market(m) => self.name_market = m,
             Msg::NameDeals(d) => self.name_deals = d,
@@ -991,6 +1062,13 @@ impl App {
             }
             Msg::Chat(v) => self.chat = v,
             Msg::ChatDict(d) => self.chat_dict = d,
+            Msg::Conversations(v) => self.conversations = v,
+            Msg::SealedSent => {
+                self.sealed_busy = false;
+                self.sealed_text.clear();
+                self.go(ctx, Action::LoadConversations);
+            }
+            Msg::NameTargets(v) => self.name_targets = v,
             Msg::Channels(v) => self.channels = v,
             Msg::ChanIdentity(i) => self.chan_identity = Some(i),
             Msg::ChannelOpened(id) => {
@@ -1255,8 +1333,11 @@ impl App {
                 // Background loads fail benignly while locked; don't banner those.
                 let background = matches!(
                     what,
-                    "status" | "balance" | "coins" | "addresses" | "history" | "sends" | "node info" | "chat" | "channels" | "channel identity" | "invoices" | "hub" | "order book" | "base account" | "dex settings" | "swap quote" | "my orders" | "swaps" | "my bids" | "hubs" | "bonds" | "mdw account" | "mdw book" | "mdw orders" | "mdw swaps" | "mdw node" | "mdw history" | "mdw coins" | "bond rules" | "rentals" | "plans" | "names" | "market" | "name deals"
+                    "status" | "balance" | "coins" | "addresses" | "history" | "sends" | "node info" | "chat" | "channels" | "channel identity" | "invoices" | "hub" | "order book" | "base account" | "dex settings" | "swap quote" | "my orders" | "swaps" | "my bids" | "hubs" | "bonds" | "mdw account" | "mdw book" | "mdw orders" | "mdw swaps" | "mdw node" | "mdw history" | "mdw coins" | "bond rules" | "rentals" | "plans" | "names" | "market" | "name deals" | "messages" | "name targets" | "burns" | "notary" | "payee backing"
                 );
+                if what == "sealed message" {
+                    self.sealed_busy = false;
+                }
                 if background {
                     tracing::debug!("{what}: {err}");
                 } else {
@@ -1413,6 +1494,7 @@ impl eframe::App for App {
             if t - self.chat_last_poll > 2.0 {
                 self.chat_last_poll = t;
                 self.go(ctx, Action::LoadChat);
+                self.go(ctx, Action::LoadConversations);
                 if self.chat_dict.is_empty() {
                     self.go(ctx, Action::LoadChatDict);
                 }
@@ -1477,6 +1559,22 @@ impl eframe::App for App {
                 self.go(ctx, Action::LoadNames);
                 self.go(ctx, Action::LoadMarket);
                 self.go(ctx, Action::LoadNameDeals);
+            }
+        }
+        if self.tab == Tab::Burns && self.handle.is_some() {
+            let t = self.t0.elapsed().as_secs_f64();
+            if t - self.burns_last_poll > 10.0 {
+                self.burns_last_poll = t;
+                self.go(ctx, Action::LoadBurns);
+                if self.names.is_empty() {
+                    self.go(ctx, Action::LoadNames);
+                }
+            }
+            // A file dropped on the window is the document to notarize.
+            let dropped: Vec<String> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.as_ref().map(|p| p.display().to_string())).collect());
+            if let Some(path) = dropped.into_iter().next() {
+                self.doc_path = path.clone();
+                self.go(ctx, Action::HashDocument { path });
             }
         }
         if self.tab == Tab::Plans && self.handle.is_some() {
@@ -1597,6 +1695,7 @@ impl eframe::App for App {
                                 Tab::Send => views::send::show(self, ui),
                                 Tab::Receive => views::receive::show(self, ui),
                                 Tab::Names => views::names::show(self, ui),
+                                Tab::Burns => views::burns::show(self, ui),
                                 Tab::History => views::history::show(self, ui),
                                 Tab::Coins => views::coins::show(self, ui),
                                 Tab::Chat => views::chat::show(self, ui),

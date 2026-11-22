@@ -32,6 +32,9 @@ pub const KIND_SELL: u8 = 31;
 pub const KIND_TAKE: u8 = 43;
 /// "trade": the seller's answer, a lock or a decline.
 pub const KIND_TRADE: u8 = 32;
+/// "who": a name claim for an order or a take. Its own message, so wallets
+/// that predate it, which read only the kinds above, see the orders as before.
+pub const KIND_WHO: u8 = 91;
 
 pub const VERSION: u8 = 1;
 
@@ -224,12 +227,73 @@ impl Answer {
     }
 }
 
+/// What a name claim is about.
+pub const CLAIM_ORDER: u8 = 0;
+pub const CLAIM_TAKE: u8 = 1;
+
+/// "This order (or take) is `name`'s", signed by the Base account the order
+/// pays (or the take locks from). Display only: the account stays the source
+/// of truth, and a wallet shows the name only when the name's `evm` record is
+/// that same account, so both sides say it.
+///
+/// ```text
+/// claim = VERSION | subject | id[16] | name_len | name | sig[65]
+/// sig   = EIP-191 signature over claim_message(subject, id, name)
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NameClaim {
+    pub subject: u8,
+    pub id: [u8; 16],
+    /// Canonical, without `.mds`.
+    pub name: String,
+    pub sig: [u8; 65],
+}
+
+/// What a claim's account signs.
+pub fn claim_message(subject: u8, id: &[u8; 16], name: &str) -> Vec<u8> {
+    let what = if subject == CLAIM_TAKE { "take" } else { "order" };
+    format!("midstate name claim v1\n{what} {}\n{name}.mds", hex::encode(id)).into_bytes()
+}
+
+impl NameClaim {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![VERSION, self.subject];
+        out.extend_from_slice(&self.id);
+        out.push(self.name.len() as u8);
+        out.extend_from_slice(self.name.as_bytes());
+        out.extend_from_slice(&self.sig);
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        if b.len() < 19 || b[0] != VERSION || b[1] > CLAIM_TAKE {
+            return None;
+        }
+        let n = b[18] as usize;
+        if b.len() != 19 + n + 65 || n == 0 || n > midstate::core::names::MAX_NAME_LEN {
+            return None;
+        }
+        let name = std::str::from_utf8(&b[19..19 + n]).ok()?.to_string();
+        // Only canonical names: the one form a name is shown and signed in.
+        if midstate::core::names::normalize(&name).ok()? != name {
+            return None;
+        }
+        Some(Self { subject: b[1], id: b[2..18].try_into().ok()?, name, sig: b[19 + n..].try_into().ok()? })
+    }
+
+    /// The account that signed it.
+    pub fn signer(&self) -> Option<[u8; 20]> {
+        crate::evm::recover_message(&claim_message(self.subject, &self.id, &self.name), &self.sig)
+    }
+}
+
 /// Any message of this protocol.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Frame {
     Advert(Advert),
     Take(Take),
     Answer(Answer),
+    Claim(NameClaim),
 }
 
 /// One chat message to send: `(words, attachments)`.
@@ -245,6 +309,7 @@ impl Frame {
             Frame::Advert(a) => outgoing(KIND_SELL, a.encode()),
             Frame::Take(t) => outgoing(KIND_TAKE, t.encode()),
             Frame::Answer(a) => outgoing(KIND_TRADE, a.encode()),
+            Frame::Claim(c) => outgoing(KIND_WHO, c.encode()),
         }
     }
 }
@@ -259,6 +324,7 @@ pub fn parse(m: &ChatMessage) -> Option<Frame> {
         KIND_SELL => Advert::decode(b).map(Frame::Advert),
         KIND_TAKE => Take::decode(b).map(Frame::Take),
         KIND_TRADE => Answer::decode(b).map(Frame::Answer),
+        KIND_WHO => NameClaim::decode(b).map(Frame::Claim),
         _ => None,
     }
 }
@@ -314,6 +380,39 @@ mod tests {
         for f in frames {
             assert_eq!(parse(&chat(&f.chat())), Some(f));
         }
+    }
+
+    #[test]
+    fn a_name_claim_round_trips_and_names_its_signer() {
+        let key = crate::evm::EvmKey::from_secret(&[5; 32]).unwrap();
+        let msg = claim_message(CLAIM_ORDER, &[1; 16], "nick");
+        let c = NameClaim { subject: CLAIM_ORDER, id: [1; 16], name: "nick".into(), sig: key.sign_message(&msg).unwrap() };
+        let f = Frame::Claim(c.clone());
+        assert_eq!(parse(&chat(&f.chat())), Some(f));
+        assert_eq!(c.signer(), Some(key.address));
+        // Moved to another order, another name or a take: another signer.
+        assert_ne!(NameClaim { id: [2; 16], ..c.clone() }.signer(), Some(key.address));
+        assert_ne!(NameClaim { name: "nicky".into(), ..c.clone() }.signer(), Some(key.address));
+        assert_ne!(NameClaim { subject: CLAIM_TAKE, ..c.clone() }.signer(), Some(key.address));
+        // An old wallet reads the claim as nothing it knows (its own kind).
+        let (w, _) = Frame::Claim(c).chat();
+        assert_eq!(w[2], KIND_WHO);
+    }
+
+    #[test]
+    fn eip191_signatures_match_ethereum_tools() {
+        // Recovering what we sign, and refusing a mangled signature.
+        let key = crate::evm::EvmKey::from_secret(&[9; 32]).unwrap();
+        let sig = key.sign_message(b"hello").unwrap();
+        assert_eq!(crate::evm::recover_message(b"hello", &sig), Some(key.address));
+        let mut bad = sig;
+        bad[64] = 30;
+        assert_eq!(crate::evm::recover_message(b"hello", &bad), None);
+        // The digest is personal_sign's: keccak256("\x19Ethereum Signed Message:\n5hello").
+        assert_eq!(
+            hex::encode(crate::evm::eip191_digest(b"hello")),
+            "50b2c43fd39106bafbba0da34fc430e1f91e3c96ea2acee2bc34119f92b37750"
+        );
     }
 
     #[test]

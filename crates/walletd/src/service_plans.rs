@@ -13,16 +13,18 @@ use crate::api::{HeldPlanView, HeldStreamView, OwnedPlanView, PlansView, SendSta
 use crate::bond;
 use crate::plans::{
     self, available, claim_inputs, decode_payee, decode_plan, decode_stream, encode_payee, encode_plan,
-    encode_stream, fee_for, free_indices, id_of, live_plan_coins, live_tranches, owner_inputs, payout_inputs,
-    payouts_in, plan_denominations, plan_of, reveal_size, shares_from_bps, stream_of, tranche_inputs, when,
-    witnesses, CovSpend, HeldPlan, HeldStream, OwnedPlan, Payee, PayoutCoin, PlanBook, PlanCoin, SentStream,
+    as_gift, encode_stream, fee_for, free_indices, id_of, live_plan_coins, live_tranches, owner_inputs,
+    payout_inputs, payouts_in, plan_addresses, plan_denominations, plan_of, reveal_size, shares_from_bps,
+    stream_of, tranche_inputs, when,
+    witnesses, CovSpend, Gift, HeldPlan, HeldStream, OwnedPlan, Payee, PayoutCoin, PlanBook, PlanCoin, SentStream,
     Vanished, KEY_HEIGHT, MAX_SPEND_INPUTS, SCAN_BUDGET,
 };
 use crate::sendplan;
 use anyhow::{anyhow, bail, Result};
 use midstate::core::plans::{Heir, InheritancePlan, PaymentStream, DAY, MIN_COIN};
 use midstate::core::{compute_address, compute_commitment, decompose_value, OutputData, Transaction};
-use std::collections::HashSet;
+use midstate::node::ScannedCoin;
+use std::collections::{HashMap, HashSet};
 
 /// Signatures an owner's or a payer's key can make: one per check-in, close
 /// or cancel.
@@ -126,7 +128,7 @@ impl Service {
         for o in &self.plans.owned {
             let Some(p) = plan_of(&o.plan) else { continue };
             let id = id_of(&p.to_bytes());
-            let coins = live_plan_coins(&p, tip, live);
+            let coins = self.plan_coins(&p, tip, live);
             let balance: u64 = coins.iter().map(|c| c.value).sum();
             let deadline = coins.iter().map(|c| p.deadline(c.k)).min();
             let busy = coins.iter().any(|c| in_flight.contains(&c.id(&p)));
@@ -141,7 +143,8 @@ impl Service {
                 deadline_text: deadline.map(|d| when(d, tip)).unwrap_or_default(),
                 overdue: deadline.is_some_and(|d| d <= tip),
                 due_soon: deadline.is_some_and(|d| d > tip && d - tip <= p.period / 10),
-                status: if o.status == "closed" {
+                // A closed plan someone paid since shows as live, to be closed again.
+                status: if o.status == "closed" && balance == 0 {
                     "closed".into()
                 } else if busy {
                     "moving".into()
@@ -161,7 +164,7 @@ impl Service {
         for h in &self.plans.held {
             let Some(p) = plan_of(&h.plan) else { continue };
             let id = id_of(&p.to_bytes());
-            let coins = live_plan_coins(&p, tip, live);
+            let coins = self.plan_coins(&p, tip, live);
             let balance: u64 = coins.iter().map(|c| c.value).sum();
             let deadline = coins.iter().map(|c| p.deadline(c.k)).min();
             let mine: u32 = p.heirs.iter().filter(|x| payees.contains(&x.pk)).map(|x| x.share).sum();
@@ -339,10 +342,147 @@ impl Service {
         self.plans.held.iter().find_map(|h| plan_of(&h.plan).filter(|p| id_of(&p.to_bytes()) == id))
     }
 
+    // ── Gifts: payments others made to a plan's addresses ────────────────
+
+    /// A plan's coins on chain as of `tip`: its own, found from its secret,
+    /// and the gifts the block scan found for it.
+    fn plan_coins(&self, p: &InheritancePlan, tip: u64, live: impl Fn(&[u8; 32]) -> bool + Copy) -> Vec<PlanCoin> {
+        let mut coins = live_plan_coins(p, tip, live);
+        if let Some(g) = self.plans.gifts.get(&id_of(&p.to_bytes())) {
+            coins.extend(g.iter().map(|g| g.coin).filter(|c| c.k <= p.epoch_after(tip) && live(&c.id(p))));
+        }
+        coins
+    }
+
+    /// A plan this wallet owns or is an heir of, by id, and what to call it.
+    fn any_plan(&self, id: &str) -> Option<(InheritancePlan, String, bool)> {
+        let owned = self.plans.owned.iter().map(|o| (&o.plan, &o.label, true));
+        let held = self.plans.held.iter().map(|h| (&h.plan, &h.label, false));
+        owned.chain(held).find_map(|(x, label, mine)| {
+            plan_of(x).filter(|p| id_of(&p.to_bytes()) == id).map(|p| (p, label.clone(), mine))
+        })
+    }
+
+    /// Every address coins of a plan this wallet owns or is an heir of could
+    /// sit at as of `height`: `address → (plan id, deadline)`. The block scan
+    /// watches them, so a payment someone makes to one — a name pointed at a
+    /// plan has its payers make them — is found, though its salt is the
+    /// payer's. Closed plans too: a payment can land after the close.
+    pub(super) fn plan_watch(&self, height: u64) -> HashMap<[u8; 32], (String, u64)> {
+        if available(height).is_err() {
+            return HashMap::new();
+        }
+        let owned = self.plans.owned.iter().map(|o| &o.plan);
+        let held = self.plans.held.iter().map(|h| &h.plan);
+        let mut out = HashMap::new();
+        for p in owned.chain(held).filter_map(|x| plan_of(x)) {
+            let id = id_of(&p.to_bytes());
+            for (a, k) in plan_addresses(&p, height) {
+                out.insert(a, (id.clone(), k));
+            }
+        }
+        out
+    }
+
+    /// Takes the coins paid to plan addresses out of a block scan's finds,
+    /// keeps the gifts among them (a plan's own coins it finds from its
+    /// secret), says so, and hands back the rest. Spent coins are left out
+    /// by the caller.
+    pub(super) fn take_plan_gifts(&mut self, found: Vec<ScannedCoin>, watch: &HashMap<[u8; 32], (String, u64)>) -> Vec<ScannedCoin> {
+        let mut rest = Vec::with_capacity(found.len());
+        let mut news: Vec<(String, u64)> = Vec::new();
+        for sc in found {
+            let Some((id, k)) = watch.get(&sc.address) else {
+                rest.push(sc);
+                continue;
+            };
+            let Some((p, _, _)) = self.any_plan(id) else { continue };
+            let Some(g) = as_gift(&p, *k, sc.value, sc.salt) else { continue };
+            let list = self.plans.gifts.entry(id.clone()).or_default();
+            if !list.iter().any(|x| x.coin == g) {
+                list.push(Gift { coin: g, height: sc.height });
+                news.push((id.clone(), sc.value));
+            }
+        }
+        if news.is_empty() {
+            return rest;
+        }
+        let _ = self.plans_save();
+        for (id, value) in news {
+            let Some((_, label, mine)) = self.any_plan(&id) else { continue };
+            let text = if mine {
+                format!("{} arrived in your plan “{label}”: a payment to its address, as a name pointed at it brings. A check-in carries it along.", bond::gmds_text(value))
+            } else {
+                format!("{} was paid into “{label}”, a plan that names you as an heir.", bond::gmds_text(value))
+            };
+            let _ = self.events.send(WalletEvent::Warning { text });
+        }
+        let _ = self.events.send(WalletEvent::WalletChanged);
+        rest
+    }
+
+    /// Looks back over the blocks the scan has already passed for gifts to a
+    /// plan this wallet has just taken in: an heir imports a plan's code
+    /// long after its owner pointed a name at it. In the background; the
+    /// finds come back as [`super::Internal::PlanGifts`].
+    pub(super) fn backfill_plan_gifts(&self, id: &str) {
+        let Some((p, _, _)) = self.any_plan(id) else { return };
+        let end = self.scan_pos;
+        if end <= p.start {
+            return;
+        }
+        let addrs: Vec<[u8; 32]> = plan_addresses(&p, end).into_iter().map(|(a, _)| a).collect();
+        let node = self.node.clone();
+        let tx = self.self_tx.clone();
+        let id = id.to_string();
+        let from = p.start;
+        tokio::spawn(async move {
+            let found = tokio::task::spawn_blocking(move || node.scan_addresses(&addrs, from, end)).await;
+            if let Ok(Ok(coins)) = found {
+                let _ = tx.send(super::Cmd::Internal(super::Internal::PlanGifts { id, coins })).await;
+            }
+        });
+    }
+
+    /// What [`Self::backfill_plan_gifts`] found: the unspent ones are kept.
+    pub(super) async fn plan_gifts_found(&mut self, id: String, coins: Vec<ScannedCoin>) {
+        let state = self.live().await;
+        let Some((p, _, _)) = self.any_plan(&id) else { return };
+        let watch: HashMap<[u8; 32], (String, u64)> =
+            plan_addresses(&p, state.height).into_iter().map(|(a, k)| (a, (id.clone(), k))).collect();
+        let live: Vec<ScannedCoin> = coins.into_iter().filter(|c| state.coins.contains(&c.coin_id)).collect();
+        self.take_plan_gifts(live, &watch);
+    }
+
+    /// Forgets gifts spent a while ago: a check-in, a close or a claim moved
+    /// them on (see [`plans::GIFT_KEEP`]).
+    fn prune_gifts(&mut self, tip: u64, live: impl Fn(&[u8; 32]) -> bool + Copy) -> bool {
+        let mut changed = false;
+        let plans: HashMap<String, InheritancePlan> = self
+            .plans
+            .owned
+            .iter()
+            .map(|o| &o.plan)
+            .chain(self.plans.held.iter().map(|h| &h.plan))
+            .filter_map(|x| plan_of(x))
+            .map(|p| (id_of(&p.to_bytes()), p))
+            .collect();
+        self.plans.gifts.retain(|id, list| {
+            let before = list.len();
+            match plans.get(id) {
+                Some(p) => list.retain(|g| tip < g.height + plans::GIFT_KEEP || live(&g.coin.id(p))),
+                None => list.clear(),
+            }
+            changed |= list.len() != before;
+            !list.is_empty()
+        });
+        changed
+    }
+
     /// The plan's coins that no send in flight touches.
     async fn free_plan_coins(&self, p: &InheritancePlan) -> (u64, Vec<PlanCoin>, Vec<PlanCoin>) {
         let state = self.live().await;
-        let all = live_plan_coins(p, state.height, |id| state.coins.contains(id));
+        let all = self.plan_coins(p, state.height, |id: &[u8; 32]| state.coins.contains(id));
         let free = all.iter().copied().filter(|c| !self.plans.spending(&c.id(p))).collect();
         (state.height, all, free)
     }
@@ -513,6 +653,8 @@ impl Service {
                 bail!("that plan names none of this wallet's keys: it is someone else's");
             }
             self.plans_save()?;
+            // Payments to its addresses may predate this wallet's knowing it.
+            self.backfill_plan_gifts(&id);
             return Ok(id);
         }
         if code.starts_with(plans::STREAM_CODE) {
@@ -1036,7 +1178,7 @@ impl Service {
         self.plans.ticked_at = tip;
         let state = self.live().await;
         let live = |id: &[u8; 32]| state.coins.contains(id);
-        let mut changed = false;
+        let mut changed = self.prune_gifts(tip, live);
 
         // Funding sends that have landed.
         for s in &mut self.plans.sent {
@@ -1067,7 +1209,7 @@ impl Service {
         for h in &self.plans.held {
             let Some(p) = plan_of(&h.plan) else { continue };
             let id = id_of(&p.to_bytes());
-            let now = live_plan_coins(&p, tip, live);
+            let now = self.plan_coins(&p, tip, live);
             let payouts: Vec<([u8; 32], [u8; 32])> = p
                 .heirs
                 .iter()
@@ -1084,7 +1226,7 @@ impl Service {
             let id = id_of(&s.to_bytes());
             let now: Vec<PlanCoin> = live_tranches(&s, live)
                 .into_iter()
-                .map(|(j, n, value)| PlanCoin { k: j as u64, n, value })
+                .map(|(j, n, value)| PlanCoin::own(j as u64, n, value))
                 .collect();
             let payouts = (0..s.count).map(|j| (s.payout_tag(j), s.recipient_pk)).collect();
             watched.push((id, now, payouts, s.first, format!("the stream “{}”", r.label)));

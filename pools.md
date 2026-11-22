@@ -66,6 +66,8 @@ midstate pool --pool-address <POOL_ADDRESS> --midwimble-rpc 127.0.0.1:9434 --mid
 ```
 `<POOL_MW_ADDRESS>` (`mw1…`) receives the pool's fee in midwimble, plus the midwimble share of any miner who hasn't given a midwimble address. If the midwimble node can't be reached or has no usable bond, the pool mines midstate alone.
 
+A miner may give a name, `nick.mds`, instead of a midstate address. Its shares are credited to the name, and each job resolves it afresh, by the wallet's own rule: the first record that takes a payment, and an MSS key only while it has 16 signatures left; a name that has lapsed or lapses within a day is not paid. So when the name's wallet swaps in a fresh payment key, the next payout goes there. A name that resolves to nothing is left out of that job, and its score waits for the next. The pool checks the name at login and refuses one that does not resolve. Each payout's name and the address it went to are logged and kept with the block (`payouts[].name`), and `/api/proof?address=nick.mds` says where this job pays it (`pays`), which the miner's audit checks against the coinbase.
+
 A merge-mining pool also takes miners who give only a midwimble address, as the midwimble web wallet's miner does. Their shares earn midwimble score as usual, and the midstate part of each one goes to `<POOL_ADDRESS>`, the way the pool keeps the midwimble part of a miner who gives no midwimble address. A pool that doesn't merge-mine turns them away. In the dashboard's rig list they appear under the pool's own address, each named after its midwimble address.
 
 Every accepted share earns a point of midwimble score for its miner's midwimble address. Each midwimble block the pool finds pays those scores, then clears them. A midwimble coinbase has room for 31 miners: a miner with at least 1/31 of the score is paid exactly, and the rest share the remaining outputs by a draw seeded with both chains' tips, so each one's expected payout is exactly its share.
@@ -86,6 +88,13 @@ midstate pool --pool-address <POOL_ADDRESS> --midwimble-rpc 127.0.0.1:9434 --mid
 * `--co-bond-fee-cut 1`: each such co-bond takes 1 percentage point off its owner's own midwimble fee when they mine, down to zero. With `--midwimble-fee 2`, one co-bond means a 1% fee, and two mean none.
 
 Both default to 0. A bond's reward address is set by its first hand-in, and only for a bond the node had never seen: until then only its owner knows its script, so nobody else can claim it. Every payout is in the midwimble coinbase, as the miners' are, so it is as auditable.
+
+### 6. Back the Pool (Optional)
+A pool can burn MDS to back its fee address (MSB-1, `docs/MSB-1.md`): proof that it put something at stake that a throwaway pool would not. The dashboard shows the backing in its header and `/pool/stats` carries it (`backing`), asked of the backend node every five minutes; miners' own dashboards show it beside the pool's fee, and the explorer ranks pools by it. Backing is counted in blocks of issuance and halves every year, so it is kept up rather than bought once:
+```bash
+midstate wallet burn --purpose pool --subject <POOL_ADDRESS> --blocks 1440 --label "your.host/pool"
+```
+Anyone can back a pool; burning from the pool's own wallet, and saying so in the label, is what makes it the pool's word.
 
 ---
 

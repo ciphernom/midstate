@@ -569,6 +569,8 @@ function render(s) {
     pool && ['Your part of the round', part != null ? pct(part) : '--',
       part != null && pool.block_reward ? 'about ' + mds(Number(pool.block_reward) * (1 - fee / 100) * part) + ' if the pool finds the next block' : ''],
     pool && ['Pool', (Number(pool.miners) || 0) + ' miners', 'fee ' + fee + '%'],
+    pool && ['Backing', pool.backing ? esc(pool.backing.backing_text) + (pool.backing.tier ? ' (' + esc(pool.backing.tier) + ')' : '') : 'none',
+      'MDS the pool burned to back itself, in blocks of issuance (MSB-1)'],
     pool && ['Merged mining', pool.merged && pool.merged.active ? 'on' : 'off', pool.merged && pool.merged.note ? String(pool.merged.note) : ''],
     !pool && ['Pool stats', '--', 'The pool’s API did not answer'],
   ]);

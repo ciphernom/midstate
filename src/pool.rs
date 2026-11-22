@@ -52,6 +52,86 @@ const BLOCK_SCORES_TABLE: TableDefinition<u64, &str> = TableDefinition::new("blo
 /// Key: Block height (u64). Value: JSON string of `{ hash, block_ts, deductions: [[address_hex, deducted_score]] }`
 const PENDING_BLOCKS_TABLE: TableDefinition<u64, &str> = TableDefinition::new("pending_blocks");
 
+// ── Payout names (MSN-1) ────────────────────────────────────────────────────
+//
+// A miner may give `nick.mds` instead of an address. Its shares are credited
+// to [`name_key`], which no script hashes to, and each job resolves the name
+// afresh by the wallet's own rule (`core::names::pays`: the first record that
+// takes a payment, an MSS key only while it has `SIGNATURES_KEPT` signatures
+// left), refusing a name that has lapsed or lapses within a day. So a name
+// whose wallet swapped its payment key is paid at the new one. A name that
+// resolves to nothing is left out of that job, its score kept for the next.
+// Every payout's name and the address it went to are logged and recorded with
+// the block.
+
+/// Payout names by the key their shares are credited to.
+const PAYOUT_NAMES_TABLE: TableDefinition<&[u8; 32], &str> = TableDefinition::new("payout_names");
+
+/// The key a payout name's shares are credited to.
+pub fn name_key(name: &str) -> [u8; 32] {
+    hash(&[b"midstate.pool.payout-name.v1:".as_slice(), name.as_bytes()].concat())
+}
+
+/// Senders refuse a name that lapses this soon (a day), as wallets do.
+const NAME_LAPSING: u64 = 1_440;
+
+/// Where a name pays, from the node's `GET /name/:name`: its `pays`, unless
+/// it has lapsed or lapses within a day.
+pub fn payout_of_name(v: &serde_json::Value) -> Result<[u8; 32], String> {
+    let name = v["name"].as_str().unwrap_or("the name");
+    if v["lapsed"].as_bool() != Some(false) {
+        return Err(format!("{name} has lapsed"));
+    }
+    let (expires, height) = (v["expires"].as_u64().unwrap_or(0), v["height"].as_u64().unwrap_or(u64::MAX));
+    if expires < height.saturating_add(NAME_LAPSING) {
+        return Err(format!("{name} lapses within a day"));
+    }
+    let pays = v["pays"].as_str().ok_or_else(|| format!("{name} has no MDS address that can take a payment"))?;
+    crate::core::types::parse_address_flexible(pays).map_err(|e| format!("{name} pays an unreadable address: {e}"))
+}
+
+/// Resolves a payout name through the node at `rpc`.
+async fn resolve_payout_name(client: &reqwest::Client, rpc: &str, name: &str) -> Result<[u8; 32], String> {
+    let res = client.get(format!("{rpc}/name/{name}")).send().await.map_err(|e| format!("the node did not answer: {e}"))?;
+    let v: serde_json::Value = res.json().await.map_err(|e| format!("the node's answer was unreadable: {e}"))?;
+    if let Some(e) = v["error"].as_str() {
+        return Err(format!("{name}.mds: {e}"));
+    }
+    payout_of_name(&v)
+}
+
+/// Remembers which name a score key belongs to, before any score is credited
+/// to it: a key the job builder does not know as a name would be paid as an
+/// address, which nothing could spend.
+fn remember_payout_name(db: &Database, key: &[u8; 32], name: &str) -> Result<(), String> {
+    let known = db
+        .begin_read()
+        .ok()
+        .and_then(|t| t.open_table(PAYOUT_NAMES_TABLE).ok())
+        .and_then(|t| t.get(key).ok().flatten().map(|v| v.value().to_string()));
+    if known.as_deref() == Some(name) {
+        return Ok(());
+    }
+    let txn = db.begin_write().map_err(|e| format!("pool database: {e}"))?;
+    {
+        let mut t = txn.open_table(PAYOUT_NAMES_TABLE).map_err(|e| format!("pool database: {e}"))?;
+        t.insert(key, name).map_err(|e| format!("pool database: {e}"))?;
+    }
+    txn.commit().map_err(|e| format!("pool database: {e}"))
+}
+
+fn payout_names(db: &Database) -> HashMap<[u8; 32], String> {
+    let mut out = HashMap::new();
+    if let Some(t) = db.begin_read().ok().and_then(|t| t.open_table(PAYOUT_NAMES_TABLE).ok()) {
+        if let Ok(iter) = t.iter() {
+            for (k, v) in iter.flatten() {
+                out.insert(*k.value(), v.value().to_string());
+            }
+        }
+    }
+    out
+}
+
 // ── Stratum Protocol Types ──────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -165,6 +245,8 @@ struct Job {
     committed_scores: Arc<Vec<([u8; 32], u64)>>,
     /// Set when this pool is merge-mining midwimble.
     midwimble: Option<MergeCommit>,
+    /// Payout names this job pays: coinbase address → (score key, name).
+    paid_names: Arc<HashMap<[u8; 32], ([u8; 32], String)>>,
 }
 
 // ── Merkle Tree Logic for Share Proofs ──────────────────────────────────────
@@ -181,6 +263,9 @@ pub struct ShareMerkleTree {
     pub root: [u8; 32],
     pub leaves: Vec<([u8; 32], u64)>, 
     pub layers: Vec<Vec<[u8; 32]>>,
+    /// Payout names in this tree: the address each one's key is paid at in
+    /// this job's coinbase, and the name. Empty when no miner gave a name.
+    pub paid_at: HashMap<[u8; 32], ([u8; 32], String)>,
 }
 
 impl ShareMerkleTree {
@@ -206,7 +291,7 @@ impl ShareMerkleTree {
     /// ```
     fn build(mut shares: Vec<([u8; 32], u64)>) -> Self {
         if shares.is_empty() {
-            return Self { root: [0; 32], leaves: vec![], layers: vec![] };
+            return Self { root: [0; 32], leaves: vec![], layers: vec![], paid_at: HashMap::new() };
         }
         
         shares.sort_by_key(|&(addr, _)| addr);
@@ -233,7 +318,7 @@ impl ShareMerkleTree {
             current_layer = next_layer;
         }
 
-        Self { root: current_layer[0], leaves: shares, layers }
+        Self { root: current_layer[0], leaves: shares, layers, paid_at: HashMap::new() }
     }
 
     /// Generates an $O(\log N)$ Merkle inclusion proof for a specific miner address.
@@ -1532,6 +1617,9 @@ struct PoolState {
     /// nothing while capping how fast one address can spend pool CPU. Stratum is
     /// exempt: it is rate-limited implicitly by holding an open TCP session.
     http_throttle: RwLock<HashMap<[u8; 32], std::time::Instant>>,
+    /// The pool's MSB-1 backing as its node last said (`GET /burns/pool/…`),
+    /// and when: shown on the dashboard and to miners' own dashboards.
+    backing: RwLock<(Option<std::time::Instant>, serde_json::Value)>,
 }
 
 /// Minimum spacing between two verified share submissions from one address.
@@ -1599,8 +1687,8 @@ async fn get_proof(
     State(state): State<Arc<PoolState>>,
     Query(query): Query<ProofQuery>,
 ) -> Json<serde_json::Value> {
-    let addr = match crate::core::types::parse_address_flexible(&query.address) {
-        Ok(a) => a,
+    let addr = match payout_key(&query.address) {
+        Ok((a, _)) => a,
         Err(_) => return Json(serde_json::json!({ "error": "Invalid address" })),
     };
     
@@ -1634,12 +1722,20 @@ async fn proof_for(state: &PoolState, addr: &[u8; 32], root: Option<&str>) -> Re
     };
     let score = tree.leaves.iter().find(|(a, _)| a == addr).map(|(_, s)| *s).unwrap_or(0);
     match tree.generate_proof(addr) {
-        Some((idx, proof)) => Ok(serde_json::json!({
-            "root": hex::encode(tree.root),
-            "score": score,
-            "index": idx,
-            "proof": proof.iter().map(hex::encode).collect::<Vec<_>>()
-        })),
+        Some((idx, proof)) => {
+            let mut v = serde_json::json!({
+                "root": hex::encode(tree.root),
+                "score": score,
+                "index": idx,
+                "proof": proof.iter().map(hex::encode).collect::<Vec<_>>()
+            });
+            // A payout name: the address this job's coinbase pays it at.
+            if let Some((paid, name)) = tree.paid_at.get(addr) {
+                v["pays"] = hex::encode(paid).into();
+                v["name"] = format!("{name}{}", crate::core::names::SUFFIX).into();
+            }
+            Ok(v)
+        }
         None => Err("Miner not found in current block precommitment".into()),
     }
 }
@@ -1671,6 +1767,29 @@ async fn get_block_scores(
         }
     }
     Json(serde_json::json!({ "error": "No committed score snapshot stored for that block" }))
+}
+
+/// The pool's MSB-1 backing: what has been burned for its fee address
+/// (purpose `pool`), from its node's burn index, asked at most every five
+/// minutes. `null` when nothing has, or the node cannot say.
+async fn pool_backing(state: &PoolState) -> serde_json::Value {
+    const EVERY: Duration = Duration::from_secs(300);
+    {
+        let c = state.backing.read().await;
+        if c.0.is_some_and(|at| at.elapsed() < EVERY) {
+            return c.1.clone();
+        }
+    }
+    let url = format!("{}/burns/pool/{}", state.node_rpc_url, state.pool_address);
+    let fresh = async {
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(2)).build().ok()?;
+        let v: serde_json::Value = client.get(&url).send().await.ok()?.json().await.ok()?;
+        Some(v["backing"].clone())
+    }
+    .await;
+    let mut cache = state.backing.write().await;
+    *cache = (Some(std::time::Instant::now()), fresh.unwrap_or(serde_json::Value::Null));
+    cache.1.clone()
 }
 
 /// Serves the Provably Fair Pool HTML dashboard.
@@ -1835,6 +1954,8 @@ async fn get_pool_stats(State(state): State<Arc<PoolState>>) -> Json<serde_json:
         // Pool fee address (so the UI can label + verify the fee coin in every block)
         // and the live network reward (for payout / coins-per-day estimates):
         "pool_address": state.pool_address,
+        // What the pool has burned to back itself (MSB-1), as its node counts it.
+        "backing": pool_backing(&state).await,
         "block_reward": state.current_block_reward.load(std::sync::atomic::Ordering::Relaxed),
         // Live confirmed chain height (blocks the pool finds are stamped with their own
         // height), and the per-rig worker breakdown (stats only; payouts are per-address):
@@ -1992,6 +2113,7 @@ pub async fn run_stratum_pool(
             std::thread::available_parallelism().map(|n| n.get().saturating_sub(1).max(1)).unwrap_or(1),
         )),
         http_throttle: RwLock::new(HashMap::new()),
+        backing: RwLock::new((None, serde_json::Value::Null)),
         merge_status: RwLock::new(MergeStatus::default()),
     });
 
@@ -2332,8 +2454,42 @@ pub async fn run_stratum_pool(
                     }
                 }
 
+                // Payout names: resolved for this job, paid at what they
+                // resolve to; one that resolves to nothing, or to an address
+                // another miner is credited at, waits for a later job.
+                let mut paid_names: HashMap<[u8; 32], ([u8; 32], String)> = HashMap::new();
+                let named = payout_names(&state_clone.db);
+                if shares_vec.iter().any(|(k, _)| named.contains_key(k)) {
+                    let keys: HashSet<[u8; 32]> = shares_vec.iter().map(|(k, _)| *k).collect();
+                    let mut paid_to: HashSet<[u8; 32]> = HashSet::new();
+                    let mut held = Vec::new();
+                    for (key, score) in shares_vec.iter().copied() {
+                        let Some(name) = named.get(&key) else { continue };
+                        match resolve_payout_name(&client, &rpc_url, name).await {
+                            Ok(at) if !keys.contains(&at) && paid_to.insert(at) => {
+                                paid_names.insert(at, (key, name.clone()));
+                            }
+                            Ok(at) => {
+                                tracing::warn!("payout name {name}.mds resolves to {}, which another miner is paid at; its score waits", hex::encode(at));
+                                held.push(key);
+                            }
+                            Err(e) => {
+                                tracing::warn!("payout name {name}.mds is not paid this job ({e}); its score of {score} waits");
+                                held.push(key);
+                            }
+                        }
+                    }
+                    if !held.is_empty() {
+                        shares_vec.retain(|(k, _)| !held.contains(k));
+                        total_score = shares_vec.iter().map(|(_, s)| *s as u128).sum();
+                    }
+                }
+                let by_key: HashMap<[u8; 32], [u8; 32]> = paid_names.iter().map(|(at, (k, _))| (*k, *at)).collect();
+                let pay_at = |k: &[u8; 32]| by_key.get(k).copied().unwrap_or(*k);
+
                 // Published with the job below, not here: see there.
-                let tree = ShareMerkleTree::build(shares_vec.clone());
+                let mut tree = ShareMerkleTree::build(shares_vec.clone());
+                tree.paid_at = paid_names.iter().map(|(at, (k, n))| (*k, (*at, n.clone()))).collect();
 
                 let mut expected_total = net_state["block_reward"].as_u64().unwrap_or(0);
                 state_clone.current_block_reward.store(expected_total, std::sync::atomic::Ordering::Relaxed);
@@ -2415,7 +2571,7 @@ pub async fn run_stratum_pool(
                         if let Some(coins) = floor_split {
                             for (addr, coin) in coins {
                                 coinbase_json.push(serde_json::json!({
-                                    "address": hex::encode(addr),
+                                    "address": hex::encode(pay_at(&addr)),
                                     "value": coin,
                                     "salt": hex::encode(rand::random::<[u8; 32]>())
                                 }));
@@ -2429,7 +2585,7 @@ pub async fn run_stratum_pool(
                                     if score > max_score { max_score = score; best_miner = *addr; }
                                 }
                                 coinbase_json.push(serde_json::json!({
-                                    "address": hex::encode(best_miner),
+                                    "address": hex::encode(pay_at(&best_miner)),
                                     "value": coin,
                                     "salt": hex::encode(rand::random::<[u8; 32]>())
                                 }));
@@ -2506,6 +2662,7 @@ pub async fn run_stratum_pool(
                             batch_template: template["batch_template"].clone(),
                             height: tip_height,
                             committed_scores: std::sync::Arc::new(shares_vec.clone()),
+                            paid_names: std::sync::Arc::new(paid_names.clone()),
                         };
 
                         if merging {
@@ -2595,7 +2752,8 @@ struct HttpTemplateQuery {
 /// a pool that merge-mines, or the work would pay its miner nothing.
 #[derive(Clone, Debug, PartialEq)]
 struct MinerId {
-    /// The midstate address its shares are credited to: its own, or the pool's.
+    /// The midstate address its shares are credited to: its own, the pool's,
+    /// or a payout name's key ([`name_key`]).
     midstate: [u8; 32],
     /// Whether `midstate` is the miner's own address.
     own_midstate: bool,
@@ -2626,6 +2784,16 @@ impl MinerId {
     }
 }
 
+/// What a miner's `address` credits: an address, or a payout name's key
+/// (with the name, canonical).
+fn payout_key(address: &str) -> Result<([u8; 32], Option<String>), String> {
+    if crate::core::names::is_name(address) {
+        let name = crate::core::names::normalize(address).map_err(|e| e.to_string())?;
+        return Ok((name_key(&name), Some(name)));
+    }
+    crate::core::types::parse_address_flexible(address).map(|a| (a, None)).map_err(|e| e.to_string())
+}
+
 /// Reads who a request is for from its `address` and `midwimble_address`.
 /// An error is the text to answer with.
 fn resolve_miner(state: &PoolState, address: &str, midwimble: Option<&str>) -> Result<MinerId, String> {
@@ -2635,8 +2803,10 @@ fn resolve_miner(state: &PoolState, address: &str, midwimble: Option<&str>) -> R
     };
     let address = address.trim();
     if !address.is_empty() {
-        let midstate = crate::core::types::parse_address_flexible(address)
-            .map_err(|e| format!("Invalid address: {e}"))?;
+        let (midstate, name) = payout_key(address).map_err(|e| format!("Invalid address: {e}"))?;
+        if let Some(name) = name {
+            remember_payout_name(&state.db, &midstate, &name)?;
+        }
         return Ok(MinerId { midstate, own_midstate: true, midwimble });
     }
     let Some(midwimble) = midwimble else {
@@ -3173,8 +3343,8 @@ async fn handle_pool_stream(
             // over HTTPS gains nothing, because the HTTPS hop is exactly the one
             // that needs a certificate the pool may not have.
             let address = params.get("address").and_then(|a| a.as_str()).unwrap_or("");
-            match crate::core::types::parse_address_flexible(address) {
-                Ok(addr) => {
+            match payout_key(address) {
+                Ok((addr, _)) => {
                     let root = params.get("root").and_then(|r| r.as_str());
                     match proof_for(&state, &addr, root).await {
                         Ok(proof) => serde_json::json!({ "ok": true, "data": proof }),
@@ -3745,6 +3915,7 @@ fn spawn_block_submission(state: &Arc<PoolState>, job: Job, ext: Extension) {
     let block_net_target_hex = hex::encode(job.network_target);
     let block_height = job.height;
     let committed_scores = job.committed_scores.clone();
+    let job_names = job.paid_names.clone();
 
     let mut batch: Batch = match serde_json::from_value(job.batch_template) {
         Ok(b) => b,
@@ -3788,6 +3959,13 @@ fn spawn_block_submission(state: &Arc<PoolState>, job: Job, ext: Extension) {
 
                     for cb in &batch.coinbase {
                         let mut a = [0u8; 32]; a.copy_from_slice(&cb.address);
+                        // A payout name's coin went to what it resolved to; its
+                        // score is under the name's key.
+                        let named = job_names.get(&a).cloned();
+                        if let Some((key, name)) = &named {
+                            tracing::info!("payout of {} to {name}.mds went to {}", cb.value, crate::core::types::encode_address_with_checksum(&a));
+                            a = *key;
+                        }
                         let deduction = ((cb.value as u128 * total_score) / (total_reward as u128)) as u64;
                         // Deduct ONLY from rows that already exist, and delete a row once its
                         // remaining score hits 0. Writing back `0.saturating_sub(d) = 0` for an
@@ -3810,10 +3988,14 @@ fn spawn_block_submission(state: &Arc<PoolState>, job: Job, ext: Extension) {
                             actual_deductions.push((hex::encode(a), removed));
                         }
 
-                        payouts.push(serde_json::json!({
-                            "address": crate::core::types::encode_address_with_checksum(&a),
+                        let mut row = serde_json::json!({
+                            "address": crate::core::types::encode_address_with_checksum(&cb.address),
                             "value": cb.value
-                        }));
+                        });
+                        if let Some((_, name)) = named {
+                            row["name"] = format!("{name}{}", crate::core::names::SUFFIX).into();
+                        }
+                        payouts.push(row);
                     }
 
                     let mut b_table = write_txn.open_table(BLOCKS_TABLE).unwrap();
@@ -4150,8 +4332,29 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
                             write_half.write_all(format!("{}\n", serde_json::to_string(&res)?).as_bytes()).await?;
                             continue;
                         }
+                        // A payout name must resolve now, so the miner finds out
+                        // before it mines for nothing; it is resolved again at
+                        // every job.
+                        if crate::core::names::is_name(&address) {
+                            let checked = match payout_key(&address) {
+                                Ok((key, Some(name))) => match resolve_payout_name(&reqwest::Client::new(), &state.node_rpc_url, &name).await {
+                                    Ok(at) => remember_payout_name(&state.db, &key, &name).map(|_| (name, at)),
+                                    Err(e) => Err(e),
+                                },
+                                Ok(_) => Err("not a name".into()),
+                                Err(e) => Err(e),
+                            };
+                            match checked {
+                                Ok((name, at)) => tracing::info!("miner logged in as {name}.mds, paid at {} for now", hex::encode(at)),
+                                Err(e) => {
+                                    let res = StratumResponse { id: req.id, result: Some(serde_json::json!(false)), error: Some(format!("Payout name refused: {e}")) };
+                                    write_half.write_all(format!("{}\n", serde_json::to_string(&res)?).as_bytes()).await?;
+                                    continue;
+                                }
+                            }
+                        }
                         // Strip the UI checksum from the miner's address
-                        if let Ok(addr_bytes) = crate::core::types::parse_address_flexible(&address) {
+                        if let Ok((addr_bytes, _)) = payout_key(&address) {
                             authorized_address = Some(addr_bytes);
                             authorized_midwimble = midwimble.unwrap_or(None);
                             let res = StratumResponse { id: req.id, result: Some(serde_json::json!(true)), error: None };
@@ -4639,6 +4842,7 @@ mod tests {
             force_new_job: AtomicBool::new(false),
             verify_permits: Arc::new(Semaphore::new(2)),
             http_throttle: RwLock::new(HashMap::new()),
+            backing: RwLock::new((None, serde_json::Value::Null)),
         })
     }
 
@@ -4665,6 +4869,7 @@ mod tests {
             batch_template: serde_json::json!({ "stand_in": true }),
             height: 8,
             committed_scores: Arc::new(Vec::new()),
+            paid_names: Arc::new(HashMap::new()),
             midwimble: Some(merge.clone()),
         });
         merge
@@ -5057,6 +5262,7 @@ mod tests {
             batch_template: serde_json::json!({ "stand_in": true }),
             height: 8,
             committed_scores: Arc::new(Vec::new()),
+            paid_names: Arc::new(HashMap::new()),
             midwimble: Some(merge),
         });
     }
@@ -5091,6 +5297,47 @@ mod tests {
         let solo = test_state_with(db, None, None);
         assert!(resolve_miner(&solo, "", Some(ALICE)).unwrap_err().contains("doesn't merge-mine"));
         assert!(resolve_miner(&solo, &own, None).is_ok());
+    }
+
+    #[test]
+    fn a_payout_name_is_credited_under_its_key_and_paid_where_it_resolves() {
+        let (_dir, db) = test_db();
+        let state = test_state(db.clone(), "http://127.0.0.1:9".into(), pool_mw());
+        let m = resolve_miner(&state, " Nick.MDS ", None).unwrap();
+        assert_eq!(m.midstate, name_key("nick"));
+        assert!(m.own_midstate);
+        assert_eq!(payout_names(&db).get(&name_key("nick")).map(String::as_str), Some("nick"), "known as a name before any score");
+        assert_ne!(name_key("nick"), name_key("nicky"));
+        assert!(resolve_miner(&state, "-x-.mds", None).unwrap_err().starts_with("Invalid address"));
+
+        // The wallet's rules, read off the node's GET /name.
+        let at = crate::core::types::encode_address_with_checksum(&[3; 32]);
+        let good = serde_json::json!({ "name": "nick.mds", "lapsed": false, "expires": 10_000, "height": 5_000, "pays": at });
+        assert_eq!(payout_of_name(&good).unwrap(), [3; 32]);
+        let lapsed = serde_json::json!({ "name": "nick.mds", "lapsed": true, "expires": 10_000, "height": 5_000, "pays": at });
+        assert!(payout_of_name(&lapsed).unwrap_err().contains("lapsed"));
+        let soon = serde_json::json!({ "name": "nick.mds", "lapsed": false, "expires": 5_100, "height": 5_000, "pays": at });
+        assert!(payout_of_name(&soon).unwrap_err().contains("within a day"));
+        let none = serde_json::json!({ "name": "nick.mds", "lapsed": false, "expires": 10_000, "height": 5_000, "pays": null });
+        assert!(payout_of_name(&none).unwrap_err().contains("no MDS address"), "e.g. every MSS key under SIGNATURES_KEPT");
+        let old_node = serde_json::json!({ "name": "nick.mds", "lapsed": false, "expires": 10_000, "pays": at });
+        assert!(payout_of_name(&old_node).is_err(), "a node that does not say its height cannot be checked for lapsing");
+    }
+
+    #[tokio::test]
+    async fn the_audit_proof_says_where_a_payout_name_is_paid() {
+        let (_dir, db) = test_db();
+        let state = test_state(db, "http://127.0.0.1:9".into(), pool_mw());
+        let key = name_key("nick");
+        let mut tree = ShareMerkleTree::build(vec![(key, 50), ([9; 32], 70)]);
+        tree.paid_at.insert(key, ([3; 32], "nick".into()));
+        *state.current_tree.write().await = tree;
+        let p = proof_for(&state, &key, None).await.unwrap();
+        assert_eq!(p["pays"], hex::encode([3; 32]));
+        assert_eq!(p["name"], "nick.mds");
+        assert_eq!(p["score"], 50);
+        let plain = proof_for(&state, &[9; 32], None).await.unwrap();
+        assert!(plain.get("pays").is_none(), "an address is paid at itself");
     }
 
     #[tokio::test]
@@ -5337,6 +5584,7 @@ mod tests {
             batch_template: serde_json::json!({ "stand_in": true }),
             height: 8,
             committed_scores: Arc::new(Vec::new()),
+            paid_names: Arc::new(HashMap::new()),
             midwimble: None,
         }
     }

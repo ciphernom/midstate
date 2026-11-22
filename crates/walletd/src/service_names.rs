@@ -21,6 +21,7 @@ use crate::api::{MarketView, NameAction, NameCard, NameEdit, NameRecordView, Nam
 use crate::{rental, sendplan};
 use anyhow::{anyhow, bail, Context, Result};
 use midstate::core::names::{self, Deal, Rec};
+use midstate::core::plans::InheritancePlan;
 use midstate::core::{compute_address, compute_commitment, decompose_value, wots, OutputData, Transaction};
 use midstate::storage::name_index::{self, How, Record};
 use serde::{Deserialize, Serialize};
@@ -198,12 +199,7 @@ mod hex_bytes {
 
 /// An amount for people.
 fn amount(units: u64) -> String {
-    let g = 1u64 << 30;
-    if units % g == 0 {
-        format!("{} gMDS", units / g)
-    } else {
-        format!("{:.4} gMDS", units as f64 / g as f64)
-    }
+    crate::bond::gmds_text(units)
 }
 
 fn deal_text(d: &Deal) -> String {
@@ -216,6 +212,38 @@ fn deal_text(d: &Deal) -> String {
 }
 
 /// Whether the chain shows what `want` asks.
+/// A name's records, with an `mds-address` that is one of `plans`' moved to
+/// the address a check-in would move the plan's coins to now, whenever the
+/// deadline it points at is less than a full period away: a payment to a
+/// plan's address whose deadline has passed is its heirs' to claim at once,
+/// so a name kept on a live plan never sends money there. The moved
+/// address's script is published in place of the old one's. A record that
+/// points at one of `closed` (a plan this wallet has ended) goes back to
+/// `own`, this wallet's own key. `None`: nothing to move.
+pub(super) fn follow_plans(recs: &[Rec], active: &[InheritancePlan], closed: &[InheritancePlan], tip: u64, own: impl FnOnce() -> Result<Rec>) -> Result<Option<Vec<Rec>>> {
+    let at = |plans: &[InheritancePlan], a: &[u8; 32]| {
+        plans.iter().find_map(|p| p.epochs_to(tip).find(|k| &p.address(*k) == a).map(|k| (p.clone(), k)))
+    };
+    let Some(i) = recs.iter().position(|r| matches!(r, Rec::MdsAddress(_))) else { return Ok(None) };
+    let Rec::MdsAddress(a) = recs[i] else { return Ok(None) };
+    let (head, script) = if let Some((p, k)) = at(active, &a) {
+        let next = p.epoch_after(tip);
+        if k >= next {
+            return Ok(None);
+        }
+        (Rec::MdsAddress(p.address(next)), names::script_records(&p.script(next)))
+    } else if at(closed, &a).is_some() {
+        (own()?, Vec::new())
+    } else {
+        return Ok(None);
+    };
+    let mut out: Vec<Rec> = recs[..i].iter().filter(|r| !matches!(r, Rec::Script(_))).cloned().collect();
+    out.push(head);
+    out.extend(script);
+    out.extend(recs[i + 1..].iter().filter(|r| !matches!(r, Rec::Script(_))).cloned());
+    Ok(Some(out))
+}
+
 fn reached(r: &Record, want: &Want) -> bool {
     r.owner == want.owner
         && r.expires >= want.expires
@@ -246,7 +274,7 @@ impl Service {
     }
 
     /// A name as the chain has it now, refused if it cannot take a payment.
-    fn live_record(&self, to: &str) -> Result<Record> {
+    pub(super) fn live_record(&self, to: &str) -> Result<Record> {
         let shown = to.trim().to_ascii_lowercase();
         let r = name_index::lookup(self.node.storage.db(), to)?.ok_or_else(|| anyhow!("{shown} is not registered"))?;
         if r.lapsed() {
@@ -280,40 +308,95 @@ impl Service {
             .ok_or_else(|| anyhow!("{} takes no MDW", to.trim()))
     }
 
-    pub(super) fn name_views(&self) -> Vec<NameView> {
-        let db = self.node.storage.db();
-        let used = |k: &[u8; 32]| self.node.storage.query_mss_leaf_index(k).unwrap_or(0);
-        self.names
-            .jobs
+    pub(super) fn name_views(&mut self) -> Vec<NameView> {
+        let db = self.node.storage.db().clone();
+        let jobs = self.names.jobs.clone();
+        let mut out = Vec::with_capacity(jobs.len());
+        for j in jobs {
+            let chain = name_index::lookup(&db, &j.name).ok().flatten();
+            let ours = |r: &&Record| r.owner == j.owner || j.want.as_ref().is_some_and(|w| w.owner == r.owner);
+            let r = chain.as_ref().filter(ours);
+            let records = r.map(|r| r.records.clone()).unwrap_or_default();
+            let has = |f: fn(&Rec) -> bool| records.iter().any(f);
+            let pays = r.and_then(|r| names::pays(&r.records, |k| self.node.storage.query_mss_leaf_index(k).unwrap_or(0)));
+            out.push(NameView {
+                name: format!("{}{}", j.name, names::SUFFIX),
+                status: j.status.clone(),
+                note: j.note.clone(),
+                pays: pays.map(|a| midstate::core::encode_address_with_checksum(&a)),
+                pays_kind: pays.map(|a| self.kind_label(&records, &a)).unwrap_or_default(),
+                sealed: has(|x| matches!(x, Rec::Kem(_))),
+                backing: self.name_backing(&j.name),
+                expires: r.map_or(0, |r| r.expires),
+                tier: names::TIERS[chain.as_ref().map_or(names::tier_of(&j.name), |r| r.tier) as usize].into(),
+                deal: r.map(|r| deal_text(&r.deal)).unwrap_or_default(),
+                renter: j.renter,
+                auto_renew: j.auto_renew,
+                records: records.iter().map(|x| x.describe()).map(|(k, v)| NameRecordView { kind: k.into(), value: v }).collect(),
+                mdw: has(|x| matches!(x, Rec::Mdw(_))),
+                identity: has(|x| matches!(x, Rec::Identity(_))),
+                evm: has(|x| matches!(x, Rec::Evm(_))),
+                text: records.iter().find_map(|x| if let Rec::Text(t) = x { Some(t.clone()) } else { None }).unwrap_or_default(),
+                pay_to: records
+                    .iter()
+                    .find_map(|x| if let Rec::MdsAddress(a) = x { Some(midstate::core::encode_address_with_checksum(a)) } else { None })
+                    .unwrap_or_default(),
+            });
+        }
+        out
+    }
+
+    /// What kind of address `address` is, for people: what the records
+    /// publish, or what this wallet knows of its own plans.
+    pub(super) fn kind_label(&self, recs: &[Rec], address: &[u8; 32]) -> String {
+        if let Some(k) = names::address_kind(recs, address) {
+            return k.label();
+        }
+        if let Some(script) = self.own_script(address) {
+            return format!("{} (yours)", midstate::core::address_kind::classify(&script).label());
+        }
+        "script address (kind not published)".into()
+    }
+
+    /// This wallet's inheritance plans: those it keeps up, and those it has
+    /// closed.
+    fn own_plans(&self) -> (Vec<InheritancePlan>, Vec<InheritancePlan>) {
+        let (mut active, mut closed) = (Vec::new(), Vec::new());
+        for o in &self.plans.owned {
+            let Some(p) = hex::decode(&o.plan).ok().and_then(|b| InheritancePlan::from_bytes(&b)) else { continue };
+            if o.status == "closed" { closed.push(p) } else { active.push(p) }
+        }
+        (active, closed)
+    }
+
+    /// The script of an address of one of this wallet's inheritance plans,
+    /// at any deadline it has reached or will reach next.
+    fn own_script(&self, address: &[u8; 32]) -> Option<Vec<u8>> {
+        let tip = name_index::meta(self.node.storage.db()).map_or(0, |m| m.next);
+        self.plans.owned.iter().filter(|p| p.status == "active").find_map(|p| {
+            let plan = InheritancePlan::from_bytes(&hex::decode(&p.plan).ok()?)?;
+            plan.epochs_to(tip).find(|k| &plan.address(*k) == address).map(|k| plan.script(k))
+        })
+    }
+
+    /// This wallet's active plans, as `(label, address, script)` at the
+    /// deadline a check-in now would move them to: what a name can point at.
+    pub(super) fn plan_targets(&self) -> Vec<(String, [u8; 32], Vec<u8>)> {
+        let tip = name_index::meta(self.node.storage.db()).map_or(0, |m| m.next);
+        self.plans
+            .owned
             .iter()
-            .map(|j| {
-                let chain = name_index::lookup(db, &j.name).ok().flatten();
-                let ours = |r: &&Record| r.owner == j.owner || j.want.as_ref().is_some_and(|w| w.owner == r.owner);
-                let r = chain.as_ref().filter(ours);
-                let records = r.map(|r| r.records.clone()).unwrap_or_default();
-                let has = |f: fn(&Rec) -> bool| records.iter().any(f);
-                NameView {
-                    name: format!("{}{}", j.name, names::SUFFIX),
-                    status: j.status.clone(),
-                    note: j.note.clone(),
-                    pays: r.and_then(|r| names::pays(&r.records, used)).map(|a| midstate::core::encode_address_with_checksum(&a)),
-                    expires: r.map_or(0, |r| r.expires),
-                    tier: names::TIERS[chain.as_ref().map_or(names::tier_of(&j.name), |r| r.tier) as usize].into(),
-                    deal: r.map(|r| deal_text(&r.deal)).unwrap_or_default(),
-                    renter: j.renter,
-                    auto_renew: j.auto_renew,
-                    records: records.iter().map(|x| x.describe()).map(|(k, v)| NameRecordView { kind: k.into(), value: v }).collect(),
-                    mdw: has(|x| matches!(x, Rec::Mdw(_))),
-                    identity: has(|x| matches!(x, Rec::Identity(_))),
-                    evm: has(|x| matches!(x, Rec::Evm(_))),
-                    text: records.iter().find_map(|x| if let Rec::Text(t) = x { Some(t.clone()) } else { None }).unwrap_or_default(),
-                }
+            .filter(|p| p.status == "active")
+            .filter_map(|p| {
+                let plan = InheritancePlan::from_bytes(&hex::decode(&p.plan).ok()?)?;
+                let k = plan.epoch_after(tip);
+                Some((p.label.clone(), plan.address(k), plan.script(k)))
             })
             .collect()
     }
 
     /// What a name is now, what it costs and what this wallet could do with it.
-    pub(super) fn find_name(&self, name: &str, years: u64) -> Result<NameCard> {
+    pub(super) fn find_name(&mut self, name: &str, years: u64) -> Result<NameCard> {
         let name = names::normalize(name)?;
         let db = self.node.storage.db();
         let tip = name_index::meta(db)?.next;
@@ -335,6 +418,13 @@ impl Service {
             Some(r) => {
                 card.since = r.since;
                 card.records = r.records.iter().map(|x| x.describe()).map(|(k, v)| NameRecordView { kind: k.into(), value: v }).collect();
+                if !r.lapsed() {
+                    let pays = names::pays(&r.records, |k| self.node.storage.query_mss_leaf_index(k).unwrap_or(0));
+                    card.pays = pays.map(|a| midstate::core::encode_address_with_checksum(&a));
+                    card.pays_kind = pays.map(|a| self.kind_label(&r.records, &a)).unwrap_or_default();
+                    card.identity = names::identity(&r.records).is_some();
+                    card.sealed = names::kem_hash(&r.records).is_some();
+                }
                 card.state = match r.deal {
                     _ if r.lapsed() && r.owner == [0; 32] => "unclaimed",
                     _ if r.lapsed() => "lapsed",
@@ -358,6 +448,7 @@ impl Service {
             }
         };
         card.tier = names::TIERS[tier as usize].into();
+        card.backing = self.name_backing(&name);
         card.rate = names::RATES[tier as usize];
         if matches!(card.state.as_str(), "available" | "unclaimed" | "lapsed") {
             card.burn = names::cost(tier, years);
@@ -446,14 +537,48 @@ impl Service {
                     span,
                     expires: r.expires,
                     mine: self.names.jobs.iter().any(|j| j.name == r.name && j.owner == r.owner && !j.renter),
+                    backing: self.name_backing(&r.name).map_or(0.0, |b| b.blocks),
                 }
             })
             .collect())
     }
 
-    /// The records an edit asks for, keeping the name's payment records.
-    fn edited(&mut self, base: &[Rec], e: &NameEdit) -> Result<Vec<u8>> {
-        let mut recs: Vec<Rec> = base.iter().filter(|r| matches!(r, Rec::MdsKey { .. } | Rec::MdsAddress(_) | Rec::Other { .. })).cloned().collect();
+    /// The records an edit asks for. Payments go to this wallet's own keys
+    /// (kept as they are), or to `pay_to` — a vault, multisig, plan or shared
+    /// wallet — with its script published when it is known, so anyone can see
+    /// what kind of address the name pays. Unknown tags are kept.
+    fn edited(&mut self, base: &[Rec], e: &NameEdit, shown: &str) -> Result<Vec<u8>> {
+        let mut recs: Vec<Rec> = Vec::new();
+        let pay_to = e.pay_to.trim();
+        if pay_to.is_empty() {
+            recs.extend(base.iter().filter(|r| matches!(r, Rec::MdsKey { .. })).cloned());
+            if recs.is_empty() {
+                recs.push(Rec::MdsKey { key: self.fresh_key(shown.to_string())?, height: DEFAULT_MSS_HEIGHT as u8 });
+            }
+        } else {
+            let addr = sendplan::decode_address(pay_to)?;
+            recs.push(Rec::MdsAddress(addr));
+            let typed = e.script.trim();
+            let script = if !typed.is_empty() {
+                let b = hex::decode(typed).map_err(|_| anyhow!("the script is not hex"))?;
+                if midstate::core::hash(&b) != addr {
+                    bail!("that script is not the script of {pay_to}: it hashes to another address");
+                }
+                if b.len() > midstate::core::script::MAX_SCRIPT_SIZE {
+                    bail!("a script is at most {} bytes", midstate::core::script::MAX_SCRIPT_SIZE);
+                }
+                Some(b)
+            } else {
+                self.own_script(&addr).or_else(|| names::published_script(base).filter(|b| midstate::core::hash(b) == addr))
+            };
+            if let Some(b) = script {
+                recs.extend(names::script_records(&b));
+            }
+        }
+        recs.extend(base.iter().filter(|r| matches!(r, Rec::Other { .. })).cloned());
+        if e.sealed {
+            recs.push(Rec::Kem(self.kem_record()?));
+        }
         if e.mdw {
             let a = self.mwb.keys.as_ref().map(|k| k.address().encode()).ok_or_else(|| anyhow!("this wallet has no MDW account yet"))?;
             recs.push(Rec::Mdw(a));
@@ -470,18 +595,29 @@ impl Service {
         names::encode(&recs)
     }
 
-    /// Records for a name this wallet takes: a payment key of its own, and
-    /// this wallet's MDW address if it has one.
+    /// Records for a name this wallet takes: a payment key of its own, this
+    /// wallet's MDW address if it has one, its identity (so payers can ask it
+    /// for a fresh address) and its KEM key's hash (so anyone can send it a
+    /// sealed message). Edit records takes any of them off.
     fn fresh_records(&mut self, shown: &str) -> Result<Vec<u8>> {
+        // The identity first: in a wallet with no MSS key yet it gets one of
+        // its own, rather than becoming this name's payment key.
+        let identity = self.ensure_identity().ok();
         let pay = self.fresh_key(shown.to_string())?;
         let mut recs = vec![Rec::MdsKey { key: pay, height: DEFAULT_MSS_HEIGHT as u8 }];
         if let Some(a) = self.mwb.keys.as_ref().map(|k| k.address().encode()) {
             recs.push(Rec::Mdw(a));
         }
+        if let Some(id) = identity {
+            recs.push(Rec::Identity(id));
+        }
+        if let Ok(h) = self.kem_record() {
+            recs.push(Rec::Kem(h));
+        }
         names::encode(&recs)
     }
 
-    fn ready_to_spend(&self) -> Result<()> {
+    pub(super) fn ready_to_spend(&self) -> Result<()> {
         if self.wallet.is_none() {
             bail!("wallet is locked");
         }
@@ -615,7 +751,7 @@ impl Service {
         let mut want = Want { owner: job.owner, records, terms: r.terms.clone(), years: 0, expires: r.expires, how: "hold".into() };
         let note = match act {
             NameAction::Edit(e) => {
-                want.records = self.edited(&r.records, &e)?;
+                want.records = self.edited(&r.records, &e, &shown)?;
                 "saving its records"
             }
             NameAction::Sell { price } => {
@@ -715,7 +851,7 @@ impl Service {
         if let Some((price, payee)) = plan.pay {
             fixed.extend(decompose_value(price).into_iter().map(|value| OutputData::Standard { address: payee, value, salt: rand::random() }));
         }
-        let commitment = self.commit_outputs(&state, fixed, Some(plan.thread.id), &to).await?;
+        let commitment = self.commit_outputs(&state, fixed, Some(plan.thread.id), &to, format!("name: {to}")).await?;
         if let Some(j) = self.names.get_mut(name) {
             j.commitment = Some(commitment);
             j.note = "solving the commit's proof-of-work".into();
@@ -727,13 +863,15 @@ impl Service {
     }
 
     /// Commit a send of `fixed` (then change), paid from this wallet, also
-    /// spending `thread` if given. Returns the commitment, recorded as pending.
-    async fn commit_outputs(
+    /// spending `thread` if given. Returns the commitment, recorded as pending;
+    /// the Send tab shows it as `what`.
+    pub(super) async fn commit_outputs(
         &mut self,
         state: &midstate::core::State,
         fixed: Vec<OutputData>,
         thread: Option<[u8; 32]>,
         to: &str,
+        what: String,
     ) -> Result<[u8; 32]> {
         self.verify_mss_indices().await?;
         let in_flight = self.in_flight_inputs();
@@ -781,7 +919,7 @@ impl Service {
             is_consolidate: false,
         });
         w.save()?;
-        let detail = format!("name: {to}");
+        let detail = what;
         self.sends.insert(
             commitment,
             SendMeta { stage: SendStage::Committing, detail: detail.clone(), amount: spend, fee, to: to.into(), updated_at: now },
@@ -797,7 +935,7 @@ impl Service {
         if self.names.genesis.as_ref().is_some_and(pending) {
             return Ok(());
         }
-        let c = self.commit_outputs(state, vec![names::genesis()], None, "the name registry").await?;
+        let c = self.commit_outputs(state, vec![names::genesis()], None, "the name registry", "name: the name registry".into()).await?;
         self.names.genesis = Some(c);
         self.names_save();
         self.broadcast_commit(c).await
@@ -998,6 +1136,33 @@ impl Service {
                 }
             }
         }
+        // The identity record follows this wallet's identity when it rotates:
+        // requests to a retired key would go unanswered.
+        let current = self.book.identity_pk;
+        let mut identity_moved = false;
+        for rec in recs.iter_mut() {
+            if let (Rec::Identity(k), Some(now)) = (&*rec, current) {
+                if *k != now && self.signatures_left(k).is_some() {
+                    *rec = Rec::Identity(now);
+                    identity_moved = true;
+                    note = "pointing it at this wallet's current identity";
+                }
+            }
+        }
+        // A name pointed at one of this wallet's plans keeps to the plan's
+        // next deadline (`follow_plans`).
+        let (active, closed) = self.own_plans();
+        let shown = format!("{}{}", job.name, names::SUFFIX);
+        let plan_moved = match follow_plans(&recs, &active, &closed, r.height, || {
+            Ok(Rec::MdsKey { key: self.fresh_key(shown.clone())?, height: DEFAULT_MSS_HEIGHT as u8 })
+        })? {
+            Some(next) => {
+                recs = next;
+                note = "moving it to its plan's next deadline";
+                true
+            }
+            None => false,
+        };
         let mut owner = job.owner;
         if self.signatures_left(&job.owner).is_some_and(|n| n <= CONTROL_RESERVE) {
             owner = self.fresh_key(format!("{}{} control", job.name, names::SUFFIX))?;
@@ -1006,7 +1171,7 @@ impl Service {
         if renew {
             note = "renewing it for a year";
         }
-        if retired.is_empty() && owner == job.owner && !renew && terms == r.terms {
+        if retired.is_empty() && owner == job.owner && !renew && terms == r.terms && !identity_moved && !plan_moved {
             return Ok(None);
         }
         if let Some(j) = self.names.get_mut(&job.name) {
@@ -1180,5 +1345,73 @@ impl Service {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use midstate::core::address_kind::AddressKind;
+    use midstate::core::plans::{Heir, DAY as PLAN_DAY};
+
+    fn plan(secret: u8) -> InheritancePlan {
+        InheritancePlan {
+            owner_pk: [1; 32],
+            heirs: vec![Heir { pk: [2; 32], share: 65_535 }],
+            start: 400_000,
+            period: 30 * PLAN_DAY,
+            secret: [secret; 32],
+        }
+    }
+
+    fn pointed_at(p: &InheritancePlan, k: u64) -> Vec<Rec> {
+        let mut recs = vec![Rec::MdsAddress(p.address(k))];
+        recs.extend(names::script_records(&p.script(k)));
+        recs.push(Rec::Identity([5; 32]));
+        recs.push(Rec::Text("hi".into()));
+        recs
+    }
+
+    fn no_key() -> Result<Rec> {
+        bail!("not asked for")
+    }
+
+    #[test]
+    fn a_name_on_a_plan_keeps_to_its_next_deadline() {
+        let p = plan(9);
+        let k = p.epoch_after(p.start);
+        let recs = pointed_at(&p, k);
+        // A full period or more before the deadline: it stays.
+        assert_eq!(follow_plans(&recs, &[p.clone()], &[], p.deadline(k) - p.period, no_key).unwrap(), None);
+        // Less than that left: it moves to where a check-in now puts the coins.
+        let tip = p.deadline(k) - p.period + 1;
+        let next = p.epoch_after(tip);
+        assert_eq!(next, k + 1);
+        let moved = follow_plans(&recs, &[p.clone()], &[], tip, no_key).unwrap().unwrap();
+        assert_eq!(moved[0], Rec::MdsAddress(p.address(next)));
+        assert_eq!(names::published_script(&moved), Some(p.script(next)));
+        assert_eq!(names::address_kind(&moved, &p.address(next)), Some(AddressKind::Plan { heirs: 1 }));
+        assert_eq!(names::pays(&moved, |_| 0), Some(p.address(next)));
+        assert_eq!(&moved[moved.len() - 2..], &[Rec::Identity([5; 32]), Rec::Text("hi".into())]);
+        assert!(names::encode(&moved).is_ok());
+        // Long past, after the wallet was away: straight to the current deadline.
+        let late = p.deadline(k) + 5 * p.period;
+        let moved = follow_plans(&recs, &[p.clone()], &[], late, no_key).unwrap().unwrap();
+        assert_eq!(moved[0], Rec::MdsAddress(p.address(p.epoch_after(late))));
+        assert!(p.deadline(p.epoch_after(late)) >= late + p.period);
+    }
+
+    #[test]
+    fn a_name_leaves_a_closed_plan_and_ignores_other_addresses() {
+        let p = plan(9);
+        let k = p.epoch_after(p.start);
+        let recs = pointed_at(&p, k);
+        let key = Rec::MdsKey { key: [3; 32], height: 10 };
+        let back = follow_plans(&recs, &[], &[p.clone()], p.start + 10, || Ok(key.clone())).unwrap().unwrap();
+        assert_eq!(back, vec![key, Rec::Identity([5; 32]), Rec::Text("hi".into())]);
+        // Someone else's plan, a multisig, or no address at all: left alone.
+        assert_eq!(follow_plans(&recs, &[plan(8)], &[plan(7)], p.deadline(k), no_key).unwrap(), None);
+        let plain = vec![Rec::MdsKey { key: [3; 32], height: 10 }, Rec::Text("x".into())];
+        assert_eq!(follow_plans(&plain, &[p.clone()], &[p], 500_000, no_key).unwrap(), None);
     }
 }

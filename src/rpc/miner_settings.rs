@@ -87,8 +87,13 @@ impl MinerSettings {
             None => None,
         };
         let payout_address = self.payout_address.trim().to_string();
-        crate::core::types::parse_address_flexible(&payout_address)
-            .map_err(|e| format!("Payout address: {e}"))?;
+        // A name.mds is paid at what it resolves to, by the pool, at each job.
+        if crate::core::names::is_name(&payout_address) {
+            crate::core::names::normalize(&payout_address).map_err(|e| format!("Payout address: {e}"))?;
+        } else {
+            crate::core::types::parse_address_flexible(&payout_address)
+                .map_err(|e| format!("Payout address: {e}"))?;
+        }
         let worker = match self.worker.trim() {
             "" => default_worker(),
             w if w.chars().count() > 64 => return Err("Worker name: 64 characters at most".into()),
@@ -253,6 +258,7 @@ mod tests {
         assert!(wrong(|s| s.fallback_url = Some("pool.example:3333".into())).contains("same pool"));
         assert!(wrong(|s| s.fallback_url = Some("x:0".into())).starts_with("Fallback pool:"));
         assert!(wrong(|s| s.payout_address = "abc".into()).starts_with("Payout address:"));
+        assert!(wrong(|s| s.payout_address = "-bad-.mds".into()).starts_with("Payout address:"));
         assert!(wrong(|s| s.midwimble_address = Some("mw1nope".into())).starts_with("Midwimble address:"));
         assert!(wrong(|s| s.worker = "a\nb".into()).starts_with("Worker name:"));
         assert!(wrong(|s| s.threads = 100_000).starts_with("Threads:"));

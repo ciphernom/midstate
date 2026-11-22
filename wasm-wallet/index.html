@@ -5341,7 +5341,10 @@ document.getElementById('btnExport').onclick = () => {
                         value.className = 'chat-attachment-value';
                         
                         // Truncate massive L2 signatures visually so they don't break the UI
-                        if (att.kind === "signature" && att.value.length > 64) {
+                        if (att.kind === "encrypted_message") {
+                            // A sealed message: ciphertext only its recipient's wallet opens.
+                            value.textContent = `sealed message, ${att.value.length / 2} bytes`;
+                        } else if (att.kind === "signature" && att.value.length > 64) {
                             value.textContent = att.value.substring(0, 32) + "..." + att.value.substring(att.value.length - 32);
                         } else {
                             value.textContent = att.value; 

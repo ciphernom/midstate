@@ -37,6 +37,10 @@ mod plans_glue;
 mod co_bond_glue;
 #[path = "service_names.rs"]
 mod names_glue;
+#[path = "service_identity.rs"]
+mod ident_glue;
+#[path = "service_burns.rs"]
+mod burns_glue;
 
 const TICK: Duration = Duration::from_secs(2);
 
@@ -109,6 +113,11 @@ enum Cmd {
     NameAct { name: String, act: NameAction, resp: oneshot::Sender<Result<()>> },
     TakeName { name: String, rent: bool, resp: oneshot::Sender<Result<String>> },
     FindName { name: String, years: u64, resp: oneshot::Sender<Result<NameCard>> },
+    Burn { req: BurnRequest, resp: oneshot::Sender<Result<String>> },
+    Burns { resp: oneshot::Sender<Result<BurnsView>> },
+    Backing { purpose: String, subject: String, resp: oneshot::Sender<Result<Option<BackingView>>> },
+    Notary { hash: String, resp: oneshot::Sender<Result<NotaryView>> },
+    SetInboxBar { bar: Option<f64>, resp: oneshot::Sender<Result<()>> },
     NameMarket { resp: oneshot::Sender<Result<Vec<MarketView>>> },
     NameDeals { resp: oneshot::Sender<Result<Vec<SoldView>>> },
     WatchName { name: String, years: u64, max_price: Option<u64>, resp: oneshot::Sender<Result<()>> },
@@ -128,6 +137,10 @@ enum Cmd {
     ExportCoin { id: String, resp: oneshot::Sender<Result<CoinExport>> },
     ChatSend { text: String, resp: oneshot::Sender<Result<()>> },
     ChatHistory(oneshot::Sender<Vec<ChatView>>),
+    /// A sealed message to a name (`service_identity`).
+    SealedSend { to: String, text: String, resp: oneshot::Sender<Result<()>> },
+    Conversations(oneshot::Sender<Vec<ConversationView>>),
+    NameTargets(oneshot::Sender<Vec<PayTargetView>>),
     ChatDict(oneshot::Sender<Vec<String>>),
     ChannelIdentity(oneshot::Sender<Result<IdentityView>>),
     Channels(oneshot::Sender<Vec<ChannelView>>),
@@ -232,6 +245,9 @@ enum Internal {
     Tick,
     /// A pool answered about a co-bond (`co_bond_glue`).
     PoolReply { id: [u8; 32], reply: co_bond_glue::PoolReply },
+    /// Payments made to a plan's addresses before this wallet took the plan
+    /// in, found by a look back over the chain (`plans_glue`).
+    PlanGifts { id: String, coins: Vec<midstate::node::ScannedCoin> },
 }
 
 impl Cmd {
@@ -244,6 +260,7 @@ impl Cmd {
             Cmd::Internal(Internal::RevealConfirmed(_)) => "a confirmed send",
             Cmd::Internal(Internal::Tick) => "the tick",
             Cmd::Internal(Internal::PoolReply { .. }) => "a pool's reply",
+            Cmd::Internal(Internal::PlanGifts { .. }) => "payments to a plan",
             _ => "a request",
         }
     }
@@ -356,6 +373,28 @@ impl WalletdHandle {
     pub async fn find_name(&self, name: String, years: u64) -> Result<NameCard> {
         ask!(self, FindName { name: name, years: years })
     }
+    /// Burn to back something, or to notarize a document (MSB-1).
+    pub async fn burn(&self, req: BurnRequest) -> Result<String> {
+        ask!(self, Burn { req: req })
+    }
+    /// The Burns page: this wallet's backing, and the chain's burn against
+    /// its issuance.
+    pub async fn burns(&self) -> Result<BurnsView> {
+        ask!(self, Burns {})
+    }
+    /// What `subject` has had burned for it as `purpose`.
+    pub async fn backing(&self, purpose: String, subject: String) -> Result<Option<BackingView>> {
+        ask!(self, Backing { purpose: purpose, subject: subject })
+    }
+    /// A document hash's notarizations.
+    pub async fn notary(&self, hash: String) -> Result<NotaryView> {
+        ask!(self, Notary { hash: hash })
+    }
+    /// The backing (blocks) a sealed message's sender needs to reach the
+    /// inbox; `None` lets every message in.
+    pub async fn set_inbox_bar(&self, bar: Option<f64>) -> Result<()> {
+        ask!(self, SetInboxBar { bar: bar })
+    }
     pub async fn name_market(&self) -> Result<Vec<MarketView>> {
         ask!(self, NameMarket {})
     }
@@ -422,6 +461,18 @@ impl WalletdHandle {
     }
     pub async fn chat_history(&self) -> Result<Vec<ChatView>> {
         Ok(ask!(self, ChatHistory))
+    }
+    /// Send `text` to a name, sealed so only its wallet reads it.
+    pub async fn sealed_send(&self, to: String, text: String) -> Result<()> {
+        ask!(self, SealedSend { to: to, text: text })
+    }
+    /// Sealed conversations, newest first.
+    pub async fn conversations(&self) -> Result<Vec<ConversationView>> {
+        Ok(ask!(self, Conversations))
+    }
+    /// What of this wallet's a name can point its payments at (its plans).
+    pub async fn name_targets(&self) -> Result<Vec<PayTargetView>> {
+        Ok(ask!(self, NameTargets))
     }
     pub async fn chat_dictionary(&self) -> Result<Vec<String>> {
         Ok(ask!(self, ChatDict))
@@ -790,6 +841,7 @@ pub fn spawn(
         bonds: BondBook::default(),
         rentals: Default::default(),
         names: Default::default(),
+        ident: Default::default(),
         market: Default::default(),
         plans: Default::default(),
         co_bond_call: None,
@@ -887,6 +939,9 @@ struct Service {
     rentals: crate::rental::RentalBook,
     /// Names this wallet registered (see `service_names`). Persisted.
     names: names_glue::NameBook,
+    /// Payments waiting on a name's fresh address, and sealed messages (see
+    /// `service_identity`). The messages are persisted.
+    ident: ident_glue::IdentityLive,
     /// The bond rental market as read off the chain; rebuilt every run.
     market: crate::rental::Market,
     /// Inheritance plans and payment streams (see `crate::plans`). Persisted:
@@ -949,6 +1004,7 @@ impl Service {
                     unlocked: self.wallet.is_some(),
                     is_hd: self.wallet.as_ref().map(|w| w.is_hd()).unwrap_or(false),
                     wallet_path: self.wallet_path.display().to_string(),
+                    inbox_bar: self.inbox_bar(),
                 });
             }
             Cmd::Create { password, phrase, resp } => {
@@ -986,6 +1042,8 @@ impl Service {
                 self.plans_unload();
                 self.mwb_unload();
                 self.eth_unload();
+                // The KEM secret and anything waiting on the wallet go too.
+                self.identity_unload();
                 // The bond's secret leaves with the wallet: the local pool
                 // mines midstate alone until it is unlocked again.
                 self.refresh_merge_bond();
@@ -1010,7 +1068,9 @@ impl Service {
                 let _ = resp.send(self.send_progress_list());
             }
             Cmd::Send { to, amount, private, resp } => {
-                let _ = resp.send(self.start_send(&to, amount, private).await);
+                // A name's wallet is asked for a fresh address first; the
+                // reply comes when it answers or the wait runs out.
+                self.send_or_ask(to, amount, private, resp).await;
             }
             Cmd::RetrySend { id, resp } => {
                 let _ = resp.send(self.retry_send(&id).await);
@@ -1029,6 +1089,26 @@ impl Service {
             }
             Cmd::FindName { name, years, resp } => {
                 let _ = resp.send(self.find_name(&name, years));
+            }
+            Cmd::Burn { req, resp } => {
+                let _ = resp.send(self.burn(req).await);
+            }
+            Cmd::Burns { resp } => {
+                let _ = resp.send(self.burns_view());
+            }
+            Cmd::Backing { purpose, subject, resp } => {
+                let r = midstate::core::burns::Purpose::parse(&purpose)
+                    .ok_or_else(|| anyhow!("no purpose {purpose:?}"))
+                    .and_then(|p| Ok((p, midstate::core::burns::parse_subject(p, &subject)?)))
+                    .map(|(p, s)| self.backing_of(p, &s));
+                let _ = resp.send(r);
+            }
+            Cmd::Notary { hash, resp } => {
+                let _ = resp.send(self.notary(&hash));
+            }
+            Cmd::SetInboxBar { bar, resp } => {
+                self.set_inbox_bar(bar);
+                let _ = resp.send(Ok(()));
             }
             Cmd::NameMarket { resp } => {
                 let _ = resp.send(self.name_market());
@@ -1129,6 +1209,25 @@ impl Service {
             }
             Cmd::ChatHistory(resp) => {
                 let _ = resp.send(self.chat_history().await);
+            }
+            Cmd::SealedSend { to, text, resp } => {
+                let _ = resp.send(self.send_sealed(&to, &text).await);
+            }
+            Cmd::Conversations(resp) => {
+                let _ = resp.send(self.conversations());
+            }
+            Cmd::NameTargets(resp) => {
+                let v = self
+                    .plan_targets()
+                    .into_iter()
+                    .map(|(label, a, script)| PayTargetView {
+                        label: format!("plan: {label}"),
+                        address: encode_address_with_checksum(&a),
+                        kind: midstate::core::address_kind::classify(&script).label(),
+                        script: hex::encode(script),
+                    })
+                    .collect();
+                let _ = resp.send(v);
             }
             Cmd::ChatDict(resp) => {
                 let _ = resp.send(chat_dictionary_vec());
@@ -1256,9 +1355,15 @@ impl Service {
                         connected: self.book.channels.iter().any(|c| {
                             c.status == ChanStatus::Active && hex::encode(c.receiver_pk) == *pk
                         }),
+                        backing: hex::decode(pk)
+                            .ok()
+                            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                            .map_or(0.0, |k| self.blocks_for(midstate::core::burns::Purpose::HUB, &k)),
                     })
                     .collect();
-                v.sort_by(|a, b| b.outbound.cmp(&a.outbound));
+                // A hub's own claims cost it nothing; its backing did. Most
+                // backed first, then the most capacity.
+                v.sort_by(|a, b| b.backing.total_cmp(&a.backing).then(b.outbound.cmp(&a.outbound)));
                 let _ = resp.send(v);
             }
             Cmd::EvmAccount(resp) => {
@@ -1557,6 +1662,7 @@ impl Service {
         self.bonds = BondBook::load(&self.wallet_path).0;
         self.rentals_load();
         self.names_load();
+        self.identity_load();
         self.plans_load();
         self.scan_pos = 0;
         self.persist_scan_pos();
@@ -1593,6 +1699,7 @@ impl Service {
         }
         self.rentals_load();
         self.names_load();
+        self.identity_load();
         self.plans_load();
         self.mwb_load();
         self.eth_load();
@@ -2699,6 +2806,18 @@ impl Service {
             bail!("node is still syncing — sending against a stale coin set would fail");
         }
         let dest = self.resolve_destination(to)?;
+        self.start_send_to(to, dest, amount, private).await
+    }
+
+    /// A send to `dest`, shown as going to `to` (an address, or the name it
+    /// was resolved from).
+    async fn start_send_to(&mut self, to: &str, dest: [u8; 32], amount: u64, private: bool) -> Result<String> {
+        if self.wallet.is_none() {
+            bail!("wallet is locked");
+        }
+        if self.node.is_syncing() {
+            bail!("node is still syncing — sending against a stale coin set would fail");
+        }
         self.ensure_restore_done()?;
         self.verify_mss_indices().await?;
 
@@ -2897,6 +3016,7 @@ impl Service {
         match msg {
             Internal::Tick => self.tick().await,
             Internal::PoolReply { id, reply } => self.pool_reply(id, reply),
+            Internal::PlanGifts { id, coins } => self.plan_gifts_found(id, coins).await,
             Internal::CommitStalled(c) => {
                 self.set_stage(
                     c,
@@ -3603,6 +3723,7 @@ impl Service {
                 nonce: m.nonce,
                 reply_to: m.reply_to,
                 attachments: m.attachments.len(),
+                sealed: m.attachments.iter().any(|a| matches!(a, midstate::chat::ChatAttachment::EncryptedMessage(_))),
             })
             .collect()
     }
@@ -4691,6 +4812,17 @@ impl Service {
                     address: encoded,
                 });
             }
+            w::CMD_KEM_REQ => {
+                let target = f.address.ok_or_else(|| anyhow!("KEM request without a target"))?;
+                if target != me {
+                    return Ok(());
+                }
+                self.answer_kem_request(id, tip)?;
+            }
+            w::CMD_KEM => {
+                let payload = f.payload.ok_or_else(|| anyhow!("KEM reply without the key"))?;
+                self.on_kem_reply(id, payload).await?;
+            }
             _ => {} // HTLC / resign / legacy traffic: not handled in this build
         }
         Ok(())
@@ -5152,7 +5284,7 @@ impl Service {
 
     /// Ask a peer for an invoice, to be paid automatically when it arrives.
     async fn request_invoice(&mut self, payee_hex: &str, amount: u64) -> Result<()> {
-        let payee = parse_hex32(payee_hex).context("payee must be 64 hex characters")?;
+        let payee = self.peer_key(payee_hex)?;
         let _ = self.ensure_identity()?;
         let req_id: [u8; 32] = rand::random();
         self.book.inv_reqs.insert(hex::encode(req_id), (payee, amount));
@@ -5396,7 +5528,7 @@ impl Service {
 
     /// Ask a peer to fund a channel toward us, so they can pay us instantly.
     async fn request_channel(&mut self, peer_hex: &str, capacity: u64) -> Result<()> {
-        let peer = parse_hex32(peer_hex).context("peer key must be 64 hex characters")?;
+        let peer = self.peer_key(peer_hex)?;
         let me = self.ensure_identity()?;
         if peer == me {
             bail!("that is this wallet's own identity key");
@@ -5432,7 +5564,7 @@ impl Service {
     // trustworthy on a public medium.
 
     async fn request_address(&mut self, peer_hex: &str) -> Result<()> {
-        let peer = parse_hex32(peer_hex).context("peer key must be 64 hex characters")?;
+        let peer = self.peer_key(peer_hex)?;
         let me = self.ensure_identity()?;
         if peer == me {
             bail!("that is this wallet's own identity key");
@@ -7041,6 +7173,9 @@ impl Service {
     async fn tick(&mut self) {
         let status = self.sync_status().await;
         let _ = self.events.send(WalletEvent::NodeTick { status: status.clone() });
+        // First, so a payment waiting on a name's wallet is answered (sent,
+        // or refused) even while the wallet is locked or the node syncs.
+        self.tick_name_sends(status.height).await;
 
         if self.wallet.is_none() {
             return;
@@ -7058,6 +7193,7 @@ impl Service {
         if let Err(e) = self.tick_channels(status.height).await {
             tracing::warn!("channel tick: {e:#}");
         }
+        self.tick_sealed(status.height).await;
         note_slow("the channel tick", t);
         let t = Instant::now();
         if let Err(e) = self.tick_swaps(status.height).await {
@@ -7104,12 +7240,15 @@ impl Service {
         let end = tip.min(self.scan_pos + SCAN_CHUNK);
 
         // Watch targets: HD-derived watch list ∪ every address we already
-        // hold coins or MSS keys on (covers sibling sends to used addresses).
+        // hold coins or MSS keys on (covers sibling sends to used addresses)
+        // ∪ the addresses of our plans, for payments made to them.
+        let plan_watch = self.plan_watch(end);
         let addrs: Vec<[u8; 32]> = {
             let w = self.wallet.as_ref().unwrap();
             let mut set: HashSet<[u8; 32]> = w.watched_addresses().into_iter().collect();
             set.extend(w.coins().iter().map(|c| c.address));
             set.extend(w.mss_keys().iter().map(|m| midstate::core::compute_address(&m.master_pk)));
+            set.extend(plan_watch.keys().copied());
             set.into_iter().collect()
         };
 
@@ -7169,6 +7308,8 @@ impl Service {
         // money: imported, it sat in the balance as "unconfirmed" forever.
         let state = self.node.get_state().await;
         let found: Vec<_> = found.into_iter().filter(|sc| state.coins.contains(&sc.coin_id)).collect();
+        // Payments to our plans' addresses belong to the plans, not the wallet.
+        let found = if plan_watch.is_empty() { found } else { self.take_plan_gifts(found, &plan_watch) };
 
         // Coins arriving at a key we already spent from are quarantined by
         // `import_scanned` (a second signature would leak the key), so they

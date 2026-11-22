@@ -52,6 +52,12 @@
 //!   [`Message::ChatV2`] (index 19) causes a bincode `InvalidTagEncoding`
 //!   error, which `deserialize_bin` surfaces as `Err` and the receiver
 //!   drops the message. No panic, no DoS, no state pollution.
+//! - The same holds one level down for a `ChatV2` carrying
+//!   [`crate::chat::ChatAttachment::EncryptedMessage`], appended after every
+//!   other attachment: a node that predates it fails the decode and only
+//!   logs the inbound failure. The sender, though, sees its request fail, and
+//!   a failed request to its sync peer aborts its sync, so such a chat is sent
+//!   only to peers that list [`SEALED_CHAT_PROTOCOL`] (`Network::send`).
 use crate::core::{Batch, BatchHeader, Transaction};
 use futures::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 use libp2p::StreamProtocol;
@@ -274,6 +280,11 @@ pub fn deserialize_bin(bytes: &[u8]) -> anyhow::Result<Self> {
                             anyhow::bail!("ChatV2 signature attachment exceeds MAX_SIGNATURE_SIZE (1536 bytes)");
                         }
                     }
+                    if let crate::node::ChatAttachment::EncryptedMessage(b) = att {
+                        if b.len() > crate::chat::MAX_ENCRYPTED_MESSAGE_SIZE {
+                            anyhow::bail!("ChatV2 encrypted message exceeds 1536 bytes");
+                        }
+                    }
                 }
             }          
             _ => {}
@@ -285,6 +296,24 @@ pub fn deserialize_bin(bytes: &[u8]) -> anyhow::Result<Self> {
 
 // ── libp2p request-response codec ───────────────────────────────────────────
 pub const MIDSTATE_PROTOCOL: StreamProtocol = StreamProtocol::new("/midstate/2.0.0");
+
+/// A capability, not a second wire format: a node that lists it (identify
+/// carries every protocol a node serves) decodes
+/// [`crate::chat::ChatAttachment::EncryptedMessage`]. Its messages are the
+/// same `Message`s with the same codec; streams still negotiate
+/// [`MIDSTATE_PROTOCOL`] first. A chat carrying a sealed message is sent only
+/// to peers that list this (`Network::send`), so nodes that predate it never
+/// receive one (`crate::chat` module docs say what they would do).
+pub const SEALED_CHAT_PROTOCOL: StreamProtocol = StreamProtocol::new("/midstate/sealed-chat/1.0.0");
+
+impl Message {
+    /// Whether this message carries a sealed chat attachment, which only
+    /// peers listing [`SEALED_CHAT_PROTOCOL`] can decode.
+    pub fn needs_sealed_chat(&self) -> bool {
+        matches!(self, Message::ChatV2 { attachments, .. }
+            if attachments.iter().any(|a| matches!(a, crate::chat::ChatAttachment::EncryptedMessage(_))))
+    }
+}
 const MAX_MSG_SIZE: usize = 10_000_000;
 
 #[derive(Debug, Clone, Default)]
@@ -448,6 +477,26 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn sealed_messages_are_capped_and_flagged() {
+        use crate::chat::ChatAttachment;
+        let chat = |atts: Vec<ChatAttachment>| Message::ChatV2 {
+            sender: "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN".into(),
+            timestamp: 0,
+            nonce: 0,
+            reply_to: None,
+            words: vec![],
+            attachments: atts,
+        };
+        let ok = chat(vec![ChatAttachment::EncryptedMessage(vec![b'a'; 1536])]);
+        assert!(Message::deserialize_bin(&ok.serialize_bin()).is_ok(), "ASCII ciphertext is still ciphertext");
+        assert!(ok.needs_sealed_chat());
+        let big = chat(vec![ChatAttachment::EncryptedMessage(vec![1; 1537])]);
+        assert!(Message::deserialize_bin(&big.serialize_bin()).is_err());
+        assert!(!chat(vec![ChatAttachment::Signature(vec![1; 10])]).needs_sealed_chat());
+        assert!(!Message::Ping { nonce: 1 }.needs_sealed_chat());
     }
 
     #[test]

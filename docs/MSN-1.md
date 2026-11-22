@@ -87,18 +87,55 @@ ignored.
 | 4 | evm | Base account, 20 bytes |
 | 5 | identity | identity key: ask it for a fresh address, an invoice, a channel |
 | 6 | text | a line of UTF-8 |
+| 7 | — | held for a Nostr public key; not built yet |
+| 8 | kem | `H(key)` of an ML-KEM-512 public key, for sealed messages |
+| 9 | script | part of the script behind an mds-address; the parts in order are the script |
+
+Tags 8–9 are client-side: a client that predates them keeps and ignores them,
+as it does any tag (and as clients do tag 7 today).
 
 An MDS payment goes to the first mds-address, or mds-key with at least 16
 signatures left. Senders refuse a name that has lapsed or lapses within a day.
+A sender that can reach the name's identity key asks it for a fresh one-time
+address first, and pays the record only if no answer comes.
+
+- **What kind of address.** An mds-address is the hash of a script, so the
+  address alone says nothing. When the records publish the script (`script`
+  parts that hash to the address), wallets, the explorer and `GET /name` show
+  what it is: a single key, an m-of-n multisig, a vault, an inheritance plan, a
+  payment stream, a covenant. A name that publishes nothing shows as a script
+  address of unpublished kind.
+- **Sealed messages.** The `kem` record lets anyone open a sealed chat session
+  with the name; see `src/sealed.rs`.
 
 ## Software
 
 - **Node:** follows the registry inside each block's write, with an undo log,
   so reorgs unwind exactly. Always on.
   - `GET /name/nick`: holder, tier, `since`, `expires`, deal, records, and
-    where MDS pays now.
+    where MDS pays now, with what kind of address that is (`pays_kind`), the
+    index's `height`, the identity, kem and published script, and the
+    MSB-1 `backing` burned for it (`docs/MSB-1.md`).
+  - `GET /name/nick/proof`: the name's leaf, the records and terms it commits
+    to, and its Merkle proof to the root of the registry's current thread (the
+    predecessor's leaf, for a name never registered). Clients check a node's
+    answer with it rather than trust it (midwimble's resolver does).
   - `GET /names/market`: names offered for sale or rent.
-- **Explorer:** search `nick.mds`.
+- **Explorer:** search `nick.mds`: what it pays and what kind of address that
+  is, its wallet's handshake and sealed messages, its MSB-1 backing, and a
+  link to its proof.
+- **Pool:** a miner may give `nick.mds` as its payout; each job resolves it
+  by `pays`, and refuses one that has lapsed or lapses within a day
+  (`pools.md`).
+- **Midwimble:** `midwimble wallet send --to nick.mds`, `midwimble name nick`,
+  and the explorer resolve a name's MDW record through a Midstate node
+  (`--midstate-rpc`, your own by default) and check it against the registry
+  root with the proof. Then they have the node prove the registry coin
+  unspent (`GET /utxo_proof/:coin`) and check that proof against the state
+  root of the midstate header midwimble consensus relayed at that height
+  (`GET /relay/{height}` on the midwimble node). A node whose state is not the
+  relayed chain's is refused; when the relay has not reached the node's tip
+  yet, the answer says the state is the node's word.
 - **Wallet (the Names page):**
   - **Find a name:** one box shows what any name is (available, unclaimed,
     lapsed, held, for sale, for rent, rented, yours), what it costs, and the
@@ -123,8 +160,36 @@ signatures left. Senders refuse a name that has lapsed or lapses within a day.
     - swap payment keys with 64 or fewer signatures left, and sweep coins that
       still reach the old ones;
     - hand control to a fresh key when the control key has 16 or fewer;
-    - put the name's own records back when a rental ends.
-  - Send to `nick.mds` in MDS or MDW.
+    - put the name's own records back when a rental ends;
+    - keep a name pointed at one of the wallet's inheritance plans on the
+      plan's next deadline (the address a check-in moves its coins to), so
+      payments never land where the deadline has passed and heirs could
+      claim them at once; a name on a plan the wallet closed goes back to
+      its own key.
+  - Send to `nick.mds` in MDS or MDW. A name with an `identity` record is
+    asked for a fresh one-time address first (signed by that identity); if its
+    wallet does not answer within 20 seconds, the record is paid as before. A
+    name that points at a shared address (a published vault, multisig or plan
+    script) is paid there, never around it.
+  - **Edit records** also points a name at a vault, multisig, plan or shared
+    wallet (this wallet's plans are offered, scripts published so the kind
+    shows), and takes sealed messages (`kem`). Payments to a plan's address
+    carry their payers' salts, so the owner's and the heirs' wallets watch
+    every address of the plan in their block scan and keep what arrives as
+    the plan's coins: check-ins carry it along, and claims pay it out. New names get
+    `identity` and `kem` records by default.
+  - **Sealed messages** (the Chat page): write to `nick.mds`; only its wallet
+    reads it. One identity signature opens a session; the session key does
+    the rest.
+  - **Swap market:** a seller's or buyer's name shows on its order or trade
+    when its Base account signed the claim and the name's `evm` record is that
+    account. The account stays what the trade uses.
+  - **MDW market:** a maker's name shows on its order when the claim
+    (`mwb_wire::NameClaim`, chat kind 91, which older wallets skip) is signed
+    by the spend key of the MDW address the name's `mdw` record gives.
+  - **Backing (MSB-1):** the Send page shows what has been burned to back a
+    name being paid, and flags one with none; Find, Your names and the market
+    show it too, with a way to add to it.
   - A change that loses the race for the thread is tried again the next block.
     The chain's first registration also makes the genesis coin.
 

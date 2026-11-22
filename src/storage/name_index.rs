@@ -719,6 +719,94 @@ pub fn names_of(db: &Database, owner: &[u8; 32]) -> Result<Vec<Record>> {
     Ok(out)
 }
 
+/// What a client needs to check a name against the registry's root without
+/// trusting the index that answered: the slot's leaf, the records and terms
+/// it commits to, and its Merkle proof up to the root of the registry's
+/// current thread. For a name never registered, the leaf is its predecessor
+/// in key order, whose `next` skips over the name's key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NameProof {
+    /// The name's own leaf (`true`), or its predecessor's.
+    pub registered: bool,
+    pub slot: u64,
+    pub leaf: Leaf,
+    /// The records and terms the leaf's `data` and `deal` hash (the
+    /// predecessor's when not registered).
+    pub records: Vec<u8>,
+    pub terms: Vec<u8>,
+    /// As `OP_MERKLE_ROOT` reads it: per level, sibling ‖ side.
+    pub proof: Vec<u8>,
+    /// The current thread: its coin, root and salt.
+    pub thread: Thread,
+    /// The height the index stands at.
+    pub height: u64,
+}
+
+impl NameProof {
+    /// The root the proof reaches: `thread.root` for a good one.
+    pub fn computed_root(&self) -> [u8; 32] {
+        let mut acc = self.leaf.hash();
+        for l in 0..self.proof.len() / 33 {
+            let sib: [u8; 32] = self.proof[l * 33..l * 33 + 32].try_into().unwrap();
+            acc = if self.proof[l * 33 + 32] & 1 == 1 { crate::core::types::hash_concat(&sib, &acc) } else { crate::core::types::hash_concat(&acc, &sib) };
+        }
+        acc
+    }
+}
+
+/// A proof as `GET /name/:name/proof` serves it (midwimble's resolver reads
+/// exactly this).
+pub fn proof_json(name: &str, p: &NameProof) -> serde_json::Value {
+    serde_json::json!({
+        "name": format!("{name}{}", names::SUFFIX),
+        "registered": p.registered,
+        "slot": p.slot,
+        "leaf": {
+            "key": hex::encode(p.leaf.key),
+            "next": hex::encode(p.leaf.next),
+            "expires": p.leaf.expires,
+            "tier": p.leaf.tier,
+            "owner": hex::encode(p.leaf.owner),
+            "data": hex::encode(p.leaf.data),
+            "deal": hex::encode(p.leaf.deal),
+        },
+        "records": hex::encode(&p.records),
+        "terms": hex::encode(&p.terms),
+        "proof": hex::encode(&p.proof),
+        "root": hex::encode(p.thread.root),
+        "thread": { "coin": hex::encode(p.thread.id), "salt": hex::encode(p.thread.salt) },
+        "registry": hex::encode(names::address()),
+        "height": p.height,
+    })
+}
+
+/// The proof that `name` holds what the index says, or that it was never
+/// registered, against the registry's current root.
+pub fn prove(db: &Database, name: &str) -> Result<NameProof> {
+    let name = names::normalize(name)?;
+    let m = ready(db)?;
+    let Some(thread) = m.thread else { bail!("the name registry has not started on this chain yet") };
+    let txn = db.begin_read()?;
+    let nodes = txn.open_table(NODES)?;
+    let tree = Tree(&nodes);
+    let found = find(&txn, &name)?;
+    let (slot, leaf, registered) = match found {
+        Some((slot, leaf, true)) => (slot, leaf, true),
+        Some((_, _, false)) => bail!("another name shares {name}'s key"),
+        None => {
+            let k = names::ord(&names::key(name.as_bytes()));
+            let keys = txn.open_table(KEYS)?;
+            let (_, v) = keys.range(..k)?.next_back().ok_or_else(|| anyhow!("name index: no sentinel"))??;
+            let slot = u64::from_le_bytes(v.value()[..8].try_into()?);
+            let raw = txn.open_table(LEAVES)?.get(slot)?.ok_or_else(|| anyhow!("name index: slot missing"))?.value().to_owned();
+            (slot, Leaf::from_bytes(&raw), false)
+        }
+    };
+    let raw = txn.open_table(RECORDS)?.get(slot)?.map(|g| g.value().to_vec()).unwrap_or_else(|| vec![0; 8]);
+    let terms = txn.open_table(DEALS)?.get(slot)?.map_or_else(|| Deal::None.terms(), |g| g.value().to_vec());
+    Ok(NameProof { registered, slot, leaf, records: raw[8..].to_vec(), terms, proof: names::proof(&tree, slot)?, thread, height: m.next })
+}
+
 /// A sale or rental that landed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Sold {
@@ -1013,6 +1101,34 @@ mod tests {
         bs.save(H + 4, &block(6, vec![spend_tx(&db, "bitcoin", How::Rent, None, take)])).unwrap();
         let r = lookup(&db, "bitcoin").unwrap().unwrap();
         assert_eq!((r.owner, r.deal, r.records[1].clone()), (me, Deal::Rented { price: 100, payee, until }, Rec::Text("renter".into())));
+    }
+
+    #[test]
+    fn a_proof_reaches_the_threads_root_for_names_in_and_out() {
+        let (_d, db, bs) = chain(true, &[vec![make(names::genesis())]]);
+        bs.save(H + 1, &block(2, vec![register_tx(&db, "nick", 7)])).unwrap();
+        let p = prove(&db, "nick").unwrap();
+        assert!(p.registered);
+        assert_eq!(p.computed_root(), p.thread.root);
+        assert_eq!(p.leaf.key, names::key(b"nick"));
+        assert_eq!(crate::core::types::hash(&p.records), p.leaf.data, "the records are the leaf's");
+        assert_eq!(crate::core::types::hash(&p.terms), p.leaf.deal);
+        assert_eq!(names::parse(&p.records).unwrap(), lookup(&db, "nick").unwrap().unwrap().records);
+        // Not registered: the predecessor's leaf skips over its key.
+        let q = prove(&db, "nobody-here").unwrap();
+        let k = names::ord(&names::key(b"nobody-here"));
+        assert!(!q.registered && names::ord(&q.leaf.key) < k && k < names::ord(&q.leaf.next));
+        assert_eq!(q.computed_root(), q.thread.root);
+        // A forged record set does not hash to the leaf.
+        let forged = names::encode(&[names::Rec::MdsAddress([9; 32])]).unwrap();
+        assert_ne!(crate::core::types::hash(&forged), p.leaf.data);
+        // The coin the proof names is the registry thread's, at its address.
+        assert_eq!(p.thread.id, OutputData::Confidential { address: names::address(), commitment: p.thread.root, salt: p.thread.salt }.coin_id().unwrap());
+        if std::env::var("PRINT_NAME_PROOF").is_ok() {
+            let set = Set { records: names::encode(&[Rec::Mdw("mw1fixture".into())]).unwrap(), ..hold(&db, [8; 32], "") };
+            bs.save(H + 2, &block(3, vec![spend_tx(&db, "mdwname", How::Hold(None), None, set)])).unwrap();
+            println!("{}", proof_json("mdwname", &prove(&db, "mdwname").unwrap()));
+        }
     }
 
     #[test]

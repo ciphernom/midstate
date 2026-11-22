@@ -250,6 +250,7 @@ tr.mine > td { background: var(--accent-bg); }
     <span><span class="label">FEE</span> <span class="val" id="h-fee">--</span></span>
     <span><span class="label">MINERS</span> <span class="val" id="h-miners">--</span></span>
     <span><span class="label">HEIGHT</span> <span class="val" id="h-height">--</span></span>
+    <span id="h-backing-wrap" hidden title="MDS burned to back this pool's fee address (MSB-1), in blocks of issuance; each burn's weight halves yearly"><span class="label">BACKED</span> <span class="val" id="h-backing">--</span></span>
     <span id="h-mine" hidden></span>
     <span><div class="live-dot" id="live-dot" style="background: var(--red);"></div> <span class="label">STATUS</span> <span class="val" id="status-text">OFFLINE</span></span>
     <button id="theme-toggle" class="btn theme-toggle" onclick="toggleTheme()" aria-label="Toggle theme"><svg class="icon-sun" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg><svg class="icon-moon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg></button>
@@ -1664,6 +1665,10 @@ function renderPool(data) {
   $('h-miners').textContent = fmtInt(data.active_miners);
   const netHeight = Number(data.network_height) || 0;
   $('h-height').textContent = netHeight > 0 ? ('#' + fmtInt(netHeight)) : '--';
+  // MSB-1: what the pool burned to back itself, as its node counts it.
+  const backing = data.backing;
+  $('h-backing-wrap').hidden = !backing;
+  if (backing) $('h-backing').textContent = backing.backing_text + (backing.tier ? ' (' + backing.tier + ')' : '');
 
   const total = Number(data.total_score) || 0;
 

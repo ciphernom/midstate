@@ -36,3 +36,10 @@ pub mod plans;
 
 // MSN-1 names: one registry thread, on existing opcodes.
 pub mod names;
+
+// What kind of address a script makes (key, multisig, vault, plan), for people.
+pub mod address_kind;
+
+// MSB-1: burns that back a name, a key, a pool or a hub, or notarize a
+// document, weighed in block rewards. Client-side: no consensus rule.
+pub mod burns;

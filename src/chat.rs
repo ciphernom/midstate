@@ -2,15 +2,31 @@
 //!
 //! Midstate's chat is a dictionary-bound P2P message bus. Every chat token
 //! is a `u8` index into [`CHAT_DICTIONARY`] (256 fixed entries), and every
-//! field that gossips across the network is either a fixed-width byte
-//! payload or a tightly-bounded enumeration the receiver controls. The
-//! design property the subsystem is built around:
+//! other field that gossips across the network is a byte payload the
+//! receiver bounds. The design property the subsystem is built around:
 //!
-//! > **NoArbitraryText.** No field in any chat message admits
-//! > user-controllable `String` or variable-length `Vec<u8>` carrying
-//! > textual data. The only `String` is `sender`, which is validated as
-//! > a base58 libp2p `PeerId` in
-//! > [`crate::network::protocol::Message::deserialize_bin`].
+//! > **No readable text in the clear.** Words are dictionary indices, never
+//! > free text. The only `String` is `sender`, validated as a base58 libp2p
+//! > `PeerId` (or a 64-hex MSS key) in
+//! > [`crate::network::protocol::Message::deserialize_bin`]. Fixed-width
+//! > attachments that parse as UTF-8 are refused as graffiti
+//! > ([`ChatAttachment::is_graffiti`]).
+//!
+//! What that property does **not** say, plainly:
+//!
+//! * Two attachments carry arbitrary bytes of variable length and are not
+//!   graffiti-checked: [`ChatAttachment::Signature`] (up to 1,536 bytes) and
+//!   [`ChatAttachment::EncryptedMessage`] (up to 1,536 bytes). `Signature`
+//!   already carries more than signatures: qbolt frames and the swap markets'
+//!   adverts ride in it, in the clear. Nothing stops a sender putting text
+//!   there, and no node can tell ciphertext from text: random-looking bytes
+//!   are all a node ever sees of a sealed message.
+//! * So the property is about what Midstate software *shows*, not about what
+//!   a determined sender can smuggle: no client renders an attachment's bytes
+//!   as text, and a sealed message is readable only by the wallet holding the
+//!   key it was sealed to. Smuggling costs proof of work by the byte
+//!   ([`chat_pow_units`]) for `EncryptedMessage`, and the 20-bit chat proof of
+//!   work for `Signature` (unchanged, so existing peers keep agreeing).
 //!
 //! ## Wire variants
 //!
@@ -20,6 +36,22 @@
 //! - [`crate::network::protocol::Message::ChatV2`] — current. PoW
 //!   ([`verify_chat_pow_v2`]) additionally covers `attachments` and is
 //!   domain-separated from v1 (Lemma 2.3.1 in `verify_chat_pow_v2` docs).
+//!
+//! ## Sealed messages and older nodes
+//!
+//! [`ChatAttachment::EncryptedMessage`] is appended after every existing
+//! variant, so every other attachment (and every other `Message`) encodes
+//! byte for byte as before. A node that predates it cannot decode a `ChatV2`
+//! carrying one: bincode fails on the unknown variant index inside the
+//! attachments, `deserialize_bin` errs, and libp2p's request-response reports
+//! an inbound failure, which `network::Network` only logs. The old node
+//! drops that message and relays nothing; it neither scores nor disconnects
+//! the sender. The *sender* sees its request fail, and a failed request to
+//! its sync peer aborts its sync session. So a node sends a chat carrying a
+//! sealed message only to peers that advertise
+//! [`crate::network::protocol::SEALED_CHAT_PROTOCOL`] (`Network::send`), and
+//! older peers never see one: the chat network does not split, sealed
+//! messages simply travel among upgraded nodes.
 //!
 //! ## Chat-only frame property
 //!
@@ -103,12 +135,14 @@ pub const CHAT_DICTIONARY: &[&str] = &[
 
 /// A typed, fixed-shape attachment that rides alongside a v2 chat message.
 ///
-/// # Invariant: NoArbitraryText
+/// # Invariant: no readable text in the clear
 ///
-/// Every variant is structurally a fixed-width byte payload. There is no
-/// field in this enum that admits user-controlled `String` or
-/// variable-length `Vec<u8>` of textual data. The constraint is enforced
-/// at the type level by serde and bincode.
+/// No variant is a `String`. The fixed-width variants are refused when they
+/// parse as UTF-8 ([`ChatAttachment::is_graffiti`]). Two variants carry
+/// arbitrary bytes of variable length, bounded at 1,536: `Signature`
+/// (protocol payloads in the clear: signatures, qbolt frames, swap adverts)
+/// and `EncryptedMessage` (ciphertext). See the module docs for what that
+/// does and does not rule out.
 ///
 /// # Encoding
 ///
@@ -122,9 +156,18 @@ pub const CHAT_DICTIONARY: &[&str] = &[
 /// When mining or verifying via [`verify_chat_pow_v2`], each attachment
 /// is encoded as `tag_u8 ⌢ payload_bytes`:
 ///
-/// | Variant   | Tag    | Payload length |
-/// |-----------|--------|----------------|
-/// | `Address` | `0x01` | 32             |
+/// | Variant            | Tag    | Payload                         |
+/// |--------------------|--------|---------------------------------|
+/// | `Address`          | `0x01` | 32 bytes                        |
+/// | `CoinId`           | `0x02` | 32 bytes                        |
+/// | `MixId`            | `0x03` | 32 bytes                        |
+/// | `Commitment`       | `0x04` | 32 bytes                        |
+/// | `BlockHash`        | `0x05` | 32 bytes                        |
+/// | `Midstate`         | `0x06` | 32 bytes                        |
+/// | `DataHash`         | `0x07` | 32 bytes                        |
+/// | `LicenseChallenge` | `0x08` | commitment ‖ le8(height) ‖ salt |
+/// | `Signature`        | `0x09` | le4(len) ‖ bytes                |
+/// | `EncryptedMessage` | `0x0A` | le4(len) ‖ bytes                |
 ///
 /// Future variants append new tags; existing tags are immutable.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -160,6 +203,50 @@ pub enum ChatAttachment {
     /// Post: payload is transmitted verbatim over the P2P chat network
     /// ```
     Signature(Vec<u8>),
+    /// A sealed message: ciphertext only its recipient's wallet can open
+    /// (`crate::sealed`). Who it is for is not in the clear; recipients
+    /// trial-decrypt every one, as wallets scan for stealth payments.
+    ///
+    /// ```text
+    /// Pre:  payload.len() <= MAX_ENCRYPTED_MESSAGE_SIZE (1536 bytes)
+    /// PoW:  scales with payload size (chat_pow_units)
+    /// Wire: appended: older nodes cannot decode it, so it is sent only to
+    ///       peers that advertise SEALED_CHAT_PROTOCOL
+    /// ```
+    EncryptedMessage(Vec<u8>),
+}
+
+/// Largest [`ChatAttachment::EncryptedMessage`] payload.
+pub const MAX_ENCRYPTED_MESSAGE_SIZE: usize = 1_536;
+
+/// Leading zero bits a chat's proof of work needs, per unit of work.
+pub const CHAT_POW_BITS: u32 = 20;
+
+/// Bytes of sealed payload one unit of chat proof of work covers.
+pub const ENCRYPTED_POW_UNIT: usize = 512;
+
+/// Units of proof of work a v2 chat with `attachments` needs: one, plus one
+/// per [`ENCRYPTED_POW_UNIT`] bytes of `EncryptedMessage` payload beyond the
+/// first. A chat without one needs exactly one unit, the 20 bits it always
+/// has, so every existing chat verifies as before.
+///
+/// ```text
+/// units(m) = max(1, ⌈Σ |e| / 512⌉)   over e ∈ EncryptedMessage attachments of m
+/// ```
+pub fn chat_pow_units(attachments: &[ChatAttachment]) -> u64 {
+    let sealed: usize = attachments
+        .iter()
+        .map(|a| if let ChatAttachment::EncryptedMessage(b) = a { b.len() } else { 0 })
+        .sum();
+    (sealed.div_ceil(ENCRYPTED_POW_UNIT) as u64).max(1)
+}
+
+/// Whether `h` meets `units` of chat proof of work: its first 64 bits, big
+/// endian, under `2^(64 − 20) / units`. One unit is exactly "20 leading zero
+/// bits"; `units` of them take `units` times the hashes on average.
+pub fn meets_chat_pow(h: &[u8; 32], units: u64) -> bool {
+    let top = u64::from_be_bytes(h[..8].try_into().expect("8 bytes"));
+    top < (1u64 << (64 - CHAT_POW_BITS)) / units.max(1)
 }
 
 impl ChatAttachment {
@@ -176,6 +263,7 @@ impl ChatAttachment {
             ChatAttachment::DataHash(b) => Some(b.as_slice()),
             ChatAttachment::LicenseChallenge { .. } => None,
             ChatAttachment::Signature(_) => None,
+            ChatAttachment::EncryptedMessage(_) => None,
         };
         
         match bytes {
@@ -204,6 +292,7 @@ impl serde::Serialize for ChatAttachment {
                 DataHash(String),
                 LicenseChallenge { commitment: String, height: u64, salt: String },
                 Signature(String), 
+                EncryptedMessage(String),
             }
 
             let helper = match self {
@@ -222,6 +311,7 @@ impl serde::Serialize for ChatAttachment {
                     }
                 }
                 ChatAttachment::Signature(sig) => JsonHelper::Signature(hex::encode(sig)),
+                ChatAttachment::EncryptedMessage(b) => JsonHelper::EncryptedMessage(hex::encode(b)),
             };
             helper.serialize(serializer)
         } else {
@@ -237,6 +327,8 @@ impl serde::Serialize for ChatAttachment {
                 DataHash(&'a [u8; 32]),
                 LicenseChallenge { commitment: &'a [u8; 32], height: u64, salt: &'a [u8; 32] },
                 Signature(&'a [u8]),
+                // Appended: every variant above keeps its index and bytes.
+                EncryptedMessage(&'a [u8]),
             }
             let helper = match self {
                 ChatAttachment::Address(addr) => BincodeHelper::Address(addr),
@@ -250,6 +342,7 @@ impl serde::Serialize for ChatAttachment {
                     BincodeHelper::LicenseChallenge { commitment: &[0u8; 32], height: *height, salt }
                 }
                 ChatAttachment::Signature(sig) => BincodeHelper::Signature(sig.as_slice()), 
+                ChatAttachment::EncryptedMessage(b) => BincodeHelper::EncryptedMessage(b.as_slice()),
             };
             helper.serialize(serializer)
         }
@@ -271,6 +364,7 @@ impl<'de> serde::Deserialize<'de> for ChatAttachment {
                 DataHash(String),
                 LicenseChallenge { commitment: String, height: u64, salt: String },
                 Signature(String), 
+                EncryptedMessage(String),
             }
 
             let helper = JsonHelper::deserialize(deserializer)?;
@@ -301,6 +395,13 @@ impl<'de> serde::Deserialize<'de> for ChatAttachment {
                     let bytes = hex::decode(s).map_err(serde::de::Error::custom)?;
                     Ok(ChatAttachment::Signature(bytes))
                 }
+                JsonHelper::EncryptedMessage(s) => {
+                    let bytes = hex::decode(s).map_err(serde::de::Error::custom)?;
+                    if bytes.len() > MAX_ENCRYPTED_MESSAGE_SIZE {
+                        return Err(serde::de::Error::custom("encrypted message exceeds 1536 bytes"));
+                    }
+                    Ok(ChatAttachment::EncryptedMessage(bytes))
+                }
            }
     
         } else {
@@ -316,6 +417,7 @@ impl<'de> serde::Deserialize<'de> for ChatAttachment {
                 DataHash([u8; 32]),
                 LicenseChallenge { commitment: [u8; 32], height: u64, salt: [u8; 32] },
                 Signature(Vec<u8>),
+                EncryptedMessage(Vec<u8>),
             }
             let helper = BincodeHelper::deserialize(deserializer)?;
             match helper {
@@ -330,6 +432,7 @@ impl<'de> serde::Deserialize<'de> for ChatAttachment {
                     Ok(ChatAttachment::LicenseChallenge { commitment, height, salt })
                 }
                 BincodeHelper::Signature(sig) => Ok(ChatAttachment::Signature(sig)), 
+                BincodeHelper::EncryptedMessage(b) => Ok(ChatAttachment::EncryptedMessage(b)),
             }
         }
     }
@@ -458,7 +561,15 @@ pub fn mine_chat_pow(sender: String, timestamp: u64, reply_to: Option<u64>, word
 ///
 /// # Difficulty
 ///
-/// Same 20 leading zero bits as v1.
+/// [`chat_pow_units`] units of 20 leading zero bits ([`meets_chat_pow`]):
+/// exactly v1's 20 bits for any chat without an `EncryptedMessage`, more as
+/// sealed bytes grow.
+///
+/// # Variable-length attachments
+///
+/// `Signature` and `EncryptedMessage` enter the preimage as
+/// `tag ‖ le4(len) ‖ bytes`, length-prefixed so no two attachment lists
+/// serialize alike. The buffer's capacity is only a size hint.
 pub fn verify_chat_pow_v2(
     sender: &str,
     timestamp: u64,
@@ -467,9 +578,15 @@ pub fn verify_chat_pow_v2(
     attachments: &[ChatAttachment],
     nonce: u64,
 ) -> bool {
-    let mut data = Vec::with_capacity(
-        sender.len() + 8 + 8 + words.len() + 4 + attachments.len() * (1 + 32) + 8,
-    );
+    let attachment_bytes: usize = attachments
+        .iter()
+        .map(|a| match a {
+            ChatAttachment::LicenseChallenge { .. } => 1 + 32 + 8 + 32,
+            ChatAttachment::Signature(b) | ChatAttachment::EncryptedMessage(b) => 1 + 4 + b.len(),
+            _ => 1 + 32,
+        })
+        .sum();
+    let mut data = Vec::with_capacity(sender.len() + 8 + 8 + words.len() + 4 + attachment_bytes + 8);
     data.extend_from_slice(sender.as_bytes());
     data.extend_from_slice(&timestamp.to_le_bytes());
     data.extend_from_slice(&reply_to.unwrap_or(0).to_le_bytes());
@@ -518,12 +635,17 @@ pub fn verify_chat_pow_v2(
                 data.extend_from_slice(&(sig.len() as u32).to_le_bytes());
                 data.extend_from_slice(sig);
             }
+            ChatAttachment::EncryptedMessage(b) => {
+                data.push(0x0A); // tag: EncryptedMessage
+                data.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                data.extend_from_slice(b);
+            }
         }
     }
     data.extend_from_slice(&nonce.to_le_bytes());
 
     let h = hash(&data);
-    count_leading_zeros(&h) >= 20
+    meets_chat_pow(&h, chat_pow_units(attachments))
 }
 
 /// Search nonces from 0 upward until [`verify_chat_pow_v2`] returns `true`.
@@ -546,13 +668,16 @@ pub fn mine_chat_pow_v2(
     words: Vec<u8>,
     attachments: Vec<ChatAttachment>,
 ) -> u64 {
+    // Expected 2^20 · units tries; giving up past 16 times that has odds of
+    // about e^-16 for a correct miner.
+    let limit = (1u64 << CHAT_POW_BITS) * 16 * chat_pow_units(&attachments);
     let mut n = 0u64;
     loop {
         if verify_chat_pow_v2(&sender, timestamp, reply_to, &words, &attachments, n) {
             return n;
         }
         n += 1;
-        if n > 10_000_000 {
+        if n > limit {
             panic!("mine_chat_pow_v2: could not find valid nonce (impossible on 20-bit target)");
         }
     }
@@ -574,5 +699,145 @@ pub struct ChatManager {
 impl ChatManager {
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bincode::Options;
+
+    fn codec() -> impl Options {
+        bincode::DefaultOptions::new()
+    }
+
+    /// The attachment enum as a node before `EncryptedMessage` has it, for
+    /// checking what such a node makes of what this one sends.
+    #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+    enum OldWire {
+        Address([u8; 32]),
+        CoinId([u8; 32]),
+        MixId([u8; 32]),
+        Commitment([u8; 32]),
+        BlockHash([u8; 32]),
+        Midstate([u8; 32]),
+        DataHash([u8; 32]),
+        LicenseChallenge { commitment: [u8; 32], height: u64, salt: [u8; 32] },
+        Signature(Vec<u8>),
+    }
+
+    fn every_old_kind() -> (Vec<ChatAttachment>, Vec<OldWire>) {
+        (
+            vec![
+                ChatAttachment::Address([1; 32]),
+                ChatAttachment::CoinId([2; 32]),
+                ChatAttachment::MixId([3; 32]),
+                ChatAttachment::Commitment([4; 32]),
+                ChatAttachment::BlockHash([5; 32]),
+                ChatAttachment::Midstate([6; 32]),
+                ChatAttachment::DataHash([7; 32]),
+                ChatAttachment::LicenseChallenge { commitment: [8; 32], height: 9, salt: [10; 32] },
+                ChatAttachment::Signature(vec![11; 600]),
+            ],
+            vec![
+                OldWire::Address([1; 32]),
+                OldWire::CoinId([2; 32]),
+                OldWire::MixId([3; 32]),
+                OldWire::Commitment([4; 32]),
+                OldWire::BlockHash([5; 32]),
+                OldWire::Midstate([6; 32]),
+                OldWire::DataHash([7; 32]),
+                // The wire has always carried a zero commitment here.
+                OldWire::LicenseChallenge { commitment: [0; 32], height: 9, salt: [10; 32] },
+                OldWire::Signature(vec![11; 600]),
+            ],
+        )
+    }
+
+    #[test]
+    fn existing_attachments_encode_byte_for_byte_as_before() {
+        let (new, old) = every_old_kind();
+        assert_eq!(codec().serialize(&new).unwrap(), codec().serialize(&old).unwrap());
+        let msg = crate::network::protocol::Message::ChatV2 {
+            sender: "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN".into(),
+            timestamp: 1,
+            nonce: 2,
+            reply_to: Some(3),
+            words: vec![4, 5],
+            // Fixed-width test patterns would read as graffiti; these two are exempt.
+            attachments: new[7..].to_vec(),
+        };
+        let bytes = msg.serialize_bin();
+        assert!(crate::network::protocol::Message::deserialize_bin(&bytes).is_ok());
+    }
+
+    #[test]
+    fn an_older_node_cannot_decode_a_sealed_message_and_only_drops_it() {
+        let sealed = vec![ChatAttachment::Address([1; 32]), ChatAttachment::EncryptedMessage(vec![0xAB; 900])];
+        let bytes = codec().serialize(&sealed).unwrap();
+        // The unknown variant index fails the whole decode: the old node's
+        // `deserialize_bin` errs, the stream fails, and the message is gone.
+        assert!(codec().deserialize::<Vec<OldWire>>(&bytes).is_err());
+        // And this node reads it back whole.
+        assert_eq!(codec().deserialize::<Vec<ChatAttachment>>(&bytes).unwrap(), sealed);
+        let json = serde_json::to_value(&sealed[1]).unwrap();
+        assert_eq!(json["kind"], "encrypted_message");
+        assert_eq!(serde_json::from_value::<ChatAttachment>(json).unwrap(), sealed[1]);
+    }
+
+    #[test]
+    fn ciphertext_is_never_graffiti_but_fixed_text_still_is() {
+        // Ciphertext may well be valid UTF-8 (all ASCII here); it is exempt.
+        assert!(!ChatAttachment::EncryptedMessage(b"looks like text".to_vec()).is_graffiti());
+        assert!(ChatAttachment::DataHash(*b"this is 32 bytes of ascii text!!").is_graffiti());
+    }
+
+    #[test]
+    fn one_unit_is_exactly_the_old_twenty_bits() {
+        for i in 0..20_000u32 {
+            let h = hash(&i.to_le_bytes());
+            assert_eq!(meets_chat_pow(&h, 1), count_leading_zeros(&h) >= 20, "hash {i}");
+        }
+        let mut edge = [0u8; 32];
+        edge[2] = 0x0F; // 20 zero bits, then ones
+        edge[3] = 0xFF;
+        assert!(meets_chat_pow(&edge, 1));
+        edge[2] = 0x10; // 19 zero bits
+        assert!(!meets_chat_pow(&edge, 1));
+    }
+
+    #[test]
+    fn proof_of_work_scales_with_sealed_bytes_only() {
+        let sig = ChatAttachment::Signature(vec![0; 1536]);
+        assert_eq!(chat_pow_units(&[]), 1);
+        assert_eq!(chat_pow_units(&[sig.clone(), ChatAttachment::Address([1; 32])]), 1, "signatures stay at one unit");
+        assert_eq!(chat_pow_units(&[ChatAttachment::EncryptedMessage(vec![0; 300])]), 1);
+        assert_eq!(chat_pow_units(&[ChatAttachment::EncryptedMessage(vec![0; 513])]), 2);
+        let full = ChatAttachment::EncryptedMessage(vec![0; MAX_ENCRYPTED_MESSAGE_SIZE]);
+        assert_eq!(chat_pow_units(&[full.clone()]), 3);
+        assert_eq!(chat_pow_units(&[full.clone(), full.clone(), full.clone(), full.clone()]), 12);
+        // A harder target is a smaller one: anything meeting 3 units meets 1.
+        let h = {
+            let mut h = [0u8; 32];
+            h[2] = 0x05;
+            h
+        };
+        assert!(meets_chat_pow(&h, 1) && meets_chat_pow(&h, 3) && !meets_chat_pow(&h, 4));
+    }
+
+    #[test]
+    fn a_sealed_chat_mines_and_verifies_and_is_bound_to_its_bytes() {
+        let atts = vec![ChatAttachment::EncryptedMessage(vec![7; 700])];
+        let n = mine_chat_pow_v2("peer".into(), 5, None, vec![1], atts.clone());
+        assert!(verify_chat_pow_v2("peer", 5, None, &[1], &atts, n));
+        let mut other = atts.clone();
+        if let ChatAttachment::EncryptedMessage(b) = &mut other[0] {
+            b[0] ^= 1;
+        }
+        // With overwhelming probability the altered bytes miss the target.
+        assert!(!verify_chat_pow_v2("peer", 5, None, &[1], &other, n));
+        // The same bytes as a Signature are another preimage (tag 0x09).
+        let as_sig = vec![ChatAttachment::Signature(vec![7; 700])];
+        assert!(!verify_chat_pow_v2("peer", 5, None, &[1], &as_sig, n));
     }
 }

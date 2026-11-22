@@ -744,6 +744,57 @@ enum WalletAction {
         #[arg(long)]
         private: bool,
     },
+    /// Burn MDS for something (MSB-1): back a name, a key, a Base account, a
+    /// pool or a hub, or notarize a file. Backing is weighed in blocks of
+    /// issuance and halves every year; `--blocks 1440` burns a day's worth.
+    Burn {
+        /// Path to the encrypted wallet.dat.
+        #[arg(long, default_value_os_t = default_wallet_path())]
+        path: PathBuf,
+        /// RPC port of the node to talk to. Must match the node's --rpc-port.
+        #[arg(long, default_value = "8545")]
+        rpc_port: u16,
+        /// RPC host of the node to talk to.
+        #[arg(long, default_value = "127.0.0.1")]
+        rpc_host: String,
+        /// name, key, evm, pool, hub, notary or notary-sha256.
+        #[arg(long)]
+        purpose: String,
+        /// The name, key, address, 0x account or document hash.
+        #[arg(long)]
+        subject: Option<String>,
+        /// A file to notarize: its hash is the subject (BLAKE3 for notary,
+        /// SHA-256 for notary-sha256).
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Blocks of issuance to burn: this many of the current block reward.
+        #[arg(long)]
+        blocks: Option<u64>,
+        /// Or the amount in units.
+        #[arg(long)]
+        units: Option<u64>,
+        /// A note kept with the burn, up to 43 bytes.
+        #[arg(long, default_value = "")]
+        label: String,
+        /// Seconds to wait for the transaction to confirm before giving up.
+        #[arg(long, default_value = "120")]
+        timeout: u64,
+    },
+    /// What a name, key, account, pool, hub or document has had burned for it
+    /// (MSB-1), from a node's burn index.
+    Backing {
+        /// RPC port of the node to talk to. Must match the node's --rpc-port.
+        #[arg(long, default_value = "8545")]
+        rpc_port: u16,
+        /// RPC host of the node to talk to.
+        #[arg(long, default_value = "127.0.0.1")]
+        rpc_host: String,
+        /// name, key, evm, pool, hub, notary or notary-sha256.
+        #[arg(long)]
+        purpose: String,
+        #[arg(long)]
+        subject: String,
+    },
     /// Spend coins locked by a MidstateScript contract, supplying the bytecode
     /// and the witness values the script expects.
     SpendScript {
@@ -1171,9 +1222,21 @@ fn parse_hex32(s: &str) -> Result<[u8; 32]> {
 enum ParsedOutput {
     Standard([u8; 32], u64),
     Stateful([u8; 32], [u8; 32]),
+    /// `burn:<payload hex>:<value>`: a `DataBurn`, as many outputs as the
+    /// value has powers of two.
+    Burn(Vec<u8>, u64),
 }
 
 fn parse_output_spec(s: &str) -> Result<ParsedOutput> {
+    if let Some(rest) = s.strip_prefix("burn:") {
+        let (payload, value) = rest.split_once(':').ok_or_else(|| anyhow::anyhow!("expected burn:<payload_hex>:<value>"))?;
+        let payload = hex::decode(payload).context("invalid burn payload hex")?;
+        if payload.len() > midstate::core::types::MAX_BURN_DATA_SIZE {
+            anyhow::bail!("a burn's payload is at most {} bytes", midstate::core::types::MAX_BURN_DATA_SIZE);
+        }
+        let value: u64 = value.parse().map_err(|_| anyhow::anyhow!("invalid value: {value}"))?;
+        return Ok(ParsedOutput::Burn(payload, value));
+    }
     let parts: Vec<&str> = s.split(':').collect();
     if parts.len() < 2 || parts.len() > 3 {
         anyhow::bail!("expected format <address>:<value>[:<state_hex>]");
@@ -2009,6 +2072,12 @@ async fn wallet_spend_script(
             ParsedOutput::Stateful(addr, state) => {
                 outputs.push(midstate::core::OutputData::Confidential { address: addr, commitment: state, salt });
             }
+            ParsedOutput::Burn(payload, val) => {
+                for v in midstate::core::decompose_value(val) {
+                    outputs.push(midstate::core::OutputData::DataBurn { payload: payload.clone(), value_burned: v });
+                }
+                out_sum += val;
+            }
         }
     }
 
@@ -2203,6 +2272,10 @@ async fn handle_wallet(action: WalletAction) -> Result<()> {
         WalletAction::Send { path, rpc_port, rpc_host, coin, to, timeout, private } => {
             wallet_send(&path, rpc_port, rpc_host, coin, to, timeout, private).await
         }
+        WalletAction::Burn { path, rpc_port, rpc_host, purpose, subject, file, blocks, units, label, timeout } => {
+            wallet_burn(&path, rpc_port, rpc_host, purpose, subject, file, blocks, units, label, timeout).await
+        }
+        WalletAction::Backing { rpc_port, rpc_host, purpose, subject } => wallet_backing(rpc_port, rpc_host, purpose, subject).await,
         WalletAction::SpendScript { path, rpc_port, rpc_host, coin, bytecode, inputs, input_state, burn_data, to, timeout } => {
             wallet_spend_script(&path, rpc_port, rpc_host, coin, bytecode, inputs, input_state, burn_data, to, timeout).await
         }
@@ -3200,6 +3273,94 @@ async fn wallet_defrag(
     Ok(())
 }
 
+/// The subject a burn's options name: typed, or the hash of `file`.
+fn burn_subject(purpose: midstate::core::burns::Purpose, subject: Option<String>, file: Option<PathBuf>) -> Result<[u8; 32]> {
+    use midstate::core::burns::{self, Purpose};
+    match (subject, file) {
+        (Some(_), Some(_)) => anyhow::bail!("give --subject or --file, not both"),
+        (None, None) => anyhow::bail!("give --subject (or --file to notarize one)"),
+        (Some(s), None) => burns::parse_subject(purpose, &s),
+        (None, Some(f)) => {
+            let bytes = std::fs::read(&f).with_context(|| format!("reading {}", f.display()))?;
+            match purpose {
+                Purpose::NOTARY => Ok(*blake3::hash(&bytes).as_bytes()),
+                Purpose::NOTARY_SHA256 => {
+                    use sha2::Digest;
+                    Ok(sha2::Sha256::digest(&bytes).into())
+                }
+                _ => anyhow::bail!("--file is for notary and notary-sha256"),
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wallet_burn(
+    path: &PathBuf,
+    rpc_port: u16,
+    rpc_host: String,
+    purpose: String,
+    subject: Option<String>,
+    file: Option<PathBuf>,
+    blocks: Option<u64>,
+    units: Option<u64>,
+    label: String,
+    timeout: u64,
+) -> Result<()> {
+    use midstate::core::burns::{self, Backing, Purpose};
+    let p = Purpose::parse(&purpose).ok_or_else(|| anyhow::anyhow!("no purpose {purpose:?}: name, key, evm, pool, hub, notary or notary-sha256"))?;
+    let b = Backing::new(p, burn_subject(p, subject, file)?, &label)?;
+    let client = reqwest::Client::new();
+    let state: rpc::GetStateResponse = client
+        .get(format!("http://{rpc_host}:{rpc_port}/state"))
+        .send()
+        .await
+        .context("could not reach the node")?
+        .json()
+        .await
+        .context("the node's /state did not parse")?;
+    let value = match (blocks, units) {
+        (Some(_), Some(_)) => anyhow::bail!("give --blocks or --units, not both"),
+        (Some(n), None) => burns::cost(n, state.height),
+        (None, Some(u)) => u,
+        (None, None) if p.is_notary() => 0,
+        (None, None) => anyhow::bail!("give --blocks (of issuance) or --units to burn"),
+    };
+    println!(
+        "Burning {value} units for {} {} ({:.2} blocks of issuance at block {}; its weight halves each year).",
+        p.word(),
+        b.subject_text(),
+        burns::weight(value, state.height),
+        state.height
+    );
+    wallet_send(path, rpc_port, rpc_host, Vec::new(), vec![format!("burn:{}:{value}", hex::encode(b.payload()))], timeout, false).await
+}
+
+async fn wallet_backing(rpc_port: u16, rpc_host: String, purpose: String, subject: String) -> Result<()> {
+    let client = reqwest::Client::new();
+    let url = format!("http://{rpc_host}:{rpc_port}/burns/{purpose}/{subject}");
+    let v: serde_json::Value = client.get(&url).send().await.context("could not reach the node")?.json().await?;
+    if let Some(e) = v.get("error") {
+        anyhow::bail!("{}", e.as_str().unwrap_or("the node refused"));
+    }
+    match v.get("backing").filter(|b| !b.is_null()) {
+        Some(b) => {
+            println!("{} {}", v["purpose"].as_str().unwrap_or(""), v["subject"].as_str().unwrap_or(""));
+            println!("  backing   {} ({:.2} blocks){}", b["backing_text"].as_str().unwrap_or(""), b["backing"].as_f64().unwrap_or(0.0),
+                b["tier"].as_str().map(|t| format!(", {t}")).unwrap_or_default());
+            println!("  burned    {} units in {} burns, blocks {}–{}", b["total"], b["count"], b["first"], b["last"]);
+            if let Some(l) = b["label"].as_str().filter(|l| !l.is_empty()) {
+                println!("  label     {l}");
+            }
+            for x in v["burns"].as_array().into_iter().flatten().take(20) {
+                println!("  block {:>8}  {:>16} units  weighs {:.2} → {:.2} blocks  {}", x["height"], x["value"], x["weight"].as_f64().unwrap_or(0.0), x["weight_now"].as_f64().unwrap_or(0.0), x["label"].as_str().unwrap_or(""));
+            }
+        }
+        None => println!("Nothing has been burned for {} {}.", v["purpose"].as_str().unwrap_or(""), v["subject"].as_str().unwrap_or("")),
+    }
+    Ok(())
+}
+
 async fn wallet_send(
     path: &PathBuf,
     rpc_port: u16,
@@ -3273,9 +3434,12 @@ async fn wallet_send(
         .collect::<Result<Vec<_>>>()?;
 
     let total_send: u64 = recipient_specs.iter().map(|o| match o {
-        ParsedOutput::Standard(_, v) => *v,
+        ParsedOutput::Standard(_, v) | ParsedOutput::Burn(_, v) => *v,
         ParsedOutput::Stateful(_, _) => 0,
     }).sum();
+    if private && recipient_specs.iter().any(|o| matches!(o, ParsedOutput::Burn(..))) {
+        anyhow::bail!("a private send cannot carry a burn");
+    }
 
     let live_coins = spendable_coins_rpc(&client, rpc_port, &rpc_host, &wallet).await?;
 
@@ -3283,12 +3447,13 @@ async fn wallet_send(
         // Find standard outputs for private send logic
         let denoms: Vec<u64> = recipient_specs.iter().filter_map(|o| match o {
             ParsedOutput::Standard(_, v) => Some(*v),
-            ParsedOutput::Stateful(_, _) => None,
+            ParsedOutput::Stateful(_, _) | ParsedOutput::Burn(..) => None,
         }).collect();
         
         let recipient_address = match &recipient_specs[0] {
             ParsedOutput::Standard(a, _) => *a,
             ParsedOutput::Stateful(a, _) => *a,
+            ParsedOutput::Burn(..) => unreachable!("refused above"),
         };
         
         let pairs = wallet.plan_private_send(&live_coins, &recipient_address, &denoms)?;
@@ -3364,6 +3529,7 @@ async fn wallet_send(
                 match spec {
                     ParsedOutput::Standard(_, value) => num_outputs += decompose_value(*value).len(),
                     ParsedOutput::Stateful(_, _) => num_outputs += 1,
+                    ParsedOutput::Burn(_, value) => num_outputs += decompose_value(*value).len().max(1),
                 }
             }
             num_outputs += decompose_value(change).len();
@@ -3398,6 +3564,12 @@ async fn wallet_send(
                         ParsedOutput::Stateful(address, state) => {
                             let salt: [u8; 32] = rand::random();
                             all_outputs.push(midstate::core::OutputData::Confidential { address: *address, commitment: *state, salt });
+                        }
+                        ParsedOutput::Burn(payload, value) => {
+                            let values = if *value == 0 { vec![0] } else { midstate::core::decompose_value(*value) };
+                            for v in values {
+                                all_outputs.push(midstate::core::OutputData::DataBurn { payload: payload.clone(), value_burned: v });
+                            }
                         }
                     }
                 }
@@ -6290,5 +6462,36 @@ mod spend_script_tests {
         assert_eq!(script_timelock_height(&[]), None);
         // A timelock with nothing pushed before it commits to no height.
         assert_eq!(script_timelock_height(&[0x33]), None);
+    }
+}
+
+#[cfg(test)]
+mod burn_cli_tests {
+    use super::{burn_subject, parse_output_spec, ParsedOutput};
+    use midstate::core::burns::{Backing, Purpose};
+
+    #[test]
+    fn a_burn_spec_carries_its_payload_and_value() {
+        let b = Backing::name("nick", "hi").unwrap();
+        match parse_output_spec(&format!("burn:{}:1536", hex::encode(b.payload()))).unwrap() {
+            ParsedOutput::Burn(p, v) => assert_eq!((Backing::parse(&p), v), (Some(b), 1536)),
+            _ => panic!("a burn"),
+        }
+        assert!(parse_output_spec(&format!("burn:{}:1", "00".repeat(81))).is_err(), "over 80 bytes");
+        assert!(parse_output_spec("burn:zz:1").is_err());
+    }
+
+    #[test]
+    fn a_file_is_notarized_by_its_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("doc.txt");
+        std::fs::write(&f, b"a contract").unwrap();
+        assert_eq!(burn_subject(Purpose::NOTARY, None, Some(f.clone())).unwrap(), *blake3::hash(b"a contract").as_bytes());
+        use sha2::Digest;
+        let sha: [u8; 32] = sha2::Sha256::digest(b"a contract").into();
+        assert_eq!(burn_subject(Purpose::NOTARY_SHA256, None, Some(f.clone())).unwrap(), sha);
+        assert!(burn_subject(Purpose::NAME, None, Some(f)).is_err(), "--file is for notarizing");
+        assert_eq!(burn_subject(Purpose::NAME, Some("Nick.mds".into()), None).unwrap(), midstate::core::burns::name_subject("nick").unwrap());
+        assert!(burn_subject(Purpose::NAME, None, None).is_err());
     }
 }

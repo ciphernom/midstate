@@ -43,6 +43,33 @@ pub mod swapbook;
 pub mod service;
 /// MSN-1 names, for clients that check one before sending it.
 pub use midstate::core::names;
+/// What kind of address a script makes: for name editors.
+pub use midstate::core::address_kind;
+/// MSB-1 burns: purposes, subjects and weights, for burn forms.
+pub use midstate::core::burns;
+
+/// A document's hashes for notarizing it (MSB-1): BLAKE3 (`notary`) and
+/// SHA-256 (`notary-sha256`), hex.
+pub fn document_hashes(bytes: &[u8]) -> (String, String) {
+    use sha2::Digest;
+    (hex::encode(blake3::hash(bytes).as_bytes()), hex::encode(sha2::Sha256::digest(bytes)))
+}
+
+/// What a name pointed at `address` would show itself paying: the kind of
+/// address `script` (hex) makes, checked to be `address`'s script. An empty
+/// script says only that the kind is not published.
+pub fn describe_target(address: &str, script_hex: &str) -> Result<String, String> {
+    let a = midstate::core::parse_address_flexible(address.trim()).map_err(|e| format!("not an address: {e}"))?;
+    let script = script_hex.trim();
+    if script.is_empty() {
+        return Ok("script address (kind not published)".into());
+    }
+    let b = hex::decode(script).map_err(|_| "the script is not hex".to_string())?;
+    if midstate::core::hash(&b) != a {
+        return Err("that script is not this address's: it hashes to another".into());
+    }
+    Ok(midstate::core::address_kind::classify(&b).label())
+}
 
 pub use api::{
     AddressInfo, Balance, CoinView, HistoryView, MinerBackend, MiningView, NodeInfo, SendProgress,

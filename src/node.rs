@@ -647,6 +647,9 @@ impl NodeHandle {
 
     pub fn scan_addresses(&self, addresses: &[[u8; 32]], start: u64, end: u64) -> Result<Vec<ScannedCoin>> {
         let store = &self.storage.batches; 
+        // Wallets watch hundreds of addresses (thousands, with plans): look
+        // each output up rather than walk the list for it.
+        let addresses: std::collections::HashSet<[u8; 32]> = addresses.iter().copied().collect();
         let mut found = Vec::new();
         for height in start..end {
             if let Some(batch) = store.load(height)? {
@@ -1645,6 +1648,8 @@ pub async fn new(
 
         // MSN-1 names: always followed, before any block is stored.
         storage.enable_name_index(state.height)?;
+        // Burns and MSB-1 backing: always counted, before any block is stored.
+        storage.enable_burn_index(state.height)?;
 
         let mut recent_headers = VecDeque::new();
         let window = DIFFICULTY_LOOKBACK as u64;

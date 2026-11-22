@@ -9,7 +9,7 @@ use super::{now_secs, SendMeta, Service};
 use crate::api::*;
 use crate::base::{BaseClient, BidState, Event, Settlement};
 use crate::eth_trade::*;
-use crate::eth_wire::{parse, Advert, Answer, Decline, Frame, Take};
+use crate::eth_wire::{claim_message, parse, Advert, Answer, Decline, Frame, NameClaim, Take, CLAIM_ORDER, CLAIM_TAKE};
 use crate::sendplan;
 use anyhow::{anyhow, bail, ensure, Context as _, Result};
 use midstate::core::Transaction;
@@ -100,6 +100,9 @@ pub(super) struct EthLive {
     /// When each settled-but-unexplained Base swap was last looked up.
     lookups: HashMap<[u8; 32], u64>,
     pub(super) error: Option<String>,
+    /// Name claims heard, by order or take id: the name, and the Base
+    /// account that signed the claim.
+    names: HashMap<[u8; 16], (String, [u8; 20])>,
 }
 
 impl EthLive {
@@ -417,8 +420,18 @@ impl Service {
             .eth
             .book
             .values()
-            .map(|e| advert_view(&e.advert, false))
-            .chain(self.eth.store.orders.iter().filter(|o| o.takeable(tip)).map(|o| advert_view(&o.advert(), true)))
+            .map(|e| {
+                let mut v = advert_view(&e.advert, false);
+                v.seller_name = self.verified_name(&e.advert.order_id, &e.advert.seller_evm).unwrap_or_default();
+                v.seller_backing = self.seller_backing(&e.advert.seller_evm, &v.seller_name);
+                v
+            })
+            .chain(self.eth.store.orders.iter().filter(|o| o.takeable(tip)).map(|o| {
+                let mut v = advert_view(&o.advert(), true);
+                v.seller_name = self.own_evm_name(&o.seller_evm).unwrap_or_default();
+                v.seller_backing = self.seller_backing(&o.seller_evm, &v.seller_name);
+                v
+            }))
             .collect();
         sells.sort_by(|a, b| {
             let p = |v: &EthAdvertView| v.wei_per_gmds.parse::<u128>().unwrap_or(u128::MAX);
@@ -447,7 +460,23 @@ impl Service {
                 running: self.eth.store.swaps.iter().filter(|s| s.order_id == o.id && s.role == Role::Seller && !s.phase.settled()).count(),
             })
             .collect();
-        let swaps = self.eth.store.swaps.iter().rev().map(swap_view).collect();
+        let swaps = self
+            .eth
+            .store
+            .swaps
+            .iter()
+            .rev()
+            .map(|s| {
+                let mut v = swap_view(s);
+                let (id, acct) = match s.role {
+                    Role::Buyer => (s.order_id, s.seller_evm),
+                    Role::Seller => (s.id, s.buyer_evm),
+                    _ => ([0; 16], [0; 20]),
+                };
+                v.counterparty_name = self.verified_name(&id, &acct).unwrap_or_default();
+                v
+            })
+            .collect();
         EthMarketView { sells, orders, swaps, tip, base_error: self.eth.error.clone() }
     }
 
@@ -502,15 +531,58 @@ impl Service {
 
     fn eth_advertise(&mut self, tip: u64) {
         let mut out = Vec::new();
+        let mut claims = Vec::new();
         for o in &mut self.eth.store.orders {
             if o.takeable(tip) && (o.last_advert == 0 || tip >= o.last_advert + ADVERT_EVERY) {
                 o.last_advert = tip;
                 out.push(Frame::Advert(o.advert()));
+                claims.push((o.id, o.seller_evm));
             }
         }
         for f in out {
             self.eth_send(f);
         }
+        for (id, acct) in claims {
+            self.send_claim(CLAIM_ORDER, id, &acct);
+        }
+    }
+
+    // ── Names on offers ─────────────────────────────────────────────────
+
+    /// A name this wallet holds whose `evm` record is `acct`.
+    fn own_evm_name(&self, acct: &[u8; 20]) -> Option<String> {
+        self.names.jobs.iter().filter(|j| j.status == "registered" && !j.renter).find_map(|j| {
+            let r = self.live_record(&format!("{}{}", j.name, midstate::core::names::SUFFIX)).ok()?;
+            r.records.iter().any(|x| matches!(x, midstate::core::names::Rec::Evm(a) if a == acct)).then(|| j.name.clone())
+        })
+    }
+
+    /// Says which name an order or take of ours is, signed by its account,
+    /// when this wallet holds a name whose `evm` record is that account.
+    fn send_claim(&self, subject: u8, id: [u8; 16], acct: &[u8; 20]) {
+        let Some(name) = self.own_evm_name(acct) else { return };
+        let Ok(key) = self.evm_key() else { return };
+        if &key.address != acct {
+            return;
+        }
+        if let Ok(sig) = key.sign_message(&claim_message(subject, &id, &name)) {
+            self.eth_send(Frame::Claim(NameClaim { subject, id, name, sig }));
+        }
+    }
+
+    /// The name to show for the order or take `id` whose account is `acct`:
+    /// only when the account signed the claim and the name's `evm` record is
+    /// that same account. The account stays what the trade uses.
+    fn verified_name(&self, id: &[u8; 16], acct: &[u8; 20]) -> Option<String> {
+        let (name, signer) = self.eth.names.get(id)?;
+        if signer != acct {
+            return None;
+        }
+        let r = self.live_record(&format!("{name}{}", midstate::core::names::SUFFIX)).ok()?;
+        r.records
+            .iter()
+            .any(|x| matches!(x, midstate::core::names::Rec::Evm(a) if a == acct))
+            .then(|| format!("{name}{}", midstate::core::names::SUFFIX))
     }
 
     fn eth_send_take(&mut self, i: usize, now: u64) {
@@ -520,7 +592,9 @@ impl Service {
         }
         let sw = &self.eth.store.swaps[i];
         let t = Take { order_id: sw.order_id, take_id: sw.id, mds: sw.mds_amount, wei: sw.wei, claim_pk: sw.claim_pk, buyer_evm: sw.buyer_evm };
+        let (id, acct) = (sw.id, sw.buyer_evm);
         self.eth_send(Frame::Take(t));
+        self.send_claim(CLAIM_TAKE, id, &acct);
     }
 
     async fn eth_read_bus(&mut self, tip: u64, now: u64) {
@@ -531,6 +605,14 @@ impl Service {
             }
             let Some(frame) = parse(&m) else { continue };
             match frame {
+                Frame::Claim(c) => {
+                    if let Some(signer) = c.signer() {
+                        if self.eth.names.len() > 4_096 {
+                            self.eth.names.clear();
+                        }
+                        self.eth.names.insert(c.id, (c.name.clone(), signer));
+                    }
+                }
                 Frame::Advert(a) => {
                     let ours = self.eth.store.orders.iter().any(|o| o.id == a.order_id);
                     if !ours && a.expires > tip && a.mds >= a.min && a.min >= MIN_MDS_AMOUNT && a.wei_per_gmds > 0 {
@@ -1198,6 +1280,8 @@ fn advert_view(a: &Advert, mine: bool) -> EthAdvertView {
         wei_per_gmds: a.wei_per_gmds.to_string(),
         expires: a.expires,
         mine,
+        seller_name: String::new(),
+        seller_backing: 0.0,
     }
 }
 
@@ -1227,6 +1311,7 @@ fn swap_view(s: &EthSwap) -> EthSwapView {
         note,
         settled: s.phase.settled(),
         counterparty: if counterparty == [0; 20] { String::new() } else { crate::evm::to_checksum_address(&counterparty) },
+        counterparty_name: String::new(),
         eth_deadline: s.eth_deadline,
         timeout: s.timeout,
         base_tx: s.eth_tx.map(|h| format!("0x{}", hex::encode(h))),

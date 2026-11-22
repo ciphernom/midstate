@@ -20,6 +20,7 @@ function toggleTheme(){var d=document.documentElement,n=d.getAttribute('data-the
   --in: #0f7b45; --in-bg: #e5f4ec; --out: #a15c07; --out-bg: #fbf0df;
   --rew: #5b4bb7; --rew-bg: #eeebfa; --seal: #2f5f9e; --seal-bg: #e7eef8; --bad: #b42318; --bad-bg: #fdecea;
   --shadow: 0 1px 0 rgba(0,0,0,.02);
+  --series-1: #2a78d6; --series-2: #eb6834;
 }
 [data-theme="dark"] {
   --bg: #0a0a0a; --card: #121212; --raised: #161616; --line: #262626; --line2: #1d1d1d;
@@ -28,7 +29,26 @@ function toggleTheme(){var d=document.documentElement,n=d.getAttribute('data-the
   --in: #5fd39a; --in-bg: #0f2a1c; --out: #f0b35b; --out-bg: #2c1f0b;
   --rew: #b3a6ff; --rew-bg: #211c3a; --seal: #8db5ec; --seal-bg: #122033; --bad: #ff8a80; --bad-bg: #2d1210;
   --shadow: none;
+  --series-1: #3987e5; --series-2: #d95926;
 }
+/* Burn charts: two validated slots (issued, burned, --series-1/2 above),
+   drawn at the container's own width so marks and text keep their sizes. */
+.viz { position: relative; min-height: 40px; }
+.viz svg { display: block; overflow: visible; }
+.viz .grid { stroke: var(--line2); stroke-width: 1; }
+.viz .base { stroke: var(--line); stroke-width: 1; }
+.viz .ax { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.viz .val { fill: var(--text); font-size: 11px; font-weight: 600; }
+.viz .ref { stroke: var(--muted); stroke-width: 1; }
+.viz .s1 { fill: var(--series-1); } .viz .s2 { fill: var(--series-2); }
+.viz .hit { fill: transparent; cursor: default; }
+.viz .hit:hover + .mk, .viz .mk:hover { opacity: .8; }
+.viz-legend { display: flex; flex-wrap: wrap; gap: 16px; font-size: 12px; color: var(--muted); margin: 2px 0 8px; }
+.viz-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
+.viz-legend i.line { height: 0; border-top: 1px solid var(--muted); border-radius: 0; width: 14px; vertical-align: 3px; }
+.viz-tip { position: absolute; pointer-events: none; background: var(--ink); color: var(--card); font-size: 12px; line-height: 1.45; padding: 6px 9px; z-index: 30; white-space: nowrap; transform: translate(-50%, calc(-100% - 8px)); display: none; }
+.burn-meter { height: 8px; border-radius: 4px; background: color-mix(in oklab, var(--series-2) 18%, var(--card)); overflow: hidden; margin: 8px 0 4px; }
+.burn-meter > i { display: block; height: 100%; border-radius: 4px; background: var(--series-2); }
 * { box-sizing: border-box; }
 html { -webkit-text-size-adjust: 100%; }
 body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif; }
@@ -380,6 +400,7 @@ button.tok.more:hover { color: var(--ink); border-color: var(--muted); }
       <a href="?q=transactions" data-page="txs">Transactions</a>
       <a href="?q=mempool" data-page="mempool">Pending</a>
       <a href="?q=supply" data-page="supply">Supply</a>
+      <a href="?q=burns" data-page="burns">Burns</a>
       <a href="?q=learn" data-page="learn">New to Midstate?</a>
     </nav>
     <div class="tools">
@@ -2070,6 +2091,7 @@ async function query(q, before, seq) {
     if (/^(transactions|txs|txns)$/.test(lc)) { setNav('txs'); return showTxs(seq); }
     if (/^(mempool|pending)$/.test(lc)) { setNav('mempool'); return showMempool(seq); }
     if (/^(supply|rich ?list|holders|richlist)$/.test(lc)) { setNav('supply'); return showSupply(seq); }
+    if (/^(burns?|burned|backing)$/.test(lc)) { setNav('burns'); return showBurns(seq); }
     if (/^(learn|help|about)$/.test(lc)) { setNav('learn'); return showLearn(); }
     if (lc === 'api') { setNav(''); return showApi(); }
     setNav('');
@@ -2101,6 +2123,15 @@ async function resolveHash(q, seq) {
             if (stale(seq)) return;
             if (t.revealed) return showTx(t.revealed.height, t.revealed.tx, seq);
             if (t.sealed) return showTx(t.sealed.height, t.sealed.tx, seq);
+        }
+    } catch (_) {}
+    // A document's hash, notarized (MSB-1): the burn index answers at once.
+    try {
+        const r = await fetch('/burns/notary/' + q);
+        if (r.ok) {
+            const n = await r.json();
+            if (stale(seq)) return;
+            if (n.blake3.burns.length || n.sha256.burns.length) return showNotary(n);
         }
     } catch (_) {}
     const mp = findInMempool(q);
@@ -2575,16 +2606,34 @@ function historyRow(h, i, received, sent, when) {
 
 // ── Names ───────────────────────────────────────────────────────────────
 
+/** What kind of address a record pays, as the node read it from the
+ *  records: a key, or what the name's published script makes. */
+function kindText(k) {
+    if (!k) return '';
+    const shared = k.kind && !['key', 'tagged_key', 'unknown'].includes(k.kind);
+    return shared ? badge('rew', escHtml(k.label)) : `<span class="dim">${escHtml(k.label)}</span>`;
+}
+
 function nameCard(n) {
     const d = n.deal;
     const deal = !d ? '' : d.kind === 'sale' ? `for sale at ${fmtAmtText(d.price)}` : d.kind === 'rent' ? `for rent at ${fmtAmtText(d.price)} per ${fmtInt(d.span)} blocks` : `rented out until block ${fmtInt(d.until)}`;
-    const recs = (n.records || []).map(r => [escHtml(r.type), `<span class="hash">${escHtml(r.value)}</span>${r.signatures_left != null ? ` <span class="dim">· ${fmtInt(r.signatures_left)} signatures left</span>` : ''}`]);
+    const shown = (n.records || []).filter(r => r.type !== 'script');
+    const recs = shown.map(r => [escHtml(r.type), `<span class="hash">${escHtml(r.value)}</span>${r.signatures_left != null ? ` <span class="dim">· ${fmtInt(r.signatures_left)} signatures left</span>` : ''}${r.address_kind ? ` · ${kindText(r.address_kind)}` : ''}`]);
+    if (n.script) recs.push(['script', `<span class="dim">published, ${fmtInt(n.script.length / 2)} bytes</span>`]);
+    const can = [];
+    if (n.identity) can.push('its wallet hands out a fresh address for each payment, and invoices');
+    if (n.kem) can.push('it takes sealed (post-quantum encrypted) messages');
+    const slug = escHtml(String(n.name || '').replace(/\.mds$/, ''));
     return card(`<span class="mono">${escHtml(n.name)}</span>`, `<div class="card-b">${kv([
         ['Tier', badge(n.tier === 'platinum' || n.tier === 'gold' ? 'rew' : '', escHtml(n.tier || ''))],
         ['Owner', `<span class="hash">${short(n.owner || '', 8)}</span>`, 'The control key: it updates the records and renews the name. It is separate from the addresses the name pays.'],
         ['Registered', `block ${fmtInt(n.since)} to block ${fmtInt(n.expires)}${n.lapsed ? ` ${badge('bad', 'Lapsed')}` : ''}`],
         deal ? ['Market', escHtml(deal)] : null,
-        n.pays ? ['Pays', who(n.pays, 10), 'Send to the name and wallets pay this address: the first record that takes a payment.'] : null,
+        n.pays ? ['Pays', `${who(n.pays, 10)} ${kindText(n.pays_kind)}`, 'Send to the name and wallets pay this address: the first record that takes a payment. A vault, multisig or plan shows its kind when the name publishes its script.'] : null,
+        can.length ? ['Wallet', escHtml(can.join('; '))] : null,
+        ['Backing', n.backing ? `${n.backing.tier ? badge('out', escHtml(n.backing.tier)) + ' ' : ''}${escHtml(n.backing.backing_text)} <span class="dim">· ${fmtGShort(n.backing.total)} gMDS burned in ${fmtInt(n.backing.count)} burn${n.backing.count === 1 ? '' : 's'}</span>` : '<span class="dim">none burned</span>',
+            'MDS burned to back this name (MSB-1). A burn weighs what it cost in block rewards, and its weight halves every year. A name made to look like this one would have to burn as much.'],
+        ['Proof', `<a href="/name/${slug}/proof">leaf and Merkle proof</a> <span class="dim">· check it against the registry root yourself</span>`],
     ])}${recs.length ? `<details class="more-d" open><summary>Records (${recs.length})</summary>${kv(recs)}</details>` : ''}</div>`, help('Like ENS on Ethereum: a readable name that points at addresses and other records.'));
 }
 
@@ -2711,6 +2760,15 @@ async function showSupply(seq) {
     if (s.holders != null) facts.push(['Holders', fmtInt(s.holders)]);
     if (s.unspent_coins != null) facts.push(['Unspent coins', fmtInt(s.unspent_coins)]);
     if (s.verified != null) facts.push(['Supply check', s.verified ? badge('ok', 'Adds up', 'check') + ' <span class="dim">unspent coins equal issued minus burned</span>' : badge('bad', 'Does not add up')]);
+    // What the chain burns against what it issues (the burn index; MSB-1).
+    try {
+        const r = await fetch('/burns');
+        if (r.ok) {
+            const b = await r.json();
+            if (b.trailing && b.trailing.issued) facts.push(['Burned, last 365 days', `${fmtG(b.trailing.burned)} gMDS · ${fmtShare(b.trailing.share || 0)} of what the year issued <a href="${href.q('burns')}">Burns ${ic('right')}</a>`]);
+        }
+    } catch (_) {}
+    if (stale(seq)) return;
     let note = '';
     if (ix.status === 'disabled') note = `<div class="note">Circulating supply, holders and the rich list come from the node's balance index. Start the node with <code>--rich-list</code> to keep it.</div>`;
     else if (ix.status === 'building' && ix.chain_blocks) note = `<div class="note">Building the balance index: block ${fmtInt(ix.indexed_blocks)} of ${fmtInt(ix.chain_blocks)} (${(ix.indexed_blocks / ix.chain_blocks * 100).toFixed(1)}%).</div>`;
@@ -2727,6 +2785,234 @@ async function showSupply(seq) {
             ${stat('Burned', `${fmtG(s.burned != null ? s.burned : s.burned_genesis)} gMDS`, s.burned != null ? 'genesis and data burns' : 'genesis')}
         </div>${note}
         ${card('Issuance', `<div class="card-b">${kv(facts)}</div>`)}${rich}`;
+}
+
+// ── Burns ───────────────────────────────────────────────────────────────
+
+const BURN_PURPOSES = [['name', 'Names'], ['pool', 'Pools'], ['hub', 'Hubs'], ['evm', 'Base accounts'], ['key', 'Keys']];
+let burnTab = 'name';
+
+/** Blocks of issuance, for people. */
+function fmtBlocks(b) {
+    if (b >= 20160) return `${(b / 10080).toFixed(1)} weeks of issuance`;
+    if (b >= 1440) return `${(b / 1440).toFixed(1)} days of issuance`;
+    if (b >= 60) return `${(b / 60).toFixed(1)} hours of issuance`;
+    return `${Number(b).toFixed(1)} blocks`;
+}
+
+/** Blocks of issuance, short: "5.2 weeks", "3.1 days", "12 blocks". */
+function fmtBlocksShort(b) {
+    if (b >= 20160) return `${(b / 10080).toFixed(1)} weeks`;
+    if (b >= 1440) return `${(b / 1440).toFixed(1)} days`;
+    if (b >= 60) return `${(b / 60).toFixed(1)} hours`;
+    return `${Number(b).toFixed(1)} blocks`;
+}
+
+/** gMDS on an axis: 0, 500, 2,000, 250K, 1.5M. */
+function fmtAxisG(g) {
+    if (g >= 1e6) return +(g / 1e6).toFixed(2) + 'M';
+    if (g >= 1e4) return +(g / 1e3).toFixed(1) + 'K';
+    return g >= 100 ? Math.round(g).toLocaleString('en') : +g.toFixed(3) + '';
+}
+
+/** A clean axis top above `max`, and its ticks. */
+function niceTicks(max, n = 4) {
+    if (!(max > 0)) return { top: 1, ticks: [0, 1] };
+    const raw = max / n, mag = Math.pow(10, Math.floor(Math.log10(raw)));
+    const step = [1, 2, 2.5, 5, 10].map(m => m * mag).find(s => s >= raw);
+    const top = Math.ceil(max / step) * step;
+    const ticks = [];
+    for (let v = 0; v <= top + step / 2; v += step) ticks.push(v);
+    return { top, ticks };
+}
+
+/** A column with a 4px rounded data-end and a square base. */
+function colPath(x, y, w, h) {
+    const r = Math.min(4, w / 2, h);
+    if (h <= 0) return '';
+    return `M${x},${y + h}V${y + r}Q${x},${y} ${x + r},${y}H${x + w - r}Q${x + w},${y} ${x + w},${y + r}V${y + h}Z`;
+}
+
+/** Hover tooltips: every `.hit` carries its text in data-tip. */
+function wireTips(root) {
+    const tip = root.querySelector('.viz-tip');
+    if (!tip) return;
+    root.querySelectorAll('[data-tip]').forEach(el => {
+        const show = () => {
+            const box = root.getBoundingClientRect(), r = el.getBoundingClientRect();
+            tip.innerHTML = el.dataset.tip;
+            tip.style.display = 'block';
+            // Centred over the mark, but never past the chart's edges.
+            const half = tip.offsetWidth / 2, x = r.left + r.width / 2 - box.left;
+            tip.style.left = Math.max(half, Math.min(box.width - half, x)) + 'px';
+            tip.style.top = (r.top - box.top) + 'px';
+        };
+        el.addEventListener('mouseenter', show);
+        el.addEventListener('focus', show);
+        el.addEventListener('mouseleave', () => { tip.style.display = 'none'; });
+        el.addEventListener('blur', () => { tip.style.display = 'none'; });
+    });
+}
+
+/** Issued and burned, each year: two columns a year on one axis, the burn's
+ *  share of issuance over each pair. `W` is the container's width in pixels. */
+function yearChart(years, W) {
+    const H = 230, L = 48, R = 8, T = 22, B = 26;
+    // The scale is in gMDS, so its ticks are round numbers of them.
+    const max = Math.max(...years.map(y => Math.max(y.issued, y.burned)), 1) / MDS_PER_GMDS;
+    const { top, ticks } = niceTicks(max);
+    const band = (W - L - R) / Math.max(years.length, 1), bw = Math.max(4, Math.min(24, (band - 18) / 2));
+    const yOf = units => T + (H - T - B) * (1 - units / MDS_PER_GMDS / top);
+    let g = '';
+    for (const t of ticks) {
+        const y = yOf(t * MDS_PER_GMDS);
+        g += `<line class="grid" x1="${L}" x2="${W - R}" y1="${y}" y2="${y}"/><text class="ax" x="${L - 8}" y="${y + 4}" text-anchor="end">${fmtAxisG(t)}</text>`;
+    }
+    years.forEach((y, i) => {
+        const cx = L + band * i + band / 2, x1 = cx - bw - 1, x2 = cx + 1;
+        const share = y.issued ? y.burned / y.issued : 0;
+        const label = y.to < y.from + 525600 ? `Year ${y.year} (so far)` : `Year ${y.year}`;
+        const tipText = `<b>${label}</b><br>Issued ${fmtGShort(y.issued)} gMDS<br>Burned ${fmtGShort(y.burned)} gMDS · ${fmtShare(share)} of issuance<br><span style="opacity:.75">names ${fmtGShort(y.by_kind.names)} · backing ${fmtGShort(y.by_kind.backing)} · other ${fmtGShort(y.by_kind.dex + y.by_kind.other)}</span>`;
+        g += `<path class="mk s1" d="${colPath(x1, yOf(y.issued), bw, yOf(0) - yOf(y.issued))}"/>`;
+        g += `<path class="mk s2" d="${colPath(x2, yOf(y.burned), bw, yOf(0) - yOf(y.burned))}"/>`;
+        g += `<text class="val" x="${cx}" y="${Math.min(yOf(y.issued), yOf(y.burned)) - 6}" text-anchor="middle">${fmtShare(share)} burned</text>`;
+        g += `<text class="ax" x="${cx}" y="${H - 8}" text-anchor="middle">${label}</text>`;
+        g += `<rect class="hit" tabindex="0" x="${L + band * i}" y="${T}" width="${band}" height="${H - T - B}" data-tip="${escHtml(tipText)}"/>`;
+    });
+    g += `<line class="base" x1="${L}" x2="${W - R}" y1="${yOf(0)}" y2="${yOf(0)}"/>`;
+    return `<div class="viz-legend"><span><i style="background:var(--series-1)"></i>Issued</span><span><i style="background:var(--series-2)"></i>Burned</span></div>
+        <svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="Issued and burned gMDS by year">${g}</svg><div class="viz-tip"></div>`;
+}
+
+/** What each day burned (columns) against the day's issuance (the line). */
+function dayChart(days, W) {
+    const H = 170, L = 48, R = 8, T = 10, B = 22;
+    const issued = days[days.length - 1].issued;
+    const max = Math.max(issued, ...days.map(d => d.burned), 1) / MDS_PER_GMDS;
+    const { top, ticks } = niceTicks(max, 3);
+    const band = (W - L - R) / days.length, bw = Math.max(1, Math.min(24, band - 2));
+    const yOf = units => T + (H - T - B) * (1 - units / MDS_PER_GMDS / top);
+    let g = '';
+    for (const t of ticks) {
+        const y = yOf(t * MDS_PER_GMDS);
+        g += `<line class="grid" x1="${L}" x2="${W - R}" y1="${y}" y2="${y}"/><text class="ax" x="${L - 8}" y="${y + 4}" text-anchor="end">${fmtAxisG(t)}</text>`;
+    }
+    days.forEach((d, i) => {
+        const x = L + band * i + (band - bw) / 2;
+        const tipText = `<b>Day ${fmtInt(d.day)}</b> · blocks ${fmtInt(d.from)}–${fmtInt(d.to - 1)}<br>Burned ${fmtGShort(d.burned)} gMDS · ${d.share != null ? fmtShare(d.share) : '—'} of the ${fmtGShort(d.issued)} issued`;
+        g += `<path class="mk s2" d="${colPath(x, yOf(d.burned), bw, yOf(0) - yOf(d.burned))}"/>`;
+        g += `<rect class="hit" tabindex="0" x="${L + band * i}" y="${T}" width="${band}" height="${H - T - B}" data-tip="${escHtml(tipText)}"/>`;
+    });
+    g += `<line class="ref" x1="${L}" x2="${W - R}" y1="${yOf(issued)}" y2="${yOf(issued)}"/>`;
+    g += `<line class="base" x1="${L}" x2="${W - R}" y1="${yOf(0)}" y2="${yOf(0)}"/>`;
+    g += `<text class="ax" x="${L}" y="${H - 6}">${days.length} days ago</text><text class="ax" x="${W - R}" y="${H - 6}" text-anchor="end">today</text>`;
+    return `<div class="viz-legend"><span><i style="background:var(--series-2)"></i>Burned that day</span><span><i class="line"></i>Issued that day</span></div>
+        <svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="gMDS burned each day, against the day's issuance">${g}</svg><div class="viz-tip"></div>`;
+}
+
+/** The Burns page's charts, drawn at their containers' widths. */
+let burnCharts = null;
+function drawBurnCharts() {
+    if (!burnCharts) return;
+    const y = $('viz-years'), d = $('viz-days');
+    if (y && burnCharts.years.length) { y.innerHTML = yearChart(burnCharts.years, y.clientWidth); wireTips(y); }
+    if (d && burnCharts.days.length) { d.innerHTML = dayChart(burnCharts.days, d.clientWidth); wireTips(d); }
+}
+let burnResize = null;
+window.addEventListener('resize', () => { clearTimeout(burnResize); burnResize = setTimeout(drawBurnCharts, 120); });
+
+function subjectLink(s) {
+    return s.purpose === 'name' ? `<a class="mono" href="${href.q(s.subject)}">${escHtml(s.subject)}</a>` : `<span class="hash">${escHtml(short(s.subject, 10))}</span>`;
+}
+
+async function showBurns(seq) {
+    view().innerHTML = loading('Counting burns…');
+    let b, days = null, recent = [], tops = {};
+    try {
+        const [r1, r2, r3] = await Promise.all([fetch('/burns'), fetch('/burns/days?days=60'), fetch('/burns/recent?limit=25')]);
+        b = await r1.json();
+        if (r2.ok) days = await r2.json();
+        if (r3.ok) recent = await r3.json();
+        const lists = await Promise.all(BURN_PURPOSES.map(([p]) => fetch(`/burns/top?purpose=${p}&limit=20`).then(r => r.ok ? r.json() : null).catch(() => null)));
+        BURN_PURPOSES.forEach(([p], i) => { tops[p] = lists[i] ? lists[i].top : []; });
+    } catch (_) { if (!stale(seq)) message('Burns unavailable', '<p>The node did not answer.</p>'); return; }
+    if (stale(seq)) return;
+    if (b.error) return message('Burns unavailable', `<p>${escHtml(b.error)}</p>`);
+    const t = b.trailing, share = t.share || 0;
+    const stat = (k, v, sub, tip) => `<div class="stat"><div class="k">${k}${tip ? help(tip) : ''}</div><div class="v">${v}</div><div class="s">${sub}</div></div>`;
+    const ix = b.index;
+    const note = !ix.ready ? `<div class="note">${ix.missing != null ? `This node does not have block ${fmtInt(ix.missing)}, so its counts stop there.` : `Counting the chain's burns: block ${fmtInt(ix.height)} of ${fmtInt(ix.chain)}.`}</div>`
+        : ix.from > 0 ? `<div class="note">This node pruned its blocks before ${fmtInt(ix.from)}; its totals start there.</div>` : '';
+    const years = b.years.filter(y => y.to > y.from);
+    const yearRows = years.map(y => [`Year ${y.year}${y.to < y.from + 525600 ? ' <span class="dim">(so far)</span>' : ''}`, `${fmtG(y.issued)}`, `${fmtG(y.burned)}`, fmtShare(y.share || 0), fmtG(y.by_kind.names), fmtG(y.by_kind.backing), fmtG(y.by_kind.dex + y.by_kind.other)]);
+    const leaders = (p) => {
+        const list = tops[p] || [];
+        if (!list.length) return `<div class="empty">Nothing burned to back ${BURN_PURPOSES.find(x => x[0] === p)[1].toLowerCase()} yet.</div>`;
+        return dual(table([{ t: '#' }, { t: 'Subject' }, { t: 'Backing', r: 1 }, { t: '' }, { t: 'Burned', r: 1 }, { t: 'Burns', r: 1 }, { t: 'Last', r: 1 }],
+            list.map((s, i) => [`<span class="mono">${i + 1}</span>`, `${subjectLink(s)}${s.label ? ` <span class="dim">“${escHtml(s.label)}”</span>` : ''}`, escHtml(s.backing_text), s.tier ? badge('out', escHtml(s.tier)) : '', `${fmtGShort(s.total)} gMDS`, fmtInt(s.count), `<a class="mono" href="${href.block(s.last)}">${fmtInt(s.last)}</a>`])),
+            list.map((s, i) => `<div class="li h"><span class="dir self">#${i + 1}</span><div><div class="t1">${subjectLink(s)}</div><div class="t2">${escHtml(s.backing_text)}${s.tier ? ' · ' + escHtml(s.tier) : ''}</div></div><div class="end">${fmtGShort(s.total)} gMDS</div></div>`).join(''));
+    };
+    const recentRows = recent.map(r => [`<a class="mono" href="${href.tx(r.height, r.tx)}">${fmtInt(r.height)}</a>`, escHtml(r.purpose), r.purpose === 'name' ? `<a class="mono" href="${href.q(r.subject)}">${escHtml(r.subject)}</a>` : `<span class="hash">${escHtml(short(r.subject, 10))}</span>`,
+        r.purpose.startsWith('notary') ? '<span class="dim">timestamp</span>' : `${Number(r.weight).toFixed(1)} blocks`, `${fmtGShort(r.value)} gMDS`, r.label ? escHtml(r.label) : '']);
+    view().innerHTML = `<div class="page-h"><h1>Burns</h1><span class="sub">at block ${fmtInt(ix.height)}</span></div>
+        <div class="stats">
+            ${stat('Burned, last 365 days', `${fmtG(t.burned)} gMDS`, `${fmtShare(share)} of issuance`)}
+            ${stat('Issued, last 365 days', `${fmtG(t.issued)} gMDS`, `${fmtGShort(b.reward)} gMDS a block now`)}
+            ${stat('Backing held', fmtBlocksShort(b.held.blocks), `of issuance · upkeep ${fmtShare(b.held.upkeep_share)} a year`, 'All the MSB-1 backing anyone holds, in blocks: each burn weighs what it cost in block rewards and halves every year. Keeping it all where it is burns this share of what the chain issues each year, whatever the year.')}
+            ${stat('Burned, all time', `${fmtG(b.totals.burned)} gMDS`, `${fmtInt(b.totals.count)} burns of value`)}
+        </div>${note}
+        ${card('Burned against issued', `<div class="card-b pad">
+            <div class="burn-meter" role="meter" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${(Math.min(share, 1) * 100).toFixed(1)}" aria-label="Burned as a share of issuance, last 365 days"><i style="width:${(Math.min(share, 1) * 100).toFixed(2)}%"></i></div>
+            <div class="dim" style="font-size:12.5px;margin-bottom:12px">The last 365 days burned ${fmtShare(share)} of what they issued. The chain's aim: burn a little less than it issues, each year.</div>
+            <div class="viz" id="viz-years"></div>
+            <details class="more-d"><summary>As a table</summary>${table([{ t: 'Year' }, { t: 'Issued', r: 1 }, { t: 'Burned', r: 1 }, { t: 'Share', r: 1 }, { t: 'Names', r: 1 }, { t: 'Backing', r: 1 }, { t: 'Other', r: 1 }], yearRows)}<div class="dim" style="font-size:12px;padding:6px 0">In gMDS. Names: MSN-1 registrations and renewals; backing: MSB-1; other: everything else burned.</div></details>
+        </div>`, help('A burn destroys MDS for good. Names burn to register and renew; MSB-1 burns back a name, a pool, a hub or an account, or notarize a document. Rewards halve every year, so the same burn is a larger share of each year\'s issuance.'))}
+        ${days && days.days.length ? card('The last 60 days', `<div class="card-b pad"><div class="viz" id="viz-days"></div></div>`) : ''}
+        ${card('Most backed', `<div class="card-b"><div class="tabs" id="burn-tabs">${BURN_PURPOSES.map(([p, label]) => `<a data-p="${p}" class="${p === burnTab ? 'on' : ''}">${label} <span class="dim">${(b.held.by_purpose[p] || { subjects: 0 }).subjects}</span></a>`).join('')}</div><div id="burn-top">${leaders(burnTab)}</div></div>`,
+            help('Ranked by backing now. Wallets show it beside names, sellers, pools and hubs, and sort by it: a burn is a cost a throwaway identity would not carry.'))}
+        ${card('Check a document', `<div class="card-b pad"><p class="dim" style="margin:0 0 10px">Pick a file to see whether it was notarized, and since when. It is hashed here, in the browser; nothing is uploaded.</p>
+            <input type="file" id="notary-file"> <span id="notary-out" class="dim"></span></div>`)}
+        ${card('Recent MSB-1 burns', `<div class="card-b">${recent.length ? dual(table([{ t: 'Block' }, { t: 'For' }, { t: 'Subject' }, { t: 'Weight', r: 1 }, { t: 'Burned', r: 1 }, { t: 'Label' }], recentRows),
+            recent.map(r => `<div class="li h"><span class="dir out">${escHtml(r.purpose.replace('notary-sha256', 'notary').toUpperCase())}</span><div><div class="t1">${r.purpose === 'name' ? `<a class="mono" href="${href.q(r.subject)}">${escHtml(r.subject)}</a>` : `<span class="hash">${escHtml(short(r.subject, 8))}</span>`}</div><div class="t2">Block <a class="mono" href="${href.tx(r.height, r.tx)}">${fmtInt(r.height)}</a>${r.label ? ' · ' + escHtml(r.label) : ''}</div></div><div class="end">${fmtGShort(r.value)} gMDS</div></div>`).join(''))
+            : '<div class="empty">No MSB-1 burns yet.</div>'}</div>`)}`;
+    burnCharts = { years, days: days ? days.days : [] };
+    drawBurnCharts();
+    const tabs = $('burn-tabs');
+    if (tabs) tabs.addEventListener('click', e => {
+        const btn = e.target.closest('a[data-p]');
+        if (!btn) return;
+        burnTab = btn.dataset.p;
+        tabs.querySelectorAll('a').forEach(x => x.classList.toggle('on', x === btn));
+        $('burn-top').innerHTML = leaders(burnTab);
+    });
+    const file = $('notary-file');
+    if (file) file.addEventListener('change', async () => {
+        const f = file.files && file.files[0];
+        const out = $('notary-out');
+        if (!f) return;
+        out.textContent = 'Hashing…';
+        try {
+            const bytes = new Uint8Array(await f.arrayBuffer());
+            const b3 = blake3Hex(bytes);
+            const sha = [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))].map(x => x.toString(16).padStart(2, '0')).join('');
+            const [a, c] = await Promise.all([fetch('/burns/notary/' + b3).then(r => r.json()), fetch('/burns/notary/' + sha).then(r => r.json())]);
+            const marks = [...a.blake3.burns.map(x => ({ ...x, h: 'BLAKE3' })), ...c.sha256.burns.map(x => ({ ...x, h: 'SHA-256' }))].sort((x, y) => x.height - y.height);
+            out.innerHTML = marks.length
+                ? `${badge('ok', 'Notarized', 'check')} at block <a class="mono" href="${href.tx(marks[0].height, marks[0].tx)}">${fmtInt(marks[0].height)}</a>, ${utc(marks[0].time)}: it existed by then. <span class="dim">(${marks.length} notarization${marks.length === 1 ? '' : 's'}, ${marks[0].h})</span>`
+                : `Not notarized on this chain. <span class="hash">BLAKE3 ${short(b3, 8)}</span>`;
+        } catch (e) { out.textContent = 'Could not check: ' + e.message; }
+    });
+}
+
+/** A document hash's notarizations, from a search. */
+function showNotary(n) {
+    const marks = [...n.blake3.burns.map(x => ({ ...x, h: 'BLAKE3' })), ...n.sha256.burns.map(x => ({ ...x, h: 'SHA-256' }))].sort((x, y) => x.height - y.height);
+    const first = marks[0];
+    view().innerHTML = `<div class="page-h"><h1>Notarized document</h1></div>
+        ${card('Hash', `<div class="card-b pad"><span class="hash addr-full">${escHtml(n.hash)}</span>${copyBtn(n.hash)}
+            <p style="margin:10px 0 0">${badge('ok', 'Notarized', 'check')} at block <a class="mono" href="${href.tx(first.height, first.tx)}">${fmtInt(first.height)}</a>, ${utc(first.time)}. A document with this ${first.h} hash existed by then.</p></div>`)}
+        ${card(`Notarizations <span class="dim">(${marks.length})</span>`, `<div class="card-b">${table([{ t: 'Block' }, { t: 'When' }, { t: 'Hash' }, { t: 'Burned', r: 1 }, { t: 'Label' }],
+            marks.map(m => [`<a class="mono" href="${href.tx(m.height, m.tx)}">${fmtInt(m.height)}</a>`, ago(m.time), m.h, `${fmtGShort(m.value)} gMDS`, m.label ? escHtml(m.label) : '']))}</div>`)}`;
 }
 
 // ── Learn ───────────────────────────────────────────────────────────────
@@ -2765,7 +3051,15 @@ function showApi() {
         ['/address/:address/coins?limit=', 'the coins an address holds, largest first (address index)'],
         ['/richlist/:address', 'balance, coins and rank (address index)'],
         ['/coin/:id', 'whether a coin exists'],
-        ['/name/:name', 'a .mds name and its records'],
+        ['/name/:name', 'a .mds name and its records, what kind of address it pays'],
+        ['/name/:name/proof', 'a name\'s leaf and Merkle proof to the registry root'],
+        ['/burns', 'burned against issued, by year and kind; all the backing held'],
+        ['/burns/days?days=', 'burned and issued by day'],
+        ['/burns/top?purpose=&limit=', 'the most-backed names, pools, hubs, accounts or keys'],
+        ['/burns/recent?limit=', 'the newest MSB-1 burns'],
+        ['/burns/:purpose/:subject', 'what something has had burned for it, burn by burn'],
+        ['/burns/notary/:hash', 'a document hash\'s notarizations (BLAKE3 or SHA-256)'],
+        ['/burns/payload?purpose=&subject=&label=', 'the bytes of an MSB-1 burn, to build one yourself'],
         ['/mempool', 'what is waiting'],
         ['/supply, /supply/circulating', 'supply figures'],
         ['/richlist?limit=', 'the largest holders'],

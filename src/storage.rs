@@ -1,6 +1,7 @@
 mod batch_store;
 pub mod balance_index;
 pub mod name_index;
+pub mod burn_index;
 pub mod search_index;
 pub use batch_store::BatchStore;
 
@@ -377,6 +378,16 @@ impl Storage {
     /// start its worker, which catches up in the background.
     pub fn enable_name_index(&self, chain_len: u64) -> Result<()> {
         let index = self.batches.names();
+        index.enable(&self.db, chain_len)?;
+        index.spawn_worker(self.db.clone());
+        Ok(())
+    }
+
+    /// Turn on the burn index (every burn, MSB-1 backing) for a chain of
+    /// `chain_len` blocks and start its worker, which catches up in the
+    /// background.
+    pub fn enable_burn_index(&self, chain_len: u64) -> Result<()> {
+        let index = self.batches.burns();
         index.enable(&self.db, chain_len)?;
         index.spawn_worker(self.db.clone());
         Ok(())

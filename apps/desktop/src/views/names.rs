@@ -35,6 +35,25 @@ fn short(name: &str) -> String {
     name.trim_end_matches(".mds").to_string()
 }
 
+/// What backs a name (MSB-1 burns), and a way to add to it.
+fn backing_row(app: &mut App, ui: &mut Ui, name: &str, b: Option<&midstate_walletd::api::BackingView>) {
+    ui.horizontal(|ui| {
+        match b {
+            Some(b) => {
+                if !b.tier.is_empty() {
+                    theme::badge(ui, &b.tier, theme::gold());
+                }
+                theme::hint(ui, &format!("backed by {} ({} burned)", b.text, gmds(b.total)));
+            }
+            None => theme::hint(ui, "no backing burned for it"),
+        }
+        if ui.small_button("Back…").on_hover_text("Burn MDS to back this name: wallets show it to payers and to everyone it messages").clicked() {
+            app.burn_form = crate::views::burns::BurnForm::backing("name", name);
+            app.tab = crate::app::Tab::Burns;
+        }
+    });
+}
+
 pub fn show(app: &mut App, ui: &mut Ui) {
     let ctx = ui.ctx().clone();
     theme::heading(ui, "Names");
@@ -87,8 +106,26 @@ fn find(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
             _ => format!("Held, for {} more. Not offered.", days(left)),
         };
         theme::hint(ui, &line);
-        for r in &card.records {
+        if let Some(p) = &card.pays {
+            ui.label(RichText::new(format!("Pays {} — {}", theme::grouped_hash(p, 24), card.pays_kind)).size(12.0));
+        }
+        let mut can = Vec::new();
+        if card.identity {
+            can.push("its wallet hands out a fresh address for each payment");
+        }
+        if card.sealed {
+            can.push("it takes sealed messages");
+        }
+        if !can.is_empty() {
+            theme::hint(ui, &format!("{}.", can.join("; ")));
+        }
+        for r in card.records.iter().filter(|r| r.kind != "script") {
             ui.label(RichText::new(format!("{:<12}{}", r.kind, r.value)).monospace().size(10.5).color(theme::muted()));
+        }
+        backing_row(app, ui, &card.name, card.backing.as_ref());
+        if card.sealed && ui.small_button("Message…").clicked() {
+            app.sealed_to = card.name.clone();
+            app.tab = crate::app::Tab::Chat;
         }
         // The action this state allows, behind a confirm that says what it spends.
         let (label, act, spend) = match card.state.as_str() {
@@ -178,14 +215,21 @@ fn yours(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
                 theme::badge(ui, &n.status, if gold { theme::gold() } else { theme::muted() });
                 if let Some(p) = &n.pays {
                     ui.label(RichText::new(format!("pays {}", theme::grouped_hash(p, 24))).monospace().size(11.0));
+                    theme::hint(ui, &n.pays_kind);
+                }
+                if n.sealed {
+                    theme::badge(ui, "messages", theme::muted());
                 }
             });
             if n.expires > tip {
                 let renter = if n.renter { "You rent it. " } else { "" };
                 theme::hint(ui, &format!("{renter}Held for {} more. {}", days(n.expires - tip), n.deal));
             }
-            for r in &n.records {
+            for r in n.records.iter().filter(|r| r.kind != "script") {
                 ui.label(RichText::new(format!("{:<12}{}", r.kind, r.value)).monospace().size(10.5).color(theme::muted()));
+            }
+            if n.status == "registered" {
+                backing_row(app, ui, &n.name, n.backing.as_ref());
             }
             if !n.note.is_empty() {
                 theme::hint(ui, &n.note);
@@ -210,7 +254,19 @@ fn yours(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
                     app.go(ctx, Action::NameAct { name: name.clone(), act: NameAction::Renew { years: 1 } });
                 }
                 if ui.small_button("Edit records").clicked() {
-                    app.name_edit = Some((name.clone(), NameEdit { mdw: n.mdw, identity: n.identity, evm: n.evm, text: n.text.clone() }));
+                    app.name_edit = Some((
+                        name.clone(),
+                        NameEdit {
+                            mdw: n.mdw,
+                            identity: n.identity,
+                            evm: n.evm,
+                            text: n.text.clone(),
+                            pay_to: n.pay_to.clone(),
+                            script: String::new(),
+                            sealed: n.sealed,
+                        },
+                    ));
+                    app.go(ctx, Action::LoadNameTargets);
                 }
                 if n.deal.is_empty() {
                     if ui.small_button("Sell…").clicked() {
@@ -288,16 +344,60 @@ fn give_box(app: &mut App, ui: &mut Ui, ctx: &egui::Context, name: &str) {
 }
 
 fn edit_box(app: &mut App, ui: &mut Ui, ctx: &egui::Context, name: &str) {
+    let targets = app.name_targets.clone();
     let Some((_, e)) = app.name_edit.as_mut().filter(|(e, _)| e == name) else { return };
+    // Where MDS payments go: this wallet's own key, or a shared address.
+    let mut shared = !e.pay_to.trim().is_empty();
+    ui.horizontal(|ui| {
+        ui.label("Payments go to");
+        if ui.radio(!shared, "this wallet").clicked() {
+            shared = false;
+            e.pay_to.clear();
+            e.script.clear();
+        }
+        if ui.radio(shared, "a vault, multisig or plan").clicked() && !shared {
+            shared = true;
+            e.pay_to = " ".into();
+        }
+    });
+    if shared {
+        ui.add(TextEdit::singleline(&mut e.pay_to).hint_text("its midstate address").desired_width(f32::INFINITY));
+        ui.add(
+            TextEdit::singleline(&mut e.script)
+                .hint_text("its script, hex (optional: published so everyone sees what kind of address it is)")
+                .desired_width(f32::INFINITY),
+        );
+        if !targets.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                theme::hint(ui, "or one of this wallet's:");
+                for t in &targets {
+                    if ui.small_button(&t.label).on_hover_text(&t.kind).clicked() {
+                        e.pay_to = t.address.clone();
+                        e.script = t.script.clone();
+                    }
+                }
+            });
+        }
+        if !e.pay_to.trim().is_empty() {
+            match midstate_walletd::describe_target(&e.pay_to, &e.script) {
+                Ok(kind) => theme::hint(ui, &format!("Payments to {name}.mds go to this {kind}. The identity handshake is skipped for a shared address.")),
+                Err(err) => {
+                    ui.label(RichText::new(err).color(theme::red()).size(12.0));
+                }
+            }
+        }
+    }
     ui.checkbox(&mut e.mdw, "Take MDW (this wallet's midwimble address)");
-    ui.checkbox(&mut e.identity, "Identity key (people can ask it for a fresh address, an invoice, a channel)");
+    ui.checkbox(&mut e.identity, "Identity key (payers ask it for a fresh address each time; invoices; channels)");
+    ui.checkbox(&mut e.sealed, "Take sealed messages (publishes this wallet's ML-KEM key hash)");
     ui.checkbox(&mut e.evm, "Base account (this wallet's)");
     ui.add(TextEdit::singleline(&mut e.text).hint_text("a line of text, e.g. a website").desired_width(f32::INFINITY));
     ui.horizontal(|ui| {
         if ui.add_enabled(!app.busy, egui::Button::new("Save")).clicked() {
             app.busy = true;
             app.error.clear();
-            let edit = app.name_edit.as_ref().map(|(_, e)| e.clone()).unwrap_or_default();
+            let mut edit = app.name_edit.as_ref().map(|(_, e)| e.clone()).unwrap_or_default();
+            edit.pay_to = edit.pay_to.trim().to_string();
             app.go(ctx, Action::NameAct { name: name.to_string(), act: NameAction::Edit(edit) });
         }
         if ui.button("Cancel").clicked() {
@@ -341,6 +441,10 @@ fn market(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(&m.name).strong());
                 theme::badge(ui, &m.tier, theme::muted());
+                // Backing goes with the name to its next holder.
+                if let Some(t) = midstate_walletd::burns::tier(m.backing) {
+                    theme::badge(ui, t, theme::gold());
+                }
                 let terms = if m.kind == "rent" {
                     format!("{} for {}", gmds(m.price), days(m.span))
                 } else {
