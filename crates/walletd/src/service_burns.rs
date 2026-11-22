@@ -38,14 +38,19 @@ pub(super) fn backing_view(s: &burn_index::Subject) -> BackingView {
 }
 
 fn nothing(purpose: Purpose, subject: &[u8; 32]) -> BackingView {
-    BackingView { purpose: purpose.word(), subject: burns::subject_text(purpose, subject), text: "nothing burned yet".into(), ..BackingView::default() }
+    // A name's backing counts from its registration: burns from before it
+    // may exist, but do not count.
+    let text = if purpose == Purpose::NAME { "nothing burned since it was registered" } else { "nothing burned yet" };
+    BackingView { purpose: purpose.word(), subject: burns::subject_text(purpose, subject), text: text.into(), ..BackingView::default() }
 }
 
 impl Service {
-    /// What `subject` has had burned for it as `purpose`, now; `None` if
-    /// nothing, or if the index cannot say.
+    /// The backing that counts for `subject` as `purpose`, now: for a name,
+    /// what was burned since its current registration began
+    /// (`burn_index::counts_from`). `None` if nothing counts, or if the
+    /// indexes cannot say.
     pub(super) fn backing_of(&self, purpose: Purpose, subject: &[u8; 32]) -> Option<BackingView> {
-        burn_index::backing(self.node.storage.db(), purpose, subject, None).ok().flatten().map(|s| backing_view(&s))
+        burn_index::counted(self.node.storage.db(), purpose, subject).ok().flatten().map(|s| backing_view(&s))
     }
 
     /// Blocks of backing behind `purpose`'s `subject`: zero for none.
@@ -130,7 +135,7 @@ impl Service {
             v.held = held.iter().map(|(_, b, _)| b).sum();
             v.upkeep_share = burns::upkeep(v.held) / midstate::core::BLOCKS_PER_YEAR as f64;
         }
-        let top = |p: Purpose| burn_index::top(db, p, TOP).map(|l| l.iter().map(backing_view).collect()).unwrap_or_default();
+        let top = |p: Purpose| burn_index::top_counted(db, p, TOP).map(|l| l.iter().map(backing_view).collect()).unwrap_or_default();
         v.top_names = top(Purpose::NAME);
         v.top_pools = top(Purpose::POOL);
         v.top_hubs = top(Purpose::HUB);

@@ -175,7 +175,8 @@ pub struct MarketView {
     pub expires: u64,
     /// This wallet's own offer.
     pub mine: bool,
-    /// Blocks of MSB-1 backing burned for it: it goes with the name.
+    /// Blocks of MSB-1 backing burned for it since its registration began:
+    /// it goes to the buyer.
     #[serde(default)]
     pub backing: f64,
 }

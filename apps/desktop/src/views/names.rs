@@ -441,7 +441,8 @@ fn market(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(&m.name).strong());
                 theme::badge(ui, &m.tier, theme::muted());
-                // Backing goes with the name to its next holder.
+                // Backing goes with the name to its buyer (MSB-1: it ends
+                // only if the name lapses and another key claims it).
                 if let Some(t) = midstate_walletd::burns::tier(m.backing) {
                     theme::badge(ui, t, theme::gold());
                 }

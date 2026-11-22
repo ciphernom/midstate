@@ -2631,8 +2631,8 @@ function nameCard(n) {
         deal ? ['Market', escHtml(deal)] : null,
         n.pays ? ['Pays', `${who(n.pays, 10)} ${kindText(n.pays_kind)}`, 'Send to the name and wallets pay this address: the first record that takes a payment. A vault, multisig or plan shows its kind when the name publishes its script.'] : null,
         can.length ? ['Wallet', escHtml(can.join('; '))] : null,
-        ['Backing', n.backing ? `${n.backing.tier ? badge('out', escHtml(n.backing.tier)) + ' ' : ''}${escHtml(n.backing.backing_text)} <span class="dim">· ${fmtGShort(n.backing.total)} gMDS burned in ${fmtInt(n.backing.count)} burn${n.backing.count === 1 ? '' : 's'}</span>` : '<span class="dim">none burned</span>',
-            'MDS burned to back this name (MSB-1). A burn weighs what it cost in block rewards, and its weight halves every year. A name made to look like this one would have to burn as much.'],
+        ['Backing', n.backing ? `${n.backing.tier ? badge('out', escHtml(n.backing.tier)) + ' ' : ''}${escHtml(n.backing.backing_text)} <span class="dim">· ${fmtGShort(n.backing.total)} gMDS burned in ${fmtInt(n.backing.count)} burn${n.backing.count === 1 ? '' : 's'}${n.registered != null ? ` since block ${fmtInt(n.registered)}` : ''}</span>` : `<span class="dim">${/^0+$/.test(n.owner || '') ? 'none counts until it is claimed' : 'none burned since it was registered'}</span>`,
+            'MDS burned to back this name (MSB-1). A burn weighs what it cost in block rewards, and its weight halves every year. A name made to look like this one would have to burn as much. Backing counts from when the current registration began: a sale passes it on, but a name another key claims after it lapsed starts from none.'],
         ['Proof', `<a href="/name/${slug}/proof">leaf and Merkle proof</a> <span class="dim">· check it against the registry root yourself</span>`],
     ])}${recs.length ? `<details class="more-d" open><summary>Records (${recs.length})</summary>${kv(recs)}</details>` : ''}</div>`, help('Like ENS on Ethereum: a readable name that points at addresses and other records.'));
 }
@@ -2969,7 +2969,7 @@ async function showBurns(seq) {
         </div>`, help('A burn destroys MDS for good. Names burn to register and renew; MSB-1 burns back a name, a pool, a hub or an account, or notarize a document. Rewards halve every year, so the same burn is a larger share of each year\'s issuance.'))}
         ${days && days.days.length ? card('The last 60 days', `<div class="card-b pad"><div class="viz" id="viz-days"></div></div>`) : ''}
         ${card('Most backed', `<div class="card-b"><div class="tabs" id="burn-tabs">${BURN_PURPOSES.map(([p, label]) => `<a data-p="${p}" class="${p === burnTab ? 'on' : ''}">${label} <span class="dim">${(b.held.by_purpose[p] || { subjects: 0 }).subjects}</span></a>`).join('')}</div><div id="burn-top">${leaders(burnTab)}</div></div>`,
-            help('Ranked by backing now. Wallets show it beside names, sellers, pools and hubs, and sort by it: a burn is a cost a throwaway identity would not carry.'))}
+            help('Ranked by backing now; a name\'s counts from its current registration. Wallets show it beside names, sellers, pools and hubs, and sort by it: a burn is a cost a throwaway identity would not carry.'))}
         ${card('Check a document', `<div class="card-b pad"><p class="dim" style="margin:0 0 10px">Pick a file to see whether it was notarized, and since when. It is hashed here, in the browser; nothing is uploaded.</p>
             <input type="file" id="notary-file"> <span id="notary-out" class="dim"></span></div>`)}
         ${card('Recent MSB-1 burns', `<div class="card-b">${recent.length ? dual(table([{ t: 'Block' }, { t: 'For' }, { t: 'Subject' }, { t: 'Weight', r: 1 }, { t: 'Burned', r: 1 }, { t: 'Label' }], recentRows),

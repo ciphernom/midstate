@@ -9,6 +9,10 @@
 //! * `GET /burns/recent?limit=`: the newest MSB-1 burns.
 //! * `GET /burns/:purpose/:subject?limit=`: a subject's backing and burns.
 //! * `GET /burns/notary/:hash`: a document hash, under both notary purposes.
+//!
+//! Backing is what counts by MSB-1's rule (`burn_index::counts_from`): a
+//! name's from when its current registration began, so a name someone else
+//! claims after it lapsed starts again from nothing.
 
 use crate::core::burns::{self, Backing, Purpose};
 use crate::core::types::{block_reward, BLOCKS_PER_YEAR};
@@ -150,7 +154,7 @@ pub async fn get_burn_top(State(node): State<AppState>, Query(q): Query<HashMap<
         Ok(p) => p,
         Err(r) => return r,
     };
-    match burn_index::top(node.storage.db(), p, limit(&q, 50, 500)) {
+    match burn_index::top_counted(node.storage.db(), p, limit(&q, 50, 500)) {
         Ok(list) => Json(json!({ "purpose": p.word(), "top": list.iter().map(|s| s.json()).collect::<Vec<_>>() })).into_response(),
         Err(e) => unavailable(e),
     }
@@ -181,26 +185,34 @@ pub async fn get_burn_recent(State(node): State<AppState>, Query(q): Query<HashM
     }
 }
 
-/// A subject's backing and burns, as JSON.
+/// A subject's backing and burns, as JSON: `backing` is what counts,
+/// `counts_from` the height burns count from (`null`: none count, as for a
+/// name no one holds), and each burn says whether it `counts`.
 pub fn subject_json(db: &redb::Database, p: Purpose, subject: &[u8; 32], limit: usize) -> anyhow::Result<Value> {
-    let s = burn_index::backing(db, p, subject, None)?;
+    let from = burn_index::counts_from(db, p, subject)?;
+    let s = match from {
+        Some(h) => burn_index::backing_from(db, p, subject, h)?,
+        None => None,
+    };
     let list = burn_index::history(db, p, subject, limit)?;
     Ok(json!({
         "purpose": p.word(),
         "subject": burns::subject_text(p, subject),
         "subject_hex": hex::encode(subject),
         "backing": s.as_ref().map(|s| s.json()),
+        "counts_from": from,
         "burns": list.iter().map(|b| json!({
             "height": b.height, "tx": b.tx, "time": b.time, "value": b.value,
             "weight": b.weight, "weight_now": b.weight_now, "label": b.label,
+            "counts": from.is_some_and(|h| b.height >= h),
         })).collect::<Vec<_>>(),
     }))
 }
 
-/// What a name's backing looks like inside `GET /name/:name`.
+/// What a name's backing looks like inside `GET /name/:name`: what counts.
 pub fn name_backing(db: &redb::Database, name: &str) -> Value {
     let Ok(subject) = burns::name_subject(name) else { return Value::Null };
-    match burn_index::backing(db, Purpose::NAME, &subject, None) {
+    match burn_index::counted(db, Purpose::NAME, &subject) {
         Ok(Some(s)) => s.json(),
         _ => Value::Null,
     }

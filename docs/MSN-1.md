@@ -114,8 +114,10 @@ address first, and pays the record only if no answer comes.
   so reorgs unwind exactly. Always on.
   - `GET /name/nick`: holder, tier, `since`, `expires`, deal, records, and
     where MDS pays now, with what kind of address that is (`pays_kind`), the
-    index's `height`, the identity, kem and published script, and the
-    MSB-1 `backing` burned for it (`docs/MSB-1.md`).
+    index's `height`, the identity, kem and published script, the MSB-1
+    `backing` burned for it, and `registered`, the height its current
+    registration began: backing counts from there, so a name another key
+    claims after it lapsed starts from none (`docs/MSB-1.md`).
   - `GET /name/nick/proof`: the name's leaf, the records and terms it commits
     to, and its Merkle proof to the root of the registry's current thread (the
     predecessor's leaf, for a name never registered). Clients check a node's

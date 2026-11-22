@@ -6,7 +6,9 @@
 //! * [`NODES`]: the Merkle tree, `level << 32 | index → hash`. Empty subtrees
 //!   are not stored.
 //! * [`LEAVES`]: `slot → key ‖ next ‖ expires ‖ owner ‖ data`.
-//! * [`RECORDS`]: `slot → since ‖ records`, `since` the height its holder got it.
+//! * [`RECORDS`]: `slot → since ‖ registered ‖ records`: `since` the height
+//!   its holder got it, `registered` the height its current registration
+//!   began (see [`Record::registered`]).
 //! * [`DEALS`]: `slot → terms`, for names offered or rented out.
 //! * [`OWNERS`]: `owner ‖ slot`, every name by its control key.
 //! * [`KEYS`]: `key → slot ‖ name`, in key order, so a new name's neighbour is
@@ -47,7 +49,7 @@ pub const LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("names_log");
 pub const META: TableDefinition<&str, &[u8]> = TableDefinition::new("names_meta");
 
 /// Bump to rebuild every node's index on upgrade.
-const VERSION: u64 = 4;
+const VERSION: u64 = 5;
 const STEP_BUDGET: Duration = Duration::from_millis(250);
 const STEP_PAUSE: Duration = Duration::from_millis(20);
 const IDLE_WAIT: Duration = Duration::from_secs(30);
@@ -119,7 +121,7 @@ impl Meta {
 #[derive(Serialize, Deserialize)]
 enum Logged {
     Genesis,
-    /// With the slot's `since ‖ records` before a change.
+    /// With the slot's `since ‖ registered ‖ records` before a change.
     Spend(Op, Option<Vec<u8>>),
 }
 
@@ -217,9 +219,10 @@ impl<'t> Writer<'t> {
         Ok(())
     }
 
-    fn set_name(&mut self, pos: u64, name: &[u8], since: u64, records: &[u8]) -> Result<()> {
+    /// A new name in slot `pos`: held, and registered, from `height`.
+    fn set_name(&mut self, pos: u64, name: &[u8], height: u64, records: &[u8]) -> Result<()> {
         self.keys.insert(names::ord(&names::key(name)), [&pos.to_le_bytes()[..], name].concat().as_slice())?;
-        self.records.insert(pos, [&since.to_le_bytes()[..], records].concat().as_slice())?;
+        self.records.insert(pos, [&height.to_le_bytes()[..], &height.to_le_bytes()[..], records].concat().as_slice())?;
         Ok(())
     }
 
@@ -275,17 +278,22 @@ impl<'t> Writer<'t> {
                     }
                     None
                 }
-                Op::Change { by, pos, records, terms, .. } => {
+                Op::Change { by, pos, records, terms, leaf, owner, .. } => {
                     let Some(old) = self.records.get(*pos)?.map(|g| g.value().to_vec()) else {
                         return self.broke(m, height, "a change to a slot this mirror has no records for");
                     };
+                    if old.len() < 16 {
+                        return self.broke(m, height, "records this mirror cannot read");
+                    }
                     // A reclaim or a sale starts a new holding; the holder's own
                     // change, or a rental, does not.
                     let since = match by {
                         By::Lapse | By::Buy => height.to_le_bytes().to_vec(),
                         By::Owner | By::Rent => old[..8].to_vec(),
                     };
-                    self.records.insert(*pos, [&since[..], records].concat().as_slice())?;
+                    let fresh = new_registration(*by, &leaf.owner, owner);
+                    let registered = if fresh { height.to_le_bytes().to_vec() } else { old[8..16].to_vec() };
+                    self.records.insert(*pos, [&since[..], &registered[..], records].concat().as_slice())?;
                     self.set_terms(*pos, terms)?;
                     Some(old)
                 }
@@ -339,6 +347,15 @@ impl<'t> Writer<'t> {
         m.thread = e.before;
         Ok(())
     }
+}
+
+/// Whether a change starts a new registration of a name: a claim of a name
+/// nobody held (a premium name, owner zero), or a reclaim after it lapsed by
+/// a key that did not hold it. A sale, a transfer, a rental, a late renewal
+/// (the owner's update after expiry) or the holder reclaiming its own name
+/// goes on with the registration before ([`Record::registered`]).
+fn new_registration(by: By, old_owner: &[u8; 32], new_owner: &[u8; 32]) -> bool {
+    *old_owner == [0; 32] || (by == By::Lapse && new_owner != old_owner)
 }
 
 /// Undo every spend at or above height `to`, so that `next <= to`.
@@ -597,8 +614,15 @@ pub struct Record {
     /// The last height it is held at; from the next, anyone may reclaim it.
     pub expires: u64,
     pub tier: u8,
-    /// When its holder got it.
+    /// When its holder got it: its registration, or the sale or reclaim
+    /// that gave it to this holder.
     pub since: u64,
+    /// When its current registration began: when it was registered, or
+    /// claimed or reclaimed after lapsing by a key that did not hold it.
+    /// Sales, transfers, rentals and late renewals do not start a new one.
+    /// MSB-1 backing burned for the name counts from here: a name taken
+    /// over after it lapsed starts with none.
+    pub registered: u64,
     pub records: Vec<names::Rec>,
     pub terms: Vec<u8>,
     pub deal: Deal,
@@ -648,7 +672,8 @@ fn record(txn: &redb::ReadTransaction, m: &Meta, name: String, slot: u64, leaf: 
         expires: leaf.expires,
         tier: leaf.tier,
         since: u64::from_le_bytes(raw[..8].try_into()?),
-        records: names::parse(&raw[8..]).unwrap_or_default(),
+        registered: u64::from_le_bytes(raw[8..16].try_into()?),
+        records: names::parse(&raw[16..]).unwrap_or_default(),
         deal: Deal::parse(&terms),
         terms,
         height: m.next,
@@ -802,9 +827,9 @@ pub fn prove(db: &Database, name: &str) -> Result<NameProof> {
             (slot, Leaf::from_bytes(&raw), false)
         }
     };
-    let raw = txn.open_table(RECORDS)?.get(slot)?.map(|g| g.value().to_vec()).unwrap_or_else(|| vec![0; 8]);
+    let raw = txn.open_table(RECORDS)?.get(slot)?.map(|g| g.value().to_vec()).unwrap_or_else(|| vec![0; 16]);
     let terms = txn.open_table(DEALS)?.get(slot)?.map_or_else(|| Deal::None.terms(), |g| g.value().to_vec());
-    Ok(NameProof { registered, slot, leaf, records: raw[8..].to_vec(), terms, proof: names::proof(&tree, slot)?, thread, height: m.next })
+    Ok(NameProof { registered, slot, leaf, records: raw[16..].to_vec(), terms, proof: names::proof(&tree, slot)?, thread, height: m.next })
 }
 
 /// A sale or rental that landed.
@@ -1063,6 +1088,61 @@ mod tests {
     }
 
     #[test]
+    fn a_registration_ends_only_when_another_key_takes_the_name_over() {
+        let (a, b, none) = ([1u8; 32], [2u8; 32], [0u8; 32]);
+        // Claimed from nobody: a premium name's first holder.
+        assert!(new_registration(By::Lapse, &none, &a));
+        assert!(new_registration(By::Buy, &none, &a));
+        // Reclaimed after it lapsed, by someone else: starts again.
+        assert!(new_registration(By::Lapse, &a, &b));
+        // The holder reclaiming its own, renewing late, rotating its key,
+        // selling or renting: the registration goes on.
+        assert!(!new_registration(By::Lapse, &a, &a));
+        assert!(!new_registration(By::Owner, &a, &a));
+        assert!(!new_registration(By::Owner, &a, &b));
+        assert!(!new_registration(By::Buy, &a, &b));
+        assert!(!new_registration(By::Rent, &a, &a));
+    }
+
+    #[test]
+    fn a_names_backing_counts_from_its_registration() {
+        use crate::core::burns::{Backing, Purpose};
+        use crate::storage::burn_index::{self, backing, counted, counts_from, held, top_counted};
+        let burn = |value: u64| {
+            let coin = InputReveal { predicate: Predicate::p2pk(&[1; 32]), value, salt: [1; 32], commitment: None };
+            reveal(vec![coin], vec![Witness::ScriptInputs(vec![])], Backing::name("bitcoin", "").unwrap().outputs(value))
+        };
+        let s = crate::core::burns::name_subject("bitcoin").unwrap();
+        let (_d, db, bs) = chain(true, &[vec![make(names::genesis())]]);
+        bs.burns().enable(&db, H + 1).unwrap();
+        bs.burns().catch_up(&db).unwrap();
+        // Burned for while unclaimed: nothing counts, though the burn stands.
+        bs.save(H + 1, &block(2, vec![burn(1 << 20)])).unwrap();
+        assert_eq!(counts_from(&db, Purpose::NAME, &s).unwrap(), None, "no one holds it");
+        assert!(counted(&db, Purpose::NAME, &s).unwrap().is_none());
+        assert_eq!(backing(&db, Purpose::NAME, &s, None).unwrap().unwrap().total, 1 << 20);
+        assert!(top_counted(&db, Purpose::NAME, 5).unwrap().is_empty());
+        assert!(held(&db).unwrap().iter().all(|(p, _, _)| *p != Purpose::NAME));
+        // Claimed, and backed in the same block: that burn counts, the
+        // earlier one never will.
+        let claim = spend_tx(&db, "bitcoin", How::Hold(None), None, hold(&db, [7; 32], "one"));
+        bs.save(H + 2, &block(3, vec![claim, burn(1 << 10)])).unwrap();
+        assert_eq!(counts_from(&db, Purpose::NAME, &s).unwrap(), Some(H + 2));
+        let c = counted(&db, Purpose::NAME, &s).unwrap().unwrap();
+        assert_eq!((c.total, c.count, c.first), (1 << 10, 1, H + 2));
+        assert_eq!(top_counted(&db, Purpose::NAME, 5).unwrap(), vec![c.clone()]);
+        let names_held = held(&db).unwrap().into_iter().find(|(p, _, _)| *p == Purpose::NAME).unwrap();
+        assert!((names_held.1 - c.backing).abs() < 1e-12 && names_held.2 == 1);
+        // A burn for another subject entirely is untouched by the rule.
+        assert_eq!(counts_from(&db, Purpose::POOL, &[9; 32]).unwrap(), Some(0));
+        // The claim reorged out: no one holds it again.
+        bs.save(H + 2, &block(4, vec![burn(1 << 10)])).unwrap();
+        assert_eq!(counts_from(&db, Purpose::NAME, &s).unwrap(), None);
+        assert!(counted(&db, Purpose::NAME, &s).unwrap().is_none());
+        assert_eq!(burn_index::backing(&db, Purpose::NAME, &s, None).unwrap().unwrap().count, 2);
+    }
+
+    #[test]
     fn claims_sales_and_rentals_and_a_reorg_restores_them() {
         let seed = [5u8; 32];
         let me = wots::keygen(&seed);
@@ -1072,6 +1152,7 @@ mod tests {
         bs.save(H + 1, &block(2, vec![claim])).unwrap();
         let r = lookup(&db, "bitcoin").unwrap().unwrap();
         assert_eq!((r.owner, r.since, r.lapsed()), (me, H + 1, false));
+        assert_eq!(r.registered, H + 1, "claiming a premium name registers it");
         assert!(plan(&db, "bitcoin", How::Hold(Some([9; 32])), &hold(&db, [9; 32], "")).is_err(), "not its owner");
         // Offered for sale, then bought.
         let payee = [6u8; 32];
@@ -1082,6 +1163,7 @@ mod tests {
         bs.save(H + 3, &block(4, vec![spend_tx(&db, "bitcoin", How::Buy, None, buy)])).unwrap();
         let r = lookup(&db, "bitcoin").unwrap().unwrap();
         assert_eq!((r.owner, r.since, r.deal, r.records[1].clone()), ([8; 32], H + 3, Deal::None, Rec::Text("two".into())));
+        assert_eq!(r.registered, H + 1, "a sale passes the registration on");
         assert!(listings(&db).unwrap().is_empty());
         assert_eq!(names_of(&db, &[8; 32]).unwrap().iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), vec!["bitcoin"]);
         assert!(names_of(&db, &me).unwrap().is_empty(), "the seller holds it no more");

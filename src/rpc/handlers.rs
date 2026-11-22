@@ -1173,6 +1173,9 @@ pub async fn get_name(
                 "owner": hex::encode(r.owner),
                 "slot": r.slot,
                 "since": r.since,
+                // Where its backing counts from (MSB-1): when this
+                // registration began.
+                "registered": r.registered,
                 "expires": r.expires,
                 "lapsed": r.lapsed(),
                 "height": r.height,

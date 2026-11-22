@@ -232,7 +232,11 @@ fn mine(app: &mut App, ui: &mut Ui) {
     theme::heading(ui, "Your backing");
     theme::panel_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
-        theme::hint(ui, "Wallets show a name's backing to everyone who pays it or reads its messages: an hour of issuance makes it backed, a day well backed, a week strongly backed.");
+        theme::hint(
+            ui,
+            "Wallets show a name's backing to everyone who pays it or reads its messages: an hour of issuance makes it backed, a day well backed, a week strongly backed. \
+             It goes with the name if you sell it, and ends if you let it lapse and someone else claims it.",
+        );
         for m in &b.mine {
             ui.horizontal(|ui| {
                 backing_line(ui, m);

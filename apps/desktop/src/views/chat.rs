@@ -76,8 +76,9 @@ fn sealed(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
     });
 }
 
-/// Who reaches the inbox: everyone, or names backed at least so much. The
-/// rest wait under Requests, unread by default but never dropped.
+/// Who reaches the inbox: verified names (until the user picks another),
+/// everyone, or names backed at least so much. The rest wait under Requests,
+/// unread by default but never dropped.
 fn inbox_bar(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
     let bar = app.status.as_ref().and_then(|s| s.inbox_bar);
     ui.horizontal(|ui| {

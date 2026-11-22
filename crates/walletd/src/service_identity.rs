@@ -84,7 +84,7 @@ pub(super) struct Queued {
 }
 
 /// What the wallet keeps of sealed messaging. Persisted next to the wallet.
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub(super) struct SealedBook {
     #[serde(default)]
     pub chats: Vec<Conversation>,
@@ -104,9 +104,30 @@ pub(super) struct SealedBook {
     pub legacy_secret: Option<String>,
     /// The MSB-1 backing (blocks) a sender's name needs for its messages to
     /// reach the inbox; below it they are message requests. `None`: every
-    /// message reaches the inbox.
-    #[serde(default)]
+    /// message reaches the inbox, saved as `null`. A new book, and one saved
+    /// before there was a bar, take verified names only (`Some(0.0)`).
+    #[serde(default = "verified_names")]
     pub inbox_bar: Option<f64>,
+}
+
+/// The inbox's bar until its user picks another: verified names, so a
+/// stranger's first message is a request, not an interruption.
+fn verified_names() -> Option<f64> {
+    Some(0.0)
+}
+
+impl Default for SealedBook {
+    fn default() -> Self {
+        SealedBook {
+            chats: Vec::new(),
+            outbox: Vec::new(),
+            kem_reqs: HashMap::new(),
+            peer_kems: HashMap::new(),
+            seen: VecDeque::new(),
+            legacy_secret: None,
+            inbox_bar: verified_names(),
+        }
+    }
 }
 
 impl SealedBook {
@@ -557,6 +578,18 @@ impl Service {
 mod tests {
     use super::*;
     use midstate::core::script::compile_multisig_2of3;
+
+    #[test]
+    fn the_inbox_takes_verified_names_unless_told_otherwise() {
+        assert_eq!(SealedBook::default().inbox_bar, Some(0.0));
+        let before: SealedBook = serde_json::from_str(r#"{"chats":[],"seen":[]}"#).unwrap();
+        assert_eq!(before.inbox_bar, Some(0.0), "a book saved before there was a bar");
+        for bar in [None, Some(0.0), Some(60.0), Some(1_440.0)] {
+            let b = SealedBook { inbox_bar: bar, ..SealedBook::default() };
+            let back: SealedBook = serde_json::from_slice(&serde_json::to_vec(&b).unwrap()).unwrap();
+            assert_eq!(back.inbox_bar, bar, "a choice, \"everyone\" too, survives a save");
+        }
+    }
 
     #[test]
     fn a_payment_asks_the_identity_unless_the_name_points_at_a_shared_address() {

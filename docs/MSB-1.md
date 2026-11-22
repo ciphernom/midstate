@@ -1,5 +1,9 @@
 # MSB-1: burns that back things
 
+**Status: final, version 1.** The payload, the purposes 1–7, the weight, the
+tiers and how a name's backing is counted are fixed: see [Frozen](#frozen) for
+what may still be added, and how.
+
 MSB-1 gives people reasons to burn MDS that last as long as the chain does:
 burning *backs* a name, a key, a Base account, a mining pool or a payment-channel
 hub, and wallets show and rank by that backing; or it *notarizes* a document. It
@@ -100,9 +104,10 @@ where a cheap identity would otherwise cost the reader:
 - **Paying a name.** The Send page shows what backs the name being paid. A
   name with none is flagged: *make sure it is the name you mean.* A lookalike
   would have to burn as much to look the same.
-- **Sealed messages.** The inbox has a bar: everyone, verified names, names
-  backed an hour or more, or a day or more. Messages below it wait under
-  Requests, never dropped. Conversations show their sender's tier.
+- **Sealed messages.** The inbox has a bar: verified names unless its user
+  picks another (everyone, names backed an hour or more, or a day or more).
+  Messages below it wait under Requests, never dropped. Conversations show
+  their sender's tier.
 - **The ETH and MDW swap markets.** A seller's verified name shows its backing
   as a tier; on the ETH market, with its Base account's added.
 - **Channel hubs.** Hubs are listed most-backed first: a hub's adverts are its
@@ -110,14 +115,43 @@ where a cheap identity would otherwise cost the reader:
 - **Mining pools.** A pool's dashboard shows its backing (purpose `pool`, its
   fee address), asked of its node every five minutes. Miners' own dashboards
   show it too.
-- **The name market.** Backing belongs to the name, so it goes to the name's
-  next holder. Listings show their tier.
+- **The name market.** Backing goes with a name's registration, so a sale
+  passes it to the buyer. Listings show their tier.
 - **Leaderboards.** The explorer ranks names, pools, hubs, accounts and keys by
   backing.
 
 Anyone can back anything. Backing is what someone burned for a subject, not the
 subject's own statement. A pool that wants its backing to mean "we stand behind
 this" burns it itself, and says so in the label.
+
+## When a name changes hands
+
+A name's backing counts the burns made for it since its **current
+registration** began. A registration begins when someone claims a name no one
+held (a new name, or a premium name's first claim), or when a key other than
+its last holder's reclaims it after it lapsed. Nothing else ends one:
+
+| what happens to the name | its backing |
+|---|---|
+| sold, transferred, its key rotated | kept: it goes with the name |
+| rented out, renewed, renewed late by its holder | kept |
+| lapsed, and claimed by another key | starts again from nothing |
+| never registered, or a premium name never claimed | none counts |
+
+So a lapsed name cannot be picked up, backing and all, for the price of its
+registration: whoever takes it over starts from nothing. Burns for a name
+before it is registered never count; back a name once it is held.
+
+Why a sale keeps it: a sale off the market is a transfer its holder signs,
+which the chain cannot tell from a key rotation (wallets rotate as their
+one-time signatures run low), and resetting on market sales alone would only
+push sales off the market. A lapse is the one change a holder did not agree
+to.
+
+The rule is the readers', not consensus. The index keeps every burn; it counts
+a name's from the height its registration began (`registered` in
+`GET /name/:name`), and `GET /burns/name/:name` says where backing counts from
+(`counts_from`) and, for each burn, whether it `counts`.
 
 ## Notarizing
 
@@ -141,13 +175,17 @@ reports from where its totals run (`from`).
   by purpose, dex, other); the last 365 days; all the backing held, and the
   share of issuance keeping it up burns.
 - `GET /burns/days?days=`: burned and issued by day.
-- `GET /burns/top?purpose=&limit=`: the most-backed subjects.
+- `GET /burns/top?purpose=&limit=`: the most-backed subjects, by the backing
+  that counts.
 - `GET /burns/recent?limit=`: the newest MSB-1 burns.
 - `GET /burns/:purpose/:subject?limit=`: a subject's backing and its burns,
-  newest first (a name, a `0x` account, a checksummed address or 64 hex).
+  newest first (a name, a `0x` account, a checksummed address or 64 hex):
+  `counts_from`, the height its burns count from (`null`: none do), and
+  each burn's `counts`.
 - `GET /burns/notary/:hash`: a document hash under both notary purposes.
 - `GET /burns/payload?purpose=&subject=&label=`: the bytes of an MSB-1 burn.
-- `GET /name/:name` now includes the name's `backing`.
+- `GET /name/:name` now includes the name's `backing`, and `registered`,
+  the height its current registration began.
 
 The index also counts every other burn: MSN-1 (`MSN1…` payloads), the DEX's
 order books (`MDX…`, usually value 0) and anything else, including outputs paid
@@ -170,3 +208,50 @@ to the all-zero burn address. Burns of value 0 are not stored, except MSB-1's.
 No consensus rule changes. Nodes without the burn index accept and relay MSB-1
 burns like any burn. Wallets without MSB-1 treat them as burns with a payload.
 New wallet API fields are optional (`#[serde(default)]`).
+
+## Frozen
+
+Version 1 is final. These are fixed, and burns already on chain keep the
+meaning they were made with:
+
+- the tag `MSB1` and the layout: purpose at byte 4, subject at bytes 5–36,
+  the label after, 80 bytes at most (a label of up to 43);
+- purposes 1–7 and what each one's subject is, including the canonical-name
+  and zero-padding rules;
+- the weight: `v / block_reward(h)` blocks, halving every 525,600 blocks;
+- the tiers: 60, 1,440 and 10,080 blocks, named backed, well backed and
+  strongly backed;
+- the name rule above.
+
+What may change, and how:
+
+- **New purposes** take the next number, 8 and up, written here first. A number
+  is never reused or redefined, even for a use given up. Readers already keep
+  and index purposes they do not know (shown as `purpose-N`), so burns for a
+  new purpose count from the first one; readers need an upgrade only to name
+  it.
+- **Anything else**, a layout, a weight or a tier changed, is a new tag
+  (`MSB2`), read beside MSB-1, never instead of it.
+- Wallets may set bars of their own, as the inbox's are; the three tier names
+  keep their values.
+
+### Test vectors
+
+`core::burns::tests::the_format_is_frozen` checks these.
+
+```text
+name "nick", label "for the shop":
+  4d534231016e69636b00000000000000000000000000000000000000000000000000000000666f72207468652073686f70
+evm 0x00112233445566778899aabbccddeeff00112233, no label:
+  4d5342310300112233445566778899aabbccddeeff00112233000000000000000000000000
+```
+
+| | value |
+|---|---|
+| `block_reward(0)` | 1,073,741,824 units (2^30) |
+| weight of `block_reward(0)` units at height 0 | 1 block |
+| the same units at height 525,600 | 2 blocks (the reward halved) |
+| a burn of 1 block, 525,600 blocks later | 0.5 blocks |
+| a day of backing at height 0 (`cost(1440, 0)`) | 1,546,188,226,560 units |
+| an hour at height 525,600 (`cost(60, 525600)`) | 32,212,254,720 units |
+| keeping up `B` blocks a year | `B · ln 2` blocks |

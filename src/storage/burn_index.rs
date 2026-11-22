@@ -329,24 +329,31 @@ impl<'t> Writer<'t> {
     fn rescore(&mut self, k: &[u8; 33]) -> Result<()> {
         let p = Purpose(k[0]);
         let s: [u8; 32] = k[1..].try_into().expect("32 bytes");
-        let (lo, hi) = (entry_key(p, &s, 0, 0), entry_key(p, &s, u64::MAX, u32::MAX));
-        let mut n: Option<Score> = None;
-        for item in self.subjects.range::<&[u8; 45]>(&lo..=&hi)? {
-            let (key, v) = item?;
-            let height = u64::from_be_bytes(key.value()[33..41].try_into()?);
-            let e: Entry = bincode::deserialize(v.value())?;
-            let x = n.get_or_insert(Score { first: height, ..Score::default() });
-            x.anchors += burns::anchor(e.value, height);
-            x.total = x.total.saturating_add(e.value);
-            x.count += 1;
-            x.last = height;
-            if !e.label.is_empty() {
-                x.label = e.label;
-            }
-        }
+        let n = score_of(&self.subjects, p, &s, 0)?;
         let old = self.score(k)?;
         self.set_score(p, &s, old.as_ref(), n.as_ref())
     }
+}
+
+/// A subject's score from its burns at or above height `from`, summed from
+/// [`SUBJECTS`]; `None` if it has none there.
+fn score_of<T: ReadableTable<&'static [u8; 45], &'static [u8]>>(t: &T, p: Purpose, s: &[u8; 32], from: u64) -> Result<Option<Score>> {
+    let (lo, hi) = (entry_key(p, s, from, 0), entry_key(p, s, u64::MAX, u32::MAX));
+    let mut n: Option<Score> = None;
+    for item in t.range::<&[u8; 45]>(&lo..=&hi)? {
+        let (key, v) = item?;
+        let height = u64::from_be_bytes(key.value()[33..41].try_into()?);
+        let e: Entry = bincode::deserialize(v.value())?;
+        let x = n.get_or_insert(Score { first: height, ..Score::default() });
+        x.anchors += burns::anchor(e.value, height);
+        x.total = x.total.saturating_add(e.value);
+        x.count += 1;
+        x.last = height;
+        if !e.label.is_empty() {
+            x.label = e.label;
+        }
+    }
+    Ok(n)
 }
 
 /// Undo every block at or above height `to`, so that `next <= to`.
@@ -716,20 +723,135 @@ pub fn top(db: &Database, purpose: Purpose, limit: usize) -> Result<Vec<Subject>
 }
 
 /// All the backing anyone holds, by purpose, at the index's height: blocks
-/// and subjects.
+/// and subjects. Only what counts ([`counts_from`]): a name no one holds, or
+/// burns from before its current registration, hold nothing.
 pub fn held(db: &Database) -> Result<Vec<(Purpose, f64, u64)>> {
     let m = ready(db)?;
     let txn = db.begin_read()?;
     let t = txn.open_table(SCORES)?;
+    let subjects = txn.open_table(SUBJECTS)?;
     let mut by: std::collections::BTreeMap<Purpose, (f64, u64)> = Default::default();
     for item in t.iter()? {
         let (k, v) = item?;
-        let sc: Score = bincode::deserialize(v.value())?;
-        let e = by.entry(Purpose(k.value()[0])).or_default();
+        let p = Purpose(k.value()[0]);
+        let mut sc: Score = bincode::deserialize(v.value())?;
+        if p == Purpose::NAME {
+            let s: [u8; 32] = k.value()[1..].try_into()?;
+            let Some(from) = counts_from(db, p, &s)? else { continue };
+            if from > sc.first {
+                let Some(c) = score_of(&subjects, p, &s, from)? else { continue };
+                sc = c;
+            }
+        }
+        let e = by.entry(p).or_default();
         e.0 += burns::backing_at(sc.anchors, m.next);
         e.1 += 1;
     }
     Ok(by.into_iter().map(|(p, (b, n))| (p, b, n)).collect())
+}
+
+/// Where `subject`'s backing counts from, by MSB-1's rule for names
+/// (docs/MSB-1.md, "When a name changes hands"): a name's from the height its
+/// current registration began (`name_index::Record::registered`), so a name
+/// another key claims after it lapsed starts again from nothing, and `None`
+/// while no one holds it (never registered, or a premium name never
+/// claimed), when none of its burns count. Every other purpose counts every
+/// burn: `Some(0)`.
+pub fn counts_from(db: &Database, purpose: Purpose, subject: &[u8; 32]) -> Result<Option<u64>> {
+    if purpose != Purpose::NAME {
+        return Ok(Some(0));
+    }
+    let Some(name) = burns::subject_name(subject) else { return Ok(None) };
+    Ok(super::name_index::lookup(db, &name)?.filter(|r| r.owner != [0; 32]).map(|r| r.registered))
+}
+
+/// The backing that counts for `subject` now, by [`counts_from`]: what
+/// wallets and explorers show, rank and gate on. `None` if nothing counts.
+pub fn counted(db: &Database, purpose: Purpose, subject: &[u8; 32]) -> Result<Option<Subject>> {
+    match counts_from(db, purpose, subject)? {
+        Some(from) => backing_from(db, purpose, subject, from),
+        None => Ok(None),
+    }
+}
+
+/// What `subject` has had burned for it as `purpose` at or above height
+/// `from`, at the index's height: burns before `from` do not count. `None` if
+/// nothing counts.
+pub fn backing_from(db: &Database, purpose: Purpose, subject: &[u8; 32], from: u64) -> Result<Option<Subject>> {
+    let m = ready(db)?;
+    let txn = db.begin_read()?;
+    let tables = (txn.open_table(SCORES), txn.open_table(SUBJECTS));
+    let (scores, subjects) = match tables {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(redb::TableError::TableDoesNotExist(_)), _) | (_, Err(redb::TableError::TableDoesNotExist(_))) => return Ok(None),
+        (Err(e), _) | (_, Err(e)) => return Err(e.into()),
+    };
+    Ok(score_from(&scores, &subjects, purpose, subject, from)?.map(|sc| Subject::of(purpose, *subject, sc, m.next)))
+}
+
+/// A subject's score counting its burns from `from`: the whole score when
+/// every burn counts, else summed again from the burns that do.
+fn score_from<A, B>(scores: &A, subjects: &B, p: Purpose, s: &[u8; 32], from: u64) -> Result<Option<Score>>
+where
+    A: ReadableTable<&'static [u8; 33], &'static [u8]>,
+    B: ReadableTable<&'static [u8; 45], &'static [u8]>,
+{
+    let Some(raw) = scores.get(&subject_key(p, s))? else { return Ok(None) };
+    let sc: Score = bincode::deserialize(raw.value())?;
+    if from <= sc.first {
+        return Ok(Some(sc));
+    }
+    if from > sc.last {
+        return Ok(None);
+    }
+    score_of(subjects, p, s, from)
+}
+
+/// The most-backed subjects for `purpose` counting, for each, only its burns
+/// from the height `from_of` gives it (`None`: none of its burns count).
+/// Ranks order subjects by every burn's weight, an upper bound of what
+/// counts, so the walk stops once nothing further down could make the list:
+/// exact, and as cheap as [`top`] while few subjects lose backing.
+pub fn top_from(db: &Database, purpose: Purpose, limit: usize, from_of: impl Fn(&[u8; 32]) -> Result<Option<u64>>) -> Result<Vec<Subject>> {
+    /// Ranks looked at, at most: past this many the list is the best of
+    /// those, which only matters once thousands of names lost their backing.
+    const WALK: usize = 10_000;
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let m = ready(db)?;
+    let txn = db.begin_read()?;
+    let ranks = txn.open_table(RANKS)?;
+    let scores = txn.open_table(SCORES)?;
+    let subjects = txn.open_table(SUBJECTS)?;
+    let mut lo = [0u8; 41];
+    lo[0] = purpose.0;
+    let mut hi = [0xffu8; 41];
+    hi[0] = purpose.0;
+    let mut out: Vec<Subject> = Vec::new();
+    for item in ranks.range::<&[u8; 41]>(&lo..=&hi)?.rev().take(WALK) {
+        let (k, _) = item?;
+        let all = burns::backing_at(f64::from_bits(u64::from_be_bytes(k.value()[1..9].try_into()?)), m.next);
+        if out.len() >= limit && out[limit - 1].backing >= all {
+            break;
+        }
+        let s: [u8; 32] = k.value()[9..].try_into()?;
+        let Some(from) = from_of(&s)? else { continue };
+        let Some(sc) = score_from(&scores, &subjects, purpose, &s, from)? else { continue };
+        out.push(Subject::of(purpose, s, sc, m.next));
+        out.sort_by(|a, b| b.backing.total_cmp(&a.backing));
+        out.truncate(limit);
+    }
+    Ok(out)
+}
+
+/// The most-backed subjects for `purpose` by the backing that counts
+/// ([`counts_from`]).
+pub fn top_counted(db: &Database, purpose: Purpose, limit: usize) -> Result<Vec<Subject>> {
+    if purpose != Purpose::NAME {
+        return top(db, purpose, limit);
+    }
+    top_from(db, purpose, limit, |s| counts_from(db, purpose, s))
 }
 
 /// A recent MSB-1 burn.
@@ -890,6 +1012,33 @@ mod tests {
         let txn = db.begin_read().unwrap();
         assert_eq!(txn.open_table(RANKS).unwrap().iter().unwrap().count(), 0);
         assert_eq!(txn.open_table(DAYS).unwrap().iter().unwrap().count(), 0);
+    }
+
+    #[test]
+    fn backing_can_count_from_a_height_and_ranks_stay_exact() {
+        let r = block_reward(0);
+        let (a, b, c) = (Backing::name("alpha", "").unwrap(), Backing::name("bravo", "").unwrap(), Backing::name("charlie", "").unwrap());
+        // alpha: a lot early (block 0), a little late (block 3); bravo and
+        // charlie: steady amounts at block 2.
+        let (_d, db, _bs) = store(&[
+            vec![burn_tx(a.outputs(100 * r))],
+            vec![],
+            vec![burn_tx(b.outputs(10 * r)), burn_tx(c.outputs(5 * r))],
+            vec![burn_tx(a.outputs(r))],
+        ]);
+        let all = backing(&db, Purpose::NAME, &a.subject, None).unwrap().unwrap();
+        let late = backing_from(&db, Purpose::NAME, &a.subject, 3).unwrap().unwrap();
+        assert_eq!((all.total, late.total, late.count, late.first), (101 * r, r, 1, 3));
+        assert!(backing_from(&db, Purpose::NAME, &a.subject, 4).unwrap().is_none(), "nothing since");
+        // Counting alpha only from block 3 drops it from first to last.
+        let cut = |s: &[u8; 32]| Ok(Some(if *s == a.subject { 3 } else { 0 }));
+        let names = |l: Vec<Subject>| l.iter().map(|x| burns::subject_text(x.purpose, &x.subject)).collect::<Vec<_>>();
+        assert_eq!(names(top(&db, Purpose::NAME, 3).unwrap()), vec!["alpha.mds", "bravo.mds", "charlie.mds"]);
+        assert_eq!(names(top_from(&db, Purpose::NAME, 3, cut).unwrap()), vec!["bravo.mds", "charlie.mds", "alpha.mds"]);
+        assert_eq!(names(top_from(&db, Purpose::NAME, 2, cut).unwrap()), vec!["bravo.mds", "charlie.mds"]);
+        // A subject none of whose burns count is left out.
+        let gone = |s: &[u8; 32]| Ok((*s != b.subject).then_some(0));
+        assert_eq!(names(top_from(&db, Purpose::NAME, 3, gone).unwrap()), vec!["alpha.mds", "charlie.mds"]);
     }
 
     #[test]

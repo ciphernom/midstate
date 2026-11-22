@@ -3343,20 +3343,32 @@ async fn wallet_backing(rpc_port: u16, rpc_host: String, purpose: String, subjec
     if let Some(e) = v.get("error") {
         anyhow::bail!("{}", e.as_str().unwrap_or("the node refused"));
     }
+    let (what, which) = (v["purpose"].as_str().unwrap_or(""), v["subject"].as_str().unwrap_or(""));
+    // A name's backing counts from its current registration (MSB-1).
+    let from = v["counts_from"].as_u64();
+    let burns = v["burns"].as_array().cloned().unwrap_or_default();
     match v.get("backing").filter(|b| !b.is_null()) {
         Some(b) => {
-            println!("{} {}", v["purpose"].as_str().unwrap_or(""), v["subject"].as_str().unwrap_or(""));
+            println!("{what} {which}");
             println!("  backing   {} ({:.2} blocks){}", b["backing_text"].as_str().unwrap_or(""), b["backing"].as_f64().unwrap_or(0.0),
                 b["tier"].as_str().map(|t| format!(", {t}")).unwrap_or_default());
             println!("  burned    {} units in {} burns, blocks {}–{}", b["total"], b["count"], b["first"], b["last"]);
+            if let Some(h) = from.filter(|h| *h > 0) {
+                println!("  counted   from block {h}, when its current registration began");
+            }
             if let Some(l) = b["label"].as_str().filter(|l| !l.is_empty()) {
                 println!("  label     {l}");
             }
-            for x in v["burns"].as_array().into_iter().flatten().take(20) {
-                println!("  block {:>8}  {:>16} units  weighs {:.2} → {:.2} blocks  {}", x["height"], x["value"], x["weight"].as_f64().unwrap_or(0.0), x["weight_now"].as_f64().unwrap_or(0.0), x["label"].as_str().unwrap_or(""));
+            for x in burns.iter().take(20) {
+                let not = if x["counts"].as_bool() == Some(false) { "  (before its registration: does not count)" } else { "" };
+                println!("  block {:>8}  {:>16} units  weighs {:.2} → {:.2} blocks  {}{not}", x["height"], x["value"], x["weight"].as_f64().unwrap_or(0.0), x["weight_now"].as_f64().unwrap_or(0.0), x["label"].as_str().unwrap_or(""));
             }
         }
-        None => println!("Nothing has been burned for {} {}.", v["purpose"].as_str().unwrap_or(""), v["subject"].as_str().unwrap_or("")),
+        None if !burns.is_empty() => match from {
+            Some(h) => println!("Nothing counts for {what} {which}: what was burned for it came before its current registration, at block {h}."),
+            None => println!("Nothing counts for {what} {which}: no one holds it, and a name's burns count once it is registered."),
+        },
+        None => println!("Nothing has been burned for {what} {which}."),
     }
     Ok(())
 }

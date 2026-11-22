@@ -344,6 +344,30 @@ pub fn burns_of(outputs: &[OutputData]) -> Vec<(Vec<u8>, u64)> {
 mod tests {
     use super::*;
 
+    /// MSB-1 v1 is final (docs/MSB-1.md, "Frozen"): these are its test
+    /// vectors. A change that breaks this test changes what burns already on
+    /// chain mean, and needs a new tag instead.
+    #[test]
+    fn the_format_is_frozen() {
+        assert_eq!((TAG, HEAD, LABEL_MAX, MAX_BURN_DATA_SIZE), (b"MSB1", 37, 43, 80));
+        let words: Vec<(u8, String)> = Purpose::ALL.iter().map(|p| (p.0, p.word())).collect();
+        let want = [(1, "name"), (2, "key"), (3, "evm"), (4, "pool"), (5, "hub"), (6, "notary"), (7, "notary-sha256")];
+        assert_eq!(words, want.map(|(n, w)| (n, w.to_string())));
+        assert_eq!(hex::encode(Backing::name("nick", "for the shop").unwrap().payload()), "4d534231016e69636b00000000000000000000000000000000000000000000000000000000666f72207468652073686f70");
+        let account: [u8; 20] = hex::decode("00112233445566778899aabbccddeeff00112233").unwrap().try_into().unwrap();
+        assert_eq!(hex::encode(Backing::evm(&account, "").unwrap().payload()), "4d5342310300112233445566778899aabbccddeeff00112233000000000000000000000000");
+        // Weight: in blocks, halving every year.
+        assert_eq!(HALF_LIFE, 525_600);
+        let r = block_reward(0);
+        assert_eq!(r, 1 << 30);
+        assert_eq!((weight(r, 0), weight(r, HALF_LIFE), weight_at(r, 0, HALF_LIFE)), (1.0, 2.0, 0.5));
+        assert_eq!((cost(1_440, 0), cost(60, HALF_LIFE)), (1_546_188_226_560, 32_212_254_720));
+        assert_eq!(upkeep(1.0), std::f64::consts::LN_2);
+        // Tiers: an hour, a day and a week of issuance.
+        assert_eq!(TIERS, [(60.0, "backed"), (1_440.0, "well backed"), (10_080.0, "strongly backed")]);
+        assert_eq!([tier(59.9), tier(60.0), tier(1_440.0), tier(10_080.0)], [None, Some("backed"), Some("well backed"), Some("strongly backed")]);
+    }
+
     #[test]
     fn payloads_round_trip_and_wrong_subjects_are_not_backing() {
         let b = Backing::name("Nick.mds", "for the hub").unwrap();
