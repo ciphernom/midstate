@@ -372,7 +372,8 @@ pub struct App {
     pub mwb_node_last_poll: f64,
 
     // MDS <-> MDW (Trade tab, midwimble market)
-    /// 0: MDS <-> ETH on Base; 1: MDS <-> MDW on midwimble.
+    /// 0: MDS <-> ETH on Base; 1: MDS <-> USDC on Base; 2: MDS <-> MDW on
+    /// midwimble.
     pub market: usize,
     // MDS <-> ETH (Trade tab)
     pub eth_market: Option<EthMarketView>,
@@ -389,6 +390,7 @@ pub struct App {
     pub eth_sell_hours: String,
     pub eth_notice: String,
     pub eth_last_poll: f64,
+    pub evm_last_poll: f64,
     pub mwb_tab: usize,
     pub mwb_account: Option<MwbAccountView>,
     pub mwb_book: Vec<MwbBookEntryView>,
@@ -655,6 +657,7 @@ impl App {
             eth_sell_hours: "24".into(),
             eth_notice: String::new(),
             eth_last_poll: 0.0,
+            evm_last_poll: 0.0,
             mwb_tab: 0,
             mwb_account: None,
             mwb_book: Vec::new(),
@@ -1058,6 +1061,13 @@ impl App {
             Msg::SealedSettings => {
                 self.go(ctx, Action::LoadStatus);
                 self.go(ctx, Action::LoadConversations);
+            }
+            Msg::PostageSet(names) => {
+                if !names.is_empty() {
+                    self.toast(ctx, format!("Saving the new price to {}: it applies once that confirms.", names.join(", ")));
+                }
+                self.go(ctx, Action::LoadStatus);
+                self.go(ctx, Action::LoadNames);
             }
             Msg::Recipient { name, card } => self.msgr.recipient(name, card),
             Msg::SealedSent => {
@@ -1493,6 +1503,8 @@ impl eframe::App for App {
                 self.chat_last_poll = t;
                 self.go(ctx, Action::LoadChat);
                 self.go(ctx, Action::LoadConversations);
+                // What strangers pay, as it lands.
+                self.go(ctx, Action::LoadStatus);
                 if self.chat_dict.is_empty() {
                     self.go(ctx, Action::LoadChatDict);
                 }
@@ -1516,7 +1528,8 @@ impl eframe::App for App {
             // without this your own newly published order never shows up.
             // Base is read only while its market is on screen; with it hidden
             // the wallet makes no calls to Base at all.
-            let eth = self.market == 0;
+            // Both Base markets read the same book and the same trades.
+            let eth = self.market <= 1;
             if eth && t - self.eth_last_poll > 3.0 {
                 self.eth_last_poll = t;
                 self.go(ctx, Action::LoadEthMarket);
@@ -1526,7 +1539,7 @@ impl eframe::App for App {
                 self.dex_syncing = true;
                 self.go(ctx, Action::SyncOrderBook);
             }
-            if self.market == 1 && t - self.mwb_last_poll > 3.0 {
+            if self.market == 2 && t - self.mwb_last_poll > 3.0 {
                 self.mwb_last_poll = t;
                 for a in [Action::LoadMwbAccount, Action::LoadMwbBook, Action::LoadMwbOrders, Action::LoadMwbSwaps] {
                     self.go(ctx, a);
@@ -1538,7 +1551,9 @@ impl eframe::App for App {
                 self.go(ctx, Action::LoadMyOrders);
                 self.go(ctx, Action::LoadSwaps);
                 self.go(ctx, Action::LoadMyBids);
-                if self.evm.is_none() {
+                // Balances move with every trade: read again now and then.
+                if self.evm.is_none() || t - self.evm_last_poll > 30.0 {
+                    self.evm_last_poll = t;
                     self.go(ctx, Action::LoadEvmAccount);
                 }
                 if self.dex_cfg.is_none() {

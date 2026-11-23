@@ -305,7 +305,7 @@ fn midwimble_panel(app: &mut App, ui: &mut Ui) {
         }
         if ui.button(RichText::new("Trade MDS ↔ MDW").size(11.0)).clicked() {
             app.tab = Tab::Trade;
-            app.market = 1;
+            app.market = 2;
             app.mwb_last_poll = 0.0;
         }
         if n.peers == 0 {

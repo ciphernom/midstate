@@ -109,7 +109,7 @@ pub(super) struct Watch {
 }
 
 impl NameJob {
-    fn done(&self) -> bool {
+    pub(super) fn done(&self) -> bool {
         matches!(self.status.as_str(), "taken" | "lost" | "failed" | "ended" | "given")
     }
 
@@ -424,6 +424,7 @@ impl Service {
                     card.pays_kind = pays.map(|a| self.kind_label(&r.records, &a)).unwrap_or_default();
                     card.identity = names::identity(&r.records).is_some();
                     card.sealed = names::kem_hash(&r.records).is_some();
+                    card.postage = names::postage(&r.records).map_or(midstate::sealed::STAMP_BITS, u32::from);
                 }
                 card.state = match r.deal {
                     _ if r.lapsed() && r.owner == [0; 32] => "unclaimed",
@@ -575,6 +576,8 @@ impl Service {
                 recs.extend(names::script_records(&b));
             }
         }
+        // Kept as they are: tags this wallet does not know, and (below) the
+        // price strangers pay, which is set from Messages.
         recs.extend(base.iter().filter(|r| matches!(r, Rec::Other { .. })).cloned());
         if e.sealed {
             recs.push(Rec::Kem(self.kem_record()?));
@@ -592,6 +595,7 @@ impl Service {
         if !e.text.trim().is_empty() {
             recs.push(Rec::Text(e.text.trim().to_string()));
         }
+        recs.extend(base.iter().filter(|r| matches!(r, Rec::Postage(_))).cloned());
         names::encode(&recs)
     }
 
@@ -770,6 +774,10 @@ impl Service {
             NameAction::Unlist => {
                 want.terms = Deal::None.terms();
                 "taking it off the market"
+            }
+            NameAction::Postage { bits } => {
+                want.records = names::encode(&super::ident_glue::with_postage(&r.records, bits)?)?;
+                "changing what strangers pay to write to it"
             }
             NameAction::Renew { years } => {
                 if !(1..=names::MAX_YEARS).contains(&years) {

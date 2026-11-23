@@ -55,6 +55,13 @@
 //! for. Wallets stamp until the other side has written back, and drop a
 //! stranger's message without one ([`Received::stamp_bits`]).
 //!
+//! The recipient sets the price: a name's `postage` record says how many
+//! bits a stranger's message to it must show, [`STAMP_BITS`] if it says
+//! none, so a wallet under attack can make each message cost hours. Work
+//! that long is done off the wallet's back: [`Session::reserve`] and
+//! [`prepare_opening`] hand out the key, [`mine_stamp_until`] works it, and
+//! the message is sealed once it is done.
+//!
 //! # Timers
 //!
 //! Every message carries its sender's timer for the conversation (`ttl`,
@@ -89,8 +96,9 @@ const TAG_LEN: usize = 16;
 const VERSION: u8 = 2;
 const KIND_HELLO: u8 = 0;
 const KIND_MESSAGE: u8 = 1;
-/// Leading zero bits a stamp's work needs: about a second of one core
-/// (2^24 BLAKE3 compressions), spread over all of them when it is made.
+/// Leading zero bits a stamp's work needs unless the recipient's name asks
+/// otherwise: about a second of one core (2^24 BLAKE3 compressions), spread
+/// over all of them when it is made.
 pub const STAMP_BITS: u32 = 24;
 /// The longest message body, in bytes.
 pub const MAX_BODY: usize = 750;
@@ -143,9 +151,14 @@ pub fn stamp_bits(key: &[u8; 32], nonce: u64) -> u32 {
 /// A nonce whose work under `key` shows `bits`, found on every core. Zero
 /// bits asks for none: the nonce is 0, and carries what work it happens to.
 pub fn mine_stamp(key: &[u8; 32], bits: u32) -> u64 {
+    mine_stamp_until(key, bits, &std::sync::atomic::AtomicBool::new(false)).expect("never stopped")
+}
+
+/// [`mine_stamp`], giving up (`None`) once `stop` is set.
+pub fn mine_stamp_until(key: &[u8; 32], bits: u32, stop: &std::sync::atomic::AtomicBool) -> Option<u64> {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     if bits == 0 {
-        return 0;
+        return Some(0);
     }
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(16) as u64;
     let start = rand::random::<u64>() >> 1;
@@ -168,11 +181,41 @@ pub fn mine_stamp(key: &[u8; 32], bits: u32) -> u64 {
                     if done.load(Ordering::Acquire) {
                         return;
                     }
+                    if stop.load(Ordering::Acquire) {
+                        done.store(true, Ordering::Release);
+                        return;
+                    }
                 }
             });
         }
     });
-    found.load(Ordering::Acquire)
+    let nonce = found.load(Ordering::Acquire);
+    (stamp_bits(key, nonce) >= bits).then_some(nonce)
+}
+
+/// Stamp work this machine does a second on all its cores, measured once.
+pub fn stamp_rate() -> f64 {
+    static RATE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *RATE.get_or_init(|| {
+        let key = [7u8; 32];
+        let n = 1u64 << 16;
+        let t = std::time::Instant::now();
+        let mut best = 0;
+        for i in 0..n {
+            best = best.max(stamp_bits(&key, i));
+        }
+        std::hint::black_box(best);
+        let one = n as f64 / t.elapsed().as_secs_f64().max(1e-6);
+        one * std::thread::available_parallelism().map_or(1, |n| n.get()) as f64
+    })
+}
+
+/// About how long a stamp of `bits` takes this machine, in seconds.
+pub fn stamp_seconds(bits: u32) -> f64 {
+    if bits == 0 {
+        return 0.0;
+    }
+    (1u64 << bits.min(63)) as f64 / stamp_rate()
 }
 
 fn encapsulation_key(public: &[u8]) -> Result<EncapsulationKey<MlKem512>> {
@@ -281,16 +324,35 @@ impl Session {
     /// `ttl` (seconds; 0 for none), with a stamp worth `stamp` bits (0 for
     /// none). An empty body says only the timer.
     pub fn seal(&mut self, body: &[u8], ttl: u32, stamp: u32) -> Result<Vec<u8>> {
+        let (n, key) = self.reserve();
+        self.seal_reserved(n, body, ttl, mine_stamp(&key, stamp))
+    }
+
+    /// The next number this side sends, taken, and the key its stamp is
+    /// worked under: for a message whose stamp is made elsewhere, and
+    /// sealed with [`Session::seal_reserved`] once it is done.
+    pub fn reserve(&mut self) -> (u64, [u8; 32]) {
         let n = self.sent;
+        self.sent += 1;
+        (n, self.stamp_key(n))
+    }
+
+    /// The key the stamp of this side's message `n` is worked under, as
+    /// [`Session::reserve`] gave it: to take the work up again later.
+    pub fn stamp_key(&self, n: u64) -> [u8; 32] {
+        message_stamp_key(&self.id, self.opener, n)
+    }
+
+    /// Seals `body` as this side's message `n`, taken with
+    /// [`Session::reserve`], carrying the stamp nonce `stamp`.
+    pub fn seal_reserved(&self, n: u64, body: &[u8], ttl: u32, stamp: u64) -> Result<Vec<u8>> {
         let route = Self::route(&self.send_key, n);
-        let work = mine_stamp(&message_stamp_key(&self.id, self.opener, n), stamp);
         let nonce: [u8; NONCE_LEN] = rand::random();
         let mut aad = route.to_vec();
         aad.extend_from_slice(&n.to_le_bytes());
         let ct = XChaCha20Poly1305::new(Key::from_slice(&self.send_key))
-            .encrypt(XNonce::from_slice(&nonce), Payload { msg: &plaintext(KIND_MESSAGE, &[], ttl, work, body)?, aad: &aad })
+            .encrypt(XNonce::from_slice(&nonce), Payload { msg: &plaintext(KIND_MESSAGE, &[], ttl, stamp, body)?, aad: &aad })
             .map_err(|_| anyhow!("sealing failed"))?;
-        self.sent += 1;
         Ok([&route[..], &nonce, &ct].concat())
     }
 
@@ -402,6 +464,49 @@ pub struct OpenAs<'a> {
 /// message, under the timer `ttl`, stamped with `stamp` bits of work.
 /// Returns the opening's bytes and this side's session.
 pub fn open_session(recipient_public: &[u8], recipient_hash: &[u8; 32], me: Option<OpenAs>, body: &[u8], ttl: u32, stamp: u32) -> Result<(Vec<u8>, Session)> {
+    let prepared = prepare_opening(recipient_public, recipient_hash, me)?;
+    let nonce = mine_stamp(&prepared.stamp_key(), stamp);
+    prepared.finish(body, ttl, nonce)
+}
+
+/// An opening made up to its stamp: the encapsulation done and the claim
+/// signed, so work on its stamp can stop and start again without signing
+/// twice. It holds the session's secret: keep it as a [`Session`] is kept.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Prepared {
+    ct: Vec<u8>,
+    ss: Vec<u8>,
+    head: Vec<u8>,
+    recipient_hash: [u8; 32],
+}
+
+impl Prepared {
+    /// The key the opening's stamp is worked under.
+    pub fn stamp_key(&self) -> [u8; 32] {
+        opening_stamp_key(&self.recipient_hash, &self.ct)
+    }
+
+    /// The `kem` hash of the key it was sealed to.
+    pub fn recipient_hash(&self) -> [u8; 32] {
+        self.recipient_hash
+    }
+
+    /// The opening's bytes and this side's session, carrying `body` under
+    /// the timer `ttl`, with the stamp nonce `stamp`.
+    pub fn finish(self, body: &[u8], ttl: u32, stamp: u64) -> Result<(Vec<u8>, Session)> {
+        let k = derive("midstate.sealed.open.v1", &[&self.ss, &self.ct]);
+        let sealed = XChaCha20Poly1305::new(Key::from_slice(&k))
+            .encrypt(XNonce::from_slice(&[0; NONCE_LEN]), Payload { msg: &plaintext(KIND_HELLO, &self.head, ttl, stamp, body)?, aad: &self.ct })
+            .map_err(|_| anyhow!("sealing failed"))?;
+        let opening = [self.ct.as_slice(), &sealed].concat();
+        ensure!(opening.len() <= MAX_ENCRYPTED_MESSAGE_SIZE * MAX_ATTACHMENTS, "opening too large");
+        Ok((opening, Session::new(&self.ss, &self.ct, true)))
+    }
+}
+
+/// [`open_session`] up to the stamp: encapsulates to the recipient and signs
+/// the claim, if there is one.
+pub fn prepare_opening(recipient_public: &[u8], recipient_hash: &[u8; 32], me: Option<OpenAs>) -> Result<Prepared> {
     check_public(recipient_public, recipient_hash)?;
     let ek = encapsulation_key(recipient_public)?;
     let m: [u8; 32] = rand::random();
@@ -421,14 +526,7 @@ pub fn open_session(recipient_public: &[u8], recipient_hash: &[u8; 32], me: Opti
             h
         }
     };
-    let work = mine_stamp(&opening_stamp_key(recipient_hash, &ct), stamp);
-    let k = derive("midstate.sealed.open.v1", &[&ss, &ct]);
-    let sealed = XChaCha20Poly1305::new(Key::from_slice(&k))
-        .encrypt(XNonce::from_slice(&[0; NONCE_LEN]), Payload { msg: &plaintext(KIND_HELLO, &head, ttl, work, body)?, aad: &ct })
-        .map_err(|_| anyhow!("sealing failed"))?;
-    let opening = [ct.as_slice(), &sealed].concat();
-    ensure!(opening.len() <= MAX_ENCRYPTED_MESSAGE_SIZE * MAX_ATTACHMENTS, "opening too large");
-    Ok((opening, Session::new(&ss, &ct, true)))
+    Ok(Prepared { ct, ss, head, recipient_hash: *recipient_hash })
 }
 
 /// An opening this wallet's key opened.
@@ -594,6 +692,34 @@ mod tests {
         assert!(bob_side.open(2, &plain).unwrap().stamp_bits < BITS);
         let back = bob_side.seal(b"back", 0, BITS).unwrap();
         assert!(alice.open(1, &back).unwrap().stamp_bits >= BITS, "the other way too");
+    }
+
+    #[test]
+    fn a_stamp_can_be_made_elsewhere_and_stopped() {
+        const BITS: u32 = 12;
+        let bob = KemKeys::from_secret(&[2; 32]);
+        // An opening, stamped between preparing and finishing it, and kept
+        // (as a wallet keeps it while the work goes on) in between.
+        let prepared = prepare_opening(&bob.public(), &bob.public_hash(), None).unwrap();
+        assert_eq!(prepared.recipient_hash(), bob.public_hash());
+        let kept: Prepared = serde_json::from_slice(&serde_json::to_vec(&prepared).unwrap()).unwrap();
+        assert_eq!(kept.stamp_key(), prepared.stamp_key());
+        let nonce = mine_stamp_until(&kept.stamp_key(), BITS, &std::sync::atomic::AtomicBool::new(false)).unwrap();
+        let (opening, mut alice) = kept.finish(b"hi", 0, nonce).unwrap();
+        let o = try_open(&bob, &opening).unwrap();
+        assert!(o.stamp_bits >= BITS);
+        // A message: its number taken now, sealed later; another goes first.
+        let (n, key) = alice.reserve();
+        assert_eq!(alice.stamp_key(n), key, "the work can be taken up again");
+        let quick = alice.seal(b"quick", 0, 0).unwrap();
+        let slow = alice.seal_reserved(n, b"slow", 0, mine_stamp(&key, BITS)).unwrap();
+        let mut bob_side = o.session;
+        assert_eq!(bob_side.open(2, &quick).unwrap().body, b"quick");
+        let got = bob_side.open(1, &slow).unwrap();
+        assert_eq!((got.body.as_slice(), got.stamp_bits >= BITS), (&b"slow"[..], true));
+        // Stopped: no nonce.
+        assert_eq!(mine_stamp_until(&key, 60, &std::sync::atomic::AtomicBool::new(true)), None);
+        assert!(stamp_rate() > 0.0 && stamp_seconds(24) > stamp_seconds(20) && stamp_seconds(0) == 0.0);
     }
 
     #[test]

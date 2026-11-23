@@ -152,6 +152,11 @@ enum Cmd {
     SealedTimer { id: String, ttl: u32, resp: oneshot::Sender<Result<()>> },
     /// Drop what waits for a name's key.
     SealedCancel { to: String, resp: oneshot::Sender<Result<()>> },
+    /// Drop what in a conversation still waits on its stamp.
+    SealedUnsend { id: String, resp: oneshot::Sender<Result<()>> },
+    /// What strangers' sealed messages must pay, in stamp bits; the names
+    /// whose records change.
+    SetPostage { bits: u32, resp: oneshot::Sender<Result<Vec<String>>> },
     Conversations(oneshot::Sender<Vec<ConversationView>>),
     NameTargets(oneshot::Sender<Vec<PayTargetView>>),
     ChatDict(oneshot::Sender<Vec<String>>),
@@ -172,7 +177,8 @@ enum Cmd {
     RepairHistory(oneshot::Sender<Result<String>>),
     RequestChannel { peer: String, capacity: u64, resp: oneshot::Sender<Result<()>> },
     Hubs(oneshot::Sender<Vec<HubAdView>>),
-    EthSell { mds: u64, wei_per_gmds: String, min: u64, life: u64, resp: oneshot::Sender<Result<String>> },
+    /// `asset`: "ETH" or "USDC"; the price is in its smallest unit.
+    EthSell { asset: String, mds: u64, wei_per_gmds: String, min: u64, life: u64, resp: oneshot::Sender<Result<String>> },
     EthCancelSell { id: String, resp: oneshot::Sender<Result<()>> },
     EthBuy { order_id: String, mds: u64, resp: oneshot::Sender<Result<String>> },
     EthFillBid { bid_id: String, resp: oneshot::Sender<Result<String>> },
@@ -180,6 +186,7 @@ enum Cmd {
     MyOrders(oneshot::Sender<Vec<MyOrderView>>),
     ReclaimOrder { group_id: String, resp: oneshot::Sender<Result<String>> },
     PlaceBid {
+        asset: String,
         mds_amount: u64,
         wei: String,
         ttl_secs: u64,
@@ -261,6 +268,8 @@ enum Internal {
     /// Payments made to a plan's addresses before this wallet took the plan
     /// in, found by a look back over the chain (`plans_glue`).
     PlanGifts { id: String, coins: Vec<midstate::node::ScannedCoin> },
+    /// A sealed message's stamp is done (`ident_glue`, `crate::stamper`).
+    Stamped { job: u64, bits: u32, nonce: u64 },
 }
 
 impl Cmd {
@@ -274,6 +283,7 @@ impl Cmd {
             Cmd::Internal(Internal::Tick) => "the tick",
             Cmd::Internal(Internal::PoolReply { .. }) => "a pool's reply",
             Cmd::Internal(Internal::PlanGifts { .. }) => "payments to a plan",
+            Cmd::Internal(Internal::Stamped { .. }) => "a stamped message",
             _ => "a request",
         }
     }
@@ -514,9 +524,20 @@ impl WalletdHandle {
     pub async fn sealed_timer(&self, id: String, ttl: u32) -> Result<()> {
         ask!(self, SealedTimer { id: id, ttl: ttl })
     }
-    /// Stop trying to send what waits for a name's key.
+    /// Stop trying to send what waits for a name's key, or on the stamp
+    /// of the opening to it.
     pub async fn sealed_cancel(&self, to: String) -> Result<()> {
         ask!(self, SealedCancel { to: to })
+    }
+    /// Stop sending what in a sealed conversation still waits on its stamp.
+    pub async fn sealed_unsend(&self, id: String) -> Result<()> {
+        ask!(self, SealedUnsend { id: id })
+    }
+    /// Ask `bits` of strangers' sealed messages (16 to 40; 24 is the
+    /// standard): every name of this wallet's that takes them publishes the
+    /// price. Returns the names whose records change.
+    pub async fn set_postage(&self, bits: u32) -> Result<Vec<String>> {
+        ask!(self, SetPostage { bits: bits })
     }
     /// Sealed conversations, newest first.
     pub async fn conversations(&self) -> Result<Vec<ConversationView>> {
@@ -574,10 +595,11 @@ impl WalletdHandle {
     }
     /// Publish a sell order: lock MDS behind limit-order covenants and
     /// announce them on-chain, in a single transaction.
-    /// Puts MDS up for sale for ETH on Base. Nothing is locked until a
+    /// Puts MDS up for sale for ETH or USDC (`asset`) on Base, priced in
+    /// the asset's smallest unit per 2^30 units. Nothing is locked until a
     /// buyer asks; each buyer then gets a lock only it can claim.
-    pub async fn eth_sell(&self, mds: u64, wei_per_gmds: String, min: u64, life: u64) -> Result<String> {
-        ask!(self, EthSell { mds: mds, wei_per_gmds: wei_per_gmds, min: min, life: life })
+    pub async fn eth_sell(&self, asset: String, mds: u64, wei_per_gmds: String, min: u64, life: u64) -> Result<String> {
+        ask!(self, EthSell { asset: asset, mds: mds, wei_per_gmds: wei_per_gmds, min: min, life: life })
     }
     pub async fn eth_cancel_sell(&self, id: String) -> Result<()> {
         ask!(self, EthCancelSell { id: id })
@@ -596,16 +618,18 @@ impl WalletdHandle {
     pub async fn my_orders(&self) -> Result<Vec<MyOrderView>> {
         Ok(ask!(self, MyOrders))
     }
-    /// Take one unit of a published sell order: escrow ETH against its hash.
-    /// Escrow ETH as a resting buy order for MDS.
+    /// Escrow ETH or USDC (`asset`) as a resting buy order for MDS: `wei`
+    /// and `fill_bond` in the asset's smallest unit.
     pub async fn place_bid(
         &self,
+        asset: String,
         mds_amount: u64,
         wei: String,
         ttl_secs: u64,
         fill_bond: String,
     ) -> Result<String> {
         ask!(self, PlaceBid {
+            asset: asset,
             mds_amount: mds_amount,
             wei: wei,
             ttl_secs: ttl_secs,
@@ -1059,6 +1083,7 @@ impl Service {
                     inbox_bar: self.inbox_bar(),
                     blocked: self.blocked_names(),
                     drop_anonymous: self.drop_anonymous(),
+                    postage: if self.wallet.is_some() { self.postage_view() } else { Default::default() },
                 });
             }
             Cmd::Create { password, phrase, resp } => {
@@ -1296,6 +1321,12 @@ impl Service {
             Cmd::SealedCancel { to, resp } => {
                 let _ = resp.send(self.cancel_sealed(&to));
             }
+            Cmd::SealedUnsend { id, resp } => {
+                let _ = resp.send(self.unsend_sealed(&id));
+            }
+            Cmd::SetPostage { bits, resp } => {
+                let _ = resp.send(self.set_postage(bits).await);
+            }
             Cmd::Conversations(resp) => {
                 let _ = resp.send(self.conversations());
             }
@@ -1378,8 +1409,12 @@ impl Service {
             Cmd::RequestAddress { peer, resp } => {
                 let _ = resp.send(self.request_address(&peer).await);
             }
-            Cmd::EthSell { mds, wei_per_gmds, min, life, resp } => {
-                let _ = resp.send(self.eth_sell(mds, &wei_per_gmds, min, life).await);
+            Cmd::EthSell { asset, mds, wei_per_gmds, min, life, resp } => {
+                let r = match crate::eth_trade::Asset::parse(&asset) {
+                    Ok(a) => self.eth_sell(a, mds, &wei_per_gmds, min, life).await,
+                    Err(e) => Err(e),
+                };
+                let _ = resp.send(r);
             }
             Cmd::EthCancelSell { id, resp } => {
                 let _ = resp.send(self.eth_cancel_sell(&id));
@@ -1396,8 +1431,11 @@ impl Service {
             Cmd::MyOrders(resp) => {
                 let _ = resp.send(self.my_orders());
             }
-            Cmd::PlaceBid { mds_amount, wei, ttl_secs, fill_bond, resp } => {
-                let r = self.place_bid(mds_amount, &wei, ttl_secs, &fill_bond).await;
+            Cmd::PlaceBid { asset, mds_amount, wei, ttl_secs, fill_bond, resp } => {
+                let r = match crate::eth_trade::Asset::parse(&asset) {
+                    Ok(a) => self.place_bid(a, mds_amount, &wei, ttl_secs, &fill_bond).await,
+                    Err(e) => Err(e),
+                };
                 let _ = resp.send(r);
             }
             Cmd::CancelBid { bid_id, resp } => {
@@ -1469,6 +1507,8 @@ impl Service {
                     confirmations: c.confirmations,
                     scan_window: self.dex_window,
                     start_block: self.dex_start_block,
+                    usdc_contract: c.usdc_contract.clone(),
+                    usdc_token: c.usdc_token.clone(),
                 });
             }
             Cmd::SetDexConfig { cfg, resp } => {
@@ -1477,6 +1517,13 @@ impl Service {
                     if !cfg.rpc_url.starts_with("http") {
                         bail!("the RPC endpoint must be an http(s) URL");
                     }
+                    if !cfg.usdc_contract.trim().is_empty() {
+                        crate::evm::parse_address(&cfg.usdc_contract).context("the USDC swap contract")?;
+                        if cfg.usdc_contract.trim().eq_ignore_ascii_case(cfg.contract.trim()) {
+                            bail!("the USDC swap contract is a contract of its own (MidstateTokenSwap), not the ETH one");
+                        }
+                    }
+                    crate::evm::parse_address(if cfg.usdc_token.trim().is_empty() { crate::evm::BASE_USDC } else { &cfg.usdc_token }).context("the USDC token")?;
                     Ok(())
                 })();
                 if r.is_ok() {
@@ -1485,6 +1532,8 @@ impl Service {
                         chain_id: cfg.chain_id,
                         contract: cfg.contract,
                         confirmations: cfg.confirmations,
+                        usdc_contract: cfg.usdc_contract.trim().to_string(),
+                        usdc_token: if cfg.usdc_token.trim().is_empty() { crate::evm::BASE_USDC.into() } else { cfg.usdc_token.trim().to_string() },
                     };
                     self.dex_window = cfg.scan_window.clamp(1_000, 20_000_000);
                     self.dex_start_block = cfg.start_block;
@@ -3100,6 +3149,7 @@ impl Service {
             Internal::Tick => self.tick().await,
             Internal::PoolReply { id, reply } => self.pool_reply(id, reply),
             Internal::PlanGifts { id, coins } => self.plan_gifts_found(id, coins).await,
+            Internal::Stamped { job, bits, nonce } => self.on_stamped(job, bits, nonce),
             Internal::CommitStalled(c) => {
                 self.set_stage(
                     c,
@@ -5724,6 +5774,13 @@ impl Service {
             }
             _ => None,
         };
+        let usdc_balance = match (secret, BaseClient::for_asset(self.dex_cfg.clone(), crate::eth_trade::Asset::Usdc)) {
+            (Some(s), Ok(c)) => match crate::evm::EvmKey::from_secret(&s) {
+                Ok(k) => c.token_balance(&k.address).await.ok().map(|b| b.to_string()),
+                Err(_) => None,
+            },
+            _ => None,
+        };
         EvmAccountView {
             address,
             balance_wei,
@@ -5731,6 +5788,9 @@ impl Service {
             rpc_url: self.dex_cfg.rpc_url.clone(),
             contract: self.dex_cfg.contract.clone(),
             missing_key,
+            usdc_ready: self.dex_cfg.usdc_ready(),
+            usdc_contract: self.dex_cfg.usdc_contract.clone(),
+            usdc_balance,
         }
     }
 
@@ -5752,6 +5812,14 @@ impl Service {
         // other requests between them; the view asks again until caught up.
         self.dex_head = safe;
         self.dex.sync_base(&client, safe.min(self.dex.base_cursor + 40_000)).await?;
+        // The USDC contract's bids and trades, from the same start.
+        if self.dex_cfg.usdc_ready() {
+            let usdc = BaseClient::for_asset(self.dex_cfg.clone(), crate::eth_trade::Asset::Usdc)?;
+            if self.dex.usdc_cursor == 0 {
+                self.dex.usdc_cursor = if self.dex_start_block > 0 { self.dex_start_block.saturating_sub(1) } else { safe.saturating_sub(self.dex_window) };
+            }
+            self.dex.sync_base(&usdc, safe.min(self.dex.usdc_cursor + 40_000)).await?;
+        }
 
         let height = self.node.get_state().await.height;
         if self.dex.mds_cursor == 0 {
@@ -5788,6 +5856,7 @@ impl Service {
                 reserved: b.reserved_by.is_some(),
                 takeable: b.is_takeable(now),
                 mine: my_evm == Some(b.maker),
+                asset: b.asset.symbol().into(),
             })
             .collect();
 
@@ -5857,7 +5926,7 @@ impl Service {
             bids,
             asks,
             base_cursor: self.dex.base_cursor,
-            behind: self.dex_head.saturating_sub(self.dex.base_cursor),
+            behind: self.dex_head.saturating_sub(if self.dex_cfg.usdc_ready() { self.dex.base_cursor.min(self.dex.usdc_cursor) } else { self.dex.base_cursor }),
             mds_cursor: self.dex.mds_cursor,
             last_error: self.dex_error.clone(),
             bids_created: st.bids_created,
@@ -5876,6 +5945,7 @@ impl Service {
                     mds: t.mds,
                     price: t.price(),
                     kind: t.kind.to_string(),
+                    asset: t.asset.symbol().into(),
                 })
                 .collect(),
         }
@@ -6423,7 +6493,7 @@ impl Service {
             let Ok(tx) = parse_hex32(&tx_hex) else { continue };
             match client.receipt(&tx).await {
                 Ok(Some(r)) if r.success => {
-                    if let Some(swap_id) = crate::base::locked_swap_id(&r.logs) {
+                    if let Some(swap_id) = crate::base::locked_swap_id(&r.logs, &client.contract()) {
                         if let Some(s) = self.swaps.find_mut(&id) {
                             s.phase = Phase::EthLocked { swap_id: hex::encode(swap_id) };
                             s.updated = now;
@@ -6441,19 +6511,28 @@ impl Service {
             }
         }
 
-        // 1b. A freshly created bid has no id until its receipt lands.
-        let pending_bids: Vec<(String, String)> = self
+        // 1b. A freshly created bid has no id until its receipt lands, read
+        //     from the logs of the contract it was made on.
+        let pending_bids: Vec<(String, String, crate::eth_trade::Asset)> = self
             .book
             .bids
             .iter()
             .filter(|b| b.bid_id.is_empty() && !b.tx.is_empty())
-            .map(|b| (b.tx.clone(), b.secret_hash.clone()))
+            .map(|b| (b.tx.clone(), b.secret_hash.clone(), b.asset))
             .collect();
-        for (tx_hex, hash_hex) in pending_bids {
+        for (tx_hex, hash_hex, asset) in pending_bids {
             let Ok(tx) = parse_hex32(&tx_hex) else { continue };
+            let Ok(on) = BaseClient::for_asset(self.dex_cfg.clone(), asset) else { continue };
             if let Ok(Some(r)) = client.receipt(&tx).await {
-                if r.success {
-                    if let Some(id) = crate::base::created_bid_id(&r.logs) {
+                if !r.success {
+                    // Reverted: nothing was escrowed, and the order never was.
+                    if let Some(b) = self.book.bids.iter_mut().find(|b| b.secret_hash == hash_hex) {
+                        b.cancelled = true;
+                    }
+                    self.book.save(&self.wallet_path);
+                    self.ch_notice(format!("A {} buy order did not go through; nothing was escrowed.", asset.symbol()));
+                } else {
+                    if let Some(id) = crate::base::created_bid_id(&r.logs, &on.contract()) {
                         if let Some(b) =
                             self.book.bids.iter_mut().find(|b| b.secret_hash == hash_hex)
                         {
@@ -6465,7 +6544,8 @@ impl Service {
             }
         }
 
-        // 1c. Fill our resting bids.
+        // 1c. Fill our resting bids (ETH: version-1 fills come from wallets
+        //     that predate USDC).
         //
         // A seller who takes a bid locks MDS in a covenant paying our address
         // and announces it on midstate (MDXT) — which exists precisely because
@@ -6477,7 +6557,7 @@ impl Service {
             .book
             .bids
             .iter()
-            .filter(|b| !b.cancelled && !b.bid_id.is_empty())
+            .filter(|b| !b.cancelled && !b.bid_id.is_empty() && b.asset == crate::eth_trade::Asset::Eth)
             .cloned()
             .collect();
         if !open_bids.is_empty() {
@@ -7135,34 +7215,45 @@ impl Service {
 
     // ── Placing a buy order ─────────────────────────────────────────────
 
-    /// Escrow ETH in the contract as a resting bid for MDS.
+    /// Escrow ETH or USDC in its contract as a resting bid for MDS.
     ///
     /// The direction is inverted from a sell order, and it matters: here WE
     /// generate the secret. A seller who wants the bid locks MDS on midstate
     /// against our hash, we claim that covenant — which publishes the secret —
-    /// and the seller then uses it to collect the escrow. So the ETH is only
-    /// ever paid out against a secret we chose to release.
+    /// and the seller then uses it to collect the escrow. So the escrow is
+    /// only ever paid out against a secret we chose to release.
+    ///
+    /// USDC is paid in with a permit signed for exactly the escrow, in the
+    /// same transaction: no standing approval is left behind.
     async fn place_bid(
         &mut self,
+        asset: crate::eth_trade::Asset,
         mds_amount: u64,
         wei_s: &str,
         ttl_secs: u64,
         bond_s: &str,
     ) -> Result<String> {
+        use crate::eth_trade::Asset;
         if self.wallet.is_none() {
             bail!("wallet is locked");
         }
         let wei: u128 = wei_s.parse().unwrap_or(0);
         let bond: u128 = bond_s.parse().unwrap_or(0);
         if mds_amount == 0 || wei == 0 {
-            bail!("both the MDS amount and the ETH you are offering must be greater than zero");
+            bail!("both the MDS amount and the {} you are offering must be greater than zero", asset.symbol());
         }
         if !(3_600..=7_776_000).contains(&ttl_secs) {
             bail!("the contract requires a bid lifetime between 1 hour and 90 days");
         }
 
         let key = self.evm_key()?;
-        let client = BaseClient::new(self.dex_cfg.clone())?;
+        let client = BaseClient::for_asset(self.dex_cfg.clone(), asset)?;
+        if asset == Asset::Usdc {
+            let have = client.token_balance(&key.address).await.context("could not read your USDC balance")?;
+            anyhow::ensure!(have >= wei, "this escrows {}; your Base account holds {}", asset.format(wei, 6), asset.format(have, 6));
+            // A permit takes the token's next nonce: one USDC payment at a time.
+            anyhow::ensure!(!self.token_payment_in_flight(), "another USDC payment of yours is still confirming; post this once it has");
+        }
 
         // Somewhere for the seller to pay. A fresh reusable address, because a
         // one-time key that gets used elsewhere would strand the fill.
@@ -7191,19 +7282,27 @@ impl Service {
             expiry: now + ttl_secs,
             created: now,
             cancelled: false,
+            asset,
         });
         self.book.save(&self.wallet_path);
 
-        let tx = client
-            .create_bid(&key, secret_hash, mds_amount, mds_addr, ttl_secs, bond, wei)
-            .await?;
+        let tx = match asset {
+            Asset::Eth => client.create_bid(&key, secret_hash, mds_amount, mds_addr, ttl_secs, bond, wei).await?,
+            Asset::Usdc => {
+                let (_, base_now) = client.head().await?;
+                let permit = client.permit(&key, wei, base_now).await?;
+                let data = crate::base::token_bid_call(secret_hash, wei, mds_amount, mds_addr, ttl_secs, bond, Some(&permit))?;
+                client.send(&key, 0, data).await?
+            }
+        };
         if let Some(b) = self.book.bids.last_mut() {
             b.tx = hex::encode(tx);
         }
         self.book.save(&self.wallet_path);
         self.ch_notice(format!(
-            "Buy order escrowed: {} wei for {} MDS. Sellers can now fill it.",
-            wei, mds_amount
+            "Buy order escrowed: {} for {} MDS units. Sellers can now fill it.",
+            asset.format(wei, if asset == Asset::Eth { 8 } else { 6 }),
+            mds_amount
         ));
         Ok(hex::encode(tx))
     }
@@ -7218,13 +7317,13 @@ impl Service {
             .ok_or_else(|| anyhow!("no such buy order in this wallet"))?;
         let id = parse_hex32(&bid.bid_id)?;
         let key = self.evm_key()?;
-        let client = BaseClient::new(self.dex_cfg.clone())?;
+        let client = BaseClient::for_asset(self.dex_cfg.clone(), bid.asset)?;
         let tx = client.cancel_bid(&key, id).await?;
         if let Some(b) = self.book.bids.iter_mut().find(|b| b.bid_id == bid_id) {
             b.cancelled = true;
         }
         self.book.save(&self.wallet_path);
-        Ok(format!("Cancelling — your ETH returns in {}", hex::encode(tx)))
+        Ok(format!("Cancelling — your {} returns in {}", bid.asset.symbol(), hex::encode(tx)))
     }
 
     fn my_bids_view(&self) -> Vec<MyBidView> {
@@ -7249,6 +7348,7 @@ impl Service {
                     "open".into()
                 },
                 cancelled: b.cancelled,
+                asset: b.asset.symbol().into(),
             })
             .collect()
     }

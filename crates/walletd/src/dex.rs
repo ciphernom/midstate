@@ -2,10 +2,11 @@
 //!
 //! Neither side requires trusting a counterparty or an indexer:
 //!
-//! * **Bids** (someone offering ETH for MDS) escrow their ETH inside
-//!   `MidstateAtomicSwap` at creation. A `BidCreated` with no matching
-//!   `BidClaimed`/`BidCancelled` is therefore *funded* liquidity, verifiable
-//!   from contract logs alone.
+//! * **Bids** (someone offering ETH or USDC for MDS) escrow it inside
+//!   `MidstateAtomicSwap` (ETH) or `MidstateTokenSwap` (USDC) at creation. A
+//!   `BidCreated` with no matching `BidClaimed`/`BidCancelled` is therefore
+//!   *funded* liquidity, verifiable from contract logs alone. Each bid and
+//!   trade carries the currency of the contract it was read from.
 //! * **Asks** (someone offering MDS for ETH) publish an MDXA announcement as
 //!   zero-value burns in the very transaction that funds the HTLC, so an ask
 //!   is verifiable by checking those coins are still unspent.
@@ -15,6 +16,7 @@
 //! still being built.
 
 use crate::base::{BaseClient, Event};
+use crate::eth_trade::Asset;
 use anyhow::Result;
 use midstate::core::dex::{Announcement, FragmentPool, MakerAnnouncement, TakerAnnouncement};
 use midstate::node::NodeHandle;
@@ -37,6 +39,8 @@ pub struct Bid {
     pub reserved_by: Option<[u8; 20]>,
     pub fill_deadline: Option<u64>,
     pub block: u64,
+    /// What it pays in; `amount` and `fill_bond` are in its smallest unit.
+    pub asset: Asset,
 }
 
 impl Bid {
@@ -124,8 +128,9 @@ impl ScanStats {
 #[derive(Clone, Debug)]
 pub struct Trade {
     pub block: u64,
-    /// Wei paid.
+    /// Paid, in `asset`'s smallest unit.
     pub wei: u128,
+    pub asset: Asset,
     /// MDS moved, where it can be resolved. Bids carry it on-chain; for the
     /// lock/claim direction it comes from the seller's own announcement.
     pub mds: Option<u64>,
@@ -151,6 +156,8 @@ pub struct OrderBook {
     pub fills: Vec<(u64, midstate::core::dex::FillAnnouncement)>,
     /// Highest Base block folded in, so scanning resumes rather than restarts.
     pub base_cursor: u64,
+    /// The same, for the USDC contract.
+    pub usdc_cursor: u64,
     /// Highest midstate height scanned for announcements.
     pub mds_cursor: u64,
     pub stats: ScanStats,
@@ -173,10 +180,15 @@ impl OrderBook {
     /// order, so a claim or cancellation always supersedes the creation it
     /// follows regardless of how the range was chunked.
     pub async fn sync_base(&mut self, client: &BaseClient, to: u64) -> Result<usize> {
-        if to <= self.base_cursor {
+        let asset = client.asset;
+        let cursor = match asset {
+            Asset::Eth => self.base_cursor,
+            Asset::Usdc => self.usdc_cursor,
+        };
+        if to <= cursor {
             return Ok(0);
         }
-        let from = self.base_cursor.saturating_add(1);
+        let from = cursor.saturating_add(1);
         // Whatever was read is applied and the cursor moves to where the
         // read got: a range Base would not serve is retried next time, never
         // skipped, and one bad range no longer throws away the rest.
@@ -196,7 +208,7 @@ impl OrderBook {
                         Bid {
                             bid_id, maker, hashlock, amount, fill_bond, mds_amount,
                             maker_mds_addr, expiry,
-                            reserved_by: None, fill_deadline: None, block,
+                            reserved_by: None, fill_deadline: None, block, asset,
                         },
                     );
                 }
@@ -212,7 +224,7 @@ impl OrderBook {
                 Event::BidClaimed { bid_id, .. } => {
                     self.stats.bids_closed += 1;
                     if let Some((wei, mds)) = self.pending_bids.remove(&bid_id) {
-                        self.push_trade(Trade { block, wei, mds: Some(mds), kind: "buy" });
+                        self.push_trade(Trade { block, wei, asset, mds: Some(mds), kind: "buy" });
                     }
                     self.bids.remove(&bid_id);
                 }
@@ -232,12 +244,12 @@ impl OrderBook {
                     // recover the amount the settlement event omits.
                     if let Some((wei, h)) = self.pending_eth.remove(&swap_id) {
                         let mds = self.mds_for_hash(&h);
-                        self.push_trade(Trade { block, wei, mds, kind: "sell" });
+                        self.push_trade(Trade { block, wei, asset, mds, kind: "sell" });
                     } else {
                         // Escrowed before our scan window opened; the hashlock
                         // is still enough to price it if the ask is known.
                         if let Some(mds) = self.mds_for_hash(&hashlock) {
-                            self.push_trade(Trade { block, wei: 0, mds: Some(mds), kind: "sell" });
+                            self.push_trade(Trade { block, wei: 0, asset, mds: Some(mds), kind: "sell" });
                         }
                     }
                 }
@@ -247,7 +259,10 @@ impl OrderBook {
                 }
             }
         }
-        self.base_cursor = reached.max(self.base_cursor);
+        match asset {
+            Asset::Eth => self.base_cursor = reached.max(self.base_cursor),
+            Asset::Usdc => self.usdc_cursor = reached.max(self.usdc_cursor),
+        }
         match part.error {
             Some(e) => Err(e.context(format!("Base stopped answering at block {}", reached + 1))),
             None => Ok(n),
@@ -430,6 +445,7 @@ mod tests {
             reserved_by: None,
             fill_deadline: None,
             block: 1,
+            asset: Asset::Eth,
         }
     }
 

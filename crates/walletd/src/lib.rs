@@ -41,6 +41,7 @@ pub mod sendplan;
 pub mod swap;
 pub mod swapbook;
 pub mod service;
+pub mod stamper;
 /// MSN-1 names, for clients that check one before sending it.
 pub use midstate::core::names;
 /// What kind of address a script makes: for name editors.
@@ -52,6 +53,11 @@ pub const SEALED_MAX: usize = midstate::sealed::MAX_BODY;
 /// The timers a sealed conversation can have, in seconds: none, an hour, a
 /// day, a week, four weeks.
 pub const SEALED_TIMERS: [u32; 5] = [0, 3_600, 86_400, 7 * 86_400, 28 * 86_400];
+/// What a stranger's sealed message must show unless the name it goes to
+/// asks more or less (its `postage` record), in stamp bits.
+pub const POSTAGE_STANDARD: u32 = midstate::sealed::STAMP_BITS;
+/// About how long a stamp of so many bits takes this computer, in seconds.
+pub use midstate::sealed::stamp_seconds;
 
 /// A document's hashes for notarizing it (MSB-1): BLAKE3 (`notary`) and
 /// SHA-256 (`notary-sha256`), hex.

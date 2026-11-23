@@ -1,14 +1,21 @@
-//! MDS -> ETH sell orders on midstate's chat bus.
+//! MDS -> ETH and MDS -> USDC sell orders on midstate's chat bus.
 //!
 //! Four messages, each one chat message, all in the clear:
 //!
 //! ```text
-//! words   = [WORD_DEX, WORD_MARK, kind]
+//! words   = [WORD_DEX, WORD_MARK, kind]            (ETH)
+//!         | [WORD_DEX, WORD_MARK, kind, WORD_FIAT] (USDC: adverts and takes)
 //! advert  = VERSION | order_id[16] | seller_evm[20] | mds[8] | min[8] | wei_per_gmds[16] | expires[8]
 //! take    = VERSION | order_id[16] | take_id[16] | mds[8] | wei[16] | claim_pk[32] | buyer_evm[20]
 //! lock    = VERSION | take_id[16] | 1 | secret_hash[32] | timeout[8] | refund_pk[32]
 //! decline = VERSION | take_id[16] | 0 | reason[1]
 //! ```
+//!
+//! A USDC advert or take is the ETH one with a fourth word, so wallets that
+//! predate USDC, which read three-word messages only, never see an order
+//! they cannot settle, and a take can never be read as one for the other
+//! currency's order. Amounts in it (`wei_per_gmds`, `wei`) are millionths
+//! of a dollar.
 //!
 //! Nothing here needs to be secret or authentic, because nobody moves money
 //! on a message alone. The buyer locks ETH only once the lock a `lock`
@@ -35,6 +42,10 @@ pub const KIND_TRADE: u8 = 32;
 /// "who": a name claim for an order or a take. Its own message, so wallets
 /// that predate it, which read only the kinds above, see the orders as before.
 pub const KIND_WHO: u8 = 91;
+/// "fiat": the fourth word of a USDC advert or take.
+pub const WORD_FIAT: u8 = 36;
+
+use crate::eth_trade::Asset;
 
 pub const VERSION: u8 = 1;
 
@@ -48,10 +59,13 @@ pub struct Advert {
     pub mds: u64,
     /// The smallest take the seller accepts.
     pub min: u64,
-    /// Price: wei per 2^30 units.
+    /// Price: the asset's smallest units (wei, or millionths of a dollar)
+    /// per 2^30 units.
     pub wei_per_gmds: u128,
     /// Midstate height after which the order no longer stands.
     pub expires: u64,
+    /// What it sells for: carried by the message's words, not its body.
+    pub asset: Asset,
 }
 
 impl Advert {
@@ -81,6 +95,7 @@ impl Advert {
             min: r.u64()?,
             wei_per_gmds: r.u128()?,
             expires: r.u64()?,
+            asset: Asset::Eth,
         })
     }
 }
@@ -97,6 +112,8 @@ pub struct Take {
     pub claim_pk: [u8; 32],
     /// The account the buyer's ETH lock comes from and refunds to.
     pub buyer_evm: [u8; 20],
+    /// What the buyer pays in: carried by the message's words.
+    pub asset: Asset,
 }
 
 impl Take {
@@ -126,6 +143,7 @@ impl Take {
             wei: r.u128()?,
             claim_pk: r.arr()?,
             buyer_evm: r.arr()?,
+            asset: Asset::Eth,
         })
     }
 }
@@ -299,32 +317,41 @@ pub enum Frame {
 /// One chat message to send: `(words, attachments)`.
 pub type Outgoing = (Vec<u8>, Vec<ChatAttachment>);
 
-fn outgoing(kind: u8, body: Vec<u8>) -> Outgoing {
-    (vec![WORD_DEX, WORD_MARK, kind], vec![ChatAttachment::Signature(body)])
+fn outgoing(kind: u8, asset: Asset, body: Vec<u8>) -> Outgoing {
+    let mut words = vec![WORD_DEX, WORD_MARK, kind];
+    if asset == Asset::Usdc {
+        words.push(WORD_FIAT);
+    }
+    (words, vec![ChatAttachment::Signature(body)])
 }
 
 impl Frame {
     pub fn chat(&self) -> Outgoing {
         match self {
-            Frame::Advert(a) => outgoing(KIND_SELL, a.encode()),
-            Frame::Take(t) => outgoing(KIND_TAKE, t.encode()),
-            Frame::Answer(a) => outgoing(KIND_TRADE, a.encode()),
-            Frame::Claim(c) => outgoing(KIND_WHO, c.encode()),
+            Frame::Advert(a) => outgoing(KIND_SELL, a.asset, a.encode()),
+            Frame::Take(t) => outgoing(KIND_TAKE, t.asset, t.encode()),
+            Frame::Answer(a) => outgoing(KIND_TRADE, Asset::Eth, a.encode()),
+            Frame::Claim(c) => outgoing(KIND_WHO, Asset::Eth, c.encode()),
         }
     }
 }
 
 /// Parses a chat message, or `None` if it is not one of ours.
 pub fn parse(m: &ChatMessage) -> Option<Frame> {
-    if m.words.len() != 3 || m.words[0] != WORD_DEX || m.words[1] != WORD_MARK || m.attachments.len() != 1 {
+    let asset = match m.words.get(3..) {
+        Some([]) => Asset::Eth,
+        Some([WORD_FIAT]) => Asset::Usdc,
+        _ => return None,
+    };
+    if m.words[0] != WORD_DEX || m.words[1] != WORD_MARK || m.attachments.len() != 1 {
         return None;
     }
     let ChatAttachment::Signature(b) = &m.attachments[0] else { return None };
-    match m.words[2] {
-        KIND_SELL => Advert::decode(b).map(Frame::Advert),
-        KIND_TAKE => Take::decode(b).map(Frame::Take),
-        KIND_TRADE => Answer::decode(b).map(Frame::Answer),
-        KIND_WHO => NameClaim::decode(b).map(Frame::Claim),
+    match (m.words[2], asset) {
+        (KIND_SELL, _) => Advert::decode(b).map(|a| Frame::Advert(Advert { asset, ..a })),
+        (KIND_TAKE, _) => Take::decode(b).map(|t| Frame::Take(Take { asset, ..t })),
+        (KIND_TRADE, Asset::Eth) => Answer::decode(b).map(Frame::Answer),
+        (KIND_WHO, Asset::Eth) => NameClaim::decode(b).map(Frame::Claim),
         _ => None,
     }
 }
@@ -372,8 +399,19 @@ mod tests {
                 min: 1 << 30,
                 wei_per_gmds: 4_000_000_000_000_000,
                 expires: 400_000,
+                asset: Asset::Eth,
             }),
-            Frame::Take(Take { order_id: [1; 16], take_id: [3; 16], mds: 1 << 30, wei: 4_000_000_000_000_000, claim_pk: [4; 32], buyer_evm: [5; 20] }),
+            Frame::Advert(Advert {
+                order_id: [8; 16],
+                seller_evm: [2; 20],
+                mds: 5 << 30,
+                min: 1 << 30,
+                wei_per_gmds: 12_500_000,
+                expires: 400_000,
+                asset: Asset::Usdc,
+            }),
+            Frame::Take(Take { order_id: [1; 16], take_id: [3; 16], mds: 1 << 30, wei: 4_000_000_000_000_000, claim_pk: [4; 32], buyer_evm: [5; 20], asset: Asset::Eth }),
+            Frame::Take(Take { order_id: [8; 16], take_id: [9; 16], mds: 1 << 30, wei: 12_500_000, claim_pk: [4; 32], buyer_evm: [5; 20], asset: Asset::Usdc }),
             Frame::Answer(Answer::Lock { take_id: [3; 16], secret_hash: [6; 32], timeout: 400_187, refund_pk: [7; 32] }),
             Frame::Answer(Answer::Decline { take_id: [3; 16], reason: Decline::Busy }),
         ];
@@ -416,8 +454,29 @@ mod tests {
     }
 
     #[test]
+    fn a_usdc_order_is_one_more_word_that_old_wallets_never_read() {
+        let a = Advert { order_id: [1; 16], seller_evm: [2; 20], mds: 1 << 30, min: 1 << 30, wei_per_gmds: 2_000_000, expires: 9, asset: Asset::Usdc };
+        let (words, atts) = Frame::Advert(a.clone()).chat();
+        assert_eq!(words, vec![WORD_DEX, WORD_MARK, KIND_SELL, WORD_FIAT]);
+        // The body is the ETH advert's: only the words say USDC.
+        let eth = Frame::Advert(Advert { asset: Asset::Eth, ..a.clone() }).chat();
+        assert_eq!(atts, eth.1);
+        // What a wallet before USDC checks first: three words, or not ours.
+        assert_ne!(words.len(), 3);
+        // A fourth word that is not "fiat", or a USDC answer or claim, is not ours.
+        let mut odd = chat(&(words.clone(), atts.clone()));
+        odd.words[3] = 37;
+        assert_eq!(parse(&odd), None);
+        let ans = Frame::Answer(Answer::Decline { take_id: [3; 16], reason: Decline::Gone }).chat();
+        let mut ans = chat(&ans);
+        ans.words.push(WORD_FIAT);
+        assert_eq!(parse(&ans), None);
+        assert_eq!(WORD_FIAT as usize, midstate::chat::CHAT_DICTIONARY.iter().position(|w| *w == "fiat").unwrap());
+    }
+
+    #[test]
     fn other_protocols_and_truncations_are_not_ours() {
-        let a = Frame::Advert(Advert { order_id: [1; 16], seller_evm: [2; 20], mds: 1, min: 1, wei_per_gmds: 1, expires: 1 });
+        let a = Frame::Advert(Advert { order_id: [1; 16], seller_evm: [2; 20], mds: 1, min: 1, wei_per_gmds: 1, expires: 1, asset: Asset::Eth });
         let mut o = a.chat();
         o.0[0] = 33; // the MDW market's "swap"
         assert_eq!(parse(&chat(&o)), None);

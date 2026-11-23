@@ -90,9 +90,11 @@ ignored.
 | 7 | — | held for a Nostr public key; not built yet |
 | 8 | kem | `H(key)` of an ML-KEM-512 public key, for sealed messages |
 | 9 | script | part of the script behind an mds-address; the parts in order are the script |
+| 10 | postage | one byte, 16–40: the stamp bits a stranger's sealed message to the name must show |
 
-Tags 8–9 are client-side: a client that predates them keeps and ignores them,
-as it does any tag (and as clients do tag 7 today).
+Tags 8–10 are client-side: a client that predates them keeps and ignores them,
+as it does any tag (and as clients do tag 7 today). A `postage` outside 16–40,
+or not one byte, is kept and read as no price: the standard, 24.
 
 An MDS payment goes to the first mds-address, or mds-key with at least 16
 signatures left. Senders refuse a name that has lapsed or lapses within a day.
@@ -106,7 +108,10 @@ address first, and pays the record only if no answer comes.
   payment stream, a covenant. A name that publishes nothing shows as a script
   address of unpublished kind.
 - **Sealed messages.** The `kem` record lets anyone open a sealed chat session
-  with the name; see `src/sealed.rs`.
+  with the name; see `src/sealed.rs`. The `postage` record is what the holder
+  charges a stranger to be written to: each step of 4 bits is sixteen times
+  the work. A wallet holding several names asks the lowest of their prices,
+  so a stranger who paid what the name they wrote to asks is heard.
 
 ## Software
 
@@ -188,11 +193,22 @@ address first, and pays the record only if no answer comes.
     Senders under the inbox's bar wait under Requests until accepted or
     answered; a conversation can be deleted, and messages still waiting for
     a name's key can be stopped.
-  - **Strangers pay to be heard.** Until a wallet answers or accepts a
-    conversation, every message in it must carry a stamp: proof of work
-    (24 bits, about a second of one core) bound to that one message, inside
-    the seal so only the recipient can check it. Wallets stamp until the
-    other side writes back. A request keeps at most three of its sender's
+  - **Strangers pay to be heard, at the recipient's price.** Until a wallet
+    answers or accepts a conversation, every message in it must carry a
+    stamp: proof of work bound to that one message, inside the seal so only
+    the recipient can check it, of the bits the recipient's names ask
+    (`postage`; 24 bits, about a second of one core, where they say none).
+    Wallets stamp until the other side writes back. A wallet under attack
+    raises its price from Messages (Strangers pay: standard, raised 28,
+    high 32, very high 36, maximum 40 bits), which changes the `postage`
+    record on each of its names that takes sealed messages; it applies once
+    that confirms, and senders read it from the chain. Stamps are worked on
+    a thread of their own, cheapest first, so a dear one holds nothing up: a
+    message being stamped shows as such, can be called off, goes when its
+    stamp is done, and its work starts again after a restart (an opening
+    being stamped is kept made up to its stamp, so it is signed once). A
+    price that changes while a stamp is worked lands on the work in hand.
+    A request keeps at most three of its sender's
     messages, raises no notice, and goes after 30 days unanswered; at most
     100 are kept. A verified name can be blocked (its conversations go and
     nothing it sends is read); anyone else is blocked by forgetting the

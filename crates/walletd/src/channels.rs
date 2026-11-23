@@ -418,6 +418,10 @@ pub struct MyBid {
     pub created: u64,
     #[serde(default)]
     pub cancelled: bool,
+    /// What it pays in: ETH (`MidstateAtomicSwap`) or USDC
+    /// (`MidstateTokenSwap`). `wei` and `fill_bond` are in its smallest unit.
+    #[serde(default)]
+    pub asset: crate::eth_trade::Asset,
 }
 
 /// A hub's self-description, as heard on the bus.

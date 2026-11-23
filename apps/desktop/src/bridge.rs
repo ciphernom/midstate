@@ -59,8 +59,13 @@ pub enum Action {
     SealedRead { id: String },
     SealedAccept { id: String },
     SealedDelete { id: String },
-    /// Stop trying to send what waits for a name's key.
+    /// Stop trying to send what waits for a name's key, or on the stamp of
+    /// the opening to it.
     SealedCancel { to: String },
+    /// Stop sending what in a conversation still waits on its stamp.
+    SealedUnsend { id: String },
+    /// What strangers' sealed messages must pay, in stamp bits.
+    SetPostage { bits: u32 },
     /// Block whoever is on the other side of a conversation.
     SealedBlock { id: String },
     SealedUnblock { name: String },
@@ -97,12 +102,13 @@ pub enum Action {
     LoadMyOrders,
     ReclaimOrder { group_id: String },
     LoadEthMarket,
-    EthSell { mds: u64, wei_per_gmds: String, min: u64, life: u64 },
+    /// `asset`: "ETH" or "USDC"; the price in its smallest unit per gMDS.
+    EthSell { asset: String, mds: u64, wei_per_gmds: String, min: u64, life: u64 },
     EthCancelSell { id: String },
     EthBuy { order_id: String, mds: u64 },
     EthFillBid { bid_id: String },
     LoadSwaps,
-    PlaceBid { mds_amount: u64, wei: String, ttl_secs: u64, fill_bond: String },
+    PlaceBid { asset: String, mds_amount: u64, wei: String, ttl_secs: u64, fill_bond: String },
     CancelBid { bid_id: String },
     LoadMyBids,
     LoadHubs,
@@ -200,6 +206,8 @@ pub enum Msg {
     SealedChanged,
     /// Who is blocked, or whether anonymous senders are, changed.
     SealedSettings,
+    /// What strangers pay is changing: the names whose records change.
+    PostageSet(Vec<String>),
     /// What a name a new message is for turned out to be.
     Recipient { name: String, card: Result<NameCard, String> },
     NameTargets(Vec<PayTargetView>),
@@ -550,6 +558,8 @@ fn perform(
             Action::SealedAccept { id } => run!("accept message request", h.sealed_accept(id), |_| Msg::SealedChanged),
             Action::SealedDelete { id } => run!("delete conversation", h.sealed_delete(id), |_| Msg::SealedChanged),
             Action::SealedCancel { to } => run!("stop sending", h.sealed_cancel(to), |_| Msg::SealedChanged),
+            Action::SealedUnsend { id } => run!("stop sending", h.sealed_unsend(id), |_| Msg::SealedChanged),
+            Action::SetPostage { bits } => run!("what strangers pay", h.set_postage(bits), Msg::PostageSet),
             Action::SealedBlock { id } => run!("block", h.sealed_block(id), |_| Msg::SealedSettings),
             Action::SealedUnblock { name } => run!("unblock", h.sealed_unblock(name), |_| Msg::SealedSettings),
             Action::SetDropAnonymous { on } => run!("anonymous senders", h.set_drop_anonymous(on), |_| Msg::SealedSettings),
@@ -596,8 +606,8 @@ fn perform(
             }
             Action::LoadMyOrders => run!("my orders", h.my_orders(), Msg::MyOrders),
             Action::LoadEthMarket => run!("ETH market", h.eth_market(), Msg::EthMarket),
-            Action::EthSell { mds, wei_per_gmds, min, life } => {
-                run!("post sell order", h.eth_sell(mds, wei_per_gmds, min, life), |_| Msg::EthDone(
+            Action::EthSell { asset, mds, wei_per_gmds, min, life } => {
+                run!("post sell order", h.eth_sell(asset, mds, wei_per_gmds, min, life), |_| Msg::EthDone(
                     "Sell order posted. Buyers see it while this app is open; each sale locks only what that buyer asked for.".into()
                 ))
             }
@@ -615,8 +625,8 @@ fn perform(
                 ))
             }
             Action::LoadSwaps => run!("swaps", h.swaps(), Msg::Swaps),
-            Action::PlaceBid { mds_amount, wei, ttl_secs, fill_bond } => {
-                run!("place bid", h.place_bid(mds_amount, wei, ttl_secs, fill_bond), Msg::BidPlaced)
+            Action::PlaceBid { asset, mds_amount, wei, ttl_secs, fill_bond } => {
+                run!("place bid", h.place_bid(asset, mds_amount, wei, ttl_secs, fill_bond), Msg::BidPlaced)
             }
             Action::CancelBid { bid_id } => {
                 run!("cancel bid", h.cancel_bid(bid_id), Msg::BidCancelled)

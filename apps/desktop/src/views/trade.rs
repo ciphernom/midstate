@@ -1,13 +1,15 @@
-//! Trading MDS for ETH on Base, wallet to wallet.
+//! Trading MDS for ETH or USDC on Base, wallet to wallet.
 //!
-//! Every trade is an atomic swap against the `MidstateAtomicSwap` contract:
-//! both sides are paid, or both get their money back. Three tabs:
+//! Every trade is an atomic swap against a contract on Base:
+//! `MidstateAtomicSwap` for ETH, `MidstateTokenSwap` for USDC. Both sides
+//! are paid, or both get their money back. The two markets are one page in
+//! two currencies, each with three tabs:
 //!
 //! * **Buy MDS**: sell orders heard on the bus (each seller's wallet locks
 //!   the MDS for one buyer when asked), and posting a buy order, whose ETH
-//!   waits in the contract for a seller.
+//!   or USDC waits in the contract for a seller.
 //! * **Sell MDS**: buy orders escrowed on Base, and posting a sell order.
-//! * **My trades**: what is under way, and what finished.
+//! * **My trades**: what is under way, and what finished, in both.
 
 use crate::app::App;
 use crate::bridge::Action;
@@ -18,6 +20,10 @@ use midstate_walletd::api::{BidView, DexConfigView, EthAdvertView, EthSwapView};
 const TABS: [&str; 3] = ["Buy MDS", "Sell MDS", "My trades"];
 const GMDS: u128 = 1 << 30;
 const WEI: u128 = 1_000_000_000_000_000_000;
+/// USDC's smallest unit: a millionth of a dollar.
+const MICRO: u128 = 1_000_000;
+const ETH: &str = "ETH";
+const USDC: &str = "USDC";
 
 /// Base's public explorer. Everything the wallet claims about the ETH leg is
 /// independently checkable there, so it should always be one click away.
@@ -64,17 +70,49 @@ fn eth_of(wei: u128) -> String {
     format!("{shown} ETH")
 }
 
-/// A price, wei per 2^30 units, as ETH per gMDS.
-fn per_mds(wei_per_gmds: &str) -> String {
-    eth(wei_per_gmds)
+/// Millionths of a dollar as USDC: cents always, more places only when
+/// they say something.
+fn usdc_of(micro: u128) -> String {
+    let (whole, frac) = (micro / MICRO, micro % MICRO);
+    let mut f = format!("{frac:06}");
+    while f.len() > 2 && f.ends_with('0') {
+        f.pop();
+    }
+    let whole = whole.to_string();
+    let mut grouped = String::new();
+    for (i, c) in whole.chars().enumerate() {
+        if i > 0 && (whole.len() - i) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(c);
+    }
+    format!("{grouped}.{f} USDC")
 }
 
-/// A price in wei per unit, as ETH per gMDS.
-fn per_mds_f(wei_per_unit: f64) -> String {
+/// An amount in `asset`'s smallest unit, as that currency.
+fn amount_of(asset: &str, v: u128) -> String {
+    if asset == USDC {
+        usdc_of(v)
+    } else {
+        eth_of(v)
+    }
+}
+
+fn amount(asset: &str, v: &str) -> String {
+    amount_of(asset, v.parse().unwrap_or(0))
+}
+
+/// A price, smallest units per 2^30 units, per gMDS.
+fn per_mds(asset: &str, wei_per_gmds: &str) -> String {
+    amount(asset, wei_per_gmds)
+}
+
+/// A price in smallest units per unit, per gMDS.
+fn per_mds_f(asset: &str, wei_per_unit: f64) -> String {
     if wei_per_unit <= 0.0 {
         return "—".into();
     }
-    eth_of((wei_per_unit * GMDS as f64).round() as u128)
+    amount_of(asset, (wei_per_unit * GMDS as f64).round() as u128)
 }
 
 /// Units as gMDS (2^30 units), as the wallet shows amounts this size.
@@ -103,6 +141,36 @@ fn parse_eth(s: &str) -> Option<u128> {
     whole.checked_mul(WEI)?.checked_add(frac).filter(|v| *v > 0)
 }
 
+/// USDC typed by a person, in millionths of a dollar, exactly.
+fn parse_usdc(s: &str) -> Option<u128> {
+    let t = s.trim().trim_start_matches('$').replace(',', "");
+    let (i, f) = t.split_once('.').unwrap_or((&t, ""));
+    if (i.is_empty() && f.is_empty()) || f.len() > 6 || !i.chars().all(|c| c.is_ascii_digit()) || !f.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let whole: u128 = if i.is_empty() { 0 } else { i.parse().ok()? };
+    let frac: u128 = if f.is_empty() { 0 } else { format!("{f:0<6}").parse().ok()? };
+    whole.checked_mul(MICRO)?.checked_add(frac).filter(|v| *v > 0)
+}
+
+/// An amount of `asset` typed by a person, in its smallest unit.
+fn parse_amount(asset: &str, s: &str) -> Option<u128> {
+    if asset == USDC {
+        parse_usdc(s)
+    } else {
+        parse_eth(s)
+    }
+}
+
+/// The currency of the market on screen.
+fn asset_of(app: &App) -> &'static str {
+    if app.market == 1 {
+        USDC
+    } else {
+        ETH
+    }
+}
+
 /// What `units` cost at `wei_per_gmds`, rounded up as the seller's wallet does.
 fn cost(units: u64, wei_per_gmds: u128) -> u128 {
     (units as u128 * wei_per_gmds).div_ceil(GMDS)
@@ -119,25 +187,51 @@ fn caption(ui: &mut Ui, t: &str) {
 pub fn show(app: &mut App, ui: &mut Ui) {
     let ctx = ui.ctx().clone();
     theme::heading(ui, "Trade");
-    let mut market = app.market.min(1);
-    if theme::segmented(ui, &["MDS ↔ ETH (Base)", "MDS ↔ MDW (midwimble)"], &mut market) {
+    let mut market = app.market.min(2);
+    if theme::segmented(ui, &["MDS ↔ ETH (Base)", "MDS ↔ USDC (Base)", "MDS ↔ MDW (midwimble)"], &mut market) {
+        // Prices typed in one currency mean nothing in the other.
+        if (market == 1) != (app.market == 1) {
+            app.eth_sell_price.clear();
+            app.bid_wei.clear();
+            app.bid_bond = "0".into();
+            app.eth_buy = None;
+            app.eth_fill = None;
+        }
         app.market = market;
         app.mwb_last_poll = 0.0;
         app.eth_last_poll = 0.0;
     }
     ui.add_space(6.0);
-    if app.market == 1 {
+    if app.market == 2 {
         crate::views::trade_mdw::show(app, ui, &ctx);
         return;
     }
+    let asset = asset_of(app);
     theme::hint(
         ui,
-        "Swap MDS and ETH on Base, wallet to wallet. Every trade is atomic: both sides are paid, \
-         or both get their money back. Keep the app open while a trade runs.",
+        &format!(
+            "Swap MDS and {asset} on Base, wallet to wallet. Every trade is atomic: both sides are paid, \
+             or both get their money back. Keep the app open while a trade runs."
+        ),
     );
     ui.add_space(6.0);
     account_strip(app, ui, &ctx);
     ui.add_space(8.0);
+    if asset == USDC && !app.evm.as_ref().is_some_and(|a| a.usdc_ready) {
+        theme::panel_frame().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new("USDC trading is not switched on yet").font(theme::font_medium(14.0)));
+            theme::hint(
+                ui,
+                "USDC trades run through their own contract on Base (MidstateTokenSwap), the same \
+                 protocol as ETH's for one token. Once it is deployed, its address goes under \
+                 Connection below, and this market opens.",
+            );
+        });
+        ui.add_space(10.0);
+        connection(app, ui, &ctx);
+        return;
+    }
 
     let running = app.eth_market.as_ref().map_or(0, |m| m.swaps.iter().filter(|s| !s.settled).count())
         + app.swaps.iter().filter(|s| !s.settled).count();
@@ -158,8 +252,8 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         theme::hint(ui, &format!("Base is not answering right now ({e}). Trades wait and retry; nothing is lost."));
     }
     match app.eth_tab {
-        0 => buy_view(app, ui, &ctx),
-        1 => sell_view(app, ui, &ctx),
+        0 => buy_view(app, ui, &ctx, asset),
+        1 => sell_view(app, ui, &ctx, asset),
         _ => my_trades(app, ui, &ctx),
     }
     ui.add_space(10.0);
@@ -168,16 +262,18 @@ pub fn show(app: &mut App, ui: &mut Ui) {
 
 // ── Buy MDS ─────────────────────────────────────────────────────────────────
 
-fn buy_view(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
-    let sells: Vec<EthAdvertView> = app.eth_market.as_ref().map(|m| m.sells.clone()).unwrap_or_default();
+fn buy_view(app: &mut App, ui: &mut Ui, ctx: &egui::Context, asset: &str) {
+    let sells: Vec<EthAdvertView> = app.eth_market.as_ref().map(|m| m.sells.iter().filter(|a| a.asset == asset).cloned().collect()).unwrap_or_default();
     theme::panel_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.label(RichText::new("Sell orders").font(theme::font_medium(14.0)));
         theme::hint(
             ui,
-            "Buy instantly from a seller whose wallet is online. The seller locks the MDS so that only \
-             you can claim it; your ETH is locked only after that, and comes back to you if the seller \
-             never claims it.",
+            &format!(
+                "Buy instantly from a seller whose wallet is online. The seller locks the MDS so that only \
+                 you can claim it; your {asset} is locked only after that, and comes back to you if the seller \
+                 never claims it."
+            ),
         );
         ui.add_space(4.0);
         if sells.iter().all(|a| a.mine) {
@@ -189,7 +285,7 @@ fn buy_view(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
             }
             ui.end_row();
             for a in sells.iter().filter(|a| !a.mine) {
-                ui.label(theme::mono(per_mds(&a.wei_per_gmds)).size(11.5).color(theme::ink()));
+                ui.label(theme::mono(per_mds(asset, &a.wei_per_gmds)).size(11.5).color(theme::ink()));
                 ui.label(theme::mono(gmds(a.mds)).size(11.5));
                 ui.horizontal(|ui| {
                     // A name only when the seller's account signed it and the
@@ -224,37 +320,44 @@ fn buy_view(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
         }
     });
     ui.add_space(8.0);
-    place_bid_panel(app, ui, ctx);
+    place_bid_panel(app, ui, ctx, asset);
     if let Some(b) = app.book.clone() {
         ui.add_space(8.0);
-        egui::CollapsingHeader::new("Recent trades").id_salt("eth_recent").show(ui, |ui| trades_panel(ui, &b));
+        egui::CollapsingHeader::new("Recent trades").id_salt(("eth_recent", asset)).show(ui, |ui| trades_panel(ui, &b, asset));
     }
 }
 
 fn buy_form(app: &mut App, ui: &mut Ui, ctx: &egui::Context, a: &EthAdvertView) {
+    let asset = a.asset.as_str();
     theme::panel_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
         let price: u128 = a.wei_per_gmds.parse().unwrap_or(0);
         ui.horizontal(|ui| {
             theme::hint(ui, "buy");
             field(ui, &mut app.eth_buy_amount, "gMDS", 120.0);
-            theme::hint(ui, &format!("gMDS of {} available, at {} per gMDS", gmds(a.mds), per_mds(&a.wei_per_gmds)));
+            theme::hint(ui, &format!("gMDS of {} available, at {} per gMDS", gmds(a.mds), per_mds(asset, &a.wei_per_gmds)));
         });
         let units = parse_mds(&app.eth_buy_amount);
         let ok = units.is_some_and(|u| u >= a.min && u <= a.mds);
         match units {
             Some(u) if ok => {
-                ui.label(RichText::new(format!("You pay {} (plus Base gas) for {}.", eth_of(cost(u, price)), gmds(u))).size(13.0).color(theme::bright()));
+                let gas = if asset == USDC { "plus a little ETH for gas" } else { "plus Base gas" };
+                ui.label(RichText::new(format!("You pay {} ({gas}) for {}.", amount_of(asset, cost(u, price)), gmds(u))).size(13.0).color(theme::bright()));
             }
             Some(_) => theme::hint(ui, &format!("Between {} and {}.", gmds(a.min), gmds(a.mds))),
             None => theme::hint(ui, "Enter an amount of gMDS."),
         }
-        theme::hint(
-            ui,
+        let how = if asset == USDC {
+            "What happens: the seller's wallet locks the MDS for you (about two blocks), your wallet \
+             checks it on chain, then locks your USDC, in one transaction that approves exactly that \
+             amount and no more. The seller claims the USDC, which hands your wallet the key to the \
+             MDS. If anything stalls, your USDC comes back after an hour."
+        } else {
             "What happens: the seller's wallet locks the MDS for you (about two blocks), your wallet \
              checks it on chain, then locks your ETH. The seller claims the ETH, which hands your wallet \
-             the key to the MDS. If anything stalls, your ETH comes back after an hour.",
-        );
+             the key to the MDS. If anything stalls, your ETH comes back after an hour."
+        };
+        theme::hint(ui, how);
         theme::right_aligned(ui, |ui| {
             if ui.add_enabled(ok && !app.busy, egui::Button::new("Confirm buy")).clicked() {
                 app.busy = true;
@@ -268,18 +371,20 @@ fn buy_form(app: &mut App, ui: &mut Ui, ctx: &egui::Context, a: &EthAdvertView) 
     });
 }
 
-fn place_bid_panel(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
+fn place_bid_panel(app: &mut App, ui: &mut Ui, ctx: &egui::Context, asset: &str) {
     egui::CollapsingHeader::new("Post a buy order")
-        .id_salt("eth_post_bid")
+        .id_salt(("eth_post_bid", asset))
         .default_open(false)
         .show(ui, |ui| {
             theme::panel_frame().show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 theme::hint(
                     ui,
-                    "Your ETH waits in the contract until a seller fills the order, so it works while you \
-                     are away. A seller reserves it, locks the MDS to you, and your wallet collects it, \
-                     which pays them. Cancel any time before someone reserves it.",
+                    &format!(
+                        "Your {asset} waits in the contract until a seller fills the order, so it works while you \
+                         are away. A seller reserves it, locks the MDS to you, and your wallet collects it, \
+                         which pays them. Cancel any time before someone reserves it."
+                    ),
                 );
                 egui::Grid::new("eth_bid_form").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
                     theme::hint(ui, "amount");
@@ -290,8 +395,8 @@ fn place_bid_panel(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
                     ui.end_row();
                     theme::hint(ui, "price");
                     ui.horizontal(|ui| {
-                        field(ui, &mut app.bid_wei, "0.001", 120.0);
-                        theme::hint(ui, "ETH per gMDS");
+                        field(ui, &mut app.bid_wei, if asset == USDC { "2.50" } else { "0.001" }, 120.0);
+                        theme::hint(ui, &format!("{asset} per gMDS"));
                     });
                     ui.end_row();
                     theme::hint(ui, "for");
@@ -303,16 +408,17 @@ fn place_bid_panel(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
                     theme::hint(ui, "seller's bond");
                     ui.horizontal(|ui| {
                         field(ui, &mut app.bid_bond, "0", 120.0);
-                        theme::hint(ui, "ETH, kept by you if a seller reserves and never delivers");
+                        theme::hint(ui, &format!("{asset}, kept by you if a seller reserves and never delivers"));
                     });
                     ui.end_row();
                 });
                 let units = parse_mds(&app.bid_mds);
-                let price = parse_eth(&app.bid_wei);
-                let bond = if app.bid_bond.trim().is_empty() { Some(0) } else { parse_eth(&app.bid_bond).or(Some(0)) };
+                let price = parse_amount(asset, &app.bid_wei);
+                let bond = if app.bid_bond.trim().is_empty() { Some(0) } else { parse_amount(asset, &app.bid_bond).or(Some(0)) };
                 let total = units.zip(price).map(|(u, p)| cost(u, p));
                 if let (Some(u), Some(t)) = (units, total) {
-                    ui.label(RichText::new(format!("Escrows {} for {}.", eth_of(t), gmds(u))).size(13.0).color(theme::bright()));
+                    let how = if asset == USDC { ", approved and escrowed in one transaction" } else { "" };
+                    ui.label(RichText::new(format!("Escrows {} for {}{how}.", amount_of(asset, t), gmds(u))).size(13.0).color(theme::bright()));
                 }
                 theme::right_aligned(ui, |ui| {
                     let can = !app.busy && total.is_some_and(|t| t > 0);
@@ -323,6 +429,7 @@ fn place_bid_panel(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
                         app.go(
                             ctx,
                             Action::PlaceBid {
+                                asset: asset.to_string(),
                                 mds_amount: units.unwrap_or(0),
                                 wei: total.unwrap_or(0).to_string(),
                                 ttl_secs: app.bid_hours.trim().parse::<u64>().unwrap_or(24).clamp(1, 2160) * 3600,
@@ -337,16 +444,18 @@ fn place_bid_panel(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
 
 // ── Sell MDS ────────────────────────────────────────────────────────────────
 
-fn sell_view(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
-    let bids: Vec<BidView> = app.book.as_ref().map(|b| b.bids.clone()).unwrap_or_default();
+fn sell_view(app: &mut App, ui: &mut Ui, ctx: &egui::Context, asset: &str) {
+    let bids: Vec<BidView> = app.book.as_ref().map(|b| b.bids.iter().filter(|b| b.asset == asset).cloned().collect()).unwrap_or_default();
     theme::panel_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.label(RichText::new("Buy orders").font(theme::font_medium(14.0)));
         theme::hint(
             ui,
-            "ETH already escrowed on Base, waiting for MDS. Sell into one: your wallet reserves it, \
-             locks the MDS so it can only go to that buyer, and collects the ETH when the buyer takes \
-             the MDS. If the buyer never does, your MDS comes back.",
+            &format!(
+                "{asset} already escrowed on Base, waiting for MDS. Sell into one: your wallet reserves it, \
+                 locks the MDS so it can only go to that buyer, and collects the {asset} when the buyer takes \
+                 the MDS. If the buyer never does, your MDS comes back."
+            ),
         );
         ui.add_space(4.0);
         let open: Vec<&BidView> = bids.iter().filter(|b| b.takeable && !b.mine).collect();
@@ -359,10 +468,10 @@ fn sell_view(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
             }
             ui.end_row();
             for b in &open {
-                ui.label(theme::mono(per_mds_f(b.price)).size(11.5).color(theme::ink()));
+                ui.label(theme::mono(per_mds_f(asset, b.price)).size(11.5).color(theme::ink()));
                 ui.label(theme::mono(gmds(b.mds_amount)).size(11.5));
-                ui.label(theme::mono(eth(&b.wei)).size(11.5));
-                ui.label(theme::mono(if b.fill_bond == "0" { "none".into() } else { eth(&b.fill_bond) }).size(11.0).color(theme::muted()));
+                ui.label(theme::mono(amount(asset, &b.wei)).size(11.5));
+                ui.label(theme::mono(if b.fill_bond == "0" { "none".into() } else { amount(asset, &b.fill_bond) }).size(11.0).color(theme::muted()));
                 let armed = app.eth_fill.as_deref() == Some(b.bid_id.as_str());
                 if ui.add_enabled(!app.busy, egui::Button::new(if armed { "Close" } else { "Sell" })).clicked() {
                     app.eth_fill = if armed { None } else { Some(b.bid_id.clone()) };
@@ -374,12 +483,17 @@ fn sell_view(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
             ui.add_space(6.0);
             theme::panel_frame().show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(RichText::new(format!("Sell {} for {}.", gmds(b.mds_amount), eth(&b.wei))).size(13.0).color(theme::bright()));
-                let bond = if b.fill_bond == "0" { "no bond".to_string() } else { format!("a bond of {}, returned when you are paid", eth(&b.fill_bond)) };
+                ui.label(RichText::new(format!("Sell {} for {}.", gmds(b.mds_amount), amount(asset, &b.wei))).size(13.0).color(theme::bright()));
+                let bond = if b.fill_bond == "0" {
+                    "no bond".to_string()
+                } else {
+                    format!("a bond of {}, returned when you are paid", amount(asset, &b.fill_bond))
+                };
+                let gas = if asset == USDC { "plus a little ETH for gas" } else { "plus gas" };
                 theme::hint(
                     ui,
                     &format!(
-                        "Your wallet reserves the order on Base ({bond}, plus gas), then locks the MDS and a \
+                        "Your wallet reserves the order on Base ({bond}, {gas}), then locks the MDS and a \
                          little more for the buyer's claim fee. The reservation lasts four hours."
                     ),
                 );
@@ -397,12 +511,12 @@ fn sell_view(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
         }
     });
     ui.add_space(8.0);
-    sell_order_form(app, ui, ctx);
+    sell_order_form(app, ui, ctx, asset);
 }
 
-fn sell_order_form(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
+fn sell_order_form(app: &mut App, ui: &mut Ui, ctx: &egui::Context, asset: &str) {
     egui::CollapsingHeader::new("Post a sell order")
-        .id_salt("eth_post_sell")
+        .id_salt(("eth_post_sell", asset))
         .default_open(false)
         .show(ui, |ui| {
             theme::panel_frame().show(ui, |ui| {
@@ -421,8 +535,8 @@ fn sell_order_form(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
                     ui.end_row();
                     theme::hint(ui, "price");
                     ui.horizontal(|ui| {
-                        field(ui, &mut app.eth_sell_price, "0.001", 120.0);
-                        theme::hint(ui, "ETH per gMDS");
+                        field(ui, &mut app.eth_sell_price, if asset == USDC { "2.50" } else { "0.001" }, 120.0);
+                        theme::hint(ui, &format!("{asset} per gMDS"));
                     });
                     ui.end_row();
                     theme::hint(ui, "smallest sale");
@@ -439,10 +553,10 @@ fn sell_order_form(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
                     ui.end_row();
                 });
                 let units = parse_mds(&app.eth_sell_mds);
-                let price = parse_eth(&app.eth_sell_price);
+                let price = parse_amount(asset, &app.eth_sell_price);
                 let min = parse_mds(&app.eth_sell_min).unwrap_or(1 << 20);
                 if let (Some(u), Some(p)) = (units, price) {
-                    ui.label(RichText::new(format!("{} for {} in all.", gmds(u), eth_of(cost(u, p)))).size(13.0).color(theme::bright()));
+                    ui.label(RichText::new(format!("{} for {} in all.", gmds(u), amount_of(asset, cost(u, p)))).size(13.0).color(theme::bright()));
                 }
                 theme::right_aligned(ui, |ui| {
                     let can = !app.busy && units.is_some() && price.is_some();
@@ -453,7 +567,7 @@ fn sell_order_form(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
                         app.eth_notice.clear();
                         app.go(
                             ctx,
-                            Action::EthSell { mds: units.unwrap_or(0), wei_per_gmds: price.unwrap_or(0).to_string(), min, life: hours * 60 },
+                            Action::EthSell { asset: asset.to_string(), mds: units.unwrap_or(0), wei_per_gmds: price.unwrap_or(0).to_string(), min, life: hours * 60 },
                         );
                     }
                 });
@@ -478,7 +592,7 @@ fn swap_row(ui: &mut Ui, s: &EthSwapView) {
         theme::badge(ui, kind_label(&s.kind), if s.settled { theme::muted() } else { theme::ink() });
         ui.label(theme::mono(gmds(s.mds)).size(11.5));
         theme::hint(ui, "for");
-        ui.label(theme::mono(eth(&s.wei)).size(11.5));
+        ui.label(theme::mono(amount(&s.asset, &s.wei)).size(11.5));
         if !s.counterparty.is_empty() {
             theme::hint(ui, "with");
             if !s.counterparty_name.is_empty() {
@@ -521,7 +635,7 @@ fn my_trades(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
                 ui.horizontal_wrapped(|ui| {
                     theme::badge(ui, "selling", theme::ink());
                     ui.label(theme::mono(gmds(o.mds)).size(11.5));
-                    theme::hint(ui, &format!("at {} per gMDS", per_mds(&o.wei_per_gmds)));
+                    theme::hint(ui, &format!("at {} per gMDS", per_mds(&o.asset, &o.wei_per_gmds)));
                     if o.sold > 0 {
                         theme::hint(ui, &format!("· {} sold", gmds(o.sold)));
                     }
@@ -539,14 +653,14 @@ fn my_trades(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
                     theme::badge(ui, "buying", theme::ink());
                     ui.label(theme::mono(gmds(b.mds_amount)).size(11.5));
                     theme::hint(ui, "for");
-                    ui.label(theme::mono(eth(&b.wei)).size(11.5));
+                    ui.label(theme::mono(amount(&b.asset, &b.wei)).size(11.5));
                     if !b.tx.is_empty() {
                         explorer_link(ui, "Base tx ↗", basescan_tx(&b.tx));
                     }
                     if !b.bid_id.is_empty()
                         && ui
                             .add_enabled(!app.busy, egui::Button::new(RichText::new("cancel").size(10.5)))
-                            .on_hover_text("Returns your ETH, if no seller has reserved it")
+                            .on_hover_text(format!("Returns your {}, if no seller has reserved it", b.asset))
                             .clicked()
                     {
                         cancel_bid = Some(b.bid_id.clone());
@@ -654,11 +768,15 @@ fn account_strip(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
             }
             explorer_link(ui, "view on Basescan", basescan_address(&a.address));
         });
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("contract").font(FontId::monospace(9.5)).color(theme::muted()));
-            ui.label(theme::mono(short_hex(&a.contract, 10)).size(11.0).color(theme::muted()));
-            explorer_link(ui, "view on Basescan", basescan_address(&a.contract));
-        });
+        let usdc = app.market == 1;
+        let contract = if usdc { a.usdc_contract.clone() } else { a.contract.clone() };
+        if !contract.is_empty() {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("contract").font(FontId::monospace(9.5)).color(theme::muted()));
+                ui.label(theme::mono(short_hex(&contract, 10)).size(11.0).color(theme::muted()));
+                explorer_link(ui, "view on Basescan", basescan_address(&contract));
+            });
+        }
         ui.horizontal(|ui| {
             match &a.balance_wei {
                 Some(w) => ui.label(theme::mono(eth(w)).size(12.5)),
@@ -668,6 +786,13 @@ fn account_strip(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
                         .color(theme::muted()),
                 ),
             };
+            if usdc {
+                match &a.usdc_balance {
+                    Some(u) => ui.label(theme::mono(amount(USDC, u)).size(12.5)),
+                    None if a.usdc_ready => ui.label(RichText::new("USDC balance unavailable").size(12.0).color(theme::muted())),
+                    None => ui.label(RichText::new("")),
+                };
+            }
             theme::right_aligned(ui, |ui| {
                 let label = if app.dex_syncing { "Scanning…" } else { "Refresh" };
                 if ui.add_enabled(!app.dex_syncing, egui::Button::new(label)).clicked() {
@@ -678,8 +803,13 @@ fn account_strip(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
         });
         theme::hint(
             ui,
-            "Same recovery phrase, standard derivation path — this account also opens in \
-             MetaMask. Swaps need a little ETH here for gas.",
+            if usdc {
+                "Same recovery phrase, standard derivation path — this account also opens in \
+                 MetaMask. USDC trades still need a little ETH here for gas."
+            } else {
+                "Same recovery phrase, standard derivation path — this account also opens in \
+                 MetaMask. Swaps need a little ETH here for gas."
+            },
         );
     });
 }
@@ -711,6 +841,23 @@ fn connection(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
                     theme::hint(ui, "contract");
                     ui.add(
                         TextEdit::singleline(&mut next.contract)
+                            .font(egui::TextStyle::Monospace)
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    theme::hint(ui, "USDC contract");
+                    ui.add(
+                        TextEdit::singleline(&mut next.usdc_contract)
+                            .font(egui::TextStyle::Monospace)
+                            .hint_text("MidstateTokenSwap, once deployed")
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    theme::hint(ui, "USDC token");
+                    ui.add(
+                        TextEdit::singleline(&mut next.usdc_token)
                             .font(egui::TextStyle::Monospace)
                             .desired_width(f32::INFINITY),
                     );
@@ -794,11 +941,14 @@ fn changed(a: &DexConfigView, b: &DexConfigView) -> bool {
         || a.chain_id != b.chain_id
         || a.confirmations != b.confirmations
         || a.scan_window != b.scan_window
+        || a.start_block != b.start_block
+        || a.usdc_contract != b.usdc_contract
+        || a.usdc_token != b.usdc_token
 }
 
 
 /// What the market has actually done, as opposed to what it is offering.
-fn trades_panel(ui: &mut Ui, b: &midstate_walletd::api::OrderBookView) {
+fn trades_panel(ui: &mut Ui, b: &midstate_walletd::api::OrderBookView, asset: &str) {
     theme::hint(
         ui,
         "Trades that settled, rebuilt from the contract's own events — every one is a real \
@@ -809,18 +959,19 @@ fn trades_panel(ui: &mut Ui, b: &midstate_walletd::api::OrderBookView) {
 
     theme::panel_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
-        if b.trades.is_empty() {
+        let trades: Vec<&midstate_walletd::api::TradeView> = b.trades.iter().filter(|t| t.asset == asset).collect();
+        if trades.is_empty() {
             theme::hint(ui, "No completed trades in the scanned range.");
             return;
         }
-        egui::Grid::new("trades").num_columns(5).spacing([20.0, 7.0]).striped(true).show(ui, |ui| {
-            for h in ["Block", "Type", "Amount", "ETH", "Price per gMDS"] {
+        egui::Grid::new(("trades", asset)).num_columns(5).spacing([20.0, 7.0]).striped(true).show(ui, |ui| {
+            for h in ["Block", "Type", "Amount", asset, "Price per gMDS"] {
                 ui.label(
                     RichText::new(h.to_uppercase()).font(FontId::monospace(9.5)).color(theme::muted()),
                 );
             }
             ui.end_row();
-            for t in &b.trades {
+            for t in trades {
                 ui.label(theme::mono(units(t.block)).size(11.0).color(theme::muted()));
                 theme::badge(
                     ui,
@@ -834,15 +985,39 @@ fn trades_panel(ui: &mut Ui, b: &midstate_walletd::api::OrderBookView) {
                     None => theme::mono("—").size(11.5).color(theme::faint()),
                 });
                 ui.label(
-                    theme::mono(if t.wei == "0" { "—".to_string() } else { eth(&t.wei) })
+                    theme::mono(if t.wei == "0" { "—".to_string() } else { amount(asset, &t.wei) })
                         .size(11.5),
                 );
                 ui.label(match t.price {
-                    Some(p) => theme::mono(per_mds_f(p)).size(11.5).color(theme::ink()),
+                    Some(p) => theme::mono(per_mds_f(asset, p)).size(11.5).color(theme::ink()),
                     None => theme::mono("—").size(11.0).color(theme::faint()),
                 });
                 ui.end_row();
             }
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usdc_reads_and_parses_as_dollars() {
+        assert_eq!(usdc_of(12_500_000), "12.50 USDC");
+        assert_eq!(usdc_of(1), "0.000001 USDC");
+        assert_eq!(usdc_of(1_234_567_890_000), "1,234,567.89 USDC");
+        assert_eq!(usdc_of(0), "0.00 USDC");
+        assert_eq!(parse_usdc("2.5"), Some(2_500_000));
+        assert_eq!(parse_usdc("$1,000.01"), Some(1_000_010_000));
+        assert_eq!(parse_usdc(".000001"), Some(1));
+        assert_eq!(parse_usdc("0.0000001"), None, "finer than a millionth");
+        assert_eq!(parse_usdc("0"), None);
+        assert_eq!(parse_usdc("abc"), None);
+        // The same text is a very different amount in the other currency.
+        assert_eq!(parse_amount(USDC, "1"), Some(1_000_000));
+        assert_eq!(parse_amount(ETH, "1"), Some(WEI));
+        assert_eq!(amount(USDC, "2500000"), "2.50 USDC");
+        assert_eq!(per_mds_f(USDC, 2_500_000.0 / GMDS as f64), "2.50 USDC");
+    }
 }

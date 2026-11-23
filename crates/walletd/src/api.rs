@@ -24,6 +24,28 @@ pub struct WalletStatus {
     /// Anonymous senders' sealed messages are dropped unread.
     #[serde(default)]
     pub drop_anonymous: bool,
+    /// What a stranger's sealed message must pay to reach this wallet.
+    #[serde(default)]
+    pub postage: PostageView,
+}
+
+/// What strangers pay to write to this wallet: the stamp a sealed message
+/// must carry until its user answers or accepts the conversation.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PostageView {
+    /// In bits of stamp work: the lowest price among this wallet's names
+    /// that take sealed messages (`POSTAGE_STANDARD` where they say none).
+    pub bits: u32,
+    /// The price once the record changes on their way land, if it differs.
+    #[serde(default)]
+    pub pending: Option<u32>,
+    /// The names that take this wallet's sealed messages (`nick.mds`).
+    #[serde(default)]
+    pub names: Vec<String>,
+    /// Those whose price can be changed now: held (not rented), and not
+    /// changing already.
+    #[serde(default)]
+    pub settable: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -152,6 +174,10 @@ pub struct NameCard {
     /// It takes sealed messages (a `kem` record).
     #[serde(default)]
     pub sealed: bool,
+    /// What a stranger's sealed message to it must pay, in stamp bits (its
+    /// `postage` record, or the standard).
+    #[serde(default)]
+    pub postage: u32,
     /// What has been burned to back it (MSB-1), if anything.
     #[serde(default)]
     pub backing: Option<BackingView>,
@@ -218,6 +244,10 @@ pub struct ConversationView {
     /// recipient), as until the other side has written.
     #[serde(default)]
     pub stamping: bool,
+    /// The bits of stamp this wallet's next message here needs: what the
+    /// other side's name asks, until they write; 0 after.
+    #[serde(default)]
+    pub stamp_bits: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -236,6 +266,9 @@ pub struct MessageLineView {
     /// 0 for none). `mine` says which side.
     #[serde(default)]
     pub timer: Option<u32>,
+    /// Not sent yet: its stamp is being worked (see `ConversationView::stamp_bits`).
+    #[serde(default)]
+    pub stamping: bool,
 }
 
 /// Something of this wallet's a name can point its payments at.
@@ -263,6 +296,9 @@ pub enum NameAction {
     AutoRenew(bool),
     /// Hand it to another wallet: a control key (64 hex), or the holder of a name.
     Give { to: String },
+    /// Ask `bits` of strangers' sealed messages to it (its `postage`
+    /// record; the standard publishes none). Nothing else changes.
+    Postage { bits: u32 },
 }
 
 /// The records a held name should carry besides its payment keys.
@@ -926,6 +962,15 @@ pub struct EvmAccountView {
     pub contract: String,
     /// Set when the wallet predates EVM key derivation.
     pub missing_key: bool,
+    /// USDC can be traded: a `MidstateTokenSwap` is set.
+    #[serde(default)]
+    pub usdc_ready: bool,
+    /// That contract, when set.
+    #[serde(default)]
+    pub usdc_contract: String,
+    /// USDC held, in millionths of a dollar; `None` if it could not be read.
+    #[serde(default)]
+    pub usdc_balance: Option<String>,
 }
 
 /// A resting buy order: ETH escrowed in the contract, waiting for MDS.
@@ -942,6 +987,10 @@ pub struct BidView {
     pub reserved: bool,
     pub takeable: bool,
     pub mine: bool,
+    /// "ETH" or "USDC": what the Base side pays in. Amounts here are in its
+    /// smallest unit (wei, or millionths of a dollar).
+    #[serde(default = "eth_symbol")]
+    pub asset: String,
 }
 
 /// One independently-takeable unit of an ask.
@@ -1015,6 +1064,10 @@ pub struct TradeView {
     pub price: Option<f64>,
     /// "sell" — an ask was taken; "buy" — a bid was filled.
     pub kind: String,
+    /// "ETH" or "USDC": what the Base side pays in. Amounts here are in its
+    /// smallest unit (wei, or millionths of a dollar).
+    #[serde(default = "eth_symbol")]
+    pub asset: String,
 }
 
 /// Where the EVM leg points. Editable so the same build can follow a contract
@@ -1029,6 +1082,12 @@ pub struct DexConfigView {
     pub scan_window: u64,
     /// Scan from this exact block instead of the window. 0 = use the window.
     pub start_block: u64,
+    /// `MidstateTokenSwap` for USDC; empty: USDC trading off.
+    #[serde(default)]
+    pub usdc_contract: String,
+    /// The token it was deployed for: USDC on Base.
+    #[serde(default)]
+    pub usdc_token: String,
 }
 
 /// One prerequisite for a swap, phrased so it can be acted on.
@@ -1123,6 +1182,10 @@ pub struct MyBidView {
     /// "confirming" until the contract assigns an id, then "open".
     pub status: String,
     pub cancelled: bool,
+    /// "ETH" or "USDC": what the Base side pays in. Amounts here are in its
+    /// smallest unit (wei, or millionths of a dollar).
+    #[serde(default = "eth_symbol")]
+    pub asset: String,
 }
 
 /// A hub heard advertising itself on the chat bus.
@@ -1360,6 +1423,14 @@ pub struct EthAdvertView {
     /// verified name, together.
     #[serde(default)]
     pub seller_backing: f64,
+    /// "ETH" or "USDC": what the Base side pays in. Amounts here are in its
+    /// smallest unit (wei, or millionths of a dollar).
+    #[serde(default = "eth_symbol")]
+    pub asset: String,
+}
+
+fn eth_symbol() -> String {
+    "ETH".into()
 }
 
 /// One of our sell orders.
@@ -1376,6 +1447,10 @@ pub struct EthOrderView {
     pub status: String,
     /// Sales of this order still under way.
     pub running: usize,
+    /// "ETH" or "USDC": what the Base side pays in. Amounts here are in its
+    /// smallest unit (wei, or millionths of a dollar).
+    #[serde(default = "eth_symbol")]
+    pub asset: String,
 }
 
 /// A trade this wallet is in, or was.
@@ -1407,6 +1482,10 @@ pub struct EthSwapView {
     pub base_tx: Option<String>,
     pub created: u64,
     pub updated: u64,
+    /// "ETH" or "USDC": what the Base side pays in. Amounts here are in its
+    /// smallest unit (wei, or millionths of a dollar).
+    #[serde(default = "eth_symbol")]
+    pub asset: String,
 }
 
 /// The ETH market as this wallet sees it.

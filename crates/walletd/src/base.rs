@@ -1,4 +1,9 @@
-//! Base JSON-RPC client and a typed binding for `MidstateAtomicSwap`.
+//! Base JSON-RPC client and a typed binding for `MidstateAtomicSwap` (ETH)
+//! and `MidstateTokenSwap` (USDC). The two contracts share their events and
+//! their `swaps`/`bids` getters, so one reader serves both; a client is made
+//! for one of them ([`BaseClient::for_asset`]), and only its calls that move
+//! value differ: the token's are paid in with an EIP-2612 permit, in the
+//! same transaction.
 //!
 //! The contract is deliberately never trusted to enforce cross-chain safety —
 //! it cannot, because it has no idea what the Midstate side looks like.
@@ -6,6 +11,7 @@
 //! actually keeps a swap atomic lives in [`check_ordering`] and is ours to get
 //! right.
 
+use crate::eth_trade::Asset;
 use crate::evm::*;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
@@ -21,6 +27,28 @@ pub struct ChainConfig {
     /// Blocks to wait before believing a lock. Base reorgs are shallow but not
     /// impossible, and a swap acted on too early is a swap that can be undone.
     pub confirmations: u64,
+    /// `MidstateTokenSwap` for USDC; empty while there is none, and USDC
+    /// trading is off.
+    #[serde(default = "default_usdc_contract")]
+    pub usdc_contract: String,
+    /// The token that contract was deployed for: USDC.
+    #[serde(default = "default_usdc_token")]
+    pub usdc_token: String,
+}
+
+fn default_usdc_contract() -> String {
+    BASE_MAINNET_TOKEN_CONTRACT.into()
+}
+
+fn default_usdc_token() -> String {
+    BASE_USDC.into()
+}
+
+impl ChainConfig {
+    /// Whether USDC can be traded: a `MidstateTokenSwap` is set.
+    pub fn usdc_ready(&self) -> bool {
+        !self.usdc_contract.trim().is_empty()
+    }
 }
 
 impl Default for ChainConfig {
@@ -30,6 +58,8 @@ impl Default for ChainConfig {
             chain_id: BASE_MAINNET_CHAIN_ID,
             contract: BASE_MAINNET_CONTRACT.into(),
             confirmations: 3,
+            usdc_contract: default_usdc_contract(),
+            usdc_token: default_usdc_token(),
         }
     }
 }
@@ -38,7 +68,14 @@ pub struct BaseClient {
     http: reqwest::Client,
     pub cfg: ChainConfig,
     contract: [u8; 20],
+    /// What the contract trades: ETH, or the token at `token`.
+    pub asset: Asset,
+    token: Option<[u8; 20]>,
 }
+
+/// How long a permit stands, in seconds: past the time a payment may still
+/// be mined, so it never runs out on a transaction that is on its way.
+pub const PERMIT_SECS: u64 = 1_800;
 
 fn hex_u64(v: &Value) -> Result<u64> {
     let s = v.as_str().ok_or_else(|| anyhow!("expected a hex quantity"))?;
@@ -54,13 +91,32 @@ fn hex_bytes(v: &Value) -> Result<Vec<u8>> {
 }
 
 impl BaseClient {
+    /// A client for the ETH contract.
     pub fn new(cfg: ChainConfig) -> Result<Self> {
-        let contract = parse_address(&cfg.contract)?;
+        Self::for_asset(cfg, Asset::Eth)
+    }
+
+    /// A client for the contract that trades `asset`.
+    pub fn for_asset(cfg: ChainConfig, asset: Asset) -> Result<Self> {
+        let (contract, token) = match asset {
+            Asset::Eth => (parse_address(&cfg.contract)?, None),
+            Asset::Usdc => {
+                if !cfg.usdc_ready() {
+                    bail!("USDC trading is not set up: this wallet knows no MidstateTokenSwap contract yet (Trade settings)");
+                }
+                (parse_address(&cfg.usdc_contract).context("the USDC swap contract")?, Some(parse_address(&cfg.usdc_token).context("the USDC token")?))
+            }
+        };
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(20))
             .build()
             .context("failed to build the HTTP client")?;
-        Ok(Self { http, cfg, contract })
+        Ok(Self { http, cfg, contract, asset, token })
+    }
+
+    /// The contract this client calls.
+    pub fn contract(&self) -> [u8; 20] {
+        self.contract
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
@@ -163,16 +219,44 @@ impl BaseClient {
     }
 
     async fn eth_call(&self, data: &[u8]) -> Result<Vec<u8>> {
+        self.eth_call_to(&self.contract, data).await
+    }
+
+    async fn eth_call_to(&self, to: &[u8; 20], data: &[u8]) -> Result<Vec<u8>> {
         let v = self
             .call(
                 "eth_call",
                 json!([{
-                    "to": to_checksum_address(&self.contract),
+                    "to": to_checksum_address(to),
                     "data": format!("0x{}", hex::encode(data)),
                 }, "latest"]),
             )
             .await?;
         hex_bytes(&v)
+    }
+
+    // ── The token ───────────────────────────────────────────────────────
+
+    fn token(&self) -> Result<[u8; 20]> {
+        self.token.ok_or_else(|| anyhow!("the ETH contract has no token"))
+    }
+
+    /// What `owner` holds of the token, in its smallest unit.
+    pub async fn token_balance(&self, owner: &[u8; 20]) -> Result<u128> {
+        let out = self.eth_call_to(&self.token()?, &encode_call("balanceOf(address)", &[Word::Address(*owner)])).await?;
+        Ok(words(&out).first().map(word_u128).unwrap_or(0))
+    }
+
+    /// A permit for the contract to take `value` of the token from `key`'s
+    /// account, standing for [`PERMIT_SECS`] from Base's `now`: under the
+    /// token's own domain, at the account's next permit nonce.
+    pub async fn permit(&self, key: &EvmKey, value: u128, now: u64) -> Result<Permit> {
+        let token = self.token()?;
+        let sep = self.eth_call_to(&token, &encode_call("DOMAIN_SEPARATOR()", &[])).await?;
+        let sep: [u8; 32] = sep.get(..32).and_then(|b| b.try_into().ok()).ok_or_else(|| anyhow!("the token takes no permits (no DOMAIN_SEPARATOR)"))?;
+        let nonce = self.eth_call_to(&token, &encode_call("nonces(address)", &[Word::Address(key.address)])).await?;
+        let nonce = words(&nonce).first().map(word_u128).ok_or_else(|| anyhow!("the token takes no permits (no nonces)"))?;
+        key.sign_permit(&sep, &self.contract, value, nonce, now + PERMIT_SECS)
     }
 
     /// Build, sign and broadcast a contract call. Returns the transaction hash.
@@ -488,12 +572,14 @@ impl BaseClient {
         if amount == 0 {
             return Ok(None);
         }
+        // The struct's order: beneficiary, refundTo, amount, timeout,
+        // hashlock, settled.
         Ok(Some(SwapState {
             beneficiary: word_address(&w[0]),
             refund_to: word_address(&w[1]),
             amount,
-            hashlock: w[3],
-            timeout: word_u64(&w[4]),
+            timeout: word_u64(&w[3]),
+            hashlock: w[4],
             settled: word_bool(&w[5]),
         }))
     }
@@ -579,6 +665,8 @@ pub struct Receipt {
 
 #[derive(Clone, Debug)]
 pub struct Log {
+    /// The contract that emitted it.
+    pub address: [u8; 20],
     pub topics: Vec<[u8; 32]>,
     pub data: Vec<u8>,
     pub block: u64,
@@ -594,7 +682,9 @@ fn parse_log(v: &Value) -> Result<Log> {
             }
         }
     }
+    let address = v.get("address").and_then(|a| a.as_str()).and_then(|a| parse_address(a).ok()).unwrap_or([0; 20]);
     Ok(Log {
+        address,
         topics,
         data: v.get("data").map(hex_bytes).transpose()?.unwrap_or_default(),
         block: v.get("blockNumber").map(hex_u64).transpose()?.unwrap_or(0),
@@ -757,6 +847,63 @@ pub fn reserve_call(bid_id: [u8; 32], fill_window_secs: u64) -> Vec<u8> {
     encode_call("reserveBid(bytes32,uint256)", &[Word::Bytes32(bid_id), Word::U256(fill_window_secs as u128)])
 }
 
+fn permit_words(p: &Permit) -> [Word; 4] {
+    [Word::U64(p.deadline), Word::U64(p.v.into()), Word::Bytes32(p.r), Word::Bytes32(p.s)]
+}
+
+fn with_permit(sig: &str, mut args: Vec<Word>, permit: Option<&Permit>) -> Vec<u8> {
+    match permit {
+        Some(p) => {
+            args.extend(permit_words(p));
+            let name = sig.split('(').next().unwrap_or(sig);
+            let params = &sig[name.len()..sig.len() - 1];
+            encode_call(&format!("{name}WithPermit{params},uint256,uint8,bytes32,bytes32)"), &args)
+        }
+        None => encode_call(sig, &args),
+    }
+}
+
+/// The call data of `MidstateTokenSwap.lock()`, or of `lockWithPermit()`
+/// with a permit for exactly `amount`.
+pub fn token_lock_call(hashlock: [u8; 32], beneficiary: [u8; 20], amount: u128, refund_delay: u64, permit: Option<&Permit>) -> Result<Vec<u8>> {
+    if !(600..=604_800).contains(&refund_delay) {
+        bail!("the contract requires a refund delay between 10 minutes and 7 days");
+    }
+    let args = vec![Word::Bytes32(hashlock), Word::Address(beneficiary), Word::U256(amount), Word::U256(refund_delay as u128)];
+    Ok(with_permit("lock(bytes32,address,uint256,uint256)", args, permit))
+}
+
+/// The call data of `MidstateTokenSwap.createBid()`, or of
+/// `createBidWithPermit()` with a permit for exactly `amount`.
+pub fn token_bid_call(
+    hashlock: [u8; 32],
+    amount: u128,
+    mds_amount: u64,
+    maker_mds_addr: [u8; 32],
+    ttl_secs: u64,
+    fill_bond: u128,
+    permit: Option<&Permit>,
+) -> Result<Vec<u8>> {
+    if !(3_600..=7_776_000).contains(&ttl_secs) {
+        bail!("the contract requires a bid lifetime between 1 hour and 90 days");
+    }
+    let args = vec![
+        Word::Bytes32(hashlock),
+        Word::U256(amount),
+        Word::U64(mds_amount),
+        Word::Bytes32(maker_mds_addr),
+        Word::U256(ttl_secs as u128),
+        Word::U256(fill_bond),
+    ];
+    Ok(with_permit("createBid(bytes32,uint256,uint64,bytes32,uint256,uint256)", args, permit))
+}
+
+/// The call data of `MidstateTokenSwap.reserveBid()`, or of
+/// `reserveBidWithPermit()` with a permit for exactly the bid's bond.
+pub fn token_reserve_call(bid_id: [u8; 32], fill_window_secs: u64, permit: Option<&Permit>) -> Vec<u8> {
+    with_permit("reserveBid(bytes32,uint256)", vec![Word::Bytes32(bid_id), Word::U256(fill_window_secs as u128)], permit)
+}
+
 /// `(nonce, max_priority_fee, max_fee)` of a signed type-2 transaction.
 pub fn tx_fees(raw: &[u8]) -> Option<(u64, u128, u128)> {
     // An RLP item's header: its length and its payload's.
@@ -792,17 +939,18 @@ pub fn tx_fees(raw: &[u8]) -> Option<(u64, u128, u128)> {
     Some((u64::try_from(ints[1]).ok()?, ints[2], ints[3]))
 }
 
-/// Pull our own swap id out of the receipt for a `lock()` call.
-pub fn locked_swap_id(logs: &[Log]) -> Option<[u8; 32]> {
-    logs.iter().find_map(|l| match decode_event(l) {
+/// Pull our own swap id out of the receipt for a `lock()` call to
+/// `contract`. A token's own logs in the same receipt are passed over.
+pub fn locked_swap_id(logs: &[Log], contract: &[u8; 20]) -> Option<[u8; 32]> {
+    logs.iter().filter(|l| &l.address == contract).find_map(|l| match decode_event(l) {
         Some(Event::Locked { swap_id, .. }) => Some(swap_id),
         _ => None,
     })
 }
 
-/// Our own bid id from the receipt for a `createBid()` call.
-pub fn created_bid_id(logs: &[Log]) -> Option<[u8; 32]> {
-    logs.iter().find_map(|l| match decode_event(l) {
+/// Our own bid id from the receipt for a `createBid()` call to `contract`.
+pub fn created_bid_id(logs: &[Log], contract: &[u8; 20]) -> Option<[u8; 32]> {
+    logs.iter().filter(|l| &l.address == contract).find_map(|l| match decode_event(l) {
         Some(Event::BidCreated { bid_id, .. }) => Some(bid_id),
         _ => None,
     })
@@ -845,6 +993,32 @@ pub fn check_ordering(reveal_deadline: u64, act_deadline: u64, margin_secs: u64)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_swap_calls_are_the_ones_solidity_reads() {
+        // From ethers v6's Interface over MidstateTokenSwap's compiled ABI.
+        let p = Permit {
+            deadline: 1_800_000_000,
+            v: 27,
+            r: hex::decode("8a6127509bbf9e7582b9d46d4090d8f78e232878a6eb7e67702843552b23d470").unwrap().try_into().unwrap(),
+            s: hex::decode("44ada3f00850cc586510c0e7443e1df64f987166e33ac1412fb7bc21e606b5ae").unwrap().try_into().unwrap(),
+        };
+        let (h, bid, mds, who) = ([0xab; 32], [0xcd; 32], [0xef; 32], [0x11; 20]);
+        let hexed = |b: Vec<u8>| hex::encode(b);
+        let tail = "000000000000000000000000000000000000000000000000000000006b49d200000000000000000000000000000000000000000000000000000000000000001b8a6127509bbf9e7582b9d46d4090d8f78e232878a6eb7e67702843552b23d47044ada3f00850cc586510c0e7443e1df64f987166e33ac1412fb7bc21e606b5ae";
+        let lock_args = "abababababababababababababababababababababababababababababababab000000000000000000000000111111111111111111111111111111111111111100000000000000000000000000000000000000000000000000000000004c4b400000000000000000000000000000000000000000000000000000000000000e10";
+        assert_eq!(hexed(token_lock_call(h, who, 5_000_000, 3600, None).unwrap()), format!("9561080b{lock_args}"));
+        assert_eq!(hexed(token_lock_call(h, who, 5_000_000, 3600, Some(&p)).unwrap()), format!("e1888dc6{lock_args}{tail}"));
+        let bid_args = "abababababababababababababababababababababababababababababababab00000000000000000000000000000000000000000000000000000000006acfc00000000000000000000000000000000000000000000000000000000040000000efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef00000000000000000000000000000000000000000000000000000000000151800000000000000000000000000000000000000000000000000000000000011170";
+        assert_eq!(hexed(token_bid_call(h, 7_000_000, 1 << 30, mds, 86_400, 70_000, None).unwrap()), format!("23c3d88c{bid_args}"));
+        assert_eq!(hexed(token_bid_call(h, 7_000_000, 1 << 30, mds, 86_400, 70_000, Some(&p)).unwrap()), format!("c1d95de2{bid_args}{tail}"));
+        let res_args = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd0000000000000000000000000000000000000000000000000000000000003840";
+        assert_eq!(hexed(token_reserve_call(bid, 14_400, None)), format!("512bc49c{res_args}"));
+        assert_eq!(hexed(token_reserve_call(bid, 14_400, Some(&p))), format!("6f25ab80{res_args}{tail}"));
+        // The ETH contract's reservation is the same call, paid in ETH.
+        assert_eq!(reserve_call(bid, 14_400), token_reserve_call(bid, 14_400, None));
+        assert!(token_lock_call(h, who, 1, 599, None).is_err() && token_bid_call(h, 1, 1, mds, 3_599, 0, None).is_err());
+    }
 
     #[test]
     fn a_signed_transaction_gives_back_its_nonce_and_fees() {
@@ -892,7 +1066,7 @@ mod tests {
         for w in data {
             d.extend_from_slice(&w.encode());
         }
-        Log { topics: t, data: d, block: 1 }
+        Log { address: [0xaa; 20], topics: t, data: d, block: 1 }
     }
 
     #[test]
@@ -914,7 +1088,10 @@ mod tests {
             }
             other => panic!("expected Locked, got {other:?}"),
         }
-        assert_eq!(locked_swap_id(&[log]), Some([7u8; 32]));
+        assert_eq!(locked_swap_id(&[log.clone()], &[0xaa; 20]), Some([7u8; 32]));
+        // Another contract's event of the same shape (a token's, a decoy's)
+        // is not the lock.
+        assert_eq!(locked_swap_id(&[log], &[0xbb; 20]), None);
     }
 
     #[test]
@@ -960,20 +1137,23 @@ mod tests {
 
     #[test]
     fn swap_state_decodes_from_words() {
+        // The getter returns the struct in declaration order: beneficiary,
+        // refundTo, amount, timeout, hashlock, settled (both contracts).
         let mut data = Vec::new();
         for w in [
             Word::Address([1; 20]),
             Word::Address([2; 20]),
             Word::U256(999),
-            Word::Bytes32([3; 32]),
             Word::U64(1234),
+            Word::Bytes32([3; 32]),
             Word::Bool(true),
         ] {
             data.extend_from_slice(&w.encode());
         }
         let w = words(&data);
         assert_eq!(word_u128(&w[2]), 999);
-        assert_eq!(word_u64(&w[4]), 1234);
+        assert_eq!(word_u64(&w[3]), 1234);
+        assert_eq!(w[4], [3u8; 32]);
         assert!(word_bool(&w[5]));
         assert_eq!(word_address(&w[0]), [1u8; 20]);
     }

@@ -1,5 +1,14 @@
-//! MDS <-> ETH trading on Base: sell orders, selling into buy orders, and
-//! the decisions that take each swap from its locks to its claims.
+//! MDS <-> ETH and MDS <-> USDC trading on Base: sell orders, selling into
+//! buy orders, and the decisions that take each swap from its locks to its
+//! claims.
+//!
+//! Both currencies run the same machine. ETH trades go through
+//! `MidstateAtomicSwap.sol`; USDC trades through `MidstateTokenSwap.sol`,
+//! the same protocol for one ERC-20, whose events read the same. A trade's
+//! [`Asset`] says which, and every amount in it (`wei`, `wei_per_gmds`,
+//! `fill_bond`) is counted in that asset's smallest unit: wei, or a
+//! millionth of a dollar. A lock on the other contract is never the lock a
+//! trade waits for, whatever its numbers say.
 //!
 //! # Sell orders: the seller locks first
 //!
@@ -120,6 +129,64 @@ mod wei {
     }
 }
 
+// ── What the Base side pays in ──────────────────────────────────────────────
+
+/// The currency of a trade's Base side.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Asset {
+    /// Ether, in wei, through `MidstateAtomicSwap`.
+    #[default]
+    Eth,
+    /// USDC, in millionths of a dollar, through `MidstateTokenSwap`.
+    Usdc,
+}
+
+impl Asset {
+    pub const ALL: [Asset; 2] = [Asset::Eth, Asset::Usdc];
+
+    pub fn symbol(self) -> &'static str {
+        match self {
+            Asset::Eth => "ETH",
+            Asset::Usdc => "USDC",
+        }
+    }
+
+    /// Decimal places between the smallest unit and one whole coin.
+    pub fn decimals(self) -> u32 {
+        match self {
+            Asset::Eth => 18,
+            Asset::Usdc => 6,
+        }
+    }
+
+    /// `ETH` or `USDC`, in any case.
+    pub fn parse(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_uppercase().as_str() {
+            "" | "ETH" => Ok(Asset::Eth),
+            "USDC" => Ok(Asset::Usdc),
+            other => bail!("{other} is not traded here: ETH or USDC"),
+        }
+    }
+
+    /// `amount` smallest units as whole coins, to `places` decimals at most,
+    /// trailing zeros dropped: `1.5 USDC`.
+    pub fn format(self, amount: u128, places: u32) -> String {
+        let one = 10u128.pow(self.decimals());
+        let (whole, frac) = (amount / one, amount % one);
+        let places = places.min(self.decimals());
+        let frac = frac / 10u128.pow(self.decimals() - places);
+        let mut f = format!("{frac:0width$}", width = places as usize);
+        while f.ends_with('0') {
+            f.pop();
+        }
+        if f.is_empty() {
+            format!("{whole} {}", self.symbol())
+        } else {
+            format!("{whole}.{f} {}", self.symbol())
+        }
+    }
+}
+
 // ── Roles and phases ────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,6 +271,9 @@ pub struct EthOrder {
     /// MDS sold so far.
     #[serde(default)]
     pub sold: u64,
+    /// What it sells for; its price is in this asset's smallest unit.
+    #[serde(default)]
+    pub asset: Asset,
 }
 
 impl EthOrder {
@@ -218,6 +288,7 @@ impl EthOrder {
             min: self.min.max(MIN_MDS_AMOUNT),
             wei_per_gmds: self.wei_per_gmds,
             expires: self.expires,
+            asset: self.asset,
         }
     }
 }
@@ -238,10 +309,12 @@ pub fn tradeable_amount(mds: u64) -> u64 {
     v
 }
 
-/// Why a take of `order` for `mds` and `wei` cannot stand, if it cannot.
-pub fn check_take(order: &EthOrder, tip: u64, mds: u64, wei: u128) -> std::result::Result<(), crate::eth_wire::Decline> {
+/// Why a take of `order` for `mds` and `wei`, paid in `asset`, cannot
+/// stand, if it cannot. A take in another currency asks for an order that
+/// is not on offer.
+pub fn check_take(order: &EthOrder, tip: u64, mds: u64, wei: u128, asset: Asset) -> std::result::Result<(), crate::eth_wire::Decline> {
     use crate::eth_wire::Decline;
-    if !order.takeable(tip) {
+    if !order.takeable(tip) || asset != order.asset {
         return Err(Decline::Gone);
     }
     if mds < order.min.max(MIN_MDS_AMOUNT) || mds > order.mds || tradeable_amount(mds) != mds {
@@ -345,6 +418,10 @@ pub struct EthSwap {
     /// payment. Its hash is `eth_tx`.
     #[serde(default)]
     pub eth_pending: Option<EthPending>,
+    /// What the Base side pays in: every amount here is in its unit, and
+    /// only its contract's locks and bids are this swap's.
+    #[serde(default)]
+    pub asset: Asset,
 }
 
 /// A signed Base transaction that may yet be mined.
@@ -396,6 +473,7 @@ impl EthSwap {
             refund_mask: 0,
             reveal_sent: false,
             eth_pending: None,
+            asset: Asset::Eth,
         }
     }
 
@@ -687,15 +765,19 @@ pub fn pk_of(seed: &[u8; 32]) -> [u8; 32] {
 
 // ── Observing ───────────────────────────────────────────────────────────────
 
-/// An ETH lock on Base, as the contract's `Locked` event reported it.
+/// A lock on Base, as a contract's `Locked` event reported it: ETH from
+/// `MidstateAtomicSwap`, USDC from `MidstateTokenSwap`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BaseLock {
     pub swap_id: [u8; 32],
     pub beneficiary: [u8; 20],
     pub refund_to: [u8; 20],
+    /// In `asset`'s smallest unit.
     pub amount: u128,
     pub timeout: u64,
     pub block: u64,
+    /// Which contract emitted it.
+    pub asset: Asset,
 }
 
 /// What a swap reads from the two chains. The service answers from its
@@ -773,10 +855,12 @@ fn depth_ok(tip: u64, since: u64) -> bool {
     tip >= since + CONFIRMATIONS
 }
 
-/// Whether `l` is the ETH a seller agreed to: enough, from the buyer that
-/// asked, to the seller, with time left to claim it by Base's clock.
+/// Whether `l` is what a seller agreed to: the trade's currency, enough of
+/// it, from the buyer that asked, to the seller, with time left to claim it
+/// by Base's clock.
 pub fn lock_meets_terms(sw: &EthSwap, l: &BaseLock, base_time: u64) -> bool {
-    l.beneficiary == sw.seller_evm
+    l.asset == sw.asset
+        && l.beneficiary == sw.seller_evm
         && l.refund_to == sw.buyer_evm
         && l.amount >= sw.wei
         && l.timeout >= base_time + CLAIM_MARGIN_SECS + CLOCK_SKEW_SECS
@@ -865,7 +949,9 @@ pub fn observe(sw: &mut EthSwap, c: &impl Chains) -> Obs {
         let locks = c.base_locks(&sw.secret_hash);
         match sw.role {
             Role::Seller => {
-                for l in locks {
+                // A lock on the other currency's contract is not about this
+                // sale at all, whatever its numbers: not counted, not taken.
+                for l in locks.into_iter().filter(|l| l.asset == sw.asset) {
                     if base_lock.is_none() && lock_meets_terms(sw, &l, base_time) {
                         base_lock = Some(l);
                     } else if Some(&l) != base_lock.as_ref() {
@@ -875,12 +961,12 @@ pub fn observe(sw: &mut EthSwap, c: &impl Chains) -> Obs {
                 // Once claimed, the claimed lock is the swap's, whatever the clock says now.
                 if let Some(id) = sw.base_swap {
                     if base_lock.as_ref().map(|l| l.swap_id) != Some(id) {
-                        base_lock = c.base_locks(&sw.secret_hash).into_iter().find(|l| l.swap_id == id);
+                        base_lock = c.base_locks(&sw.secret_hash).into_iter().find(|l| l.swap_id == id && l.asset == sw.asset);
                     }
                 }
             }
             Role::Buyer => {
-                base_lock = locks.into_iter().find(|l| match sw.base_swap {
+                base_lock = locks.into_iter().filter(|l| l.asset == sw.asset).find(|l| match sw.base_swap {
                     Some(id) => l.swap_id == id,
                     None => l.refund_to == sw.buyer_evm && l.beneficiary == sw.seller_evm,
                 });
@@ -1005,7 +1091,7 @@ fn decide_seller(sw: &EthSwap, o: &Obs) -> Decision {
         },
         Phase::MineLocked => {
             let ignored = (o.ignored_locks > 0).then(|| {
-                format!("ignored {} ETH lock(s) that did not meet this sale's terms", o.ignored_locks)
+                format!("ignored {} {} lock(s) that did not meet this sale's terms", o.ignored_locks, sw.asset.symbol())
             });
             // Claim only while the buyer would still have the settle margin's
             // worth of time to claim the MDS before we could take it back.
@@ -1390,6 +1476,7 @@ mod tests {
             created: 0,
             last_advert: 0,
             sold: 0,
+            asset: Asset::Eth,
         }
     }
 
@@ -1399,11 +1486,53 @@ mod tests {
         assert_eq!(price_of(1 << 30, 3), Some(3));
         assert_eq!(price_of(1, 3), Some(1)); // never free
         let o = order();
-        assert_eq!(check_take(&o, 1, 2 << 30, 6_000_000_000_000_000), Ok(()));
-        assert_eq!(check_take(&o, 1, 2 << 30, 5_999_999_999_999_999), Err(Decline::Price));
-        assert_eq!(check_take(&o, 1, 11 << 30, u128::MAX), Err(Decline::Amount));
-        assert_eq!(check_take(&o, 1, 1 << 20, u128::MAX), Err(Decline::Amount));
-        assert_eq!(check_take(&o, 500_000, 2 << 30, u128::MAX), Err(Decline::Gone));
+        let eth = Asset::Eth;
+        assert_eq!(check_take(&o, 1, 2 << 30, 6_000_000_000_000_000, eth), Ok(()));
+        assert_eq!(check_take(&o, 1, 2 << 30, 5_999_999_999_999_999, eth), Err(Decline::Price));
+        assert_eq!(check_take(&o, 1, 11 << 30, u128::MAX, eth), Err(Decline::Amount));
+        assert_eq!(check_take(&o, 1, 1 << 20, u128::MAX, eth), Err(Decline::Amount));
+        assert_eq!(check_take(&o, 500_000, 2 << 30, u128::MAX, eth), Err(Decline::Gone));
+        // A take in the other currency asks for an order that is not on offer,
+        // however much it offers.
+        assert_eq!(check_take(&o, 1, 2 << 30, u128::MAX, Asset::Usdc), Err(Decline::Gone));
+        let usdc = EthOrder { asset: Asset::Usdc, wei_per_gmds: 2_500_000, ..order() };
+        assert_eq!(check_take(&usdc, 1, 2 << 30, 5_000_000, Asset::Usdc), Ok(()));
+        assert_eq!(check_take(&usdc, 1, 2 << 30, 4_999_999, Asset::Usdc), Err(Decline::Price));
+        assert_eq!(check_take(&usdc, 1, 2 << 30, 5_000_000, Asset::Eth), Err(Decline::Gone));
+    }
+
+    #[test]
+    fn amounts_read_in_their_own_currency() {
+        assert_eq!(Asset::Usdc.format(12_500_000, 6), "12.5 USDC");
+        assert_eq!(Asset::Usdc.format(1, 6), "0.000001 USDC");
+        assert_eq!(Asset::Usdc.format(3_000_000, 2), "3 USDC");
+        assert_eq!(Asset::Eth.format(1_500_000_000_000_000_000, 8), "1.5 ETH");
+        assert_eq!(Asset::Eth.format(1, 8), "0 ETH", "below what is shown");
+        assert_eq!(Asset::parse("usdc").unwrap(), Asset::Usdc);
+        assert_eq!(Asset::parse("").unwrap(), Asset::Eth, "requests from before USDC are ETH");
+        assert!(Asset::parse("DAI").is_err());
+        // Journals from before USDC load as ETH.
+        let mut old = serde_json::to_value(order()).unwrap();
+        old.as_object_mut().unwrap().remove("asset");
+        assert_eq!(serde_json::from_value::<EthOrder>(old).unwrap().asset, Asset::Eth);
+        let mut sw = serde_json::to_value(EthSwap::new([1; 16], Role::Buyer, Phase::Asking, 0)).unwrap();
+        sw.as_object_mut().unwrap().remove("asset");
+        assert_eq!(serde_json::from_value::<EthSwap>(sw).unwrap().asset, Asset::Eth);
+    }
+
+    #[test]
+    fn a_lock_in_the_other_currency_is_never_the_lock_a_trade_waits_for() {
+        let mut sw = EthSwap::new([1; 16], Role::Seller, Phase::MineLocked, 0);
+        sw.asset = Asset::Usdc;
+        sw.wei = 5_000_000;
+        sw.seller_evm = [2; 20];
+        sw.buyer_evm = [3; 20];
+        let l = BaseLock { swap_id: [9; 32], beneficiary: [2; 20], refund_to: [3; 20], amount: 5_000_000, timeout: 10_000, block: 1, asset: Asset::Usdc };
+        assert!(lock_meets_terms(&sw, &l, 0));
+        // The same numbers in wei: a few millionths of a cent, not five dollars.
+        assert!(!lock_meets_terms(&sw, &BaseLock { asset: Asset::Eth, ..l.clone() }, 0));
+        sw.asset = Asset::Eth;
+        assert!(!lock_meets_terms(&sw, &l, 0));
     }
 
     #[test]

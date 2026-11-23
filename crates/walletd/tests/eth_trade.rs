@@ -7,6 +7,9 @@
 //! (the script VM included); lock coins are placed directly, as the send
 //! that funds a lock is the wallet's ordinary send.
 //!
+//! The simulated Base holds both contracts: ETH's and USDC's, every lock
+//! and bid tagged with the one it is on, and each paying in its own coin.
+//!
 //! Beyond the happy paths, the attacks the old sell orders were open to:
 //! a stranger holding the secret, the seller holding it, an underpaid or
 //! foreign ETH lock, and a buyer whose wallet never saw the claim. For buy
@@ -40,6 +43,8 @@ struct EthLock {
     timeout: u64,
     hashlock: [u8; 32],
     settled: bool,
+    /// Which contract holds it.
+    asset: Asset,
 }
 
 #[derive(Default)]
@@ -50,34 +55,46 @@ struct SimBase {
     refunded: HashSet<[u8; 32]>,
     bids: HashMap<[u8; 32], BidState>,
     bid_claims: HashSet<[u8; 32]>,
+    /// ETH, as each account's balance moved.
     balance: HashMap<[u8; 20], i128>,
+    /// USDC, the same.
+    usdc: HashMap<[u8; 20], i128>,
+    /// Which contract each bid is on.
+    bid_assets: HashMap<[u8; 32], Asset>,
     n: u64,
 }
 
 impl SimBase {
-    fn pay(&mut self, to: [u8; 20], v: u128) {
-        *self.balance.entry(to).or_default() += v as i128;
+    fn pay(&mut self, asset: Asset, to: [u8; 20], v: i128) {
+        let book = match asset {
+            Asset::Eth => &mut self.balance,
+            Asset::Usdc => &mut self.usdc,
+        };
+        *book.entry(to).or_default() += v;
     }
+    /// An ETH lock.
     fn lock(&mut self, now: u64, from: [u8; 20], hashlock: [u8; 32], beneficiary: [u8; 20], delay: u64, value: u128) -> Result<[u8; 32]> {
+        self.lock_in(Asset::Eth, now, from, hashlock, beneficiary, delay, value)
+    }
+    fn lock_in(&mut self, asset: Asset, now: u64, from: [u8; 20], hashlock: [u8; 32], beneficiary: [u8; 20], delay: u64, value: u128) -> Result<[u8; 32]> {
         ensure!((600..=604_800).contains(&delay), "bad delay");
         ensure!(value > 0 && hashlock != [0; 32], "bad lock");
         self.n += 1;
         let id = hash(&[&from[..], &hashlock, &self.n.to_le_bytes()].concat());
-        self.locks.insert(id, EthLock { beneficiary, refund_to: from, amount: value, timeout: now + delay, hashlock, settled: false });
+        self.locks.insert(id, EthLock { beneficiary, refund_to: from, amount: value, timeout: now + delay, hashlock, settled: false, asset });
         self.order.push(id);
-        self.pay(from, 0u128.wrapping_sub(0));
-        *self.balance.entry(from).or_default() -= value as i128;
+        self.pay(asset, from, -(value as i128));
         Ok(id)
     }
-    /// Anyone may call; the ETH always goes to the beneficiary.
+    /// Anyone may call; the coin always goes to the beneficiary.
     fn claim(&mut self, id: [u8; 32], preimage: [u8; 32]) -> Result<()> {
         let l = self.locks.get_mut(&id).ok_or_else(|| anyhow::anyhow!("not found"))?;
         ensure!(!l.settled, "settled");
         ensure!(hash(&preimage) == l.hashlock, "bad preimage");
         l.settled = true;
-        let (to, v) = (l.beneficiary, l.amount);
+        let (to, v, asset) = (l.beneficiary, l.amount, l.asset);
         self.claims.insert(id, preimage);
-        self.pay(to, v);
+        self.pay(asset, to, v as i128);
         Ok(())
     }
     fn refund(&mut self, now: u64, id: [u8; 32]) -> Result<()> {
@@ -85,12 +102,13 @@ impl SimBase {
         ensure!(!l.settled, "settled");
         ensure!(now >= l.timeout, "too early");
         l.settled = true;
-        let (to, v) = (l.refund_to, l.amount);
+        let (to, v, asset) = (l.refund_to, l.amount, l.asset);
         self.refunded.insert(id);
-        self.pay(to, v);
+        self.pay(asset, to, v as i128);
         Ok(())
     }
-    fn create_bid(&mut self, now: u64, maker: [u8; 20], hashlock: [u8; 32], mds_amount: u64, addr: [u8; 32], ttl: u64, bond: u128, value: u128) -> [u8; 32] {
+    #[allow(clippy::too_many_arguments)]
+    fn create_bid_in(&mut self, asset: Asset, now: u64, maker: [u8; 20], hashlock: [u8; 32], mds_amount: u64, addr: [u8; 32], ttl: u64, bond: u128, value: u128) -> [u8; 32] {
         self.n += 1;
         let id = hash(&[&maker[..], &hashlock, &self.n.to_le_bytes()].concat());
         self.bids.insert(
@@ -108,7 +126,8 @@ impl SimBase {
                 settled: false,
             },
         );
-        *self.balance.entry(maker).or_default() -= value as i128;
+        self.bid_assets.insert(id, asset);
+        self.pay(asset, maker, -(value as i128));
         id
     }
     fn reserve_bid(&mut self, now: u64, id: [u8; 32], filler: [u8; 20], window: u64, bond: u128) -> Result<()> {
@@ -119,7 +138,8 @@ impl SimBase {
         ensure!(bond == b.fill_bond, "bad bond");
         b.filler = filler;
         b.fill_deadline = now + window;
-        *self.balance.entry(filler).or_default() -= bond as i128;
+        let asset = self.bid_assets[&id];
+        self.pay(asset, filler, -(bond as i128));
         Ok(())
     }
     fn claim_bid(&mut self, now: u64, id: [u8; 32], preimage: [u8; 32]) -> Result<()> {
@@ -131,7 +151,8 @@ impl SimBase {
         b.settled = true;
         let (to, v) = (b.filler, b.amount + b.fill_bond);
         self.bid_claims.insert(id);
-        self.pay(to, v);
+        let asset = self.bid_assets[&id];
+        self.pay(asset, to, v as i128);
         Ok(())
     }
 }
@@ -254,6 +275,7 @@ impl Chains for Sim {
                     amount: l.amount,
                     timeout: l.timeout,
                     block: 0,
+                    asset: l.asset,
                 })
             })
             .collect()
@@ -291,6 +313,10 @@ struct Party {
 }
 
 fn seller_and_buyer(sim: &Sim, mds: u64, wei: u128) -> (Party, Party) {
+    seller_and_buyer_in(sim, Asset::Eth, mds, wei)
+}
+
+fn seller_and_buyer_in(sim: &Sim, asset: Asset, mds: u64, wei: u128) -> (Party, Party) {
     let take_id = [7; 16];
     let claim_seed = [11; 32];
     let refund_seed = [12; 32];
@@ -306,8 +332,10 @@ fn seller_and_buyer(sim: &Sim, mds: u64, wei: u128) -> (Party, Party) {
     b.buyer_evm = BUYER;
     b.key_seed = Some(claim_seed);
     b.claim_pk = pk_of(&claim_seed);
+    b.asset = asset;
 
     let mut s = EthSwap::new(take_id, Role::Seller, Phase::LockingMine, now);
+    s.asset = asset;
     s.order_id = [1; 16];
     s.mds_amount = mds;
     s.lock_value = mds;
@@ -370,7 +398,7 @@ fn turn(p: &mut Party, sim: &mut Sim) -> Result<Decision> {
             }
             Act::LockMds | Act::Answer | Act::Take | Act::Reserve => {}
             Act::LockEth { delay } => {
-                let id = sim.base.lock(sim.base_time(), p.sw.buyer_evm, p.sw.secret_hash, p.sw.seller_evm, *delay, p.sw.wei)?;
+                let id = sim.base.lock_in(p.sw.asset, sim.base_time(), p.sw.buyer_evm, p.sw.secret_hash, p.sw.seller_evm, *delay, p.sw.wei)?;
                 p.sw.eth_tx = Some([2; 32]);
                 p.sw.base_swap = Some(id);
                 p.sw.eth_deadline = sim.base.locks[&id].timeout;
@@ -665,10 +693,15 @@ const FILLER: [u8; 20] = [0xf1; 20];
 /// A buy order on Base, the filler's swap reserving it, and the bidder's
 /// swap that appears once the fill is announced.
 fn bid_and_filler(sim: &mut Sim, mds: u64, wei: u128, bond: u128) -> (Party, [u8; 32], [u8; 32]) {
+    bid_and_filler_in(sim, Asset::Eth, mds, wei, bond)
+}
+
+fn bid_and_filler_in(sim: &mut Sim, asset: Asset, mds: u64, wei: u128, bond: u128) -> (Party, [u8; 32], [u8; 32]) {
     let secret = [21; 32];
     let addr = [0xad; 32];
-    let id = sim.base.create_bid(sim.now, BIDDER, hash(&secret), mds, addr, 86_400, bond, wei);
+    let id = sim.base.create_bid_in(asset, sim.now, BIDDER, hash(&secret), mds, addr, 86_400, bond, wei);
     let mut f = EthSwap::new([5; 16], Role::Filler, Phase::Reserving, sim.now);
+    f.asset = asset;
     f.bid_id = id;
     f.mds_amount = mds;
     f.wei = wei;
@@ -705,6 +738,7 @@ fn bidder_for(f: &EthSwap, secret: [u8; 32], now: u64) -> Party {
     b.secret_hash = a.secret_hash;
     b.timeout = a.timeout_height;
     b.secret = Some(secret);
+    b.asset = f.asset;
     Party { sw: b, dest: a.receiver_addr, lazy: false }
 }
 
@@ -964,5 +998,116 @@ fn a_seller_retries_its_claim_only_while_base_time_leaves_the_margin() -> Result
     sim.base_ahead -= 1;
     let d = turn(&mut s, &mut sim)?;
     assert_eq!(d.acts, vec![Act::ClaimEth { swap_id: id }]);
+    Ok(())
+}
+
+// ── USDC ───────────────────────────────────────────────────────────────────
+
+/// Five dollars, in USDC's smallest unit.
+const FIVE_DOLLARS: u128 = 5_000_000;
+
+#[test]
+fn a_usdc_sell_order_completes_with_both_sides_paid_in_usdc() -> Result<()> {
+    let mut sim = Sim::new();
+    let (mut s, mut b) = seller_and_buyer_in(&sim, Asset::Usdc, 3 << 30, FIVE_DOLLARS);
+    run(&mut s, &mut b, &mut sim, 200, |_, _, _| {})?;
+    assert_eq!((s.sw.phase.clone(), b.sw.phase.clone()), (Phase::Done, Phase::Done));
+    assert!(mds_at(&sim, &b.sw, SpendKind::Claim), "the buyer holds the MDS");
+    assert_eq!(sim.base.usdc[&SELLER], FIVE_DOLLARS as i128);
+    assert_eq!(sim.base.usdc[&BUYER], -(FIVE_DOLLARS as i128));
+    assert!(sim.base.balance.values().all(|v| *v == 0), "no ETH moved");
+    assert!(sim.base.locks.values().all(|l| l.asset == Asset::Usdc), "the lock went to the USDC contract");
+    Ok(())
+}
+
+/// A USDC sale's numbers, paid on the ETH contract: five million wei is a
+/// few millionths of a cent, not five dollars. The seller never claims it,
+/// so the secret never leaves, and takes its MDS back in the end.
+#[test]
+fn a_usdc_seller_never_claims_an_eth_lock_of_the_same_numbers() -> Result<()> {
+    let mut sim = Sim::new();
+    let (mut s, _) = seller_and_buyer_in(&sim, Asset::Usdc, 1 << 30, FIVE_DOLLARS);
+    for _ in 0..4 {
+        turn(&mut s, &mut sim)?;
+        sim.mine();
+    }
+    assert_eq!(s.sw.phase, Phase::MineLocked);
+    let h = s.sw.secret_hash;
+    sim.base.lock_in(Asset::Eth, sim.now, BUYER, h, SELLER, 3_600, FIVE_DOLLARS)?;
+    sim.base.lock_in(Asset::Eth, sim.now, BUYER, h, SELLER, 3_600, 1_000 * GWEI * GWEI)?; // a thousand ETH
+    let d = turn(&mut s, &mut sim)?;
+    assert!(!d.acts.iter().any(|a| matches!(a, Act::ClaimEth { .. })), "{d:?}");
+    assert!(d.note.is_none(), "another contract's locks are not this sale's to mention: {d:?}");
+    assert!(sim.base.claims.is_empty(), "the secret stays secret");
+    for _ in 0..400 {
+        turn(&mut s, &mut sim)?;
+        if s.sw.phase.settled() {
+            break;
+        }
+        sim.mine();
+    }
+    assert_eq!(s.sw.phase, Phase::Refunded);
+    assert!(mds_at(&sim, &s.sw, SpendKind::Refund));
+    assert!(sim.base.claims.is_empty());
+    Ok(())
+}
+
+/// And the other way: an ETH sale is not paid by USDC, however much.
+#[test]
+fn an_eth_seller_never_claims_a_usdc_lock() -> Result<()> {
+    let mut sim = Sim::new();
+    let (mut s, _) = seller_and_buyer(&sim, 1 << 30, 5 * GWEI);
+    for _ in 0..4 {
+        turn(&mut s, &mut sim)?;
+        sim.mine();
+    }
+    sim.base.lock_in(Asset::Usdc, sim.now, BUYER, s.sw.secret_hash, SELLER, 3_600, 1_000_000 * FIVE_DOLLARS)?;
+    let d = turn(&mut s, &mut sim)?;
+    assert!(!d.acts.iter().any(|a| matches!(a, Act::ClaimEth { .. })), "{d:?}");
+    // Paid properly, on its own contract, it goes through.
+    sim.base.lock(sim.now, BUYER, s.sw.secret_hash, SELLER, 3_600, 5 * GWEI)?;
+    let d = turn(&mut s, &mut sim)?;
+    let id = match d.acts.as_slice() {
+        [Act::ClaimEth { swap_id }] => *swap_id,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(sim.base.locks[&id].asset, Asset::Eth);
+    Ok(())
+}
+
+#[test]
+fn a_usdc_buy_order_is_filled_with_its_bond_paid_back_in_usdc() -> Result<()> {
+    let mut sim = Sim::new();
+    let mds = (2 << 30) + 777;
+    let bond = FIVE_DOLLARS / 10;
+    let (mut f, secret, addr) = bid_and_filler_in(&mut sim, Asset::Usdc, mds, FIVE_DOLLARS, bond);
+    assert!(bond_acceptable(bond, FIVE_DOLLARS), "a tenth, weighed like for like");
+    reserve(&mut f, &mut sim)?;
+    assert_eq!(sim.base.usdc[&FILLER], -(bond as i128), "the bond is staked in USDC");
+    let mut b: Option<Party> = None;
+    for _ in 0..200 {
+        turn(&mut f, &mut sim)?;
+        if b.is_none() && f.sw.lock_commitment.is_some() {
+            b = Some(bidder_for(&f.sw, secret, sim.now));
+        }
+        if let Some(b) = b.as_mut() {
+            turn(b, &mut sim)?;
+        }
+        if f.sw.phase.settled() && b.as_ref().is_some_and(|b| b.sw.phase.settled()) {
+            break;
+        }
+        sim.mine();
+    }
+    let b = b.unwrap();
+    assert_eq!((b.sw.phase.clone(), f.sw.phase.clone()), (Phase::Done, Phase::Done));
+    assert_eq!(b.sw.asset, Asset::Usdc);
+    let got: u64 = match &sim.reveals.last().unwrap().1 {
+        MdsTx::Reveal { outputs, .. } => outputs.iter().filter(|o| o.address() == addr).map(|o| o.value()).sum(),
+        _ => 0,
+    };
+    assert!(got >= mds, "{got} < {mds}");
+    assert_eq!(sim.base.usdc[&FILLER], FIVE_DOLLARS as i128, "escrow, and the bond back, in USDC");
+    assert_eq!(sim.base.usdc[&BIDDER], -(FIVE_DOLLARS as i128));
+    assert!(sim.base.balance.values().all(|v| *v == 0), "no ETH moved");
     Ok(())
 }

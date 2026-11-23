@@ -361,7 +361,15 @@ pub mod tag {
     /// Part of the script behind an `MDS_ADDRESS`: the parts, in order, are
     /// the script, so anyone can see what kind of address the name pays.
     pub const SCRIPT: u8 = 9;
+    /// The stamp a stranger's sealed message to the name must carry, in
+    /// leading zero bits (one byte, [`super::POSTAGE_BITS`]): what the
+    /// holder charges to be written to. No record: `sealed::STAMP_BITS`.
+    pub const POSTAGE: u8 = 10;
 }
+
+/// The stamps a `postage` record may ask: from about a twentieth of a second
+/// of one core (16 bits) to about a day (40 bits).
+pub const POSTAGE_BITS: std::ops::RangeInclusive<u8> = 16..=40;
 
 /// One record: encoded as `tag ‖ length (1 byte) ‖ value`, back to back.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -374,6 +382,8 @@ pub enum Rec {
     Text(String),
     Kem([u8; 32]),
     Script(Vec<u8>),
+    /// Stamp bits a stranger's sealed message must carry.
+    Postage(u8),
     Other { tag: u8, value: Vec<u8> },
 }
 
@@ -392,6 +402,7 @@ impl Rec {
             Rec::Text(s) => (tag::TEXT, s.as_bytes().to_vec()),
             Rec::Kem(h) => (tag::KEM, h.to_vec()),
             Rec::Script(b) => (tag::SCRIPT, b.clone()),
+            Rec::Postage(bits) => (tag::POSTAGE, vec![*bits]),
             Rec::Other { tag, value } => (*tag, value.clone()),
         }
     }
@@ -409,6 +420,7 @@ impl Rec {
             tag::TEXT => text(v).map(Rec::Text),
             tag::KEM => v.try_into().ok().map(Rec::Kem),
             tag::SCRIPT if !v.is_empty() => Some(Rec::Script(v.to_vec())),
+            tag::POSTAGE if v.len() == 1 && POSTAGE_BITS.contains(&v[0]) => Some(Rec::Postage(v[0])),
             _ => None,
         };
         known.unwrap_or(Rec::Other { tag, value: v.to_vec() })
@@ -425,6 +437,7 @@ impl Rec {
             Rec::Text(t) => ("text", t.clone()),
             Rec::Kem(h) => ("kem", hex::encode(h)),
             Rec::Script(b) => ("script", hex::encode(b)),
+            Rec::Postage(bits) => ("postage", format!("{bits} bits")),
             Rec::Other { tag, value } => ("other", format!("{tag}:{}", hex::encode(value))),
         }
     }
@@ -511,6 +524,11 @@ pub fn kem_hash(recs: &[Rec]) -> Option<[u8; 32]> {
 /// The name's identity key, if it gives one.
 pub fn identity(recs: &[Rec]) -> Option<[u8; 32]> {
     recs.iter().find_map(|r| if let Rec::Identity(k) = r { Some(*k) } else { None })
+}
+
+/// The stamp bits the name asks of a stranger's sealed message, if it says.
+pub fn postage(recs: &[Rec]) -> Option<u8> {
+    recs.iter().find_map(|r| if let Rec::Postage(b) = r { Some(*b) } else { None })
 }
 
 // ── The tree ────────────────────────────────────────────────────────────────
@@ -1439,9 +1457,21 @@ mod tests {
             Rec::Other { tag: 7, value: vec![6; 32] },
             Rec::Kem([8; 32]),
             Rec::Script(vec![1, 2, 3]),
+            Rec::Postage(28),
             Rec::Other { tag: 99, value: vec![7, 7] },
         ];
         assert_eq!(parse(&encode(&all).unwrap()).unwrap(), all);
+        assert_eq!(postage(&all), Some(28));
+        assert_eq!(postage(&all[..9]), None);
+        // A price out of range, or the wrong size, is kept but not read.
+        for v in [vec![15], vec![41], vec![], vec![24, 0]] {
+            let recs = parse(&encode(&[Rec::Other { tag: tag::POSTAGE, value: v.clone() }]).unwrap()).unwrap();
+            assert_eq!(recs, vec![Rec::Other { tag: tag::POSTAGE, value: v }]);
+            assert_eq!(postage(&recs), None);
+        }
+        for bits in [*POSTAGE_BITS.start(), 24, *POSTAGE_BITS.end()] {
+            assert_eq!(parse(&[tag::POSTAGE, 1, bits]).unwrap(), vec![Rec::Postage(bits)]);
+        }
         // Wrong lengths stay as they are, kept but not read.
         assert_eq!(parse(&[tag::KEM, 2, 1, 2]).unwrap(), vec![Rec::Other { tag: tag::KEM, value: vec![1, 2] }]);
         assert_eq!(parse(&[tag::SCRIPT, 0]).unwrap(), vec![Rec::Other { tag: tag::SCRIPT, value: vec![] }]);

@@ -1,5 +1,10 @@
-//! The walletd actor's side of trading MDS for ETH on Base: sell orders on
-//! the chat bus, reading Base, and carrying out what `eth_trade` decides.
+//! The walletd actor's side of trading MDS for ETH and USDC on Base: sell
+//! orders on the chat bus, reading Base, and carrying out what `eth_trade`
+//! decides. Both contracts are read into one index, every lock tagged with
+//! the currency of the contract it came from; each act goes to the contract
+//! of its swap's currency. USDC is paid in with a permit for exactly what is
+//! paid, in the same transaction, one at a time (a permit takes the token's
+//! next nonce, so a second signed before the first is mined would fail).
 //!
 //! A child of `service`, so it shares the actor's state. Everything that
 //! decides lives in `eth_trade`; this module only reads, moves messages and
@@ -42,18 +47,21 @@ pub(super) struct BaseIndex {
     bid_claims: HashSet<[u8; 32]>,
     /// Highest Base block read; 0 until the first read.
     cursor: u64,
+    /// The same, for the USDC contract.
+    cursor_usdc: u64,
     /// Base's tip at the last read, and its timestamp.
     pub(super) head: u64,
     head_time: u64,
 }
 
 impl BaseIndex {
-    fn add(&mut self, block: u64, e: &Event) {
+    /// Folds in an event read from `asset`'s contract.
+    fn add(&mut self, block: u64, e: &Event, asset: Asset) {
         match e {
             Event::Locked { swap_id, beneficiary, refund_to, amount, timeout, hashlock } => {
                 let v = self.locks.entry(*hashlock).or_default();
                 if !v.iter().any(|l| &l.swap_id == swap_id) {
-                    v.push(BaseLock { swap_id: *swap_id, beneficiary: *beneficiary, refund_to: *refund_to, amount: *amount, timeout: *timeout, block });
+                    v.push(BaseLock { swap_id: *swap_id, beneficiary: *beneficiary, refund_to: *refund_to, amount: *amount, timeout: *timeout, block, asset });
                 }
             }
             Event::Claimed { swap_id, preimage, .. } => {
@@ -255,9 +263,12 @@ impl Service {
         // Events are not kept across a restart: read again from where the
         // oldest live swap's start, so none of them misses its lock or claim.
         self.eth.index = BaseIndex::default();
-        let from = self.eth.store.swaps.iter().filter(|s| !s.phase.settled() && s.base_from > 0).map(|s| s.base_from).min();
-        if let Some(f) = from {
+        let from = |asset: Asset| self.eth.store.swaps.iter().filter(|s| !s.phase.settled() && s.base_from > 0 && s.asset == asset).map(|s| s.base_from).min();
+        if let Some(f) = from(Asset::Eth) {
             self.eth.index.cursor = f.saturating_sub(1);
+        }
+        if let Some(f) = from(Asset::Usdc) {
+            self.eth.index.cursor_usdc = f.saturating_sub(1);
         }
     }
 
@@ -276,8 +287,24 @@ impl Service {
         w.save()
     }
 
-    fn eth_client(&self) -> Result<BaseClient> {
-        BaseClient::new(self.dex_cfg.clone())
+    /// A client for the contract of `asset`: ETH's, or USDC's.
+    fn eth_client(&self, asset: Asset) -> Result<BaseClient> {
+        BaseClient::for_asset(self.dex_cfg.clone(), asset)
+    }
+
+    /// A USDC payment of ours that may not be mined yet: a lock or a
+    /// reservation whose receipt has not come. Its permit took the token's
+    /// next nonce, so another permit waits for it.
+    pub(super) fn token_payment_in_flight(&self) -> bool {
+        self.eth.store.swaps.iter().any(|s| {
+            s.asset == Asset::Usdc
+                && s.eth_pending.is_some()
+                && match (&s.role, &s.phase) {
+                    (Role::Buyer, Phase::LockingMine) => s.base_swap.is_none(),
+                    (Role::Filler, Phase::Reserving) => true,
+                    _ => false,
+                }
+        }) || self.book.bids.iter().any(|b| b.asset == Asset::Usdc && b.bid_id.is_empty() && !b.tx.is_empty() && !b.cancelled)
     }
 
     fn eth_address(&self) -> Result<[u8; 20]> {
@@ -286,11 +313,15 @@ impl Service {
 
     // ── Commands ────────────────────────────────────────────────────────
 
-    /// Puts `mds` up for sale at `wei_per_gmds`, for `life` midstate blocks.
-    pub(super) async fn eth_sell(&mut self, mds: u64, wei_per_gmds: &str, min: u64, life: u64) -> Result<String> {
+    /// Puts `mds` up for sale for `asset` at `wei_per_gmds` (its smallest
+    /// unit per 2^30 units), for `life` midstate blocks.
+    pub(super) async fn eth_sell(&mut self, asset: Asset, mds: u64, wei_per_gmds: &str, min: u64, life: u64) -> Result<String> {
         ensure!(self.eth.loaded, "wallet is locked");
         ensure!(!self.node.is_syncing(), "the node is still syncing");
-        let price: u128 = wei_per_gmds.trim().parse().map_err(|_| anyhow!("the price is not a whole number of wei"))?;
+        if asset == Asset::Usdc {
+            ensure!(self.dex_cfg.usdc_ready(), "USDC trading is not set up: this wallet knows no MidstateTokenSwap contract yet (Trade settings)");
+        }
+        let price: u128 = wei_per_gmds.trim().parse().map_err(|_| anyhow!("the price is not a whole number of the currency's smallest unit"))?;
         ensure!(price > 0, "the price must be more than zero");
         ensure!(mds >= MIN_MDS_AMOUNT, "the smallest sale is {MIN_MDS_AMOUNT} units");
         ensure!((MIN_ORDER_LIFE..=MAX_ORDER_LIFE).contains(&life), "an order runs {MIN_ORDER_LIFE} to {MAX_ORDER_LIFE} blocks");
@@ -313,6 +344,7 @@ impl Service {
             created: now_secs(),
             last_advert: 0,
             sold: 0,
+            asset,
         });
         self.eth_save()?;
         self.eth_advertise(tip);
@@ -338,10 +370,17 @@ impl Service {
         ensure!(mds >= a.min && mds <= a.mds, "this order sells between {} and {} units", a.min, a.mds);
         let wei = price_of(mds, a.wei_per_gmds).ok_or_else(|| anyhow!("the price overflows"))?;
         let key = self.evm_key()?;
-        // Pay only what we can: the lock costs gas too.
-        let client = self.eth_client()?;
+        // Pay only what we can: the lock costs gas too, in ETH.
+        let client = self.eth_client(a.asset)?;
         let have = client.balance(&key.address).await.context("could not read your Base balance")?;
-        ensure!(have > wei, "this needs {wei} wei plus gas on Base; your account holds {have}");
+        match a.asset {
+            Asset::Eth => ensure!(have > wei, "this needs {} plus gas on Base; your account holds {}", Asset::Eth.format(wei, 8), Asset::Eth.format(have, 8)),
+            Asset::Usdc => {
+                ensure!(have > 0, "paying in USDC still takes a little ETH for gas on Base; your account holds none");
+                let usdc = client.token_balance(&key.address).await.context("could not read your USDC balance")?;
+                ensure!(usdc >= wei, "this needs {}; your Base account holds {}", Asset::Usdc.format(wei, 6), Asset::Usdc.format(usdc, 6));
+            }
+        }
         if let Some(s) = self.eth.store.swaps.iter().find(|s| s.role == Role::Buyer && s.order_id == order_id && !s.phase.settled()) {
             bail!("you are already buying from this order (trade {})", hex::encode(&s.id[..4]));
         }
@@ -358,6 +397,7 @@ impl Service {
         sw.key_seed = Some(seed);
         sw.claim_pk = pk_of(&seed);
         sw.base_from = self.eth.index.head.saturating_sub(100);
+        sw.asset = a.asset;
         self.eth.store.swaps.push(sw);
         self.eth_save()?;
         self.eth_send_take(self.eth.store.swaps.len() - 1, now);
@@ -379,9 +419,23 @@ impl Service {
             bond_acceptable(b.fill_bond, b.amount),
             "that buy order asks a bond of more than a tenth of what it pays; a buyer who never claims keeps the bond, so this wallet will not fill it"
         );
-        let client = self.eth_client()?;
+        let client = self.eth_client(b.asset)?;
         let have = client.balance(&key.address).await.context("could not read your Base balance")?;
-        ensure!(have > b.fill_bond, "reserving needs the {} wei bond plus gas on Base; your account holds {have}", b.fill_bond);
+        match b.asset {
+            Asset::Eth => ensure!(
+                have > b.fill_bond,
+                "reserving needs the {} bond plus gas on Base; your account holds {}",
+                Asset::Eth.format(b.fill_bond, 8),
+                Asset::Eth.format(have, 8)
+            ),
+            Asset::Usdc => {
+                ensure!(have > 0, "reserving takes a little ETH for gas on Base; your account holds none");
+                if b.fill_bond > 0 {
+                    let usdc = client.token_balance(&key.address).await.context("could not read your USDC balance")?;
+                    ensure!(usdc >= b.fill_bond, "reserving needs the {} bond; your Base account holds {}", Asset::Usdc.format(b.fill_bond, 6), Asset::Usdc.format(usdc, 6));
+                }
+            }
+        }
         if let Some(chain) = client.get_bid(bid_id).await? {
             ensure!(!chain.settled && chain.filler == [0; 20], "that buy order has been taken");
         }
@@ -399,6 +453,7 @@ impl Service {
         sw.key_seed = Some(seed);
         sw.refund_pk = pk_of(&seed);
         sw.base_from = self.eth.index.head.saturating_sub(100);
+        sw.asset = b.asset;
         let tip = self.node.get_state().await.height;
         sw.timeout = tip + 200;
         let need = fill_total(b.mds_amount, &sw)?;
@@ -433,9 +488,10 @@ impl Service {
                 v
             }))
             .collect();
+        // Cheapest first, within each currency.
         sells.sort_by(|a, b| {
             let p = |v: &EthAdvertView| v.wei_per_gmds.parse::<u128>().unwrap_or(u128::MAX);
-            p(a).cmp(&p(b))
+            a.asset.cmp(&b.asset).then(p(a).cmp(&p(b)))
         });
         let orders = self
             .eth
@@ -458,6 +514,7 @@ impl Service {
                 }
                 .into(),
                 running: self.eth.store.swaps.iter().filter(|s| s.order_id == o.id && s.role == Role::Seller && !s.phase.settled()).count(),
+                asset: o.asset.symbol().into(),
             })
             .collect();
         let swaps = self
@@ -591,7 +648,7 @@ impl Service {
             return;
         }
         let sw = &self.eth.store.swaps[i];
-        let t = Take { order_id: sw.order_id, take_id: sw.id, mds: sw.mds_amount, wei: sw.wei, claim_pk: sw.claim_pk, buyer_evm: sw.buyer_evm };
+        let t = Take { order_id: sw.order_id, take_id: sw.id, mds: sw.mds_amount, wei: sw.wei, claim_pk: sw.claim_pk, buyer_evm: sw.buyer_evm, asset: sw.asset };
         let (id, acct) = (sw.id, sw.buyer_evm);
         self.eth_send(Frame::Take(t));
         self.send_claim(CLAIM_TAKE, id, &acct);
@@ -615,7 +672,9 @@ impl Service {
                 }
                 Frame::Advert(a) => {
                     let ours = self.eth.store.orders.iter().any(|o| o.id == a.order_id);
-                    if !ours && a.expires > tip && a.mds >= a.min && a.min >= MIN_MDS_AMOUNT && a.wei_per_gmds > 0 {
+                    // A USDC order is shown only where it can be bought.
+                    let payable = a.asset == Asset::Eth || self.dex_cfg.usdc_ready();
+                    if !ours && payable && a.expires > tip && a.mds >= a.min && a.min >= MIN_MDS_AMOUNT && a.wei_per_gmds > 0 {
                         self.eth.book.insert(a.order_id, BookEntry { advert: a, heard: tip });
                     }
                 }
@@ -655,7 +714,7 @@ impl Service {
         }
         let decline = |svc: &Self, reason| svc.eth_send(Frame::Answer(Answer::Decline { take_id: t.take_id, reason }));
         let Some(order) = self.eth.store.orders.iter().find(|o| o.id == t.order_id).cloned() else { return };
-        if let Err(reason) = check_take(&order, tip, t.mds, t.wei) {
+        if let Err(reason) = check_take(&order, tip, t.mds, t.wei, t.asset) {
             return decline(self, reason);
         }
         let busy_buyer = self.eth.store.swaps.iter().any(|s| s.role == Role::Seller && s.buyer_evm == t.buyer_evm && !s.phase.settled());
@@ -687,6 +746,7 @@ impl Service {
         sw.secret_hash = midstate::core::types::hash(&secret);
         sw.timeout = seller_timeout(tip);
         sw.base_from = self.eth.index.head.saturating_sub(100);
+        sw.asset = order.asset;
         if let Some(o) = self.eth.store.order_mut(&order.id) {
             o.mds -= t.mds;
         }
@@ -730,6 +790,7 @@ impl Service {
             sw.timeout = f.timeout_height;
             sw.dest = Some(f.receiver_addr);
             sw.base_from = self.eth.index.head.saturating_sub(100);
+            sw.asset = bid.asset;
             new.push(sw);
         }
         if !new.is_empty() {
@@ -741,10 +802,10 @@ impl Service {
         }
     }
 
-    /// New contract events, receipts of our transactions, and the bids our
-    /// swaps are about.
+    /// New events of both contracts, receipts of our transactions, and the
+    /// bids our swaps are about.
     async fn eth_read_base(&mut self, now: u64) -> Result<()> {
-        let client = self.eth_client()?;
+        let client = self.eth_client(Asset::Eth)?;
         let (head, head_time) = client.head().await?;
         self.eth.index.head = head;
         self.eth.index.head_time = head_time;
@@ -757,19 +818,33 @@ impl Service {
                 changed = true;
             }
         }
-        if self.eth.index.cursor == 0 {
-            let from = self.eth.store.swaps.iter().filter(|s| !s.phase.settled()).map(|s| s.base_from).min().unwrap_or(head);
-            self.eth.index.cursor = from.min(safe).saturating_sub(1);
-        }
-        if safe > self.eth.index.cursor {
-            let to = safe.min(self.eth.index.cursor + BASE_PER_TICK);
-            let part = client.scan(self.eth.index.cursor + 1, to).await;
-            for (b, e) in &part.events {
-                self.eth.index.add(*b, e);
+        for asset in Asset::ALL {
+            if asset == Asset::Usdc && !self.dex_cfg.usdc_ready() {
+                continue;
             }
-            self.eth.index.cursor = part.reached.max(self.eth.index.cursor);
-            if let Some(e) = part.error {
-                tracing::warn!("Base events past block {}: {e:#}", part.reached);
+            let c = self.eth_client(asset)?;
+            let mut cursor = match asset {
+                Asset::Eth => self.eth.index.cursor,
+                Asset::Usdc => self.eth.index.cursor_usdc,
+            };
+            if cursor == 0 {
+                let live = self.eth.store.swaps.iter().filter(|s| !s.phase.settled() && s.asset == asset);
+                cursor = live.map(|s| s.base_from).min().unwrap_or(head).min(safe).saturating_sub(1);
+            }
+            if safe > cursor {
+                let to = safe.min(cursor + BASE_PER_TICK);
+                let part = c.scan(cursor + 1, to).await;
+                for (b, e) in &part.events {
+                    self.eth.index.add(*b, e, asset);
+                }
+                cursor = part.reached.max(cursor);
+                if let Some(e) = part.error {
+                    tracing::warn!("Base {} events past block {}: {e:#}", asset.symbol(), part.reached);
+                }
+            }
+            match asset {
+                Asset::Eth => self.eth.index.cursor = cursor,
+                Asset::Usdc => self.eth.index.cursor_usdc = cursor,
             }
         }
         self.eth.index.prune(&self.eth.store.swaps);
@@ -795,25 +870,35 @@ impl Service {
                     continue;
                 }
             };
-            let what = if sw.role == Role::Buyer { "ETH lock" } else { "reservation" };
+            let what = if sw.role == Role::Buyer { format!("{} lock", sw.asset.symbol()) } else { "reservation".to_string() };
+            let on = match self.eth_client(sw.asset) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("{what}: {e:#}");
+                    continue;
+                }
+            };
             match r {
                 Some(r) if !r.success => {
                     self.eth.store.swaps[i].phase = Phase::Failed(format!("the {what} reverted; nothing was paid"));
                     changed = true;
                 }
                 Some(r) if sw.role == Role::Buyer => {
-                    if let Some(Event::Locked { swap_id, timeout, .. }) = r.logs.iter().filter_map(crate::base::decode_event).find(|e| matches!(e, Event::Locked { .. })) {
+                    // Only the swap contract's own event: a token's logs ride
+                    // in the same receipt.
+                    let locked = r.logs.iter().filter(|l| l.address == on.contract()).filter_map(crate::base::decode_event).find(|e| matches!(e, Event::Locked { .. }));
+                    if let Some(Event::Locked { swap_id, timeout, .. }) = locked {
                         let s = &mut self.eth.store.swaps[i];
                         s.base_swap = Some(swap_id);
                         s.eth_deadline = timeout;
                         s.base_from = s.base_from.min(r.block);
-                        s.note = "ETH locked; waiting for the seller to claim it, which releases your MDS".into();
+                        s.note = format!("{} locked; waiting for the seller to claim it, which releases your MDS", sw.asset.symbol());
                         changed = true;
                     }
                 }
                 Some(_) => {
                     // A failed read here leaves the receipt for the next tick.
-                    let b = match client.get_bid(sw.bid_id).await {
+                    let b = match on.get_bid(sw.bid_id).await {
                         Ok(Some(b)) => b,
                         Ok(None) => {
                             tracing::warn!("reserved buy order {} not found", hex::encode(sw.bid_id));
@@ -848,23 +933,27 @@ impl Service {
                     }
                     changed = true;
                 }
-                None => changed |= self.eth_unmined(i, &client, now, what).await,
+                None => changed |= self.eth_unmined(i, &client, now, &what).await,
             }
         }
 
-        // Bids our swaps depend on.
-        let bids: Vec<[u8; 32]> = self
+        // Bids our swaps depend on, each from its own contract.
+        let bids: Vec<([u8; 32], Asset)> = self
             .eth
             .store
             .swaps
             .iter()
             .filter(|s| !s.phase.settled() && matches!(s.role, Role::Filler | Role::Bidder))
-            .map(|s| s.bid_id)
+            .map(|s| (s.bid_id, s.asset))
             .collect();
-        for id in bids {
+        for (id, asset) in bids {
             let fresh = self.eth.index.bids.get(&id).is_some_and(|(_, at)| now < at + BID_REFRESH_SECS);
             if !fresh {
-                match client.get_bid(id).await {
+                let read = match self.eth_client(asset) {
+                    Ok(c) => c.get_bid(id).await,
+                    Err(e) => Err(e),
+                };
+                match read {
                     Ok(Some(b)) => {
                         self.eth.index.bids.insert(id, (b, now));
                     }
@@ -995,8 +1084,8 @@ impl Service {
         }
         let what = match (&sw.role, &sw.phase) {
             (Role::Buyer, Phase::Done) => format!("Bought {} units of MDS.", sw.mds_amount),
-            (Role::Seller, Phase::Done) => format!("Sold {} units of MDS for {} wei.", sw.mds_amount, sw.wei),
-            (Role::Filler, Phase::Done) => format!("Filled a buy order: {} wei received.", sw.wei + sw.fill_bond),
+            (Role::Seller, Phase::Done) => format!("Sold {} units of MDS for {}.", sw.mds_amount, sw.asset.format(sw.wei, 8)),
+            (Role::Filler, Phase::Done) => format!("Filled a buy order: {} received.", sw.asset.format(sw.wei + sw.fill_bond, 8)),
             (Role::Bidder, Phase::Done) => format!("Your buy order was filled: {} units received.", sw.mds_amount),
             (_, Phase::Refunded) => "A trade did not complete; your funds came back.".into(),
             (_, Phase::Failed(r)) => format!("A trade stopped: {r}"),
@@ -1026,13 +1115,36 @@ impl Service {
             }
             Act::LockEth { delay } => {
                 let sw = self.eth.store.swaps[i].clone();
-                let data = crate::base::lock_call(sw.secret_hash, sw.seller_evm, *delay)?;
-                self.eth_send_value(i, sw.wei, data, now, "ETH lock").await
+                match sw.asset {
+                    Asset::Eth => {
+                        let data = crate::base::lock_call(sw.secret_hash, sw.seller_evm, *delay)?;
+                        self.eth_send_value(i, sw.wei, data, now, "ETH lock").await
+                    }
+                    Asset::Usdc => {
+                        let Some(permit) = self.eth_token_permit(i, sw.wei, now).await? else { return Ok(()) };
+                        let data = crate::base::token_lock_call(sw.secret_hash, sw.seller_evm, sw.wei, *delay, Some(&permit))?;
+                        self.eth_send_value(i, 0, data, now, "USDC lock").await
+                    }
+                }
             }
             Act::Reserve => {
                 let sw = self.eth.store.swaps[i].clone();
-                let data = crate::base::reserve_call(sw.bid_id, FILL_WINDOW_SECS);
-                self.eth_send_value(i, sw.fill_bond, data, now, "reservation").await
+                match sw.asset {
+                    Asset::Eth => {
+                        let data = crate::base::reserve_call(sw.bid_id, FILL_WINDOW_SECS);
+                        self.eth_send_value(i, sw.fill_bond, data, now, "reservation").await
+                    }
+                    // The bond, if the bid asks one, is paid in USDC too.
+                    Asset::Usdc if sw.fill_bond > 0 => {
+                        let Some(permit) = self.eth_token_permit(i, sw.fill_bond, now).await? else { return Ok(()) };
+                        let data = crate::base::token_reserve_call(sw.bid_id, FILL_WINDOW_SECS, Some(&permit));
+                        self.eth_send_value(i, 0, data, now, "reservation").await
+                    }
+                    Asset::Usdc => {
+                        let data = crate::base::token_reserve_call(sw.bid_id, FILL_WINDOW_SECS, None);
+                        self.eth_send_value(i, 0, data, now, "reservation").await
+                    }
+                }
             }
             Act::ClaimEth { swap_id } => {
                 if !self.eth.due(id, P_BASE, now, BASE_RETRY_SECS) {
@@ -1043,9 +1155,10 @@ impl Service {
                 s.base_swap = Some(*swap_id);
                 s.claim_sent = true;
                 let secret = s.secret.ok_or_else(|| anyhow!("no secret"))?;
+                let asset = s.asset;
                 self.eth_save()?;
                 let key = self.evm_key()?;
-                let client = self.eth_client()?;
+                let client = self.eth_client(asset)?;
                 match client.claim(&key, *swap_id, secret).await {
                     Ok(h) => {
                         self.eth.store.swaps[i].eth_tx = Some(h);
@@ -1064,7 +1177,7 @@ impl Service {
                 let sw = self.eth.store.swaps[i].clone();
                 let secret = sw.secret.ok_or_else(|| anyhow!("no secret"))?;
                 let key = self.evm_key()?;
-                let h = self.eth_client()?.claim_bid(&key, sw.bid_id, secret).await?;
+                let h = self.eth_client(sw.asset)?.claim_bid(&key, sw.bid_id, secret).await?;
                 self.eth.store.swaps[i].eth_tx = Some(h);
                 self.eth.index.bids.remove(&sw.bid_id); // read it again soon
                 self.eth_save()
@@ -1074,7 +1187,7 @@ impl Service {
                     return Ok(());
                 }
                 let key = self.evm_key()?;
-                let client = self.eth_client()?;
+                let client = self.eth_client(self.eth.store.swaps[i].asset)?;
                 match client.refund(&key, *swap_id).await {
                     Ok(h) => {
                         self.eth.store.swaps[i].eth_tx = Some(h);
@@ -1091,6 +1204,34 @@ impl Service {
         }
     }
 
+    /// A permit for swap `i` to pay `value` USDC into its contract, or `None`
+    /// while another USDC payment of ours is still on its way (its permit
+    /// holds the token's next nonce; this one waits a tick or two). Only
+    /// asked for when the payment is about to be signed.
+    async fn eth_token_permit(&mut self, i: usize, value: u128, now: u64) -> Result<Option<crate::evm::Permit>> {
+        let (id, sent) = (self.eth.store.swaps[i].id, self.eth.store.swaps[i].eth_tx.is_some());
+        if sent || !self.eth.due(id, P_BASE, now, BASE_RETRY_SECS) {
+            return Ok(None);
+        }
+        // Paced above; let the send itself be due again.
+        self.eth.pushed.remove(&(id, P_BASE));
+        if self.token_payment_in_flight() {
+            self.eth.store.swaps[i].note = "waiting for your other USDC payment to land first".into();
+            return Ok(None);
+        }
+        let client = self.eth_client(Asset::Usdc)?;
+        let key = self.evm_key()?;
+        let have = client.token_balance(&key.address).await.context("could not read your USDC balance")?;
+        if have < value {
+            let s = &mut self.eth.store.swaps[i];
+            s.phase = Phase::Failed(format!("this needs {}, and your Base account holds {}; nothing was paid", Asset::Usdc.format(value, 6), Asset::Usdc.format(have, 6)));
+            self.eth_save()?;
+            return Ok(None);
+        }
+        let base_now = now.max(self.eth.index.head_time);
+        Ok(Some(client.permit(&key, value, base_now).await?))
+    }
+
     /// Signs a value-carrying call, journals it, then sends it. Once
     /// journalled it is only ever resolved by its receipt or its nonce
     /// (`eth_unmined`): an error from the send does not mean nothing was paid.
@@ -1100,7 +1241,7 @@ impl Service {
             return Ok(());
         }
         let key = self.evm_key()?;
-        let client = self.eth_client()?;
+        let client = self.eth_client(self.eth.store.swaps[i].asset)?;
         let t = match client.sign_call(&key, value, data).await {
             Ok(t) => t,
             Err(e) => {
@@ -1135,7 +1276,7 @@ impl Service {
             return Ok(());
         }
         let from = self.eth.store.swaps[i].base_from;
-        let client = self.eth_client()?;
+        let client = self.eth_client(self.eth.store.swaps[i].asset)?;
         match client.find_settlement(swap_id, from, self.eth.index.head).await? {
             Some(Settlement::Claimed(p)) => {
                 let s = &mut self.eth.store.swaps[i];
@@ -1282,6 +1423,7 @@ fn advert_view(a: &Advert, mine: bool) -> EthAdvertView {
         mine,
         seller_name: String::new(),
         seller_backing: 0.0,
+        asset: a.asset.symbol().into(),
     }
 }
 
@@ -1296,11 +1438,11 @@ fn swap_view(s: &EthSwap) -> EthSwapView {
         Phase::Failed(r) => r.clone(),
         Phase::Done => match s.role {
             Role::Buyer | Role::Bidder => "complete: the MDS is yours".into(),
-            Role::Seller | Role::Filler => "complete: the ETH is yours".into(),
+            Role::Seller | Role::Filler => format!("complete: the {} is yours", s.asset.symbol()),
         },
         Phase::Refunded => "did not complete: your funds came back".into(),
         _ if !s.note.is_empty() => s.note.clone(),
-        p => default_note(s.role, p).into(),
+        p => default_note(s.role, p).replace("ETH", s.asset.symbol()),
     };
     EthSwapView {
         id: hex::encode(s.id),
@@ -1317,6 +1459,7 @@ fn swap_view(s: &EthSwap) -> EthSwapView {
         base_tx: s.eth_tx.map(|h| format!("0x{}", hex::encode(h))),
         created: s.created,
         updated: s.updated,
+        asset: s.asset.symbol().into(),
     }
 }
 

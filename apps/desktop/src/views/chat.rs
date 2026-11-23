@@ -4,8 +4,11 @@
 //!
 //! Sealed conversations (`midstate::sealed`) are read by two wallets alone:
 //! sealed post-quantum (ML-KEM), addressed so nobody watching the network
-//! sees who they are for. The public room is the chat bus itself: up to ten
-//! words from a fixed dictionary, each message mined by your own node.
+//! sees who they are for. A stranger's messages carry a stamp of work, at
+//! the price the recipient asks (Strangers pay, at the foot of the list),
+//! until the recipient writes back. The public room is the chat bus itself:
+//! up to ten words from a fixed dictionary, each message mined by your own
+//! node.
 //!
 //! [`draw`] takes what it shows as [`Data`] and keeps its own state in a
 //! [`Messenger`]; what it wants done comes back as [`Out`], so it can be laid
@@ -18,8 +21,8 @@ use eframe::egui::{
     self, text::LayoutJob, Align, Align2, Color32, FontId, Frame, Galley, Key, KeyboardShortcut, Layout, Margin, Modifiers, Rect, RichText, Sense,
     Stroke, StrokeKind, TextEdit, Ui,
 };
-use midstate_walletd::api::{ChatView, ConversationView, MessageLineView, NameCard};
-use midstate_walletd::{SEALED_MAX, SEALED_TIMERS};
+use midstate_walletd::api::{ChatView, ConversationView, MessageLineView, NameCard, PostageView};
+use midstate_walletd::{POSTAGE_STANDARD, SEALED_MAX, SEALED_TIMERS};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -35,6 +38,9 @@ const SIDE: f32 = 18.0;
 /// Drafts' keys for the public room and a new message.
 const PUBLIC: &str = "public";
 const NEW: &str = "new";
+/// What a wallet can ask of strangers, in bits of stamp work: each step is
+/// sixteen times the work of the one before.
+const PRICES: [(u32, &str); 5] = [(24, "Standard"), (28, "Raised"), (32, "High"), (36, "Very high"), (40, "Maximum")];
 
 // ── State ───────────────────────────────────────────────────────────────────
 
@@ -81,6 +87,8 @@ pub struct Messenger {
     confirm_delete: Option<String>,
     /// The conversation whose sender's block is being confirmed.
     confirm_block: Option<String>,
+    /// A new price for strangers, being confirmed.
+    confirm_postage: Option<u32>,
     /// The read mark last asked for, (key, lines): asked once.
     marked: Option<(String, usize)>,
     /// Where the open conversation's "new" line goes: (key, line).
@@ -186,6 +194,8 @@ pub struct Data<'a> {
     /// senders' are.
     pub blocked: &'a [String],
     pub drop_anonymous: bool,
+    /// What strangers pay to write to this wallet (`Status::postage`).
+    pub postage: &'a PostageView,
     pub sealed_busy: bool,
     pub chat_busy: bool,
     pub error: &'a str,
@@ -216,6 +226,48 @@ pub fn key(c: &ConversationView) -> String {
     }
 }
 
+/// A price, by the name the picker gives it.
+fn price_label(bits: u32) -> String {
+    PRICES.iter().find(|(b, _)| *b == bits).map_or_else(|| format!("{bits} bits"), |(_, l)| l.to_string())
+}
+
+/// A stretch of time, roughly, as people say it: "about 5 minutes". Each
+/// unit takes over at one and a half of it, so there is never "1 minute".
+fn about(secs: f64) -> String {
+    let say = |n: f64, what: &str| format!("about {} {what}s", n.round().max(2.0) as u64);
+    match secs {
+        s if s < 1.5 => "about a second".into(),
+        s if s < 90.0 => say(s, "second"),
+        s if s < 90.0 * 60.0 => say(s / 60.0, "minute"),
+        s if s < 36.0 * 3_600.0 => say(s / 3_600.0, "hour"),
+        s => say(s / 86_400.0, "day"),
+    }
+}
+
+/// How long a stamp of `bits` takes this computer, in words.
+fn work(bits: u32) -> String {
+    about(midstate_walletd::stamp_seconds(bits))
+}
+
+/// What the stamp on a message to `who` costs, said under the box: the
+/// work, here, at the price they ask.
+fn stamp_note(who: &str, bits: u32) -> String {
+    if bits <= POSTAGE_STANDARD {
+        format!("Until {who} writes back, each message carries a stamp: {} of your computer's work, so nobody can flood an inbox for free.", work(bits))
+    } else {
+        format!(
+            "{who} asks strangers more: until they write back, each message carries a stamp of {} of your computer's work ({}). It goes once the work is done; you can keep writing meanwhile.",
+            work(bits),
+            price_label(bits).to_lowercase()
+        )
+    }
+}
+
+/// This wallet's messages in `c` still being stamped.
+fn stamping(c: &ConversationView) -> usize {
+    c.lines.iter().filter(|l| l.stamping).count()
+}
+
 fn title(c: &ConversationView) -> &str {
     if c.peer.is_empty() {
         "Anonymous"
@@ -243,6 +295,7 @@ fn preview(c: &ConversationView) -> String {
         None => String::new(),
         Some(l) if l.timer.is_some() => timer_note(c, l),
         Some(l) if l.pending => format!("Waiting for its key: {}", one_line(&l.text)),
+        Some(l) if l.stamping => format!("Stamping: {}", one_line(&l.text)),
         Some(l) if l.mine => format!("You: {}", one_line(&l.text)),
         Some(l) => one_line(&l.text),
     }
@@ -274,7 +327,9 @@ fn request_reason(c: &ConversationView, bar: Option<f64>) -> String {
 
 /// The line under a conversation's name.
 fn subtitle(c: &ConversationView) -> String {
-    if c.id.is_empty() {
+    if c.id.is_empty() && stamping(c) > 0 {
+        format!("Stamping your first message to {}: it goes, sealed, once the work is done.", c.peer)
+    } else if c.id.is_empty() {
         format!("Waiting for {}'s wallet to hand over its key: your messages go as soon as it does, if it does within 15 minutes.", c.peer)
     } else if c.peer.is_empty() {
         "Whoever opened this did not say who they are. Only they read your replies.".into()
@@ -290,6 +345,7 @@ fn subtitle(c: &ConversationView) -> String {
 fn same_run(a: &MessageLineView, b: &MessageLineView) -> bool {
     a.mine == b.mine
         && a.pending == b.pending
+        && a.stamping == b.stamping
         && a.timer.is_none()
         && b.timer.is_none()
         && b.at.saturating_sub(a.at) <= RUN_SECS
@@ -480,7 +536,7 @@ fn list(m: &mut Messenger, d: &Data, ui: &mut Ui, out: &mut Vec<Out>) {
         });
     egui::TopBottomPanel::bottom("msgr_list_foot")
         .frame(Frame::NONE.fill(theme::bg()).inner_margin(Margin::symmetric(14, 10)))
-        .show_inside(ui, |ui| inbox_bar(d, ui, out));
+        .show_inside(ui, |ui| list_foot(m, d, ui, out));
     egui::CentralPanel::default().frame(Frame::NONE.fill(theme::bg())).show_inside(ui, |ui| {
         egui::ScrollArea::vertical().id_salt("msgr_rows").auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
@@ -510,7 +566,9 @@ fn rows(m: &mut Messenger, d: &Data, ui: &mut Ui) {
     for c in d.conversations.iter().filter(|c| c.request == requests && matches(c, &q)) {
         any = true;
         let k = key(c);
-        let tag = if c.id.is_empty() {
+        let tag = if stamping(c) > 0 {
+            Some("stamping")
+        } else if c.id.is_empty() {
             Some("waiting")
         } else if !c.peer.is_empty() && !c.verified {
             Some("unverified")
@@ -600,11 +658,16 @@ fn row(ui: &mut Ui, r: &Row) -> egui::Response {
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-/// Who reaches the inbox (the rest wait under Requests), whether anonymous
-/// senders are heard at all, and who is blocked.
-fn inbox_bar(d: &Data, ui: &mut Ui, out: &mut Vec<Out>) {
+/// Who reaches the inbox (the rest wait under Requests), what strangers
+/// pay to write at all, whether anonymous senders are heard, and who is
+/// blocked.
+fn list_foot(m: &mut Messenger, d: &Data, ui: &mut Ui, out: &mut Vec<Out>) {
     const BARS: [(Option<f64>, &str); 4] =
         [(Some(0.0), "verified names"), (None, "everyone"), (Some(60.0), "names backed an hour+"), (Some(1_440.0), "names backed a day+")];
+    if let Some(bits) = m.confirm_postage {
+        postage_confirm(m, d, bits, ui, out);
+        ui.add_space(8.0);
+    }
     let now = BARS.iter().find(|(b, _)| *b == d.inbox_bar).map_or("names backed more", |(_, l)| *l);
     ui.horizontal(|ui| {
         theme::hint(ui, "Inbox takes");
@@ -621,6 +684,7 @@ fn inbox_bar(d: &Data, ui: &mut Ui, out: &mut Vec<Out>) {
             .response
             .on_hover_text("The rest wait under Requests, never dropped. Backing is MDS burned for a name (the Burns page), in blocks of issuance.");
     });
+    postage_picker(m, d, ui);
     ui.horizontal(|ui| {
         let mut drop = d.drop_anonymous;
         if ui
@@ -646,6 +710,78 @@ fn inbox_bar(d: &Data, ui: &mut Ui, out: &mut Vec<Out>) {
             });
         }
     });
+}
+
+/// What strangers pay: the stamp a message from someone you have not
+/// answered must carry. Picking another price asks first.
+fn postage_picker(m: &mut Messenger, d: &Data, ui: &mut Ui) {
+    let p = d.postage;
+    ui.horizontal(|ui| {
+        theme::hint(ui, "Strangers pay");
+        ui.add_enabled_ui(!p.names.is_empty(), |ui| {
+            egui::ComboBox::from_id_salt("msgr_postage")
+                .selected_text(RichText::new(price_label(p.bits)).size(12.0))
+                .show_ui(ui, |ui| {
+                    for (bits, label) in PRICES {
+                        let text = format!("{label} · {}", work(bits));
+                        if ui.selectable_label(p.bits == bits, text).clicked() && p.bits != bits && p.pending != Some(bits) {
+                            m.confirm_postage = Some(bits);
+                        }
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "Each message from someone you have not answered carries a stamp of work at this price, or it is dropped unread. \
+                     Raise it if strangers flood you: every message they send costs them that much more. People you have \
+                     written back to pay nothing. Times are for a computer like this one.",
+                )
+                .on_disabled_hover_text("None of your names takes sealed messages yet: give one a kem record on the Names page.");
+        });
+    });
+    if let Some(next) = p.pending {
+        theme::hint(ui, &format!("Changing to {}: it applies once your names' new records confirm.", price_label(next)));
+    }
+}
+
+/// Asks before a new price goes on chain: what it costs strangers, and what
+/// it costs this wallet (a record change on each name, with its fee).
+fn postage_confirm(m: &mut Messenger, d: &Data, bits: u32, ui: &mut Ui, out: &mut Vec<Out>) {
+    let names = if d.postage.settable.is_empty() { "Your names".to_string() } else { and_list(&d.postage.settable) };
+    let (ask, button) = match bits.cmp(&d.postage.bits) {
+        std::cmp::Ordering::Greater => ("Raise", format!("Raise to {}", price_label(bits))),
+        _ if bits == POSTAGE_STANDARD => ("Lower", "Back to standard".to_string()),
+        _ => ("Lower", format!("Lower to {}", price_label(bits))),
+    };
+    let text = format!(
+        "{ask} what strangers pay to {}? Each message from someone you have not answered then takes {} of work on a computer like this one, or it is dropped. \
+         {names} change{} their records on chain, a network fee each; the price applies once that confirms.",
+        price_label(bits),
+        work(bits),
+        if d.postage.settable.len() == 1 { "s" } else { "" },
+    );
+    Frame::NONE.fill(theme::panel()).stroke(hair(theme::border2())).inner_margin(Margin::same(10)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.add(egui::Label::new(RichText::new(text).size(12.0).color(theme::bright())).wrap());
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if ui.button(button).clicked() {
+                out.push(Out::Go(Action::SetPostage { bits }));
+                m.confirm_postage = None;
+            }
+            if ui.button("Cancel").clicked() {
+                m.confirm_postage = None;
+            }
+        });
+    });
+}
+
+/// Names as a sentence lists them: "a, b and c".
+fn and_list(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
 }
 
 // ── The open conversation ───────────────────────────────────────────────────
@@ -725,7 +861,7 @@ fn thread(m: &mut Messenger, d: &Data, c: &ConversationView, ui: &mut Ui, narrow
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(title(c)).font(theme::font_medium(15.0)).color(theme::ink()));
                     if pending {
-                        theme::badge(ui, "waiting", theme::muted());
+                        theme::badge(ui, if stamping(c) > 0 { "stamping" } else { "waiting" }, theme::muted());
                     } else if c.verified {
                         theme::badge(ui, "verified", theme::ink());
                     } else if named {
@@ -838,6 +974,21 @@ fn thread(m: &mut Messenger, d: &Data, c: &ConversationView, ui: &mut Ui, narrow
 
     egui::TopBottomPanel::bottom("msgr_thread_compose").frame(compose_frame()).show_inside(ui, |ui| {
         error_line(d, ui, out);
+        let waiting = stamping(c);
+        if waiting > 0 {
+            ui.horizontal(|ui| {
+                let each = work(c.stamp_bits.max(1));
+                let text = match waiting {
+                    1 => format!("Stamping 1 message: {each} on this computer."),
+                    n => format!("Stamping {n} messages: {each} each on this computer."),
+                };
+                theme::hint(ui, &text);
+                if ui.small_button("Don't send").on_hover_text("Drop what is still being stamped. Nothing of it has gone.").clicked() {
+                    out.push(Out::Go(if pending { Action::SealedCancel { to: c.peer.clone() } } else { Action::SealedUnsend { id: c.id.clone() } }));
+                }
+            });
+            ui.add_space(4.0);
+        }
         let hint = if pending {
             format!("Add to what waits for {}", c.peer)
         } else if c.verified {
@@ -845,10 +996,7 @@ fn thread(m: &mut Messenger, d: &Data, c: &ConversationView, ui: &mut Ui, narrow
         } else {
             "Reply to whoever opened this".into()
         };
-        let note = c.stamping.then(|| {
-            let who = if named { c.peer.as_str() } else { "they" };
-            format!("Until {who} writes back, each message carries a stamp: about a second of your computer's work, so nobody can flood an inbox for free.")
-        });
+        let note = c.stamping.then(|| stamp_note(if named { c.peer.as_str() } else { "they" }, c.stamp_bits));
         if let Some(text) = composer(m, ui, &k, &hint, d.sealed_busy, note.as_deref()) {
             out.push(Out::ClearError);
             out.push(Out::Go(if pending { Action::SealedSend { to: c.peer.clone(), text } } else { Action::SealedReply { id: c.id.clone(), text } }));
@@ -903,9 +1051,17 @@ fn lines(ui: &mut Ui, k: &str, c: &ConversationView, unread_at: Option<usize>, n
         if l.expires > 0 {
             when.push_str(&format!(" · disappears in {}", theme::fmt_duration(l.expires.saturating_sub(now))));
         }
-        bubble(ui, egui::Id::new(("msgr_line", k, i)), &l.text, l.mine, l.pending, maxw, &when);
+        let unsent = l.pending || l.stamping;
+        if l.stamping {
+            when.push_str(" · stamping, not sent yet");
+        }
+        bubble(ui, egui::Id::new(("msgr_line", k, i)), &l.text, l.mine, unsent, maxw, &when);
         if ends {
-            let when = if l.pending { format!("{} · not sent yet", theme::clock(l.at)) } else { theme::clock(l.at) };
+            let when = match (l.pending, l.stamping) {
+                (true, _) => format!("{} · not sent yet", theme::clock(l.at)),
+                (_, true) => format!("{} · stamping", theme::clock(l.at)),
+                _ => theme::clock(l.at),
+            };
             stamp(ui, &when, l.mine);
         }
     }
@@ -962,8 +1118,8 @@ fn stamp(ui: &mut Ui, text: &str, mine: bool) {
 }
 
 /// The box a sealed message is written in, and its Send button. Enter sends;
-/// Shift+Enter starts a new line. `stamping`, said under it, means what is
-/// sent carries a stamp. Returns the text to send, once.
+/// Shift+Enter starts a new line. `stamping`, said under it, is what the
+/// stamp on what is sent costs. Returns the text to send, once.
 fn composer(m: &mut Messenger, ui: &mut Ui, k: &str, hint: &str, busy: bool, stamping: Option<&str>) -> Option<String> {
     let id = egui::Id::new(("msgr_composer", k));
     let enter = ui.memory(|mem| mem.has_focus(id)) && ui.input(|i| plain_enter(&i.events));
@@ -988,11 +1144,7 @@ fn composer(m: &mut Messenger, ui: &mut Ui, k: &str, hint: &str, busy: bool, sta
                 r.request_focus();
             }
         });
-        let label = match (busy, stamping.is_some()) {
-            (true, true) => "Stamping…",
-            (true, false) => "Sealing…",
-            _ => "Send",
-        };
+        let label = if busy { "Sealing…" } else { "Send" };
         if ui.add_enabled(ok, egui::Button::new(label).min_size(egui::vec2(SEND_W, 34.0))).clicked() {
             send = true;
         }
@@ -1063,6 +1215,10 @@ fn new_message(m: &mut Messenger, d: &Data, ui: &mut Ui, narrow: bool, out: &mut
             (Some(w), None) => (format!("Looking up {w}…"), None),
             (Some(_), Some(Err(e))) => (e.clone(), None),
             (Some(_), Some(Ok(card))) => match recipient_says(card) {
+                Ok(()) if card.postage > POSTAGE_STANDARD => (
+                    format!("{} takes sealed messages, and asks strangers more: {}.", card.name, price_label(card.postage).to_lowercase()),
+                    card.backing.as_ref().map(|b| b.tier.clone()).filter(|t| !t.is_empty()),
+                ),
                 Ok(()) => (format!("{} takes sealed messages.", card.name), card.backing.as_ref().map(|b| b.tier.clone()).filter(|t| !t.is_empty())),
                 Err(why) => (why, None),
             },
@@ -1098,7 +1254,12 @@ fn new_message(m: &mut Messenger, d: &Data, ui: &mut Ui, narrow: bool, out: &mut
                 Some(w) if blocked => format!("Unblock {w} to write to it"),
                 _ => "Choose who to write to first".to_string(),
             };
-            if let Some(text) = composer(m, ui, NEW, &hint, d.sealed_busy, Some("A first message carries a stamp: about a second of your computer's work, so nobody can flood an inbox for free.")) {
+            let price = match &answer {
+                Some(Ok(card)) if ready && card.postage > 0 => card.postage,
+                _ => POSTAGE_STANDARD,
+            };
+            let note = stamp_note(want.as_deref().filter(|_| ready).unwrap_or("they"), price);
+            if let Some(text) = composer(m, ui, NEW, &hint, d.sealed_busy, Some(&note)) {
                 if let Some(w) = want.clone() {
                     out.push(Out::ClearError);
                     out.push(Out::Go(Action::SealedSend { to: w.clone(), text }));
@@ -1283,6 +1444,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
     let full = ui.available_rect_before_wrap();
     let w = full.width().min(1240.0);
     let area = Rect::from_min_size(egui::pos2(full.center().x - w / 2.0, full.top()), egui::vec2(w, full.height()));
+    let standard = PostageView { bits: POSTAGE_STANDARD, ..PostageView::default() };
     let outs = {
         let d = Data {
             conversations: &app.conversations,
@@ -1291,6 +1453,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
             inbox_bar: app.status.as_ref().and_then(|s| s.inbox_bar),
             blocked: app.status.as_ref().map_or(&[][..], |s| s.blocked.as_slice()),
             drop_anonymous: app.status.as_ref().is_some_and(|s| s.drop_anonymous),
+            postage: app.status.as_ref().map_or(&standard, |s| &s.postage),
             sealed_busy: app.sealed_busy,
             chat_busy: app.chat_busy,
             error: &app.error,
@@ -1339,12 +1502,26 @@ mod tests {
     use super::*;
 
     fn line(mine: bool, text: &str, at: u64) -> MessageLineView {
-        MessageLineView { mine, text: text.into(), at, pending: false, expires: 0, timer: None }
+        MessageLineView { mine, text: text.into(), at, pending: false, expires: 0, timer: None, stamping: false }
     }
 
     fn conv(id: &str, peer: &str, verified: bool, lines: Vec<MessageLineView>) -> ConversationView {
-        ConversationView { id: id.into(), peer: peer.into(), verified, opened_by_me: false, lines, backing: 0.0, request: false, unread: 0, ttl: 0, stamping: false }
+        ConversationView {
+            id: id.into(),
+            peer: peer.into(),
+            verified,
+            opened_by_me: false,
+            lines,
+            backing: 0.0,
+            request: false,
+            unread: 0,
+            ttl: 0,
+            stamping: false,
+            stamp_bits: 0,
+        }
     }
+
+    static STANDARD: PostageView = PostageView { bits: POSTAGE_STANDARD, pending: None, names: Vec::new(), settable: Vec::new() };
 
     fn data(conversations: &[ConversationView]) -> Data<'_> {
         Data {
@@ -1354,6 +1531,7 @@ mod tests {
             inbox_bar: Some(0.0),
             blocked: &[],
             drop_anonymous: false,
+            postage: &STANDARD,
             sealed_busy: false,
             chat_busy: false,
             error: "",
@@ -1471,6 +1649,52 @@ mod tests {
         m.sending = Some(Sending::Thread("aa".into()));
         m.send_failed();
         assert_eq!(m.drafts.get("aa").map(String::as_str), Some("draft"));
+    }
+
+    #[test]
+    fn prices_and_their_work_read_as_people_say_them() {
+        assert_eq!(PRICES.map(|(b, _)| price_label(b)), ["Standard", "Raised", "High", "Very high", "Maximum"].map(String::from));
+        assert_eq!(price_label(30), "30 bits");
+        let names = ["a.mds", "b.mds", "c.mds"].map(String::from);
+        assert_eq!([&names[..0], &names[..1], &names[..2], &names[..]].map(and_list), ["", "a.mds", "a.mds and b.mds", "a.mds, b.mds and c.mds"].map(String::from));
+        assert!(PRICES.windows(2).all(|w| w[1].0 == w[0].0 + 4), "each step sixteen times the last");
+        let said = [0.2, 1.4, 1.6, 44.0, 89.0, 91.0, 600.0, 3_700.0, 5_500.0, 40_000.0, 200_000.0].map(about);
+        let want = [
+            "about a second",
+            "about a second",
+            "about 2 seconds",
+            "about 44 seconds",
+            "about 89 seconds",
+            "about 2 minutes",
+            "about 10 minutes",
+            "about 62 minutes",
+            "about 2 hours",
+            "about 11 hours",
+            "about 2 days",
+        ];
+        assert_eq!(said, want.map(String::from));
+        // The machine's own speed decides the words; the order never changes.
+        assert!(midstate_walletd::stamp_seconds(36) > midstate_walletd::stamp_seconds(24));
+        assert!(stamp_note("bob.mds", POSTAGE_STANDARD).starts_with("Until bob.mds writes back, each message carries a stamp: about"));
+        assert!(stamp_note("bob.mds", 32).starts_with("bob.mds asks strangers more"));
+        assert!(stamp_note("bob.mds", 32).contains("(high)"));
+    }
+
+    #[test]
+    fn a_message_being_stamped_shows_as_one() {
+        let mut slow = line(true, "hello there", 20);
+        slow.stamping = true;
+        let mut c = conv("ab", "bob.mds", true, vec![line(true, "hi", 10), slow.clone()]);
+        c.stamping = true;
+        c.stamp_bits = 32;
+        assert_eq!(stamping(&c), 1);
+        assert_eq!(preview(&c), "Stamping: hello there");
+        assert!(!same_run(&c.lines[0], &slow), "what went and what waits are apart");
+        // An opening being stamped: the key is in hand, it waits on the work.
+        let opening = ConversationView { id: String::new(), opened_by_me: true, ..conv("", "bob.mds", false, vec![slow.clone()]) };
+        assert!(subtitle(&opening).starts_with("Stamping your first message to bob.mds"));
+        let waiting = ConversationView { id: String::new(), opened_by_me: true, ..conv("", "bob.mds", false, vec![MessageLineView { pending: true, ..line(true, "yo", 1) }]) };
+        assert!(subtitle(&waiting).starts_with("Waiting for bob.mds's wallet"));
     }
 
     #[test]

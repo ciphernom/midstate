@@ -24,6 +24,12 @@ pub const BASE_MAINNET_CHAIN_ID: u64 = 8453;
 pub const BASE_MAINNET_RPC: &str = "https://mainnet.base.org";
 /// Deployed V1 `MidstateAtomicSwap` (the address the web wallet uses).
 pub const BASE_MAINNET_CONTRACT: &str = "0x409C52821EC5fE402Ab8b9bdc1474a8cD006f9C7";
+/// USDC on Base (Circle's, native).
+pub const BASE_USDC: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+/// `MidstateTokenSwap` for USDC on Base mainnet. Empty until it is deployed:
+/// USDC trading stays off until a contract is set (here, or in the wallet's
+/// settings).
+pub const BASE_MAINNET_TOKEN_CONTRACT: &str = "0x34214d2F2aE29Bd73a735D63ad5D857cE200B567";
 
 pub fn keccak256(bytes: &[u8]) -> [u8; 32] {
     let mut h = Keccak256::new();
@@ -109,6 +115,14 @@ impl EvmKey {
         Ok(out)
     }
 
+    /// Signs an EIP-2612 permit letting `spender` move `value` of the token
+    /// whose `DOMAIN_SEPARATOR()` is `domain_separator`, at the owner's
+    /// permit `nonce`, until `deadline`.
+    pub fn sign_permit(&self, domain_separator: &[u8; 32], spender: &[u8; 20], value: u128, nonce: u128, deadline: u64) -> Result<Permit> {
+        let (r, s, y) = self.sign_digest(&permit_digest(domain_separator, &self.address, spender, value, nonce, deadline))?;
+        Ok(Permit { deadline, v: 27 + y, r, s })
+    }
+
     /// Sign a 32-byte digest, returning `(r, s, y_parity)`.
     fn sign_digest(&self, digest: &[u8; 32]) -> Result<([u8; 32], [u8; 32], u8)> {
         let (sig, rec): (Signature, RecoveryId) = self
@@ -119,6 +133,30 @@ impl EvmKey {
         let s: [u8; 32] = sig.s().to_bytes().into();
         Ok((r, s, rec.to_byte() & 1))
     }
+}
+
+/// An EIP-2612 permit, signed: an allowance a token takes from a signature,
+/// so paying in costs one transaction rather than an approval and a call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Permit {
+    pub deadline: u64,
+    pub v: u8,
+    pub r: [u8; 32],
+    pub s: [u8; 32],
+}
+
+/// EIP-2612's digest: `keccak256(0x1901 ‖ domain ‖ keccak256(abi.encode(
+/// PERMIT_TYPEHASH, owner, spender, value, nonce, deadline)))`.
+pub fn permit_digest(domain_separator: &[u8; 32], owner: &[u8; 20], spender: &[u8; 20], value: u128, nonce: u128, deadline: u64) -> [u8; 32] {
+    let typehash = keccak256(b"Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)");
+    let mut enc = Vec::with_capacity(6 * 32);
+    for w in [Word::Bytes32(typehash), Word::Address(*owner), Word::Address(*spender), Word::U256(value), Word::U256(nonce), Word::U64(deadline)] {
+        enc.extend_from_slice(&w.encode());
+    }
+    let mut pre = vec![0x19, 0x01];
+    pre.extend_from_slice(domain_separator);
+    pre.extend_from_slice(&keccak256(&enc));
+    keccak256(&pre)
 }
 
 /// EIP-191's digest of a message: `keccak256("\x19Ethereum Signed Message:\n" ‖ len ‖ msg)`.
@@ -378,6 +416,24 @@ mod tests {
         assert_eq!(&call[4 + 32..4 + 32 + 12], &[0u8; 12]);
         assert_eq!(call[4 + 32 + 12], 0xbb);
         assert_eq!(word_u128(&words(&call[4..])[2]), 1_000);
+    }
+
+    #[test]
+    fn a_permit_is_the_one_ethereum_tools_sign() {
+        // From ethers v6's signTypedData: USDC's domain on Base ("USD Coin",
+        // version 2, chain 8453), key 0x07…07.
+        let key = EvmKey::from_secret(&[7; 32]).unwrap();
+        assert_eq!(key.checksum_address(), "0x4a62316623ad457F02cDC5D997deD67a383EC569");
+        let sep: [u8; 32] = hex::decode("02fa7265e7c5d81118673727957699e4d68f74cd74b7db77da710fe8a2c7834f").unwrap().try_into().unwrap();
+        let spender = [0x11; 20];
+        assert_eq!(
+            hex::encode(permit_digest(&sep, &key.address, &spender, 1_234_567, 3, 1_800_000_000)),
+            "919d600b6a78dc379542ba0c192c528b1bd047e92449210df4a0265db61d2f61"
+        );
+        let p = key.sign_permit(&sep, &spender, 1_234_567, 3, 1_800_000_000).unwrap();
+        assert_eq!(hex::encode(p.r), "8a6127509bbf9e7582b9d46d4090d8f78e232878a6eb7e67702843552b23d470");
+        assert_eq!(hex::encode(p.s), "44ada3f00850cc586510c0e7443e1df64f987166e33ac1412fb7bc21e606b5ae");
+        assert_eq!((p.v, p.deadline), (27, 1_800_000_000));
     }
 
     #[test]
