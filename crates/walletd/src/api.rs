@@ -18,6 +18,12 @@ pub struct WalletStatus {
     /// the inbox; `None`: every message does.
     #[serde(default)]
     pub inbox_bar: Option<f64>,
+    /// Names whose sealed messages are dropped unread (`nick.mds`).
+    #[serde(default)]
+    pub blocked: Vec<String>,
+    /// Anonymous senders' sealed messages are dropped unread.
+    #[serde(default)]
+    pub drop_anonymous: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -184,8 +190,8 @@ pub struct MarketView {
 /// A sealed conversation with a name.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConversationView {
-    /// The session's id (hex); empty while the first message waits for the
-    /// recipient's key.
+    /// The session's id (hex); empty while the first messages wait for the
+    /// recipient's key (they are `pending`).
     pub id: String,
     /// `nick.mds`, or empty for an anonymous opener.
     pub peer: String,
@@ -197,9 +203,21 @@ pub struct ConversationView {
     /// Blocks of backing burned for `peer` (MSB-1), when verified.
     #[serde(default)]
     pub backing: f64,
-    /// Below the inbox's bar: a message request, not the inbox.
+    /// Below the inbox's bar, and not accepted: a message request, not the
+    /// inbox.
     #[serde(default)]
     pub request: bool,
+    /// The other side's messages not seen yet (`sealed_read` sees them).
+    #[serde(default)]
+    pub unread: usize,
+    /// The conversation's timer, in seconds: what is sent is deleted from
+    /// both wallets this long after. 0 for none.
+    #[serde(default)]
+    pub ttl: u32,
+    /// What this wallet sends here is stamped (proof of work for the
+    /// recipient), as until the other side has written.
+    #[serde(default)]
+    pub stamping: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -208,6 +226,16 @@ pub struct MessageLineView {
     pub text: String,
     /// Unix seconds.
     pub at: u64,
+    /// Not sent yet: waiting for the recipient's wallet to hand over its key.
+    #[serde(default)]
+    pub pending: bool,
+    /// When its timer deletes it (unix seconds); 0 for never.
+    #[serde(default)]
+    pub expires: u64,
+    /// Not a message: a side set the conversation's timer to this (seconds;
+    /// 0 for none). `mine` says which side.
+    #[serde(default)]
+    pub timer: Option<u32>,
 }
 
 /// Something of this wallet's a name can point its payments at.
@@ -533,6 +561,9 @@ pub struct ChatView {
     /// It carries a sealed message: ciphertext for someone's wallet.
     #[serde(default)]
     pub sealed: bool,
+    /// This node sent it.
+    #[serde(default)]
+    pub mine: bool,
 }
 
 /// Secret material for moving one coin between wallets. Anyone holding these

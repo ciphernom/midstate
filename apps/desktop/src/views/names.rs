@@ -124,7 +124,7 @@ fn find(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
         }
         backing_row(app, ui, &card.name, card.backing.as_ref());
         if card.sealed && ui.small_button("Message…").clicked() {
-            app.sealed_to = card.name.clone();
+            app.msgr.compose_to(&card.name);
             app.tab = crate::app::Tab::Chat;
         }
         // The action this state allows, behind a confirm that says what it spends.

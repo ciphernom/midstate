@@ -54,7 +54,7 @@ impl Tab {
             Tab::Burns => "Burns",
             Tab::History => "History",
             Tab::Coins => "Coins",
-            Tab::Chat => "Chat",
+            Tab::Chat => "Messages",
             Tab::Channels => "Channels",
             Tab::Trade => "Trade",
             Tab::Bonds => "Bonds",
@@ -141,8 +141,6 @@ pub struct App {
     pub doc: Option<crate::views::burns::Doc>,
     pub doc_path: String,
     pub notary: Option<NotaryView>,
-    /// Sealed messages: show the requests rather than the inbox.
-    pub show_requests: bool,
     /// What backs the name in the Send box (MSB-1), once asked.
     pub payee_backing: Option<(String, Option<BackingView>)>,
     /// The name an offer is being made for, and its price (gMDS) and days.
@@ -204,13 +202,11 @@ pub struct App {
     // Chat
     pub chat: Vec<ChatView>,
     pub chat_dict: Vec<String>,
-    pub chat_input: String,
     pub chat_busy: bool,
     pub chat_last_poll: f64,
-    /// Sealed conversations, and the message being written.
+    /// Sealed conversations, newest first, and the messenger showing them.
     pub conversations: Vec<ConversationView>,
-    pub sealed_to: String,
-    pub sealed_text: String,
+    pub msgr: crate::views::chat::Messenger,
     pub sealed_busy: bool,
     /// What a name can point at, of this wallet's (its plans).
     pub name_targets: Vec<PayTargetView>,
@@ -244,7 +240,6 @@ pub struct App {
     pub theme_applied: Option<bool>,
     pub send_unit: usize,
     pub balance_unit: usize,
-    pub dict_filter: String,
     pub ask_peer: String,
     pub ask_pending: bool,
     pub coins_tab: CoinsTab,
@@ -514,7 +509,6 @@ impl App {
             doc: None,
             doc_path: String::new(),
             notary: None,
-            show_requests: false,
             payee_backing: None,
             name_offer: None,
             recv_label: String::new(),
@@ -529,12 +523,10 @@ impl App {
             primer_page: 0,
             chat: Vec::new(),
             chat_dict: Vec::new(),
-            chat_input: String::new(),
             chat_busy: false,
             chat_last_poll: 0.0,
             conversations: Vec::new(),
-            sealed_to: String::new(),
-            sealed_text: String::new(),
+            msgr: Default::default(),
             sealed_busy: false,
             name_targets: Vec::new(),
             channels: Vec::new(),
@@ -554,7 +546,6 @@ impl App {
             theme_applied: None,
             send_unit: 0,
             balance_unit: 3,
-            dict_filter: String::new(),
             ask_peer: String::new(),
             ask_pending: false,
             coins_tab: CoinsTab::Holdings,
@@ -1057,15 +1048,21 @@ impl App {
             }
             Msg::ChatSent => {
                 self.chat_busy = false;
-                self.chat_input.clear();
+                self.msgr.public_sent();
                 self.go(ctx, Action::LoadChat);
             }
             Msg::Chat(v) => self.chat = v,
             Msg::ChatDict(d) => self.chat_dict = d,
             Msg::Conversations(v) => self.conversations = v,
+            Msg::SealedChanged => self.go(ctx, Action::LoadConversations),
+            Msg::SealedSettings => {
+                self.go(ctx, Action::LoadStatus);
+                self.go(ctx, Action::LoadConversations);
+            }
+            Msg::Recipient { name, card } => self.msgr.recipient(name, card),
             Msg::SealedSent => {
                 self.sealed_busy = false;
-                self.sealed_text.clear();
+                self.msgr.sent();
                 self.go(ctx, Action::LoadConversations);
             }
             Msg::NameTargets(v) => self.name_targets = v,
@@ -1337,6 +1334,7 @@ impl App {
                 );
                 if what == "sealed message" {
                     self.sealed_busy = false;
+                    self.msgr.send_failed();
                 }
                 if background {
                     tracing::debug!("{what}: {err}");
@@ -1498,6 +1496,14 @@ impl eframe::App for App {
                 if self.chat_dict.is_empty() {
                     self.go(ctx, Action::LoadChatDict);
                 }
+            }
+        }
+        // Unread messages show on the rail whatever tab is open.
+        if self.tab != Tab::Chat && self.handle.is_some() && unlocked {
+            let t = self.t0.elapsed().as_secs_f64();
+            if t - self.chat_last_poll > 6.0 {
+                self.chat_last_poll = t;
+                self.go(ctx, Action::LoadConversations);
             }
         }
         if self.tab == Tab::Trade && self.handle.is_some() {
@@ -1669,8 +1675,10 @@ impl eframe::App for App {
                     ui.label(RichText::new("STATE").font(theme::font_mono_medium(13.0)).color(theme::ink()));
                 });
                 ui.add_space(14.0);
+                let unread = views::chat::unread(&self.conversations);
                 for t in Tab::ALL {
-                    if ui.selectable_label(self.tab == t, t.name()).clicked() {
+                    let label = if t == Tab::Chat && unread > 0 { format!("{}  {unread}", t.name()) } else { t.name().to_string() };
+                    if ui.selectable_label(self.tab == t, label).clicked() {
                         self.tab = t;
                         self.error.clear();
                     }
@@ -1686,6 +1694,11 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(theme::bg()).inner_margin(egui::Margin::symmetric(28, 20)))
             .show(ctx, |ui| {
+                if self.tab == Tab::Chat {
+                    // A messenger fills the window; its panes scroll on their own.
+                    views::chat::show(self, ui);
+                    return;
+                }
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.set_max_width(880.0);

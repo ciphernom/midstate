@@ -91,6 +91,8 @@ fn fatal_dialog(_title: &str, _body: &str) {
 }
 
 fn main() -> eframe::Result {
+    // Before any thread starts: the only time Unix lets the offset be read.
+    theme::init_local_offset();
     // Same profile rules as the wallet data, so the log lands beside it and
     // MIDSTATE_PROFILE / MIDSTATE_DATA_DIR move both together.
     let log_path = {

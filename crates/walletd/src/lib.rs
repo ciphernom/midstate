@@ -47,6 +47,11 @@ pub use midstate::core::names;
 pub use midstate::core::address_kind;
 /// MSB-1 burns: purposes, subjects and weights, for burn forms.
 pub use midstate::core::burns;
+/// The most a sealed message holds, in bytes.
+pub const SEALED_MAX: usize = midstate::sealed::MAX_BODY;
+/// The timers a sealed conversation can have, in seconds: none, an hour, a
+/// day, a week, four weeks.
+pub const SEALED_TIMERS: [u32; 5] = [0, 3_600, 86_400, 7 * 86_400, 28 * 86_400];
 
 /// A document's hashes for notarizing it (MSB-1): BLAKE3 (`notary`) and
 /// SHA-256 (`notary-sha256`), hex.

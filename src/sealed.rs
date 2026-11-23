@@ -16,7 +16,9 @@
 //!
 //! ```text
 //! opening  = ct (768) ‖ seal(k_open, 0, hello)
-//! hello    = v1 ‖ 0 ‖ name_len ‖ name ‖ identity (32) ‖ sig_len (2) ‖ sig ‖ body_len (2) ‖ body ‖ pad
+//! hello    = v2 ‖ 0 ‖ name_len ‖ name ‖ identity (32) ‖ sig_len (2) ‖ sig ‖ tail
+//! message  = v2 ‖ 1 ‖ tail
+//! tail     = ttl (4) ‖ stamp (8) ‖ body_len (2) ‖ body ‖ pad
 //! k_open   = derive("…open.v1", ss ‖ ct)
 //! sig      = the opener's identity key (MSS) over transcript(recipient's key hash, ct, name, identity)
 //! ```
@@ -41,6 +43,26 @@
 //! Bodies are padded to 32 bytes and capped at [`MAX_BODY`], so a session
 //! message fits one 1,536-byte attachment and an opening two.
 //!
+//! # Stamps
+//!
+//! The chat bus's proof of work is cheap, and pays for the bus. A stamp pays
+//! the recipient: work worth [`STAMP_BITS`] leading zero bits, about a
+//! second of one core, over a key that binds it to one message. An
+//! opening's binds the recipient's key hash and the encapsulation; a session
+//! message's binds the session, its direction and its number. Stamps are
+//! inside the seal, so only the recipient can check one: anyone else
+//! checking it against the names they know would learn who a message is
+//! for. Wallets stamp until the other side has written back, and drop a
+//! stranger's message without one ([`Received::stamp_bits`]).
+//!
+//! # Timers
+//!
+//! Every message carries its sender's timer for the conversation (`ttl`,
+//! seconds; 0 for none). Both wallets delete a message once its timer has
+//! run from when it was sent. The sealed copy on the chat bus stays as long
+//! as nodes keep chat history, and stays readable to whoever holds the
+//! session, as below: a timer is tidiness, not forward secrecy.
+//!
 //! # What this does not do
 //!
 //! No forward secrecy within a session: whoever later learns the recipient's
@@ -63,9 +85,13 @@ pub const KEM_CT_LEN: usize = 768;
 pub const ROUTE_LEN: usize = 16;
 const NONCE_LEN: usize = 24;
 const TAG_LEN: usize = 16;
-const VERSION: u8 = 1;
+/// 2: every message carries a timer and a stamp.
+const VERSION: u8 = 2;
 const KIND_HELLO: u8 = 0;
 const KIND_MESSAGE: u8 = 1;
+/// Leading zero bits a stamp's work needs: about a second of one core
+/// (2^24 BLAKE3 compressions), spread over all of them when it is made.
+pub const STAMP_BITS: u32 = 24;
 /// The longest message body, in bytes.
 pub const MAX_BODY: usize = 750;
 /// Attachments one sealed chat may span.
@@ -92,6 +118,61 @@ pub fn check_public(public: &[u8], expected: &[u8; 32]) -> Result<()> {
     ensure!(public.len() == KEM_PUBLIC_LEN, "a KEM key is {KEM_PUBLIC_LEN} bytes, not {}", public.len());
     ensure!(&kem_hash(public) == expected, "that KEM key is not the one the name publishes");
     encapsulation_key(public).map(|_| ())
+}
+
+// ── Stamps ──────────────────────────────────────────────────────────────────
+
+/// The key an opening's stamp is worked under: its recipient's key hash and
+/// its encapsulation, so the stamp can be neither moved nor reused.
+fn opening_stamp_key(recipient_hash: &[u8; 32], ct: &[u8]) -> [u8; 32] {
+    derive("midstate.sealed.stamp-open.v1", &[recipient_hash, ct])
+}
+
+/// A session message's: the session, the direction (from its opener or to
+/// it) and the message's number.
+fn message_stamp_key(id: &[u8; 32], from_opener: bool, n: u64) -> [u8; 32] {
+    derive("midstate.sealed.stamp-msg.v1", &[id, &[u8::from(from_opener)], &n.to_le_bytes()])
+}
+
+/// The leading zero bits of a stamp's work under `key`.
+pub fn stamp_bits(key: &[u8; 32], nonce: u64) -> u32 {
+    let h = blake3::keyed_hash(key, &nonce.to_le_bytes());
+    u64::from_be_bytes(h.as_bytes()[..8].try_into().expect("8 bytes")).leading_zeros()
+}
+
+/// A nonce whose work under `key` shows `bits`, found on every core. Zero
+/// bits asks for none: the nonce is 0, and carries what work it happens to.
+pub fn mine_stamp(key: &[u8; 32], bits: u32) -> u64 {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    if bits == 0 {
+        return 0;
+    }
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(16) as u64;
+    let start = rand::random::<u64>() >> 1;
+    let (done, found) = (AtomicBool::new(false), AtomicU64::new(0));
+    std::thread::scope(|s| {
+        for t in 0..threads {
+            let (done, found) = (&done, &found);
+            s.spawn(move || {
+                let mut nonce = start.wrapping_add(t);
+                loop {
+                    for _ in 0..4096 {
+                        if stamp_bits(key, nonce) >= bits {
+                            if !done.swap(true, Ordering::AcqRel) {
+                                found.store(nonce, Ordering::Release);
+                            }
+                            return;
+                        }
+                        nonce = nonce.wrapping_add(threads);
+                    }
+                    if done.load(Ordering::Acquire) {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    found.load(Ordering::Acquire)
 }
 
 fn encapsulation_key(public: &[u8]) -> Result<EncapsulationKey<MlKem512>> {
@@ -196,15 +277,18 @@ impl Session {
         derive("midstate.sealed.route.v1", &[key, &n.to_le_bytes()])[..ROUTE_LEN].try_into().unwrap()
     }
 
-    /// Seals `body` as this side's next message.
-    pub fn seal(&mut self, body: &[u8]) -> Result<Vec<u8>> {
+    /// Seals `body` as this side's next message, under this side's timer
+    /// `ttl` (seconds; 0 for none), with a stamp worth `stamp` bits (0 for
+    /// none). An empty body says only the timer.
+    pub fn seal(&mut self, body: &[u8], ttl: u32, stamp: u32) -> Result<Vec<u8>> {
         let n = self.sent;
         let route = Self::route(&self.send_key, n);
+        let work = mine_stamp(&message_stamp_key(&self.id, self.opener, n), stamp);
         let nonce: [u8; NONCE_LEN] = rand::random();
         let mut aad = route.to_vec();
         aad.extend_from_slice(&n.to_le_bytes());
         let ct = XChaCha20Poly1305::new(Key::from_slice(&self.send_key))
-            .encrypt(XNonce::from_slice(&nonce), Payload { msg: &plaintext(KIND_MESSAGE, &[], body)?, aad: &aad })
+            .encrypt(XNonce::from_slice(&nonce), Payload { msg: &plaintext(KIND_MESSAGE, &[], ttl, work, body)?, aad: &aad })
             .map_err(|_| anyhow!("sealing failed"))?;
         self.sent += 1;
         Ok([&route[..], &nonce, &ct].concat())
@@ -216,7 +300,7 @@ impl Session {
     }
 
     /// Opens the other side's message `n` (its route matched), or `None`.
-    pub fn open(&mut self, n: u64, bytes: &[u8]) -> Option<Vec<u8>> {
+    pub fn open(&mut self, n: u64, bytes: &[u8]) -> Option<Received> {
         if bytes.len() < ROUTE_LEN + NONCE_LEN + TAG_LEN || bytes[..ROUTE_LEN] != Self::route(&self.recv_key, n) || self.opened.contains(&n) {
             return None;
         }
@@ -226,33 +310,57 @@ impl Session {
         let plain = XChaCha20Poly1305::new(Key::from_slice(&self.recv_key))
             .decrypt(XNonce::from_slice(nonce), Payload { msg: &bytes[ROUTE_LEN + NONCE_LEN..], aad: &aad })
             .ok()?;
-        let (kind, _, body) = parse_plaintext(&plain)?;
-        (kind == KIND_MESSAGE).then(|| {
+        let p = parse_plaintext(&plain)?;
+        (p.kind == KIND_MESSAGE).then(|| {
             self.received = self.received.max(n);
             self.opened.push(n);
             let keep = (2 * WINDOW + 1) as usize;
             if self.opened.len() > keep {
                 self.opened.drain(..self.opened.len() - keep);
             }
-            body
+            let stamp_bits = stamp_bits(&message_stamp_key(&self.id, !self.opener, n), p.stamp);
+            Received { body: p.body, ttl: p.ttl, stamp_bits }
         })
     }
 }
 
-/// `v ‖ kind ‖ head ‖ body_len (2) ‖ body`, padded with zeros to 32 bytes.
-fn plaintext(kind: u8, head: &[u8], body: &[u8]) -> Result<Vec<u8>> {
+/// A message the other side sent in a session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Received {
+    /// Empty: a message that says only its timer.
+    pub body: Vec<u8>,
+    /// The sender's timer for the conversation, in seconds; 0 for none.
+    pub ttl: u32,
+    /// The work its stamp shows, in leading zero bits.
+    pub stamp_bits: u32,
+}
+
+/// `v ‖ kind ‖ head ‖ ttl (4) ‖ stamp (8) ‖ body_len (2) ‖ body`, padded
+/// with zeros to 32 bytes.
+fn plaintext(kind: u8, head: &[u8], ttl: u32, stamp: u64, body: &[u8]) -> Result<Vec<u8>> {
     ensure!(body.len() <= MAX_BODY, "a message holds at most {MAX_BODY} bytes");
     let mut p = vec![VERSION, kind];
     p.extend_from_slice(head);
+    p.extend_from_slice(&ttl.to_le_bytes());
+    p.extend_from_slice(&stamp.to_le_bytes());
     p.extend_from_slice(&(body.len() as u16).to_le_bytes());
     p.extend_from_slice(body);
     p.resize(p.len().div_ceil(32) * 32, 0);
     Ok(p)
 }
 
-/// The kind, the hello's head (empty for a message) and the body.
-fn parse_plaintext(p: &[u8]) -> Option<(u8, Option<(String, [u8; 32], Vec<u8>)>, Vec<u8>)> {
-    if p.len() < 4 || p[0] != VERSION {
+/// A plaintext, read: its kind, a hello's head (`None` for a message),
+/// and the tail every message has.
+struct Plain {
+    kind: u8,
+    head: Option<(String, [u8; 32], Vec<u8>)>,
+    ttl: u32,
+    stamp: u64,
+    body: Vec<u8>,
+}
+
+fn parse_plaintext(p: &[u8]) -> Option<Plain> {
+    if p.len() < 16 || p[0] != VERSION {
         return None;
     }
     let mut i = 2;
@@ -269,13 +377,16 @@ fn parse_plaintext(p: &[u8]) -> Option<(u8, Option<(String, [u8; 32], Vec<u8>)>,
     } else {
         None
     };
+    let ttl = u32::from_le_bytes(p.get(i..i + 4)?.try_into().ok()?);
+    let stamp = u64::from_le_bytes(p.get(i + 4..i + 12)?.try_into().ok()?);
+    i += 12;
     let b = u16::from_le_bytes(p.get(i..i + 2)?.try_into().ok()?) as usize;
     if b > MAX_BODY {
         return None;
     }
     let body = p.get(i + 2..i + 2 + b)?.to_vec();
     // The padding is zeros: anything else is not ours.
-    p[i + 2 + b..].iter().all(|x| *x == 0).then_some((p[1], head, body))
+    p[i + 2 + b..].iter().all(|x| *x == 0).then_some(Plain { kind: p[1], head, ttl, stamp, body })
 }
 
 /// How the opener says who it is: its name, the identity key the name's
@@ -288,8 +399,9 @@ pub struct OpenAs<'a> {
 
 /// Opens a session with the holder of `recipient_public` (checked against
 /// `recipient_hash`, the name's `kem` record), carrying `body` as its first
-/// message. Returns the opening's bytes and this side's session.
-pub fn open_session(recipient_public: &[u8], recipient_hash: &[u8; 32], me: Option<OpenAs>, body: &[u8]) -> Result<(Vec<u8>, Session)> {
+/// message, under the timer `ttl`, stamped with `stamp` bits of work.
+/// Returns the opening's bytes and this side's session.
+pub fn open_session(recipient_public: &[u8], recipient_hash: &[u8; 32], me: Option<OpenAs>, body: &[u8], ttl: u32, stamp: u32) -> Result<(Vec<u8>, Session)> {
     check_public(recipient_public, recipient_hash)?;
     let ek = encapsulation_key(recipient_public)?;
     let m: [u8; 32] = rand::random();
@@ -309,9 +421,10 @@ pub fn open_session(recipient_public: &[u8], recipient_hash: &[u8; 32], me: Opti
             h
         }
     };
+    let work = mine_stamp(&opening_stamp_key(recipient_hash, &ct), stamp);
     let k = derive("midstate.sealed.open.v1", &[&ss, &ct]);
     let sealed = XChaCha20Poly1305::new(Key::from_slice(&k))
-        .encrypt(XNonce::from_slice(&[0; NONCE_LEN]), Payload { msg: &plaintext(KIND_HELLO, &head, body)?, aad: &ct })
+        .encrypt(XNonce::from_slice(&[0; NONCE_LEN]), Payload { msg: &plaintext(KIND_HELLO, &head, ttl, work, body)?, aad: &ct })
         .map_err(|_| anyhow!("sealing failed"))?;
     let opening = [ct.as_slice(), &sealed].concat();
     ensure!(opening.len() <= MAX_ENCRYPTED_MESSAGE_SIZE * MAX_ATTACHMENTS, "opening too large");
@@ -324,6 +437,10 @@ pub struct Opened {
     pub session: Session,
     pub sender: Sender,
     pub body: Vec<u8>,
+    /// The opener's timer, in seconds; 0 for none.
+    pub ttl: u32,
+    /// The work the opening's stamp shows, in leading zero bits.
+    pub stamp_bits: u32,
 }
 
 /// Tries `bytes` as an opening to `keys`: `None` unless it is one, sealed to
@@ -337,15 +454,17 @@ pub fn try_open(keys: &KemKeys, bytes: &[u8]) -> Option<Opened> {
     let ss = keys.dk.decapsulate_slice(ct).ok()?.to_vec();
     let k = derive("midstate.sealed.open.v1", &[&ss, ct]);
     let plain = XChaCha20Poly1305::new(Key::from_slice(&k)).decrypt(XNonce::from_slice(&[0; NONCE_LEN]), Payload { msg: sealed, aad: ct }).ok()?;
-    let (kind, head, body) = parse_plaintext(&plain)?;
-    let (name, identity, signature) = head.filter(|_| kind == KIND_HELLO)?;
+    let p = parse_plaintext(&plain)?;
+    let (name, identity, signature) = p.head.filter(|_| p.kind == KIND_HELLO)?;
+    let mine = keys.public_hash();
     let sender = if name.is_empty() {
         Sender::Anonymous
     } else {
-        let transcript = transcript(&keys.public_hash(), ct, &name, &identity);
+        let transcript = transcript(&mine, ct, &name, &identity);
         Sender::Named { name, identity, signature, transcript }
     };
-    Some(Opened { session: Session::new(&ss, ct, false), sender, body })
+    let stamp_bits = stamp_bits(&opening_stamp_key(&mine, ct), p.stamp);
+    Some(Opened { session: Session::new(&ss, ct, false), sender, body: p.body, ttl: p.ttl, stamp_bits })
 }
 
 /// The attachments that carry `envelope` (an opening or a message).
@@ -390,7 +509,7 @@ mod tests {
 
         let mut alice_id = mss::keygen(&[1; 32], 4).unwrap();
         let alice_identity = alice_id.public_key();
-        let (opening, mut alice) = open_session(&bob.public(), &bob.public_hash(), Some(named("alice", &mut alice_id)), b"hello bob").unwrap();
+        let (opening, mut alice) = open_session(&bob.public(), &bob.public_hash(), Some(named("alice", &mut alice_id)), b"hello bob", 0, 0).unwrap();
         assert_eq!(alice_id.remaining(), 15, "one signature for the session");
 
         let atts = attachments(&opening).unwrap();
@@ -408,45 +527,88 @@ mod tests {
         assert_eq!(bob_side.id, alice.id);
 
         // Both ways, and only the other side's routes open.
-        let m1 = alice.seal(b"how are you").unwrap();
+        let m1 = alice.seal(b"how are you", 0, 0).unwrap();
         assert_eq!(attachments(&m1).unwrap().len(), 1);
         let (route, n) = bob_side.expects().find(|(r, _)| m1[..ROUTE_LEN] == r[..]).expect("bob expects it");
         assert_eq!(n, 1);
-        assert_eq!(bob_side.open(n, &m1).unwrap(), b"how are you");
+        assert_eq!(bob_side.open(n, &m1).unwrap().body, b"how are you");
         assert!(bob_side.open(n, &m1).is_none(), "a replay is not read twice");
         assert!(alice.open(1, &m1).is_none(), "not alice's own direction");
-        let r1 = bob_side.seal(b"fine").unwrap();
+        let r1 = bob_side.seal(b"fine", 0, 0).unwrap();
         let (_, n) = alice.expects().find(|(r, _)| r1[..ROUTE_LEN] == r[..]).unwrap();
-        assert_eq!(alice.open(n, &r1).unwrap(), b"fine");
+        assert_eq!(alice.open(n, &r1).unwrap().body, b"fine");
         let _ = route;
 
         // Tampering breaks the seal; routes do not repeat.
-        let mut bad = alice.seal(b"x").unwrap();
+        let mut bad = alice.seal(b"x", 0, 0).unwrap();
         let last = bad.len() - 1;
         bad[last] ^= 1;
         assert!(bob_side.open(2, &bad).is_none());
-        let m3 = alice.seal(b"y").unwrap();
+        let m3 = alice.seal(b"y", 0, 0).unwrap();
         assert_ne!(m3[..ROUTE_LEN], m1[..ROUTE_LEN]);
-        assert_eq!(bob_side.open(3, &m3).unwrap(), b"y", "a lost message does not stop the next");
+        assert_eq!(bob_side.open(3, &m3).unwrap().body, b"y", "a lost message does not stop the next");
     }
 
     #[test]
     fn anonymous_openings_and_limits() {
         let bob = KemKeys::from_secret(&[2; 32]);
-        let (opening, _) = open_session(&bob.public(), &bob.public_hash(), None, &[7; MAX_BODY]).unwrap();
+        let (opening, _) = open_session(&bob.public(), &bob.public_hash(), None, &[7; MAX_BODY], 0, 0).unwrap();
         assert_eq!(attachments(&opening).unwrap().len(), 2);
         let o = try_open(&bob, &opening).unwrap();
         assert_eq!((o.sender.clone(), o.body.len()), (Sender::Anonymous, MAX_BODY));
         assert!(!o.sender.verify(Some([0; 32])));
-        assert!(open_session(&bob.public(), &bob.public_hash(), None, &[7; MAX_BODY + 1]).is_err());
+        assert!(open_session(&bob.public(), &bob.public_hash(), None, &[7; MAX_BODY + 1], 0, 0).is_err());
         // The handshake's key must be the one the name publishes.
         let other = KemKeys::from_secret(&[4; 32]);
-        assert!(open_session(&other.public(), &bob.public_hash(), None, b"hi").is_err());
+        assert!(open_session(&other.public(), &bob.public_hash(), None, b"hi", 0, 0).is_err());
         assert!(check_public(&bob.public()[1..], &bob.public_hash()).is_err());
         // A plain session message fits one attachment at the largest body.
-        let (_, mut s) = open_session(&bob.public(), &bob.public_hash(), None, b"").unwrap();
-        assert!(s.seal(&[1; MAX_BODY]).unwrap().len() <= MAX_ENCRYPTED_MESSAGE_SIZE);
+        let (_, mut s) = open_session(&bob.public(), &bob.public_hash(), None, b"", 0, 0).unwrap();
+        assert!(s.seal(&[1; MAX_BODY], u32::MAX, 0).unwrap().len() <= MAX_ENCRYPTED_MESSAGE_SIZE);
         assert!(envelope(&[ChatAttachment::Address([1; 32])]).is_none());
+    }
+
+    #[test]
+    fn stamps_show_their_work_to_the_recipient_and_bind_one_message() {
+        const BITS: u32 = 14;
+        let bob = KemKeys::from_secret(&[2; 32]);
+        let (opening, mut alice) = open_session(&bob.public(), &bob.public_hash(), None, b"hi", 0, BITS).unwrap();
+        let o = try_open(&bob, &opening).unwrap();
+        assert!(o.stamp_bits >= BITS, "the opening's stamp shows its work to bob");
+        let (bare, _) = open_session(&bob.public(), &bob.public_hash(), None, b"hi", 0, 0).unwrap();
+        assert!(try_open(&bob, &bare).unwrap().stamp_bits < BITS, "an unstamped opening shows next to none");
+        // A stamp is good for its own key only: another recipient, another
+        // encapsulation, another message.
+        let key = opening_stamp_key(&bob.public_hash(), &opening[..KEM_CT_LEN]);
+        let nonce = mine_stamp(&key, BITS);
+        assert!(stamp_bits(&key, nonce) >= BITS);
+        assert!(stamp_bits(&opening_stamp_key(&[9; 32], &opening[..KEM_CT_LEN]), nonce) < BITS);
+        assert!(stamp_bits(&opening_stamp_key(&bob.public_hash(), &bare[..KEM_CT_LEN]), nonce) < BITS);
+        assert_eq!(mine_stamp(&key, 0), 0, "no work asked, none done");
+
+        // In a session: per direction and number.
+        let mut bob_side = o.session;
+        let stamped = alice.seal(b"one", 0, BITS).unwrap();
+        let plain = alice.seal(b"two", 0, 0).unwrap();
+        assert!(bob_side.open(1, &stamped).unwrap().stamp_bits >= BITS);
+        assert!(bob_side.open(2, &plain).unwrap().stamp_bits < BITS);
+        let back = bob_side.seal(b"back", 0, BITS).unwrap();
+        assert!(alice.open(1, &back).unwrap().stamp_bits >= BITS, "the other way too");
+    }
+
+    #[test]
+    fn every_message_carries_its_senders_timer() {
+        let bob = KemKeys::from_secret(&[2; 32]);
+        let (opening, mut alice) = open_session(&bob.public(), &bob.public_hash(), None, b"hi", 3_600, 0).unwrap();
+        let o = try_open(&bob, &opening).unwrap();
+        assert_eq!(o.ttl, 3_600);
+        let mut bob_side = o.session;
+        // A message with no body says only the timer: here, a day.
+        let set = alice.seal(b"", 86_400, 0).unwrap();
+        let got = bob_side.open(1, &set).unwrap();
+        assert_eq!((got.body.len(), got.ttl), (0, 86_400));
+        let off = bob_side.seal(b"ok", 0, 0).unwrap();
+        assert_eq!(alice.open(1, &off).unwrap().ttl, 0);
     }
 
     #[test]
@@ -454,10 +616,10 @@ mod tests {
         let bob = KemKeys::from_secret(&[2; 32]);
         let mut id = mss::keygen(&[1; 32], 4).unwrap();
         let pk = id.public_key();
-        let (opening, _) = open_session(&bob.public(), &bob.public_hash(), Some(named("alice", &mut id)), b"hi").unwrap();
+        let (opening, _) = open_session(&bob.public(), &bob.public_hash(), Some(named("alice", &mut id)), b"hi", 0, 0).unwrap();
         let Sender::Named { signature, .. } = try_open(&bob, &opening).unwrap().sender else { panic!() };
         // The same signature under another encapsulation fails: it signed the ct.
-        let (other, _) = open_session(&bob.public(), &bob.public_hash(), None, b"hi").unwrap();
+        let (other, _) = open_session(&bob.public(), &bob.public_hash(), None, b"hi", 0, 0).unwrap();
         let t = transcript(&bob.public_hash(), &other[..KEM_CT_LEN], "alice", &pk);
         let forged = Sender::Named { name: "alice".into(), identity: pk, signature, transcript: t };
         assert!(!forged.verify(Some(pk)));

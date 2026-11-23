@@ -366,6 +366,11 @@ pub struct TipUtxoProof {
 }
 
 impl NodeHandle {
+    /// This node's peer id: the sender of the chat messages it mines.
+    pub fn local_peer_id(&self) -> PeerId {
+        self.local_peer_id
+    }
+
     pub async fn get_state(&self) -> State {
         self.state.read().await.clone()
     }

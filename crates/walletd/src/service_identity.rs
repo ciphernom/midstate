@@ -16,6 +16,15 @@
 //! attachments: every wallet trial-decrypts every one, and keeps the
 //! sessions it opened or was opened into in `<wallet>.messages.json`.
 //!
+//! Strangers pay to be heard. Until this wallet answers or accepts a
+//! conversation, a message in it without a stamp ([`sealed::STAMP_BITS`])
+//! is dropped, and this wallet stamps what it sends until the other side
+//! answers. A message request keeps at most [`REQUEST_LINES`] messages and
+//! raises no notice; requests are kept to [`REQUESTS_MAX`], and go after
+//! [`REQUEST_AGE`] unanswered. Blocked names, and anonymous senders if the
+//! user says so, are dropped unread. Conversations can have a timer: both
+//! wallets delete a message once it has run.
+//!
 //! A child of `service`, sharing the actor's state, as `service_names` is.
 
 use super::{now_secs, Service};
@@ -26,7 +35,7 @@ use midstate::core::channel::wire as w;
 use midstate::core::names::{self, Rec};
 use midstate::sealed::{self, KemKeys, Sender, Session};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
@@ -42,6 +51,14 @@ const KEM_ANSWERS_PER_BLOCK: usize = 8;
 const KEM_RETRY: u64 = 3;
 /// Messages waiting for a recipient's key give up after this many seconds.
 const OUTBOX_PATIENCE: u64 = 15 * 60;
+/// Messages a request keeps from its sender until it is accepted.
+pub const REQUEST_LINES: usize = 3;
+/// Requests kept at most: past this, the one quiet longest goes.
+pub const REQUESTS_MAX: usize = 100;
+/// A request quiet this long goes when room is needed (seconds).
+pub const REQUEST_AGE: u64 = 30 * 86_400;
+// The timers a conversation can have.
+use crate::SEALED_TIMERS as TIMERS;
 
 /// A payment to a name, waiting for the name's wallet to hand over a fresh
 /// address. Not persisted: whoever asked is waiting on `resp`.
@@ -66,6 +83,67 @@ pub(super) struct Conversation {
     pub verified: bool,
     pub lines: Vec<Line>,
     pub started: u64,
+    /// Lines its user has seen: `lines[..read]`. A book saved before there
+    /// was a mark loads as all read.
+    #[serde(default = "all_read")]
+    pub read: usize,
+    /// Its user took it out of Requests, by replying or accepting it: the
+    /// other side's messages need no stamp from now on.
+    #[serde(default)]
+    pub accepted: bool,
+    /// The other side has written: this wallet's messages need no stamp.
+    #[serde(default)]
+    pub heard: bool,
+    /// The timer messages here carry, in seconds; 0 for none.
+    #[serde(default)]
+    pub ttl: u32,
+}
+
+fn all_read() -> usize {
+    usize::MAX
+}
+
+impl Conversation {
+    /// The other side's messages its user has not seen.
+    pub fn unread(&self) -> usize {
+        self.lines.iter().skip(self.read).filter(|l| !l.mine && l.timer.is_none()).count()
+    }
+
+    /// The bits of stamp this wallet's next message here needs.
+    fn stamp(&self) -> u32 {
+        if self.heard {
+            0
+        } else {
+            sealed::STAMP_BITS
+        }
+    }
+
+    /// Lines whose timer has run are deleted; the read mark keeps its place.
+    /// Whether any went.
+    fn prune(&mut self, now: u64) -> bool {
+        let before = self.lines.len();
+        let mut read = self.read;
+        let mut i = 0;
+        self.lines.retain(|l| {
+            let keep = !l.expired(now);
+            if !keep && i < self.read {
+                read -= 1;
+            }
+            i += 1;
+            keep
+        });
+        self.read = read;
+        self.lines.len() != before
+    }
+
+    /// When it last moved, for ordering conversations.
+    fn last(&self) -> u64 {
+        self.lines.last().map_or(self.started, |l| l.at)
+    }
+
+    fn id_hex(&self) -> String {
+        hex::encode(self.session.id)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -73,6 +151,26 @@ pub(super) struct Line {
     pub mine: bool,
     pub text: String,
     pub at: u64,
+    /// Its timer, in seconds: deleted `ttl` after `at`. 0 for never.
+    #[serde(default)]
+    pub ttl: u32,
+    /// Not a message: a side set the conversation's timer to this.
+    #[serde(default)]
+    pub timer: Option<u32>,
+}
+
+impl Line {
+    fn said(mine: bool, text: &str, at: u64, ttl: u32) -> Self {
+        Line { mine, text: text.to_string(), at, ttl, timer: None }
+    }
+
+    fn timer_set(mine: bool, ttl: u32, at: u64) -> Self {
+        Line { mine, text: String::new(), at, ttl: 0, timer: Some(ttl) }
+    }
+
+    fn expired(&self, now: u64) -> bool {
+        self.ttl > 0 && self.at.saturating_add(u64::from(self.ttl)) <= now
+    }
 }
 
 /// A message waiting for its recipient's KEM key.
@@ -108,6 +206,13 @@ pub(super) struct SealedBook {
     /// before there was a bar, take verified names only (`Some(0.0)`).
     #[serde(default = "verified_names")]
     pub inbox_bar: Option<f64>,
+    /// Names whose messages are dropped unread (canonical, no suffix).
+    #[serde(default)]
+    pub blocked: Vec<String>,
+    /// Drop anonymous senders' messages unread, rather than show them as
+    /// requests.
+    #[serde(default)]
+    pub drop_anonymous: bool,
 }
 
 /// The inbox's bar until its user picks another: verified names, so a
@@ -126,6 +231,8 @@ impl Default for SealedBook {
             seen: VecDeque::new(),
             legacy_secret: None,
             inbox_bar: verified_names(),
+            blocked: Vec::new(),
+            drop_anonymous: false,
         }
     }
 }
@@ -135,7 +242,13 @@ impl SealedBook {
         wallet_path.with_extension("messages.json")
     }
     pub fn load(wallet_path: &Path) -> Self {
-        std::fs::read(Self::path(wallet_path)).ok().and_then(|raw| serde_json::from_slice(&raw).ok()).unwrap_or_default()
+        let mut book: Self = std::fs::read(Self::path(wallet_path)).ok().and_then(|raw| serde_json::from_slice(&raw).ok()).unwrap_or_default();
+        for c in &mut book.chats {
+            c.read = c.read.min(c.lines.len());
+            // The other side wrote first, or has written.
+            c.heard |= !c.session.opener || c.lines.iter().any(|l| !l.mine);
+        }
+        book
     }
     pub fn save(&self, wallet_path: &Path) {
         let path = Self::path(wallet_path);
@@ -154,6 +267,92 @@ impl SealedBook {
             self.seen.pop_front();
         }
         true
+    }
+
+    /// The conversation whose session id is `id` (hex).
+    fn find(&self, id: &str) -> Option<usize> {
+        self.chats.iter().position(|c| c.id_hex() == id)
+    }
+
+    /// Conversation `id` has been seen up to its last line. False if there
+    /// is no such conversation or nothing was unseen.
+    fn mark_read(&mut self, id: &str) -> bool {
+        let Some(i) = self.find(id) else { return false };
+        let c = &mut self.chats[i];
+        let changed = c.read != c.lines.len();
+        c.read = c.lines.len();
+        changed
+    }
+
+    /// Takes conversation `id` out of Requests.
+    fn accept(&mut self, id: &str) -> Result<()> {
+        let i = self.find(id).ok_or_else(|| anyhow!("no such conversation"))?;
+        self.chats[i].accepted = true;
+        Ok(())
+    }
+
+    /// Forgets conversation `id`, its session too: what the other side sends
+    /// in it later is never read. Messages from a new session still come.
+    fn delete(&mut self, id: &str) -> Result<()> {
+        let i = self.find(id).ok_or_else(|| anyhow!("no such conversation"))?;
+        self.chats.remove(i);
+        Ok(())
+    }
+
+    /// Whether messages from `peer` (a name, without its suffix) are dropped.
+    fn is_blocked(&self, peer: &str) -> bool {
+        !peer.is_empty() && self.blocked.iter().any(|b| b == peer)
+    }
+
+    /// Blocks `name`: its conversations go, and what waits for it, and
+    /// nothing it sends is read until it is unblocked.
+    fn block(&mut self, name: &str) {
+        if !self.is_blocked(name) {
+            self.blocked.push(name.to_string());
+        }
+        self.chats.retain(|c| c.peer != name);
+        self.outbox.retain(|q| q.to != name);
+    }
+
+    fn unblock(&mut self, name: &str) -> bool {
+        let before = self.blocked.len();
+        self.blocked.retain(|b| b != name);
+        self.blocked.len() != before
+    }
+
+    /// Makes room for one more request: requests (their session ids in
+    /// `requests`) quiet for [`REQUEST_AGE`] go, then the quietest while
+    /// `max` are held.
+    fn make_room(&mut self, now: u64, requests: &HashSet<[u8; 32]>, max: usize) {
+        let is_request = |c: &Conversation| requests.contains(&c.session.id);
+        self.chats.retain(|c| !(is_request(c) && c.last().saturating_add(REQUEST_AGE) < now));
+        loop {
+            let held: Vec<usize> = (0..self.chats.len()).filter(|&i| is_request(&self.chats[i])).collect();
+            if held.len() < max {
+                return;
+            }
+            let quietest = *held.iter().min_by_key(|&&i| self.chats[i].last()).expect("not empty");
+            self.chats.remove(quietest);
+        }
+    }
+
+    /// Drops the messages waiting for `to`'s key; how many.
+    fn cancel(&mut self, to: &str) -> usize {
+        let before = self.outbox.len();
+        self.outbox.retain(|q| q.to != to);
+        before - self.outbox.len()
+    }
+
+    /// The messages waiting for a key, by name, in the order first queued.
+    fn waiting(&self) -> Vec<(String, Vec<&Queued>)> {
+        let mut out: Vec<(String, Vec<&Queued>)> = Vec::new();
+        for q in &self.outbox {
+            match out.iter_mut().find(|(n, _)| *n == q.to) {
+                Some((_, v)) => v.push(q),
+                None => out.push((q.to.clone(), vec![q])),
+            }
+        }
+        out
     }
 }
 
@@ -392,24 +591,146 @@ impl Service {
             bail!("wallet is locked");
         }
         let name = names::normalize(to)?;
-        let text = text.trim();
-        if text.is_empty() {
-            bail!("nothing to send");
+        if self.ident.book.is_blocked(&name) {
+            bail!("you blocked {name}{}: unblock it to write to it", names::SUFFIX);
         }
-        if text.len() > sealed::MAX_BODY {
-            bail!("a message holds at most {} bytes", sealed::MAX_BODY);
-        }
+        let text = checked_text(text)?;
         if let Some(i) = self.ident.book.chats.iter().rposition(|c| c.peer == name && c.verified) {
-            let bytes = self.ident.book.chats[i].session.seal(text.as_bytes())?;
-            self.node.send_chat(vec![], None, sealed::attachments(&bytes)?)?;
-            self.ident.book.chats[i].lines.push(Line { mine: true, text: text.to_string(), at: now_secs() });
-            self.sealed_save();
-            let _ = self.events.send(WalletEvent::WalletChanged);
-            return Ok(());
+            return self.seal_in(i, text);
         }
         self.ident.book.outbox.push(Queued { to: name.clone(), text: text.to_string(), queued: now_secs() });
         self.sealed_save();
         self.flush_outbox(&name).await;
+        Ok(())
+    }
+
+    /// Send `body` in conversation `i`'s own session, under its timer, and
+    /// stamped until the other side has written. Writing in a conversation
+    /// is reading it, and takes it out of Requests. An empty body says only
+    /// the timer.
+    fn seal_in(&mut self, i: usize, text: &str) -> Result<()> {
+        let (ttl, stamp) = (self.ident.book.chats[i].ttl, self.ident.book.chats[i].stamp());
+        let bytes = self.ident.book.chats[i].session.seal(text.as_bytes(), ttl, stamp)?;
+        self.node.send_chat(vec![], None, sealed::attachments(&bytes)?)?;
+        let c = &mut self.ident.book.chats[i];
+        c.lines.push(Line::said(true, text, now_secs(), ttl));
+        c.read = c.lines.len();
+        c.accepted = true;
+        self.sealed_save();
+        let _ = self.events.send(WalletEvent::WalletChanged);
+        Ok(())
+    }
+
+    /// Reply in conversation `id` (its session id, hex), to whoever is on
+    /// the other side of it: a verified name, a name the opener claimed but
+    /// that did not check out, or an anonymous opener. Only they can read it.
+    pub(super) fn reply_sealed(&mut self, id: &str, text: &str) -> Result<()> {
+        if self.wallet.is_none() {
+            bail!("wallet is locked");
+        }
+        let text = checked_text(text)?;
+        let i = self.ident.book.find(id).ok_or_else(|| anyhow!("no such conversation"))?;
+        self.seal_in(i, text)
+    }
+
+    /// Set conversation `id`'s timer (one of [`TIMERS`]): what is sent from
+    /// now on, by either side, is deleted from both wallets `ttl` seconds
+    /// after it was sent. The other side's wallet learns it from a message
+    /// that says only that.
+    pub(super) fn set_timer(&mut self, id: &str, ttl: u32) -> Result<()> {
+        if self.wallet.is_none() {
+            bail!("wallet is locked");
+        }
+        if !TIMERS.contains(&ttl) {
+            bail!("a timer is none, an hour, a day, a week or four weeks");
+        }
+        let i = self.ident.book.find(id).ok_or_else(|| anyhow!("no such conversation"))?;
+        if self.ident.book.chats[i].ttl == ttl {
+            return Ok(());
+        }
+        let stamp = self.ident.book.chats[i].stamp();
+        let bytes = self.ident.book.chats[i].session.seal(b"", ttl, stamp)?;
+        self.node.send_chat(vec![], None, sealed::attachments(&bytes)?)?;
+        let c = &mut self.ident.book.chats[i];
+        c.ttl = ttl;
+        c.lines.push(Line::timer_set(true, ttl, now_secs()));
+        c.read = c.lines.len();
+        self.sealed_save();
+        let _ = self.events.send(WalletEvent::WalletChanged);
+        Ok(())
+    }
+
+    /// Its user has seen conversation `id`.
+    pub(super) fn read_sealed(&mut self, id: &str) {
+        if self.ident.book.mark_read(id) {
+            self.sealed_save();
+        }
+    }
+
+    /// Take conversation `id` out of Requests.
+    pub(super) fn accept_sealed(&mut self, id: &str) -> Result<()> {
+        self.ident.book.accept(id)?;
+        self.sealed_save();
+        Ok(())
+    }
+
+    /// Forget conversation `id`.
+    pub(super) fn delete_sealed(&mut self, id: &str) -> Result<()> {
+        self.ident.book.delete(id)?;
+        self.sealed_save();
+        Ok(())
+    }
+
+    /// Block whoever is on the other side of conversation `id`. A verified
+    /// name is blocked by name: its conversations go, and nothing it sends is
+    /// read until it is unblocked. Anyone else (anonymous, or a name whose
+    /// claim did not check out) cannot be told from any other stranger, so
+    /// only the conversation goes, and its session with it. Returns the name
+    /// blocked, if one was.
+    pub(super) fn block_sealed(&mut self, id: &str) -> Result<Option<String>> {
+        let i = self.ident.book.find(id).ok_or_else(|| anyhow!("no such conversation"))?;
+        let c = &self.ident.book.chats[i];
+        let name = (c.verified && !c.peer.is_empty()).then(|| c.peer.clone());
+        match &name {
+            Some(n) => self.ident.book.block(n),
+            None => {
+                self.ident.book.chats.remove(i);
+            }
+        }
+        self.sealed_save();
+        Ok(name.map(|n| format!("{n}{}", names::SUFFIX)))
+    }
+
+    pub(super) fn unblock_sealed(&mut self, name: &str) -> Result<()> {
+        let name = names::normalize(name)?;
+        if !self.ident.book.unblock(&name) {
+            bail!("{name}{} is not blocked", names::SUFFIX);
+        }
+        self.sealed_save();
+        Ok(())
+    }
+
+    /// Blocked names, as shown (`nick.mds`).
+    pub(super) fn blocked_names(&self) -> Vec<String> {
+        self.ident.book.blocked.iter().map(|n| format!("{n}{}", names::SUFFIX)).collect()
+    }
+
+    pub(super) fn drop_anonymous(&self) -> bool {
+        self.ident.book.drop_anonymous
+    }
+
+    pub(super) fn set_drop_anonymous(&mut self, on: bool) {
+        self.ident.book.drop_anonymous = on;
+        self.sealed_save();
+    }
+
+    /// Stop trying to send what waits for `to`'s key.
+    pub(super) fn cancel_sealed(&mut self, to: &str) -> Result<()> {
+        let name = names::normalize(to)?;
+        if self.ident.book.cancel(&name) == 0 {
+            bail!("nothing is waiting to go to {name}{}", names::SUFFIX);
+        }
+        self.sealed_save();
         Ok(())
     }
 
@@ -440,21 +761,25 @@ impl Service {
         let first = &queued[0];
         let as_name = self.speaking_name();
         let identity = self.book.identity_pk;
+        // A first message is a stranger's until they answer: stamped.
+        let stamp = sealed::STAMP_BITS;
         let (opening, session) = match (as_name.clone(), identity) {
             (Some(me), Some(id)) => {
                 let sign = |t: &[u8; 32]| self.sign_commitment(t);
-                sealed::open_session(&public, &hash, Some(sealed::OpenAs { name: &me, identity: id, sign: Box::new(sign) }), first.text.as_bytes())?
+                let me = sealed::OpenAs { name: &me, identity: id, sign: Box::new(sign) };
+                sealed::open_session(&public, &hash, Some(me), first.text.as_bytes(), 0, stamp)?
             }
-            _ => sealed::open_session(&public, &hash, None, first.text.as_bytes())?,
+            _ => sealed::open_session(&public, &hash, None, first.text.as_bytes(), 0, stamp)?,
         };
         self.node.send_chat(vec![], None, sealed::attachments(&opening)?)?;
-        let mut chat = Conversation { session, peer: name.to_string(), verified: true, lines: Vec::new(), started: now_secs() };
-        chat.lines.push(Line { mine: true, text: first.text.clone(), at: now_secs() });
+        let mut chat = Conversation { session, peer: name.to_string(), verified: true, lines: Vec::new(), started: now_secs(), read: 0, accepted: true, heard: false, ttl: 0 };
+        chat.lines.push(Line::said(true, &first.text, now_secs(), 0));
         for q in &queued[1..] {
-            let bytes = chat.session.seal(q.text.as_bytes())?;
+            let bytes = chat.session.seal(q.text.as_bytes(), 0, chat.stamp())?;
             self.node.send_chat(vec![], None, sealed::attachments(&bytes)?)?;
-            chat.lines.push(Line { mine: true, text: q.text.clone(), at: now_secs() });
+            chat.lines.push(Line::said(true, &q.text, now_secs(), 0));
         }
+        chat.read = chat.lines.len();
         self.ident.book.outbox.retain(|q| q.to != name);
         self.ident.book.chats.push(chat);
         self.sealed_save();
@@ -462,8 +787,74 @@ impl Service {
         Ok(())
     }
 
+    /// Whether `c` is a message request now: not accepted, and under the
+    /// inbox's bar.
+    fn is_request_now(&self, c: &Conversation) -> bool {
+        if c.accepted {
+            return false;
+        }
+        let backing = if c.verified && !c.peer.is_empty() { self.name_backing(&c.peer).map_or(0.0, |b| b.blocks) } else { 0.0 };
+        self.is_request(&c.peer, c.verified, c.session.opener, backing)
+    }
+
+    /// A message the other side sent in conversation `i`: kept if it paid
+    /// what this wallet asks of it ([`admits`]).
+    fn receive(&mut self, i: usize, got: sealed::Received, at: u64) {
+        let request = self.is_request_now(&self.ident.book.chats[i]);
+        let c = &mut self.ident.book.chats[i];
+        if !admits(c, &got, request) {
+            return;
+        }
+        c.heard = true;
+        if got.ttl != c.ttl {
+            c.ttl = got.ttl;
+            c.lines.push(Line::timer_set(false, got.ttl, at));
+        }
+        if !got.body.is_empty() {
+            c.lines.push(Line::said(false, &String::from_utf8_lossy(&got.body), at, got.ttl));
+            // Requests wait quietly: a stranger cannot make this wallet speak up.
+            if !request {
+                self.notify_message(i);
+            }
+        }
+    }
+
+    /// An opening to this wallet's key: a new conversation, unless it did
+    /// not pay, or comes from a blocked name, or from someone anonymous when
+    /// those are dropped. A request makes room for itself.
+    fn welcome(&mut self, opened: sealed::Opened, at: u64) {
+        if opened.stamp_bits < sealed::STAMP_BITS || opened.body.is_empty() {
+            return;
+        }
+        let (peer, verified) = match &opened.sender {
+            Sender::Anonymous => (String::new(), false),
+            Sender::Named { name, .. } => {
+                let identity = self.live_record(&format!("{name}{}", names::SUFFIX)).ok().and_then(|r| names::identity(&r.records));
+                (name.clone(), opened.sender.verify(identity))
+            }
+        };
+        if self.ident.book.is_blocked(&peer) || (peer.is_empty() && self.ident.book.drop_anonymous) {
+            return;
+        }
+        let mut c = Conversation { session: opened.session, peer, verified, lines: Vec::new(), started: now_secs(), read: 0, accepted: false, heard: true, ttl: opened.ttl };
+        if opened.ttl > 0 {
+            c.lines.push(Line::timer_set(false, opened.ttl, at));
+        }
+        c.lines.push(Line::said(false, &String::from_utf8_lossy(&opened.body), at, opened.ttl));
+        let request = self.is_request_now(&c);
+        if request {
+            let requests: HashSet<[u8; 32]> = self.ident.book.chats.iter().filter(|c| self.is_request_now(c)).map(|c| c.session.id).collect();
+            self.ident.book.make_room(now_secs(), &requests, REQUESTS_MAX);
+        }
+        self.ident.book.chats.push(c);
+        if !request {
+            self.notify_message(self.ident.book.chats.len() - 1);
+        }
+    }
+
     /// Each tick: read every sealed chat on the bus once, keep what opens for
-    /// this wallet, and retry or give up on what waits for a key.
+    /// this wallet and pays its way, let timers run, and retry or give up on
+    /// what waits for a key.
     pub(super) async fn tick_sealed(&mut self, tip: u64) {
         if self.wallet.is_none() || self.kem_keys().is_err() {
             return;
@@ -481,10 +872,8 @@ impl Service {
                 c.session.expects().find(|(r, _)| env.len() >= r.len() && env[..r.len()] == r[..]).map(|(_, n)| (i, n))
             });
             if let Some((i, n)) = routed {
-                if let Some(body) = self.ident.book.chats[i].session.open(n, &env) {
-                    let text = String::from_utf8_lossy(&body).into_owned();
-                    self.ident.book.chats[i].lines.push(Line { mine: false, text, at: m.timestamp });
-                    self.notify_message(i);
+                if let Some(got) = self.ident.book.chats[i].session.open(n, &env) {
+                    self.receive(i, got, m.timestamp);
                 }
                 continue;
             }
@@ -492,25 +881,14 @@ impl Service {
             if self.ident.book.chats.iter().any(|c| c.session.id == opened.session.id) {
                 continue;
             }
-            let (peer, verified) = match &opened.sender {
-                Sender::Anonymous => (String::new(), false),
-                Sender::Named { name, .. } => {
-                    let identity = self.live_record(&format!("{name}{}", names::SUFFIX)).ok().and_then(|r| names::identity(&r.records));
-                    (name.clone(), opened.sender.verify(identity))
-                }
-            };
-            let text = String::from_utf8_lossy(&opened.body).into_owned();
-            self.ident.book.chats.push(Conversation {
-                session: opened.session,
-                peer,
-                verified,
-                lines: vec![Line { mine: false, text, at: m.timestamp }],
-                started: now_secs(),
-            });
-            self.notify_message(self.ident.book.chats.len() - 1);
+            self.welcome(opened, m.timestamp);
+        }
+        // Timers that have run.
+        let now = now_secs();
+        for c in &mut self.ident.book.chats {
+            changed |= c.prune(now);
         }
         // What waits for a key: ask again now and then, give up in the end.
-        let now = now_secs();
         let stale: Vec<String> = self.ident.book.outbox.iter().filter(|q| now.saturating_sub(q.queued) > OUTBOX_PATIENCE).map(|q| q.to.clone()).collect();
         if !stale.is_empty() {
             self.ident.book.outbox.retain(|q| now.saturating_sub(q.queued) <= OUTBOX_PATIENCE);
@@ -542,42 +920,241 @@ impl Service {
     }
 
     pub(super) fn conversations(&self) -> Vec<ConversationView> {
-        let mut v: Vec<ConversationView> = self
+        let now = now_secs();
+        let mut v: Vec<(u64, ConversationView)> = self
             .ident
             .book
             .chats
             .iter()
             .map(|c| {
                 let backing = if c.verified && !c.peer.is_empty() { self.name_backing(&c.peer).map_or(0.0, |b| b.blocks) } else { 0.0 };
-                ConversationView {
-                    id: hex::encode(c.session.id),
+                let lines = c
+                    .lines
+                    .iter()
+                    .filter(|l| !l.expired(now))
+                    .map(|l| MessageLineView {
+                        mine: l.mine,
+                        text: l.text.clone(),
+                        at: l.at,
+                        pending: false,
+                        expires: if l.ttl > 0 { l.at.saturating_add(u64::from(l.ttl)) } else { 0 },
+                        timer: l.timer,
+                    })
+                    .collect();
+                let view = ConversationView {
+                    id: c.id_hex(),
                     peer: if c.peer.is_empty() { String::new() } else { format!("{}{}", c.peer, names::SUFFIX) },
                     verified: c.verified,
                     opened_by_me: c.session.opener,
-                    lines: c.lines.iter().map(|l| MessageLineView { mine: l.mine, text: l.text.clone(), at: l.at }).collect(),
+                    lines,
                     backing,
-                    request: self.is_request(&c.peer, c.verified, c.session.opener, backing),
-                }
+                    request: !c.accepted && self.is_request(&c.peer, c.verified, c.session.opener, backing),
+                    unread: c.unread(),
+                    ttl: c.ttl,
+                    stamping: !c.heard,
+                };
+                (c.last(), view)
             })
             .collect();
-        v.extend(self.ident.book.outbox.iter().map(|q| ConversationView {
-            id: String::new(),
-            peer: format!("{}{}", q.to, names::SUFFIX),
-            verified: false,
-            opened_by_me: true,
-            lines: vec![MessageLineView { mine: true, text: format!("{} (waiting for its wallet's key)", q.text), at: q.queued }],
-            backing: self.name_backing(&q.to).map_or(0.0, |b| b.blocks),
-            request: false,
+        // What waits for a name's key: one conversation a name, not sent yet.
+        v.extend(self.ident.book.waiting().into_iter().map(|(to, queued)| {
+            let view = ConversationView {
+                id: String::new(),
+                peer: format!("{to}{}", names::SUFFIX),
+                verified: false,
+                opened_by_me: true,
+                lines: queued.iter().map(|q| MessageLineView { mine: true, text: q.text.clone(), at: q.queued, pending: true, expires: 0, timer: None }).collect(),
+                backing: self.name_backing(&to).map_or(0.0, |b| b.blocks),
+                request: false,
+                unread: 0,
+                ttl: 0,
+                stamping: true,
+            };
+            (queued.last().map_or(0, |q| q.queued), view)
         }));
-        v.sort_by_key(|c| std::cmp::Reverse(c.lines.last().map_or(0, |l| l.at)));
-        v
+        v.sort_by_key(|(last, _)| std::cmp::Reverse(*last));
+        v.into_iter().map(|(_, c)| c).collect()
     }
+}
+
+/// A message's text, trimmed, if there is one and it fits.
+fn checked_text(text: &str) -> Result<&str> {
+    let text = text.trim();
+    if text.is_empty() {
+        bail!("nothing to send");
+    }
+    if text.len() > sealed::MAX_BODY {
+        bail!("a message holds at most {} bytes", sealed::MAX_BODY);
+    }
+    Ok(text)
+}
+
+/// Whether a message the other side sent in `c` is kept. Until this wallet
+/// has answered or accepted, it must carry a stamp; while `c` is a request,
+/// it keeps [`REQUEST_LINES`] of the sender's messages at most.
+fn admits(c: &Conversation, got: &sealed::Received, request: bool) -> bool {
+    if !c.accepted && got.stamp_bits < sealed::STAMP_BITS {
+        return false;
+    }
+    !(request && c.lines.iter().filter(|l| !l.mine).count() >= REQUEST_LINES)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use midstate::core::script::compile_multisig_2of3;
+
+    /// A session opened to a fresh KEM key, from the opener's side.
+    fn a_session() -> Session {
+        let keys = KemKeys::from_secret(&rand::random());
+        sealed::open_session(&keys.public(), &keys.public_hash(), None, b"hello", 0, 0).unwrap().1
+    }
+
+    fn conversation(peer: &str, lines: &[(bool, &str)]) -> Conversation {
+        let lines = lines.iter().enumerate().map(|(i, (mine, t))| Line::said(*mine, t, i as u64, 0)).collect();
+        Conversation { session: a_session(), peer: peer.into(), verified: true, lines, started: 0, read: 0, accepted: false, heard: true, ttl: 0 }
+    }
+
+    #[test]
+    fn a_conversation_keeps_what_was_read_accepted_or_deleted() {
+        let mut book = SealedBook::default();
+        book.chats.push(conversation("alice", &[(false, "hi"), (false, "there"), (true, "hey")]));
+        book.chats.push(conversation("bob", &[(false, "yo")]));
+        let (a, b) = (book.chats[0].id_hex(), book.chats[1].id_hex());
+        assert_eq!((book.chats[0].unread(), book.chats[1].unread()), (2, 1));
+        assert!(book.mark_read(&a));
+        assert!(!book.mark_read(&a), "nothing new to see");
+        assert!(!book.mark_read("00"), "no such conversation");
+        book.chats[0].lines.push(Line::said(false, "again", 9, 0));
+        assert_eq!(book.chats[0].unread(), 1, "only what came after");
+        book.accept(&b).unwrap();
+        assert!(book.chats[1].accepted && !book.chats[0].accepted);
+        book.delete(&a).unwrap();
+        assert_eq!(book.chats.iter().map(|c| c.peer.as_str()).collect::<Vec<_>>(), vec!["bob"]);
+        assert!(book.delete(&a).is_err() && book.accept(&a).is_err());
+    }
+
+    fn got(body: &str, stamp_bits: u32) -> sealed::Received {
+        sealed::Received { body: body.as_bytes().to_vec(), ttl: 0, stamp_bits }
+    }
+
+    #[test]
+    fn a_stranger_pays_to_be_heard_and_a_request_holds_three() {
+        let paid = sealed::STAMP_BITS;
+        let mut c = conversation("carol", &[]);
+        // Not answered yet: a stamp, or it goes unread.
+        assert!(!admits(&c, &got("hi", 0), false));
+        assert!(!admits(&c, &got("hi", paid - 1), false));
+        assert!(admits(&c, &got("hi", paid), false));
+        // A request keeps three of the sender's messages, however they pay.
+        for i in 0..REQUEST_LINES {
+            assert!(admits(&c, &got("more", paid), true));
+            c.lines.push(Line::said(false, "more", i as u64, 0));
+        }
+        assert!(!admits(&c, &got("and more", paid), true));
+        assert!(admits(&c, &got("and more", paid), false), "in the inbox, no cap");
+        // Answered or accepted: no stamp asked, no cap.
+        c.accepted = true;
+        assert!(admits(&c, &got("thanks", 0), false));
+        // This wallet stamps until the other side has written.
+        let mut mine = conversation("dave", &[(true, "hello")]);
+        mine.heard = false;
+        assert_eq!(mine.stamp(), paid);
+        mine.heard = true;
+        assert_eq!(mine.stamp(), 0);
+    }
+
+    #[test]
+    fn blocking_a_name_drops_its_conversations_and_what_waits_for_it() {
+        let mut book = SealedBook::default();
+        book.chats.push(conversation("mallory", &[(false, "spam")]));
+        book.chats.push(conversation("mallory", &[(false, "more spam")]));
+        book.chats.push(conversation("alice", &[(false, "hi")]));
+        book.outbox.push(Queued { to: "mallory".into(), text: "stop".into(), queued: 0 });
+        book.block("mallory");
+        book.block("mallory");
+        assert_eq!(book.blocked, vec!["mallory".to_string()], "once");
+        assert!(book.is_blocked("mallory") && !book.is_blocked("alice") && !book.is_blocked(""));
+        assert_eq!(book.chats.iter().map(|c| c.peer.as_str()).collect::<Vec<_>>(), vec!["alice"]);
+        assert!(book.outbox.is_empty());
+        assert!(book.unblock("mallory") && !book.unblock("mallory"));
+        assert!(!book.is_blocked("mallory"));
+    }
+
+    #[test]
+    fn requests_make_room_for_new_ones() {
+        let mut book = SealedBook::default();
+        for (i, peer) in ["a", "b", "c", "friend"].iter().enumerate() {
+            let mut c = conversation(peer, &[(false, "hi")]);
+            c.lines[0].at = 1_000 + i as u64;
+            book.chats.push(c);
+        }
+        let requests: HashSet<[u8; 32]> = book.chats.iter().filter(|c| c.peer != "friend").map(|c| c.session.id).collect();
+        // Three requests held, room for three: the quietest goes.
+        book.make_room(2_000, &requests, 3);
+        assert_eq!(book.chats.iter().map(|c| c.peer.as_str()).collect::<Vec<_>>(), vec!["b", "c", "friend"]);
+        // Requests quiet for a month go whatever the room; the inbox stays.
+        book.make_room(1_003 + REQUEST_AGE + 1, &requests, 100);
+        assert_eq!(book.chats.iter().map(|c| c.peer.as_str()).collect::<Vec<_>>(), vec!["friend"]);
+    }
+
+    #[test]
+    fn timers_delete_messages_and_keep_the_read_mark_in_place() {
+        let mut c = conversation("alice", &[]);
+        c.lines = vec![
+            Line::said(false, "kept", 0, 0),
+            Line::said(false, "an hour", 100, 3_600),
+            Line::timer_set(true, 3_600, 150),
+            Line::said(true, "a day", 200, 86_400),
+            Line::said(false, "unread, an hour", 300, 3_600),
+        ];
+        c.read = 4;
+        assert!(!c.prune(3_000), "nothing has run yet");
+        assert!(c.prune(100 + 3_600));
+        assert_eq!(c.lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), vec!["kept", "", "a day", "unread, an hour"]);
+        assert_eq!((c.read, c.unread()), (3, 1), "the mark stays before the unread one");
+        assert!(c.prune(300 + 3_600));
+        assert_eq!(c.lines.len(), 3);
+        assert_eq!((c.read, c.unread()), (3, 0));
+        assert_eq!(c.lines[1].timer, Some(3_600), "a timer's note does not expire");
+    }
+
+    #[test]
+    fn what_waits_for_a_key_is_one_conversation_a_name() {
+        let mut book = SealedBook::default();
+        for (to, text) in [("bob", "1"), ("carol", "x"), ("bob", "2")] {
+            book.outbox.push(Queued { to: to.into(), text: text.into(), queued: 0 });
+        }
+        let w = book.waiting();
+        let shape: Vec<(&str, Vec<&str>)> = w.iter().map(|(n, q)| (n.as_str(), q.iter().map(|q| q.text.as_str()).collect())).collect();
+        assert_eq!(shape, vec![("bob", vec!["1", "2"]), ("carol", vec!["x"])]);
+        assert_eq!(book.cancel("bob"), 2);
+        assert_eq!(book.cancel("bob"), 0);
+        assert_eq!(book.outbox.len(), 1);
+    }
+
+    #[test]
+    fn a_book_saved_before_read_marks_loads_as_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet = dir.path().join("w.dat");
+        let mut book = SealedBook::default();
+        book.chats.push(conversation("alice", &[(false, "hi"), (false, "there")]));
+        let mut raw = serde_json::to_value(&book).unwrap();
+        let chat = raw["chats"][0].as_object_mut().unwrap();
+        chat.remove("read");
+        chat.remove("accepted");
+        chat.remove("heard");
+        chat.remove("ttl");
+        std::fs::write(SealedBook::path(&wallet), serde_json::to_vec(&raw).unwrap()).unwrap();
+        let back = SealedBook::load(&wallet);
+        assert_eq!((back.chats[0].read, back.chats[0].unread(), back.chats[0].accepted), (2, 0, false));
+        assert!(back.chats[0].heard, "the other side has written");
+        // And a mark survives a save.
+        let mut book = back;
+        book.chats[0].lines.push(Line::said(false, "new", 5, 0));
+        book.save(&wallet);
+        assert_eq!(SealedBook::load(&wallet).chats[0].unread(), 1);
+    }
 
     #[test]
     fn the_inbox_takes_verified_names_unless_told_otherwise() {

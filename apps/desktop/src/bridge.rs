@@ -54,6 +54,21 @@ pub enum Action {
     /// Sealed messages to and from names.
     LoadConversations,
     SealedSend { to: String, text: String },
+    /// A reply within a conversation, by its session id.
+    SealedReply { id: String, text: String },
+    SealedRead { id: String },
+    SealedAccept { id: String },
+    SealedDelete { id: String },
+    /// Stop trying to send what waits for a name's key.
+    SealedCancel { to: String },
+    /// Block whoever is on the other side of a conversation.
+    SealedBlock { id: String },
+    SealedUnblock { name: String },
+    SetDropAnonymous { on: bool },
+    /// A conversation's timer, in seconds (0: none).
+    SealedTimer { id: String, ttl: u32 },
+    /// Whether a name takes sealed messages, for a new message.
+    CheckRecipient { name: String },
     /// What of this wallet's a name can point at (its plans).
     LoadNameTargets,
     /// MSB-1: the Burns page, a burn, a document's hashes and notarizations,
@@ -181,6 +196,12 @@ pub enum Msg {
     ChatDict(Vec<String>),
     Conversations(Vec<ConversationView>),
     SealedSent,
+    /// A conversation was read, accepted, deleted or given up on.
+    SealedChanged,
+    /// Who is blocked, or whether anonymous senders are, changed.
+    SealedSettings,
+    /// What a name a new message is for turned out to be.
+    Recipient { name: String, card: Result<NameCard, String> },
     NameTargets(Vec<PayTargetView>),
     Burns(BurnsView),
     Burned(String),
@@ -524,6 +545,19 @@ fn perform(
             Action::LoadChat => run!("chat", h.chat_history(), Msg::Chat),
             Action::LoadConversations => run!("messages", h.conversations(), Msg::Conversations),
             Action::SealedSend { to, text } => run!("sealed message", h.sealed_send(to, text), |_| Msg::SealedSent),
+            Action::SealedReply { id, text } => run!("sealed message", h.sealed_reply(id, text), |_| Msg::SealedSent),
+            Action::SealedRead { id } => run!("messages", h.sealed_read(id), |_| Msg::SealedChanged),
+            Action::SealedAccept { id } => run!("accept message request", h.sealed_accept(id), |_| Msg::SealedChanged),
+            Action::SealedDelete { id } => run!("delete conversation", h.sealed_delete(id), |_| Msg::SealedChanged),
+            Action::SealedCancel { to } => run!("stop sending", h.sealed_cancel(to), |_| Msg::SealedChanged),
+            Action::SealedBlock { id } => run!("block", h.sealed_block(id), |_| Msg::SealedSettings),
+            Action::SealedUnblock { name } => run!("unblock", h.sealed_unblock(name), |_| Msg::SealedSettings),
+            Action::SetDropAnonymous { on } => run!("anonymous senders", h.set_drop_anonymous(on), |_| Msg::SealedSettings),
+            Action::SealedTimer { id, ttl } => run!("disappearing messages", h.sealed_timer(id, ttl), |_| Msg::SealedChanged),
+            Action::CheckRecipient { name } => {
+                let card = h.find_name(name.clone(), 1).await.map_err(|e| format!("{e:#}"));
+                out(Msg::Recipient { name, card });
+            }
             Action::LoadNameTargets => run!("name targets", h.name_targets(), Msg::NameTargets),
             Action::LoadChatDict => run!("chat", h.chat_dictionary(), Msg::ChatDict),
             Action::LoadChannels => run!("channels", h.channels(), Msg::Channels),

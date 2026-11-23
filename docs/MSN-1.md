@@ -180,9 +180,28 @@ address first, and pays the record only if no answer comes.
     every address of the plan in their block scan and keep what arrives as
     the plan's coins: check-ins carry it along, and claims pay it out. New names get
     `identity` and `kem` records by default.
-  - **Sealed messages** (the Chat page): write to `nick.mds`; only its wallet
-    reads it. One identity signature opens a session; the session key does
-    the rest.
+  - **Sealed messages** (the Messages page): write to `nick.mds`; only its
+    wallet reads it. One identity signature opens a session; the session key
+    does the rest. The page is a messenger: conversations down the left with
+    unread counts, the open one beside them, replies within it (to whoever
+    opened it, verified or not), and the public room pinned at the top.
+    Senders under the inbox's bar wait under Requests until accepted or
+    answered; a conversation can be deleted, and messages still waiting for
+    a name's key can be stopped.
+  - **Strangers pay to be heard.** Until a wallet answers or accepts a
+    conversation, every message in it must carry a stamp: proof of work
+    (24 bits, about a second of one core) bound to that one message, inside
+    the seal so only the recipient can check it. Wallets stamp until the
+    other side writes back. A request keeps at most three of its sender's
+    messages, raises no notice, and goes after 30 days unanswered; at most
+    100 are kept. A verified name can be blocked (its conversations go and
+    nothing it sends is read); anyone else is blocked by forgetting the
+    conversation, and anonymous senders can be dropped altogether.
+  - **Disappearing messages.** A conversation can have a timer (an hour, a
+    day, a week, four weeks): every message carries it, and both wallets
+    delete a message once it has run. The sealed copy stays on the chat bus
+    as long as nodes keep it, readable by whoever holds the session (see
+    `src/sealed.rs`): a timer is tidiness, not forward secrecy.
   - **Swap market:** a seller's or buyer's name shows on its order or trade
     when its Base account signed the claim and the name's `evm` record is that
     account. The account stays what the trade uses.

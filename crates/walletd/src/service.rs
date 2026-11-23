@@ -139,6 +139,19 @@ enum Cmd {
     ChatHistory(oneshot::Sender<Vec<ChatView>>),
     /// A sealed message to a name (`service_identity`).
     SealedSend { to: String, text: String, resp: oneshot::Sender<Result<()>> },
+    /// A reply within a sealed conversation, by its session id.
+    SealedReply { id: String, text: String, resp: oneshot::Sender<Result<()>> },
+    SealedRead { id: String, resp: oneshot::Sender<Result<()>> },
+    SealedAccept { id: String, resp: oneshot::Sender<Result<()>> },
+    SealedDelete { id: String, resp: oneshot::Sender<Result<()>> },
+    /// Block whoever is on the other side; the name blocked, if any.
+    SealedBlock { id: String, resp: oneshot::Sender<Result<Option<String>>> },
+    SealedUnblock { name: String, resp: oneshot::Sender<Result<()>> },
+    SetDropAnonymous { on: bool, resp: oneshot::Sender<Result<()>> },
+    /// A conversation's timer, in seconds (0: none).
+    SealedTimer { id: String, ttl: u32, resp: oneshot::Sender<Result<()>> },
+    /// Drop what waits for a name's key.
+    SealedCancel { to: String, resp: oneshot::Sender<Result<()>> },
     Conversations(oneshot::Sender<Vec<ConversationView>>),
     NameTargets(oneshot::Sender<Vec<PayTargetView>>),
     ChatDict(oneshot::Sender<Vec<String>>),
@@ -465,6 +478,45 @@ impl WalletdHandle {
     /// Send `text` to a name, sealed so only its wallet reads it.
     pub async fn sealed_send(&self, to: String, text: String) -> Result<()> {
         ask!(self, SealedSend { to: to, text: text })
+    }
+    /// Reply in a sealed conversation (its `id`), to whoever is on the other
+    /// side of it.
+    pub async fn sealed_reply(&self, id: String, text: String) -> Result<()> {
+        ask!(self, SealedReply { id: id, text: text })
+    }
+    /// The user has seen a sealed conversation up to now.
+    pub async fn sealed_read(&self, id: String) -> Result<()> {
+        ask!(self, SealedRead { id: id })
+    }
+    /// Take a sealed conversation out of Requests.
+    pub async fn sealed_accept(&self, id: String) -> Result<()> {
+        ask!(self, SealedAccept { id: id })
+    }
+    /// Forget a sealed conversation, and its session.
+    pub async fn sealed_delete(&self, id: String) -> Result<()> {
+        ask!(self, SealedDelete { id: id })
+    }
+    /// Block whoever is on the other side of a sealed conversation: a
+    /// verified name by name, anyone else by forgetting the conversation.
+    /// Returns the name blocked, if one was.
+    pub async fn sealed_block(&self, id: String) -> Result<Option<String>> {
+        ask!(self, SealedBlock { id: id })
+    }
+    pub async fn sealed_unblock(&self, name: String) -> Result<()> {
+        ask!(self, SealedUnblock { name: name })
+    }
+    /// Drop anonymous senders' sealed messages unread, or show them as
+    /// requests.
+    pub async fn set_drop_anonymous(&self, on: bool) -> Result<()> {
+        ask!(self, SetDropAnonymous { on: on })
+    }
+    /// Set a sealed conversation's timer (seconds; 0: none).
+    pub async fn sealed_timer(&self, id: String, ttl: u32) -> Result<()> {
+        ask!(self, SealedTimer { id: id, ttl: ttl })
+    }
+    /// Stop trying to send what waits for a name's key.
+    pub async fn sealed_cancel(&self, to: String) -> Result<()> {
+        ask!(self, SealedCancel { to: to })
     }
     /// Sealed conversations, newest first.
     pub async fn conversations(&self) -> Result<Vec<ConversationView>> {
@@ -1005,6 +1057,8 @@ impl Service {
                     is_hd: self.wallet.as_ref().map(|w| w.is_hd()).unwrap_or(false),
                     wallet_path: self.wallet_path.display().to_string(),
                     inbox_bar: self.inbox_bar(),
+                    blocked: self.blocked_names(),
+                    drop_anonymous: self.drop_anonymous(),
                 });
             }
             Cmd::Create { password, phrase, resp } => {
@@ -1212,6 +1266,35 @@ impl Service {
             }
             Cmd::SealedSend { to, text, resp } => {
                 let _ = resp.send(self.send_sealed(&to, &text).await);
+            }
+            Cmd::SealedReply { id, text, resp } => {
+                let _ = resp.send(self.reply_sealed(&id, &text));
+            }
+            Cmd::SealedRead { id, resp } => {
+                self.read_sealed(&id);
+                let _ = resp.send(Ok(()));
+            }
+            Cmd::SealedAccept { id, resp } => {
+                let _ = resp.send(self.accept_sealed(&id));
+            }
+            Cmd::SealedDelete { id, resp } => {
+                let _ = resp.send(self.delete_sealed(&id));
+            }
+            Cmd::SealedBlock { id, resp } => {
+                let _ = resp.send(self.block_sealed(&id));
+            }
+            Cmd::SealedUnblock { name, resp } => {
+                let _ = resp.send(self.unblock_sealed(&name));
+            }
+            Cmd::SetDropAnonymous { on, resp } => {
+                self.set_drop_anonymous(on);
+                let _ = resp.send(Ok(()));
+            }
+            Cmd::SealedTimer { id, ttl, resp } => {
+                let _ = resp.send(self.set_timer(&id, ttl));
+            }
+            Cmd::SealedCancel { to, resp } => {
+                let _ = resp.send(self.cancel_sealed(&to));
             }
             Cmd::Conversations(resp) => {
                 let _ = resp.send(self.conversations());
@@ -3701,6 +3784,7 @@ impl Service {
     }
 
     async fn chat_history(&self) -> Vec<ChatView> {
+        let me = self.node.local_peer_id().to_string();
         let hist = self.node.chat_history.read().await;
         hist.iter()
             // Swap adverts and negotiations ride the bus but are not
@@ -3724,6 +3808,7 @@ impl Service {
                 reply_to: m.reply_to,
                 attachments: m.attachments.len(),
                 sealed: m.attachments.iter().any(|a| matches!(a, midstate::chat::ChatAttachment::EncryptedMessage(_))),
+                mine: m.sender == me,
             })
             .collect()
     }

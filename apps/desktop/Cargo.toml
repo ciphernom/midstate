@@ -26,6 +26,8 @@ anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs = "5.0"
+# The local UTC offset, for message times (read once, at start).
+time = { version = "0.3", features = ["local-offset"] }
 
 [build-dependencies]
 # The Windows executable's icon (build.rs). Does nothing for other targets.

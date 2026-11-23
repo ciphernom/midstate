@@ -322,6 +322,102 @@ pub fn fmt_date(ts: u64) -> String {
     format!("{} {m} {y}", d.trim_start_matches('0'))
 }
 
+// ── Local time ──────────────────────────────────────────────────────────────
+// Messages show the reader's own clock and days: a conversation in UTC
+// puts a morning message on the day before for half the world.
+
+/// Seconds east of UTC, read once at start ([`init_local_offset`]).
+static LOCAL_OFFSET: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+/// Day 0, 1 January 1970, was a Thursday.
+const WEEKDAYS: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+/// Read the local UTC offset. Call first thing in `main`: on Unix it can be
+/// read soundly only while the process has one thread. If it cannot be
+/// read, times show in UTC.
+pub fn init_local_offset() {
+    if let Ok(o) = time::UtcOffset::current_local_offset() {
+        LOCAL_OFFSET.store(o.whole_seconds() as i64, Ordering::Relaxed);
+    }
+}
+
+fn local(ts: u64) -> i64 {
+    ts as i64 + LOCAL_OFFSET.load(Ordering::Relaxed)
+}
+
+/// The local day `ts` falls on, in days since 1 January 1970.
+pub fn local_day(ts: u64) -> i64 {
+    local(ts).div_euclid(86_400)
+}
+
+/// "14:05": the local time of day, 24-hour.
+pub fn clock(ts: u64) -> String {
+    let s = local(ts).rem_euclid(86_400);
+    format!("{:02}:{:02}", s / 3600, s % 3600 / 60)
+}
+
+/// Year, month (1–12) and day of a day number (Howard Hinnant's algorithm).
+fn civil(days: i64) -> (i64, usize, i64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + i64::from(m <= 2), m as usize, d)
+}
+
+fn weekday(day: i64) -> &'static str {
+    WEEKDAYS[(day + 4).rem_euclid(7) as usize]
+}
+
+/// "23 Nov", with the year unless it is this one.
+fn date_label(day: i64, today: i64) -> String {
+    let ((y, m, d), (this_year, _, _)) = (civil(day), civil(today));
+    if y == this_year {
+        format!("{d} {}", MONTHS[m - 1])
+    } else {
+        format!("{d} {} {y}", MONTHS[m - 1])
+    }
+}
+
+/// A day's heading in a conversation: Today, Yesterday, a weekday within
+/// the week, else the date.
+pub fn day_label(ts: u64, now: u64) -> String {
+    let (day, today) = (local_day(ts), local_day(now));
+    match today - day {
+        i64::MIN..=0 => "Today".into(),
+        1 => "Yesterday".into(),
+        2..=6 => weekday(day).into(),
+        _ => date_label(day, today),
+    }
+}
+
+/// When a conversation last moved, as a list shows it: the time today, then
+/// Yesterday, a weekday's first three letters, or the date.
+pub fn list_time(ts: u64, now: u64) -> String {
+    if ts == 0 {
+        return String::new();
+    }
+    let (day, today) = (local_day(ts), local_day(now));
+    match today - day {
+        i64::MIN..=0 => clock(ts),
+        1 => "Yesterday".into(),
+        2..=6 => weekday(day)[..3].into(),
+        _ => date_label(day, today),
+    }
+}
+
+/// "Mon 23 Nov 2026, 14:05": a message's time in full, local.
+pub fn local_datetime(ts: u64) -> String {
+    let day = local_day(ts);
+    let (y, m, d) = civil(day);
+    format!("{} {d} {} {y}, {}", &weekday(day)[..3], MONTHS[m - 1], clock(ts))
+}
+
 // ── Small widgets ───────────────────────────────────────────────────────────
 
 pub fn mono(t: impl ToString) -> RichText {
@@ -685,6 +781,25 @@ pub fn in_unit(v: u64, unit_ix: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_times_read_as_days_and_clocks() {
+        // 2026-11-23 08:21 UTC, a Monday. Tests leave the offset at zero.
+        let (t, day) = (1_795_422_060, 86_400);
+        assert_eq!(clock(t), "08:21");
+        assert_eq!(local_datetime(t), "Mon 23 Nov 2026, 08:21");
+        assert_eq!(day_label(t, t + 60), "Today");
+        assert_eq!(day_label(t + 60, t), "Today", "a sender's clock a little ahead");
+        assert_eq!(day_label(t, t + day), "Yesterday");
+        assert_eq!(day_label(t, t + 3 * day), "Monday");
+        assert_eq!(day_label(t, t + 7 * day), "23 Nov");
+        assert_eq!(day_label(1_767_225_540, t), "31 Dec 2025");
+        assert_eq!(list_time(t, t + 600), "08:21");
+        assert_eq!(list_time(t, t + day), "Yesterday");
+        assert_eq!(list_time(t, t + 2 * day), "Mon");
+        assert_eq!(list_time(t, t + 30 * day), "23 Nov");
+        assert_eq!(list_time(0, t), "");
+    }
 
     const MDS: usize = 0;
     const KMDS: usize = 1;

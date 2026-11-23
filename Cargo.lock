@@ -4161,6 +4161,7 @@ dependencies = [
  "midstate-walletd",
  "qrcode",
  "rand 0.8.8",
+ "time",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -4200,7 +4201,7 @@ dependencies = [
 [[package]]
 name = "midwimble"
 version = "1.4.1-DIMEBAG"
-source = "git+https://github.com/ciphernom/midwimble#bef880e0dd0148c666f9b5dadaed7e1465d41a45"
+source = "git+https://github.com/ciphernom/midwimble#c2986633b5e7566a7fc5fe79927db2c3fb3edee4"
 dependencies = [
  "anyhow",
  "argon2",
@@ -4657,6 +4658,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "num_threads"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cabcc654086861f9e1bc5115258de62ef92c79b20f4615a1b0cc57c4e82027d4"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -6906,7 +6916,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cdb87b95ec50ddfa440816d227a17b2ccbdda963a316a727fda0fc4334f7d134"
 dependencies = [
  "deranged",
+ "libc",
  "num-conv",
+ "num_threads",
  "powerfmt",
  "serde_core",
  "time-core",
