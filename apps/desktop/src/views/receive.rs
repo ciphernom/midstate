@@ -214,7 +214,7 @@ fn header(ui: &mut Ui, cols: &[&str]) {
 }
 
 /// Build (and cache) the QR texture for the current address.
-fn ensure_qr(app: &mut App, ctx: &egui::Context, addr: &str) {
+pub(crate) fn ensure_qr(app: &mut App, ctx: &egui::Context, addr: &str) {
     if app.qr.as_ref().map(|(a, _)| a == addr).unwrap_or(false) {
         return;
     }

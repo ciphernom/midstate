@@ -129,6 +129,10 @@ jobs:
       env:
         CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         RUSTFLAGS: ${{ matrix.rustflags || '' }}
+        # The app's own version, for automatic updates (apps/desktop/src/update.rs).
+        # Only a tagged build has one; any other build says "built from source"
+        # and never updates itself.
+        MIDSTATE_RELEASE: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
       run: cargo build --release --target ${{ matrix.target }} -p midstate-desktop
 
     # The desktop exe carries the Midstate logo, which Explorer, shortcuts and
@@ -528,6 +532,26 @@ jobs:
             echo "body_path=$RUNNER_TEMP/release-notes.md" >> "$GITHUB_OUTPUT"
           fi
 
+      # midstate-release.txt: the tag and every asset's SHA-256. The desktop
+      # app installs a release only once this file is signed with the release
+      # key, which never comes near CI: the maintainer checks the assets and
+      # signs it afterwards with tools/release/sign.sh. Written outside the
+      # folder first, so it does not list itself.
+      - name: Release manifest (signed later)
+        run: |
+          set -euo pipefail
+          m="$RUNNER_TEMP/midstate-release.txt"
+          {
+            echo "midstate-release 1"
+            echo "version ${GITHUB_REF_NAME}"
+            for f in artifacts/*; do
+              [ -f "$f" ] || continue
+              echo "sha256 $(sha256sum "$f" | cut -d' ' -f1) $(basename "$f")"
+            done
+          } > "$m"
+          cat "$m"
+          mv "$m" artifacts/
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
@@ -599,6 +623,16 @@ jobs:
 # the installer is UNSIGNED, so SmartScreen warns on first run ("Windows
 # protected your PC" → More info → Run anyway). Signing needs a code-signing
 # certificate held as a repository secret, and a SignTool line in the .iss.
+#
+# AUTOMATIC UPDATES. The desktop app looks for the latest release every few
+# hours and installs it only if midstate-release.txt carries a signature,
+# midstate-release.txt.sig, by a key in RELEASE_KEYS (apps/desktop/src/update.rs).
+# CI writes the manifest; it never signs. After a tag's release is up, sign it
+# from a trusted computer with the offline key:
+#     tools/release/sign.sh v6.6.0
+# which downloads every asset, checks each against the manifest, signs and
+# uploads the .sig. Until then the app does not offer the release. See
+# docs/design/auto-update.md.
 #
 # The macOS bundle is UNSIGNED. Gatekeeper will refuse it on first launch
 # ("unidentified developer", or "damaged" once the download carries a

@@ -6,6 +6,7 @@
 mod app;
 mod bridge;
 mod theme;
+mod update;
 mod views;
 mod watchdog;
 
@@ -148,10 +149,25 @@ fn main() -> eframe::Result {
     // log splits "died before main" from "died during startup".
     tracing::info!(
         "midstate-desktop {} starting on {} ({})",
-        env!("CARGO_PKG_VERSION"),
+        update::this_version(),
         std::env::consts::OS,
         std::env::consts::ARCH,
     );
+
+    // An update downloaded last time goes in now, before anything opens the
+    // wallet; then the new version starts in this one's place. The path is
+    // read once: on Linux it names the old file once that is moved aside.
+    let exe = std::env::current_exe().ok();
+    if std::env::var_os("MIDSTATE_RELAUNCHED").is_some() {
+        // The copy that started this one is closing; give it a moment.
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+    }
+    if let Some(exe) = &exe {
+        if update::apply_at_start(&app::profile().base, exe) {
+            update::relaunch(exe);
+            return Ok(());
+        }
+    }
     tracing::info!("log file: {} (the previous run's: {})", log_path.display(), prev_log_path.display());
     watchdog::start();
 
@@ -175,6 +191,21 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
     );
+
+    // "Restart now": the window has closed and the wallet with it.
+    if result.is_ok() && update::restart_requested() {
+        if let Some(exe) = &exe {
+            if let Some(dir) = exe.parent() {
+                if let Some(current) = update::THIS_RELEASE.and_then(update::parse_version) {
+                    match update::apply(&app::profile().base, dir, current) {
+                        Ok(v) => tracing::info!("restarting into {}", v.as_deref().unwrap_or("the same version")),
+                        Err(e) => tracing::warn!("could not update, restarting as is: {e:#}"),
+                    }
+                }
+            }
+            update::relaunch(exe);
+        }
+    }
 
     if let Err(e) = &result {
         tracing::error!("startup failed: {e}");

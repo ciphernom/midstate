@@ -29,6 +29,19 @@ dirs = "5.0"
 # The local UTC offset, for message times (read once, at start).
 time = { version = "0.3", features = ["local-offset"] }
 
+# Automatic updates (src/update.rs): ask GitHub for the latest release, check
+# its signed manifest, fetch and unpack this computer's archive.
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+sha2 = "0.10"
+ed25519-dalek = "2"
+flate2 = "1"
+tar = { version = "0.4", default-features = false }
+zip = { version = "2", default-features = false, features = ["deflate-flate2", "flate2"] }
+
+[dev-dependencies]
+tempfile = "3.8"
+
 [build-dependencies]
 # The Windows executable's icon (build.rs). Does nothing for other targets.
 embed-resource = "3.0"

@@ -162,6 +162,20 @@ pub struct App {
 
     // UI state
     pub tab: Tab,
+    /// The simple view (Home, Send, Receive, Activity, Messages, Names,
+    /// Settings) rather than every tab.
+    pub simple: bool,
+    pub simple_flow: crate::views::simple::send::Flow,
+    /// MDS (0) or MDW (1) on the simple Send and Receive pages.
+    pub simple_asset: usize,
+    /// The simple Send page's amount, in gMDS as typed.
+    pub simple_amount: String,
+    /// The simple Receive page asked walletd for a reusable address.
+    pub simple_addr_asked: bool,
+    pub name_copied_at: Option<f64>,
+    /// Which name the simple view copied last.
+    pub name_input_copied: String,
+    pub updater: crate::update::Updater,
     pub onboard: Onboard,
     pub busy: bool,
     pub error: String,
@@ -425,7 +439,21 @@ impl App {
             let tx = msg_tx.clone();
             let ctx = cc.egui_ctx.clone();
             rt.spawn(async move {
-                match boot().await {
+                // Started again after an update: the old copy may still be
+                // letting go of the data folder and ports for a moment.
+                let relaunched = std::env::var_os("MIDSTATE_RELAUNCHED").is_some();
+                let mut tries = 0;
+                let booted = loop {
+                    match boot().await {
+                        Err(e) if relaunched && tries < 20 => {
+                            tries += 1;
+                            tracing::info!("waiting for the previous copy to close: {e:#}");
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        }
+                        r => break r,
+                    }
+                };
+                match booted {
                     Ok(handle) => {
                         // Forward every walletd event into the message pump.
                         let mut rx = handle.subscribe();
@@ -455,7 +483,16 @@ impl App {
             });
         }
 
+        let updater = crate::update::spawn(&rt, cc.egui_ctx.clone(), profile().base);
         Self {
+            simple: crate::views::simple::load_view_pref(),
+            simple_flow: Default::default(),
+            simple_asset: 0,
+            simple_amount: String::new(),
+            simple_addr_asked: false,
+            name_copied_at: None,
+            name_input_copied: String::new(),
+            updater,
             rt,
             msg_tx,
             msg_rx,
@@ -771,12 +808,16 @@ impl App {
                     self.sends.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
                 }
                 WalletEvent::Incoming { total_value, count, .. } => {
-                    let text = format!(
-                        "Received {} units ({} coin{})",
-                        theme::units(total_value),
-                        count,
-                        if count == 1 { "" } else { "s" }
-                    );
+                    let text = if self.simple {
+                        format!("Received {}", crate::views::simple::gmds(total_value))
+                    } else {
+                        format!(
+                            "Received {} units ({} coin{})",
+                            theme::units(total_value),
+                            count,
+                            if count == 1 { "" } else { "s" }
+                        )
+                    };
                     self.toast(ctx, text);
                 }
                 WalletEvent::Warning { text } => self.toast(ctx, text),
@@ -929,6 +970,8 @@ impl App {
                 self.mwb_send_amount.clear();
                 self.mwb_notice.clear();
                 self.tab = Tab::Dashboard;
+                self.simple_flow = Default::default();
+                self.simple_amount.clear();
                 self.onboard = Onboard::Unlock;
                 self.go(ctx, Action::LoadStatus);
             }
@@ -942,6 +985,7 @@ impl App {
                 self.busy = false;
                 self.send_to.clear();
                 self.send_amount.clear();
+                self.simple_amount.clear();
                 self.addr_ok = None;
                 self.go(ctx, Action::LoadSends);
                 self.go(ctx, Action::LoadBalance);
@@ -1622,14 +1666,16 @@ impl eframe::App for App {
         }
 
         watchdog::doing("drawing", "the ribbon");
-        egui::TopBottomPanel::top("ribbon")
-            .frame(
-                egui::Frame::default()
-                    .fill(theme::bg())
-                    .inner_margin(egui::Margin::symmetric(24, 8))
-                    .stroke(egui::Stroke::new(1.0, theme::border())),
-            )
-            .show(ctx, |ui| self.ribbon(ui));
+        if !self.simple {
+            egui::TopBottomPanel::top("ribbon")
+                .frame(
+                    egui::Frame::default()
+                        .fill(theme::bg())
+                        .inner_margin(egui::Margin::symmetric(24, 8))
+                        .stroke(egui::Stroke::new(1.0, theme::border())),
+                )
+                .show(ctx, |ui| self.ribbon(ui));
+        }
 
         if let Some(e) = self.boot_error.clone() {
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -1691,16 +1737,44 @@ impl eframe::App for App {
                 });
                 ui.add_space(14.0);
                 let unread = views::chat::unread(&self.conversations);
-                for t in Tab::ALL {
-                    let label = if t == Tab::Chat && unread > 0 { format!("{}  {unread}", t.name()) } else { t.name().to_string() };
-                    if ui.selectable_label(self.tab == t, label).clicked() {
+                let tabs: &[Tab] = if self.simple { &views::simple::TABS } else { &Tab::ALL };
+                for &t in tabs {
+                    let name = if self.simple { views::simple::tab_name(t) } else { t.name() };
+                    let label = if t == Tab::Chat && unread > 0 { format!("{name}  {unread}") } else { name.to_string() };
+                    let r = if self.simple {
+                        views::simple::rail_item(ui, self.tab == t, &label)
+                    } else {
+                        ui.selectable_label(self.tab == t, label)
+                    };
+                    if r.clicked() {
+                        if t != self.tab {
+                            self.simple_addr_asked = false;
+                        }
                         self.tab = t;
                         self.error.clear();
                     }
                 }
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                    if ui.button("Lock wallet").clicked() {
+                    if self.simple {
+                        let (live, text) = views::simple::connection(self);
+                        ui.horizontal(|ui| {
+                            theme::dot(ui, live);
+                            ui.label(RichText::new(text).size(12.5).color(theme::muted()));
+                        });
+                    } else if ui.button("Lock wallet").clicked() {
                         self.go(&ui.ctx().clone(), Action::Lock);
+                    }
+                    if let crate::update::Status::Ready { version } = self.updater.status() {
+                        ui.add_space(6.0);
+                        let v = version.trim_start_matches('v').to_string();
+                        if ui
+                            .link(RichText::new(format!("Restart to update to {v}")).size(12.5))
+                            .on_hover_text("Midstate closes and opens again, updated")
+                            .clicked()
+                        {
+                            crate::update::request_restart();
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
                     }
                 });
             });
@@ -1714,10 +1788,24 @@ impl eframe::App for App {
                     views::chat::show(self, ui);
                     return;
                 }
+                if self.simple && !views::simple::TABS.contains(&self.tab) {
+                    self.tab = Tab::Dashboard;
+                }
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.vertical_centered(|ui| {
-                        ui.set_max_width(880.0);
+                        ui.set_max_width(if self.simple { 720.0 } else { 880.0 });
                         ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                            if self.simple {
+                                match self.tab {
+                                    Tab::Send => views::simple::send::show(self, ui),
+                                    Tab::Receive => views::simple::receive::show(self, ui),
+                                    Tab::History => views::simple::activity::show(self, ui),
+                                    Tab::Names => views::simple::names::show(self, ui),
+                                    Tab::Settings => views::simple::settings::show(self, ui),
+                                    _ => views::simple::home::show(self, ui),
+                                }
+                                return;
+                            }
                             match self.tab {
                                 Tab::Dashboard => views::dashboard::show(self, ui),
                                 Tab::Send => views::send::show(self, ui),

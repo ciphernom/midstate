@@ -285,7 +285,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
 /// A deliberately generous fee estimate for "send all". Overshooting leaves a
 /// little dust behind; undershooting makes the planner reject the send, which
 /// is the more annoying failure.
-fn estimated_fee(app: &App) -> u64 {
+pub(crate) fn estimated_fee(app: &App) -> u64 {
     let inputs = app
         .coins
         .iter()

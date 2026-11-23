@@ -14,5 +14,6 @@ pub mod receive;
 pub mod rent;
 pub mod send;
 pub mod settings;
+pub mod simple;
 pub mod trade;
 pub mod trade_mdw;

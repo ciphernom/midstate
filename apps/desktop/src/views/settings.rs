@@ -8,6 +8,21 @@ pub fn show(app: &mut App, ui: &mut Ui, status: &WalletStatus) {
     let ctx = ui.ctx().clone();
     theme::heading(ui, "Settings");
 
+    crate::views::simple::settings::updates(app, ui);
+    ui.add_space(8.0);
+    theme::panel_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            theme::hint(ui, "Fewer pages, plain words: Home, Send, Receive, Activity, Messages, Names and Settings.");
+            theme::right_aligned(ui, |ui| {
+                if ui.button("Use the simple view").clicked() {
+                    crate::views::simple::set_simple(app, true);
+                }
+            });
+        });
+    });
+    ui.add_space(8.0);
+
     theme::panel_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
         if let Ok(name) = std::env::var("MIDSTATE_PROFILE") {
