@@ -10,6 +10,7 @@ export const build_covenant_htlc_bytecode_hex: (a: number, b: number, c: number,
 export const build_htlc_bytecode_hex: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number) => void;
 export const build_limit_order_covenant_bytecode_hex: (a: number, b: number, c: number, d: bigint, e: bigint, f: number, g: number) => void;
 export const build_multisig_2of2_address: (a: number, b: number, c: number, d: number, e: number) => void;
+export const chat_pow_search: (a: number, b: number, c: number, d: bigint, e: number, f: number, g: number, h: number, i: number, j: number, k: bigint, l: number) => void;
 export const compute_coin_id_hex: (a: number, b: number, c: number, d: bigint, e: number, f: number) => void;
 export const compute_commitment_hex: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
 export const compute_p2pk_address_hex: (a: number, b: number, c: number) => void;
@@ -17,6 +18,7 @@ export const decrypt_cli_wallet: (a: number, b: number, c: number, d: number, e:
 export const generate_phrase: (a: number) => void;
 export const mine_chat_pow_v2_wasm: (a: number, b: number, c: number, d: bigint, e: number, f: number, g: number, h: number, i: number, j: number) => void;
 export const mine_commitment_pow: (a: number, b: number, c: number, d: bigint, e: number, f: number) => bigint;
+export const name_plan: (a: number, b: number, c: number) => void;
 export const qbolt_build_close_reveal: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number) => void;
 export const qbolt_build_legacy_close_reveal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number) => void;
 export const qbolt_build_legacy_close_state: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: bigint, k: bigint, l: number) => void;
@@ -25,6 +27,18 @@ export const qbolt_build_refund_state: (a: number, b: number, c: number, d: numb
 export const qbolt_build_state: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: bigint, i: number, j: number, k: bigint, l: bigint, m: number, n: number, o: number, p: number) => void;
 export const qbolt_channel_address: (a: number, b: number, c: number, d: number, e: number, f: bigint) => void;
 export const qbolt_channel_bytecode_hex: (a: number, b: number, c: number, d: number, e: number, f: bigint) => void;
+export const sealed_check_public: (a: number, b: number, c: number, d: number, e: number) => void;
+export const sealed_finish_opening: (a: number, b: number, c: number, d: number, e: number, f: number, g: bigint) => void;
+export const sealed_prepared_recipient: (a: number, b: number, c: number) => void;
+export const sealed_prepared_stamp_key: (a: number, b: number, c: number) => void;
+export const sealed_session_open: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+export const sealed_session_reserve: (a: number, b: number, c: number) => void;
+export const sealed_session_routes: (a: number, b: number, c: number) => void;
+export const sealed_session_seal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: bigint) => void;
+export const sealed_session_stamp_key: (a: number, b: number, c: number, d: number) => void;
+export const sealed_stamp_bits: (a: number, b: number, c: number, d: bigint) => void;
+export const sealed_stamp_search: (a: number, b: number, c: number, d: number, e: bigint, f: number) => void;
+export const sealed_verify_sender: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => number;
 export const search_nonces: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number) => void;
 export const search_nonces_pow: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: bigint, i: number) => void;
 export const verify_mss_sig_wasm: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
@@ -51,6 +65,10 @@ export const webwallet_prepare_fund_many: (a: number, b: number, c: number, d: n
 export const webwallet_prepare_fund_tx: (a: number, b: number, c: number, d: number, e: number, f: number, g: bigint, h: number, i: number, j: number) => void;
 export const webwallet_prepare_script_spend: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number) => void;
 export const webwallet_prepare_spend: (a: number, b: number, c: number, d: number, e: number, f: number, g: bigint, h: number, i: number, j: number, k: number, l: bigint) => void;
+export const webwallet_sealed_kem_hash: (a: number, b: number) => void;
+export const webwallet_sealed_kem_public: (a: number, b: number) => void;
+export const webwallet_sealed_prepare_opening: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => void;
+export const webwallet_sealed_try_open: (a: number, b: number, c: number, d: number) => void;
 export const webwallet_set_mss_leaf_index: (a: number, b: number, c: number, d: number) => void;
 export const webwallet_set_watchlist: (a: number, b: number, c: number) => void;
 export const webwallet_sign_mss_hex: (a: number, b: number, c: number, d: number, e: number, f: number) => void;

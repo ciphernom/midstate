@@ -33,6 +33,11 @@ use midstate::wallet::hd::{generate_mnemonic, master_seed_from_mnemonic, derive_
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+// Sealed messages: midstate::sealed for the page (messages.js).
+mod messages;
+// Names: MSN-1 registry spends planned from a node's proof, and name keys.
+mod registry;
+
 #[cfg(test)]
 use wasm_bindgen_test::wasm_bindgen_test_configure;
 
@@ -261,9 +266,10 @@ struct ScriptInputArg {
 
 #[derive(serde::Deserialize)]
 struct ScriptOutputArg {
-    /// "standard" | "confidential"
+    /// "standard" | "confidential" | "data_burn"
     out_type: String,
-    /// 64-hex destination address.
+    /// 64-hex destination address (none for a data_burn).
+    #[serde(default)]
     address: String,
     /// Value in sats (standard outputs only; confidential = 0).
     #[serde(default)]
@@ -276,6 +282,10 @@ struct ScriptOutputArg {
     /// otherwise a random salt is generated.
     #[serde(default)]
     salt: Option<String>,
+    /// A data_burn's payload (hex, at most 80 bytes); `value` is what it burns
+    /// (0 or a power of two), paid by the wallet like any output's value.
+    #[serde(default)]
+    payload: Option<String>,
 }
 
 // ── Context carried between phase 1 and phase 2 ─────────────────────────────
@@ -1563,6 +1573,25 @@ pub fn build_solo_extension_pow(&self, pow: &str, midstate_hex: &str, nonce: u64
         let mut output_hashes: Vec<[u8; 32]> = Vec::new();
 
         for o in &out_args {
+            if o.out_type == "data_burn" {
+                // A name's burn (MSN-1), or any DataBurn a covenant asks for.
+                let payload_hex = o.payload.as_deref().ok_or_else(|| JsValue::from_str("data_burn output requires a payload"))?;
+                let payload = hex::decode(payload_hex).map_err(|_| JsValue::from_str("Invalid data_burn payload hex"))?;
+                if payload.len() > midstate::core::types::MAX_BURN_DATA_SIZE {
+                    return Err(JsValue::from_str("data_burn payload is over 80 bytes"));
+                }
+                if o.value != 0 && !o.value.is_power_of_two() {
+                    return Err(JsValue::from_str("a data_burn burns 0 or a power of two"));
+                }
+                let out = midstate::core::types::OutputData::DataBurn { payload: payload.clone(), value_burned: o.value };
+                output_hashes.push(out.hash_for_commitment());
+                outputs_out.push(serde_json::json!({
+                    "type": "data_burn",
+                    "payload": hex::encode(&payload),
+                    "value_burned": o.value,
+                }));
+                continue;
+            }
             let mut addr_b = [0u8; 32];
             hex::decode_to_slice(&o.address, &mut addr_b)
                 .map_err(|_| JsValue::from_str("Invalid output address hex"))?;
@@ -3953,17 +3982,11 @@ mod tests {
         let utxo = WasmUtxo {
             index: 42, is_mss: true, mss_height: 10, mss_leaf: 5,
             address: "aa".repeat(32), value: 1024,
-            salt: "bb".repeat(32), coin_id: "cc".repeat(32),
+            salt: "bb".repeat(32), coin_id: "cc".repeat(32), commitment: None,
         };
         let json = serde_json::to_string(&utxo).unwrap();
         let decoded: WasmUtxo = serde_json::from_str(&json).unwrap();
         assert_eq!(utxo, decoded);
-    }
-
-    #[wasm_bindgen_test]
-    fn js_output_default_salt() {
-        let out: JsOutput = serde_json::from_str(r#"{"address":"aa","value":8}"#).unwrap();
-        assert_eq!(out.salt, "");
     }
 
     #[wasm_bindgen_test]

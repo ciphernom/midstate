@@ -972,6 +972,122 @@ export class WebWallet {
         }
     }
     /**
+     * What a name's `kem` record must hold for messages sealed to it to
+     * open here.
+     * @returns {string}
+     */
+    sealed_kem_hash() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.webwallet_sealed_kem_hash(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            deferred1_0 = r0;
+            deferred1_1 = r1;
+            return getStringFromWasm0(r0, r1);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * This wallet's ML-KEM-512 public key (800 bytes, hex): what the
+     * identity handshake hands to whoever asks (`CMD_KEM`).
+     * @returns {string}
+     */
+    sealed_kem_public() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.webwallet_sealed_kem_public(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            deferred1_0 = r0;
+            deferred1_1 = r1;
+            return getStringFromWasm0(r0, r1);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * An opening to the holder of `recipient_public_hex`, made up to its
+     * stamp (`sealed::prepare_opening`), as JSON. With `as_name`, signed
+     * as that name by the MSS key `identity_pk_hex` (in this wallet), which
+     * spends one of its leaves: the page must save the key's new leaf
+     * counter before the opening goes anywhere.
+     * @param {string} recipient_public_hex
+     * @param {string} recipient_hash_hex
+     * @param {string | null} [as_name]
+     * @param {string | null} [identity_pk_hex]
+     * @returns {string}
+     */
+    sealed_prepare_opening(recipient_public_hex, recipient_hash_hex, as_name, identity_pk_hex) {
+        let deferred6_0;
+        let deferred6_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(recipient_public_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(recipient_hash_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len1 = WASM_VECTOR_LEN;
+            var ptr2 = isLikeNone(as_name) ? 0 : passStringToWasm0(as_name, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            var len2 = WASM_VECTOR_LEN;
+            var ptr3 = isLikeNone(identity_pk_hex) ? 0 : passStringToWasm0(identity_pk_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            var len3 = WASM_VECTOR_LEN;
+            wasm.webwallet_sealed_prepare_opening(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr5 = r0;
+            var len5 = r1;
+            if (r3) {
+                ptr5 = 0; len5 = 0;
+                throw takeObject(r2);
+            }
+            deferred6_0 = ptr5;
+            deferred6_1 = len5;
+            return getStringFromWasm0(ptr5, len5);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred6_0, deferred6_1, 1);
+        }
+    }
+    /**
+     * Tries an envelope (a sealed chat's `encrypted_message` attachments,
+     * joined) as an opening sealed to this wallet's key: its JSON, or
+     * undefined if it is not one.
+     * @param {string} envelope_hex
+     * @returns {string | undefined}
+     */
+    sealed_try_open(envelope_hex) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(envelope_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.webwallet_sealed_try_open(retptr, this.__wbg_ptr, ptr0, len0);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            if (r3) {
+                throw takeObject(r2);
+            }
+            let v2;
+            if (r0 !== 0) {
+                v2 = getStringFromWasm0(r0, r1).slice();
+                wasm.__wbindgen_export4(r0, r1 * 1, 1);
+            }
+            return v2;
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
      * Update the next-leaf counter for an MSS tree.
      *
      * Called by the JS layer after loading wallet state to synchronize
@@ -1358,6 +1474,44 @@ export function build_multisig_2of2_address(pk1_hex, pk2_hex) {
 }
 
 /**
+ * A slice of a chat's proof-of-work search, as `mine_chat_pow_v2_wasm`
+ * takes the chat: the first good nonce from `start` (of `count`), or
+ * undefined. The worker yields between slices.
+ * @param {string} sender
+ * @param {bigint} timestamp
+ * @param {string} reply_to_json
+ * @param {string} words_json
+ * @param {string} attachments_json
+ * @param {bigint} start
+ * @param {number} count
+ * @returns {bigint | undefined}
+ */
+export function chat_pow_search(sender, timestamp, reply_to_json, words_json, attachments_json, start, count) {
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-32);
+        const ptr0 = passStringToWasm0(sender, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(reply_to_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(words_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passStringToWasm0(attachments_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len3 = WASM_VECTOR_LEN;
+        wasm.chat_pow_search(retptr, ptr0, len0, timestamp, ptr1, len1, ptr2, len2, ptr3, len3, start, count);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r2 = getDataViewMemory0().getBigInt64(retptr + 8 * 1, true);
+        var r4 = getDataViewMemory0().getInt32(retptr + 4 * 4, true);
+        var r5 = getDataViewMemory0().getInt32(retptr + 4 * 5, true);
+        if (r5) {
+            throw takeObject(r4);
+        }
+        return r0 === 0 ? undefined : BigInt.asUintN(64, r2);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(32);
+    }
+}
+
+/**
  * Compute the coin ID (UTXO identifier) from an address, value, and salt.
  *
  * `coin_id = BLAKE3(address || value_le_bytes || salt)`
@@ -1651,6 +1805,40 @@ export function mine_commitment_pow(commitment_hex, required_pow, target_height,
     const len1 = WASM_VECTOR_LEN;
     const ret = wasm.mine_commitment_pow(ptr0, len0, required_pow, target_height, ptr1, len1);
     return BigInt.asUintN(64, ret);
+}
+
+/**
+ * The registry spend for a name, planned from a node's proof (JSON as
+ * `GET /name/:name/proof` gives it, plus how and what to set). Errors say
+ * why the proof or the request does not hold.
+ * @param {string} req_json
+ * @returns {string}
+ */
+export function name_plan(req_json) {
+    let deferred3_0;
+    let deferred3_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(req_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.name_plan(retptr, ptr0, len0);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr2 = r0;
+        var len2 = r1;
+        if (r3) {
+            ptr2 = 0; len2 = 0;
+            throw takeObject(r2);
+        }
+        deferred3_0 = ptr2;
+        deferred3_1 = len2;
+        return getStringFromWasm0(ptr2, len2);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred3_0, deferred3_1, 1);
+    }
 }
 
 /**
@@ -2008,6 +2196,380 @@ export function qbolt_channel_bytecode_hex(sender_pk_hex, receiver_pk_hex, expir
         wasm.__wbindgen_add_to_stack_pointer(16);
         wasm.__wbindgen_export4(deferred4_0, deferred4_1, 1);
     }
+}
+
+/**
+ * `public_hex` is an ML-KEM-512 key whose hash is `hash_hex` (a name's
+ * `kem` record): a key a name's wallet handed over is checked with this.
+ * @param {string} public_hex
+ * @param {string} hash_hex
+ */
+export function sealed_check_public(public_hex, hash_hex) {
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(public_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(hash_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        wasm.sealed_check_public(retptr, ptr0, len0, ptr1, len1);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        if (r1) {
+            throw takeObject(r0);
+        }
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+    }
+}
+
+/**
+ * An opening made up to its stamp, finished: `{"opening": hex, "session": …}`,
+ * carrying `body_hex` under the timer `ttl` with the stamp nonce `stamp`.
+ * @param {string} prepared_json
+ * @param {string} body_hex
+ * @param {number} ttl
+ * @param {bigint} stamp
+ * @returns {string}
+ */
+export function sealed_finish_opening(prepared_json, body_hex, ttl, stamp) {
+    let deferred4_0;
+    let deferred4_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(prepared_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(body_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        wasm.sealed_finish_opening(retptr, ptr0, len0, ptr1, len1, ttl, stamp);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr3 = r0;
+        var len3 = r1;
+        if (r3) {
+            ptr3 = 0; len3 = 0;
+            throw takeObject(r2);
+        }
+        deferred4_0 = ptr3;
+        deferred4_1 = len3;
+        return getStringFromWasm0(ptr3, len3);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred4_0, deferred4_1, 1);
+    }
+}
+
+/**
+ * The `kem` hash of the key an opening was sealed to (hex).
+ * @param {string} prepared_json
+ * @returns {string}
+ */
+export function sealed_prepared_recipient(prepared_json) {
+    let deferred3_0;
+    let deferred3_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(prepared_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.sealed_prepared_recipient(retptr, ptr0, len0);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr2 = r0;
+        var len2 = r1;
+        if (r3) {
+            ptr2 = 0; len2 = 0;
+            throw takeObject(r2);
+        }
+        deferred3_0 = ptr2;
+        deferred3_1 = len2;
+        return getStringFromWasm0(ptr2, len2);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred3_0, deferred3_1, 1);
+    }
+}
+
+/**
+ * The key an opening's stamp is worked under (hex).
+ * @param {string} prepared_json
+ * @returns {string}
+ */
+export function sealed_prepared_stamp_key(prepared_json) {
+    let deferred3_0;
+    let deferred3_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(prepared_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.sealed_prepared_stamp_key(retptr, ptr0, len0);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr2 = r0;
+        var len2 = r1;
+        if (r3) {
+            ptr2 = 0; len2 = 0;
+            throw takeObject(r2);
+        }
+        deferred3_0 = ptr2;
+        deferred3_1 = len2;
+        return getStringFromWasm0(ptr2, len2);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred3_0, deferred3_1, 1);
+    }
+}
+
+/**
+ * The other side's message `n` (its route matched), opened: `{"session": …,
+ * "body": hex, "ttl", "stamp_bits"}`, or undefined.
+ * @param {string} session_json
+ * @param {number} n
+ * @param {string} envelope_hex
+ * @returns {string | undefined}
+ */
+export function sealed_session_open(session_json, n, envelope_hex) {
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(session_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(envelope_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        wasm.sealed_session_open(retptr, ptr0, len0, n, ptr1, len1);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        if (r3) {
+            throw takeObject(r2);
+        }
+        let v3;
+        if (r0 !== 0) {
+            v3 = getStringFromWasm0(r0, r1).slice();
+            wasm.__wbindgen_export4(r0, r1 * 1, 1);
+        }
+        return v3;
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+    }
+}
+
+/**
+ * This side's next number in a session, taken: `{"session": …, "n": n,
+ * "key": hex}`, the key its stamp is worked under.
+ * @param {string} session_json
+ * @returns {string}
+ */
+export function sealed_session_reserve(session_json) {
+    let deferred3_0;
+    let deferred3_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(session_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.sealed_session_reserve(retptr, ptr0, len0);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr2 = r0;
+        var len2 = r1;
+        if (r3) {
+            ptr2 = 0; len2 = 0;
+            throw takeObject(r2);
+        }
+        deferred3_0 = ptr2;
+        deferred3_1 = len2;
+        return getStringFromWasm0(ptr2, len2);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred3_0, deferred3_1, 1);
+    }
+}
+
+/**
+ * The routes of the other side's messages this side still expects:
+ * `[[route hex, n], …]`.
+ * @param {string} session_json
+ * @returns {string}
+ */
+export function sealed_session_routes(session_json) {
+    let deferred3_0;
+    let deferred3_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(session_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.sealed_session_routes(retptr, ptr0, len0);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr2 = r0;
+        var len2 = r1;
+        if (r3) {
+            ptr2 = 0; len2 = 0;
+            throw takeObject(r2);
+        }
+        deferred3_0 = ptr2;
+        deferred3_1 = len2;
+        return getStringFromWasm0(ptr2, len2);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred3_0, deferred3_1, 1);
+    }
+}
+
+/**
+ * This side's message `n` (reserved), sealed: the envelope, hex.
+ * @param {string} session_json
+ * @param {number} n
+ * @param {string} body_hex
+ * @param {number} ttl
+ * @param {bigint} stamp
+ * @returns {string}
+ */
+export function sealed_session_seal(session_json, n, body_hex, ttl, stamp) {
+    let deferred4_0;
+    let deferred4_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(session_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(body_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        wasm.sealed_session_seal(retptr, ptr0, len0, n, ptr1, len1, ttl, stamp);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr3 = r0;
+        var len3 = r1;
+        if (r3) {
+            ptr3 = 0; len3 = 0;
+            throw takeObject(r2);
+        }
+        deferred4_0 = ptr3;
+        deferred4_1 = len3;
+        return getStringFromWasm0(ptr3, len3);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred4_0, deferred4_1, 1);
+    }
+}
+
+/**
+ * The key the stamp of this side's message `n` is worked under (hex).
+ * @param {string} session_json
+ * @param {number} n
+ * @returns {string}
+ */
+export function sealed_session_stamp_key(session_json, n) {
+    let deferred3_0;
+    let deferred3_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(session_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.sealed_session_stamp_key(retptr, ptr0, len0, n);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr2 = r0;
+        var len2 = r1;
+        if (r3) {
+            ptr2 = 0; len2 = 0;
+            throw takeObject(r2);
+        }
+        deferred3_0 = ptr2;
+        deferred3_1 = len2;
+        return getStringFromWasm0(ptr2, len2);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred3_0, deferred3_1, 1);
+    }
+}
+
+/**
+ * The leading zero bits a stamp nonce shows under `key_hex`.
+ * @param {string} key_hex
+ * @param {bigint} nonce
+ * @returns {number}
+ */
+export function sealed_stamp_bits(key_hex, nonce) {
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(key_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.sealed_stamp_bits(retptr, ptr0, len0, nonce);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        if (r2) {
+            throw takeObject(r1);
+        }
+        return r0 >>> 0;
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+    }
+}
+
+/**
+ * A slice of a stamp's search: the first nonce from `start` (of `count`)
+ * whose work under `key_hex` shows `bits`, or undefined.
+ * @param {string} key_hex
+ * @param {number} bits
+ * @param {bigint} start
+ * @param {number} count
+ * @returns {bigint | undefined}
+ */
+export function sealed_stamp_search(key_hex, bits, start, count) {
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-32);
+        const ptr0 = passStringToWasm0(key_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.sealed_stamp_search(retptr, ptr0, len0, bits, start, count);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r2 = getDataViewMemory0().getBigInt64(retptr + 8 * 1, true);
+        var r4 = getDataViewMemory0().getInt32(retptr + 4 * 4, true);
+        var r5 = getDataViewMemory0().getInt32(retptr + 4 * 5, true);
+        if (r5) {
+            throw takeObject(r4);
+        }
+        return r0 === 0 ? undefined : BigInt.asUintN(64, r2);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(32);
+    }
+}
+
+/**
+ * Whether a named opener is who it says (`sealed::Sender::verify`), given
+ * the identity key its name's records give now (empty: none).
+ * @param {string} name
+ * @param {string} identity_hex
+ * @param {string} signature_hex
+ * @param {string} transcript_hex
+ * @param {string} identity_of_name_hex
+ * @returns {boolean}
+ */
+export function sealed_verify_sender(name, identity_hex, signature_hex, transcript_hex, identity_of_name_hex) {
+    const ptr0 = passStringToWasm0(name, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(identity_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(signature_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passStringToWasm0(transcript_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+    const len3 = WASM_VECTOR_LEN;
+    const ptr4 = passStringToWasm0(identity_of_name_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+    const len4 = WASM_VECTOR_LEN;
+    const ret = wasm.sealed_verify_sender(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4);
+    return ret !== 0;
 }
 
 /**

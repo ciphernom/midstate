@@ -1,7 +1,8 @@
-// Builds both browser libp2p bundles.
+// Builds both browser libp2p bundles, and the QR reader's.
 //
-// Rollup accepts an array of configs, so `npx rollup -c` produces both
-// light_client.bundle.js and pool_client.bundle.js in one pass. Keeping them in
+// Rollup accepts an array of configs, so `npx rollup -c` produces
+// light_client.bundle.js, pool_client.bundle.js and qr_reader.bundle.js in one
+// pass. Keeping them in
 // a single file matters more than it looks: both entry points depend on the SAME
 // libp2p and @libp2p/webrtc packages, so if their resolver settings ever drift
 // apart the app ends up shipping two subtly different builds of one library.
@@ -11,7 +12,7 @@
 //   npx rollup -c
 //
 // Both outputs are ES modules with named exports (`LightClient`, `PoolClient`),
-// which is what index.html's dynamic `import()` calls expect.
+// which is what net.js's dynamic `import()` calls expect.
 
 import resolve from '@rollup/plugin-node-resolve';
 import commonjs from '@rollup/plugin-commonjs';
@@ -54,10 +55,23 @@ export default [
             format: 'es',
             // Forces a single output file even if a dependency uses a dynamic
             // import. `output.file` (as opposed to `output.dir`) cannot emit
-            // multiple chunks, and index.html loads this by a fixed filename.
+            // multiple chunks, and net.js loads this by a fixed filename.
             inlineDynamicImports: true,
         },
         plugins: [browserResolve(), commonjs()],
         onwarn: quietCircular,
+    },
+
+    // ── QR reader: jsQR on a worker, for the send form's "Scan" ──
+    // qr_scan.js starts it only when someone scans (the browser's own
+    // BarcodeDetector is used instead where there is one).
+    {
+        input: 'qr_reader.js',
+        output: {
+            file: 'qr_reader.bundle.js',
+            format: 'es',
+            banner: '/*! jsQR 1.4.0, https://github.com/cozmo/jsQR, Apache License 2.0 */',
+        },
+        plugins: [browserResolve(), commonjs()],
     },
 ];

@@ -364,6 +364,30 @@ export class WebWallet {
      */
     prepare_spend(available_utxos_json: string, to_address_hex: string, send_amount: bigint, next_wots_index: number, databurn_hex?: string | null, databurn_value?: bigint | null): string;
     /**
+     * What a name's `kem` record must hold for messages sealed to it to
+     * open here.
+     */
+    sealed_kem_hash(): string;
+    /**
+     * This wallet's ML-KEM-512 public key (800 bytes, hex): what the
+     * identity handshake hands to whoever asks (`CMD_KEM`).
+     */
+    sealed_kem_public(): string;
+    /**
+     * An opening to the holder of `recipient_public_hex`, made up to its
+     * stamp (`sealed::prepare_opening`), as JSON. With `as_name`, signed
+     * as that name by the MSS key `identity_pk_hex` (in this wallet), which
+     * spends one of its leaves: the page must save the key's new leaf
+     * counter before the opening goes anywhere.
+     */
+    sealed_prepare_opening(recipient_public_hex: string, recipient_hash_hex: string, as_name?: string | null, identity_pk_hex?: string | null): string;
+    /**
+     * Tries an envelope (a sealed chat's `encrypted_message` attachments,
+     * joined) as an opening sealed to this wallet's key: its JSON, or
+     * undefined if it is not one.
+     */
+    sealed_try_open(envelope_hex: string): string | undefined;
+    /**
      * Update the next-leaf counter for an MSS tree.
      *
      * Called by the JS layer after loading wallet state to synchronize
@@ -445,6 +469,13 @@ export function build_htlc_bytecode_hex(secret_hash_hex: string, receiver_pk_hex
 export function build_limit_order_covenant_bytecode_hex(secret_hash_hex: string, max_claim: bigint, timeout_height: bigint, refund_pk_hex: string): string;
 
 export function build_multisig_2of2_address(pk1_hex: string, pk2_hex: string): string;
+
+/**
+ * A slice of a chat's proof-of-work search, as `mine_chat_pow_v2_wasm`
+ * takes the chat: the first good nonce from `start` (of `count`), or
+ * undefined. The worker yields between slices.
+ */
+export function chat_pow_search(sender: string, timestamp: bigint, reply_to_json: string, words_json: string, attachments_json: string, start: bigint, count: number): bigint | undefined;
 
 /**
  * Compute the coin ID (UTXO identifier) from an address, value, and salt.
@@ -567,6 +598,13 @@ export function mine_chat_pow_v2_wasm(sender: string, timestamp: bigint, reply_t
 export function mine_commitment_pow(commitment_hex: string, required_pow: number, target_height: bigint, header_hash_hex: string): bigint;
 
 /**
+ * The registry spend for a name, planned from a node's proof (JSON as
+ * `GET /name/:name/proof` gives it, plus how and what to set). Errors say
+ * why the proof or the request does not hold.
+ */
+export function name_plan(req_json: string): string;
+
+/**
  * Cooperative / unilateral-receiver close reveal.
  * Witness per input: [sender_sig, receiver_sig, 0x01].
  */
@@ -608,6 +646,73 @@ export function qbolt_build_state(channel_id_hex: string, sender_pk_hex: string,
 export function qbolt_channel_address(sender_pk_hex: string, receiver_pk_hex: string, expiry: bigint): string;
 
 export function qbolt_channel_bytecode_hex(sender_pk_hex: string, receiver_pk_hex: string, expiry: bigint): string;
+
+/**
+ * `public_hex` is an ML-KEM-512 key whose hash is `hash_hex` (a name's
+ * `kem` record): a key a name's wallet handed over is checked with this.
+ */
+export function sealed_check_public(public_hex: string, hash_hex: string): void;
+
+/**
+ * An opening made up to its stamp, finished: `{"opening": hex, "session": …}`,
+ * carrying `body_hex` under the timer `ttl` with the stamp nonce `stamp`.
+ */
+export function sealed_finish_opening(prepared_json: string, body_hex: string, ttl: number, stamp: bigint): string;
+
+/**
+ * The `kem` hash of the key an opening was sealed to (hex).
+ */
+export function sealed_prepared_recipient(prepared_json: string): string;
+
+/**
+ * The key an opening's stamp is worked under (hex).
+ */
+export function sealed_prepared_stamp_key(prepared_json: string): string;
+
+/**
+ * The other side's message `n` (its route matched), opened: `{"session": …,
+ * "body": hex, "ttl", "stamp_bits"}`, or undefined.
+ */
+export function sealed_session_open(session_json: string, n: number, envelope_hex: string): string | undefined;
+
+/**
+ * This side's next number in a session, taken: `{"session": …, "n": n,
+ * "key": hex}`, the key its stamp is worked under.
+ */
+export function sealed_session_reserve(session_json: string): string;
+
+/**
+ * The routes of the other side's messages this side still expects:
+ * `[[route hex, n], …]`.
+ */
+export function sealed_session_routes(session_json: string): string;
+
+/**
+ * This side's message `n` (reserved), sealed: the envelope, hex.
+ */
+export function sealed_session_seal(session_json: string, n: number, body_hex: string, ttl: number, stamp: bigint): string;
+
+/**
+ * The key the stamp of this side's message `n` is worked under (hex).
+ */
+export function sealed_session_stamp_key(session_json: string, n: number): string;
+
+/**
+ * The leading zero bits a stamp nonce shows under `key_hex`.
+ */
+export function sealed_stamp_bits(key_hex: string, nonce: bigint): number;
+
+/**
+ * A slice of a stamp's search: the first nonce from `start` (of `count`)
+ * whose work under `key_hex` shows `bits`, or undefined.
+ */
+export function sealed_stamp_search(key_hex: string, bits: number, start: bigint, count: number): bigint | undefined;
+
+/**
+ * Whether a named opener is who it says (`sealed::Sender::verify`), given
+ * the identity key its name's records give now (empty: none).
+ */
+export function sealed_verify_sender(name: string, identity_hex: string, signature_hex: string, transcript_hex: string, identity_of_name_hex: string): boolean;
 
 /**
  * Search a range of nonces for a valid block extension hash.
@@ -662,6 +767,7 @@ export interface InitOutput {
     readonly build_htlc_bytecode_hex: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number) => void;
     readonly build_limit_order_covenant_bytecode_hex: (a: number, b: number, c: number, d: bigint, e: bigint, f: number, g: number) => void;
     readonly build_multisig_2of2_address: (a: number, b: number, c: number, d: number, e: number) => void;
+    readonly chat_pow_search: (a: number, b: number, c: number, d: bigint, e: number, f: number, g: number, h: number, i: number, j: number, k: bigint, l: number) => void;
     readonly compute_coin_id_hex: (a: number, b: number, c: number, d: bigint, e: number, f: number) => void;
     readonly compute_commitment_hex: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly compute_p2pk_address_hex: (a: number, b: number, c: number) => void;
@@ -669,6 +775,7 @@ export interface InitOutput {
     readonly generate_phrase: (a: number) => void;
     readonly mine_chat_pow_v2_wasm: (a: number, b: number, c: number, d: bigint, e: number, f: number, g: number, h: number, i: number, j: number) => void;
     readonly mine_commitment_pow: (a: number, b: number, c: number, d: bigint, e: number, f: number) => bigint;
+    readonly name_plan: (a: number, b: number, c: number) => void;
     readonly qbolt_build_close_reveal: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number) => void;
     readonly qbolt_build_legacy_close_reveal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number) => void;
     readonly qbolt_build_legacy_close_state: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: bigint, k: bigint, l: number) => void;
@@ -677,6 +784,18 @@ export interface InitOutput {
     readonly qbolt_build_state: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: bigint, i: number, j: number, k: bigint, l: bigint, m: number, n: number, o: number, p: number) => void;
     readonly qbolt_channel_address: (a: number, b: number, c: number, d: number, e: number, f: bigint) => void;
     readonly qbolt_channel_bytecode_hex: (a: number, b: number, c: number, d: number, e: number, f: bigint) => void;
+    readonly sealed_check_public: (a: number, b: number, c: number, d: number, e: number) => void;
+    readonly sealed_finish_opening: (a: number, b: number, c: number, d: number, e: number, f: number, g: bigint) => void;
+    readonly sealed_prepared_recipient: (a: number, b: number, c: number) => void;
+    readonly sealed_prepared_stamp_key: (a: number, b: number, c: number) => void;
+    readonly sealed_session_open: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+    readonly sealed_session_reserve: (a: number, b: number, c: number) => void;
+    readonly sealed_session_routes: (a: number, b: number, c: number) => void;
+    readonly sealed_session_seal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: bigint) => void;
+    readonly sealed_session_stamp_key: (a: number, b: number, c: number, d: number) => void;
+    readonly sealed_stamp_bits: (a: number, b: number, c: number, d: bigint) => void;
+    readonly sealed_stamp_search: (a: number, b: number, c: number, d: number, e: bigint, f: number) => void;
+    readonly sealed_verify_sender: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => number;
     readonly search_nonces: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number) => void;
     readonly search_nonces_pow: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: bigint, i: number) => void;
     readonly verify_mss_sig_wasm: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
@@ -703,6 +822,10 @@ export interface InitOutput {
     readonly webwallet_prepare_fund_tx: (a: number, b: number, c: number, d: number, e: number, f: number, g: bigint, h: number, i: number, j: number) => void;
     readonly webwallet_prepare_script_spend: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number) => void;
     readonly webwallet_prepare_spend: (a: number, b: number, c: number, d: number, e: number, f: number, g: bigint, h: number, i: number, j: number, k: number, l: bigint) => void;
+    readonly webwallet_sealed_kem_hash: (a: number, b: number) => void;
+    readonly webwallet_sealed_kem_public: (a: number, b: number) => void;
+    readonly webwallet_sealed_prepare_opening: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => void;
+    readonly webwallet_sealed_try_open: (a: number, b: number, c: number, d: number) => void;
     readonly webwallet_set_mss_leaf_index: (a: number, b: number, c: number, d: number) => void;
     readonly webwallet_set_watchlist: (a: number, b: number, c: number) => void;
     readonly webwallet_sign_mss_hex: (a: number, b: number, c: number, d: number, e: number, f: number) => void;

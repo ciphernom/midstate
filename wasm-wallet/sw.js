@@ -1,7 +1,8 @@
-// pool_client.bundle.js is deliberately NOT precached: it is imported lazily by
-// index.html only when a miner configures a multiaddr pool, exactly as
-// light_client.bundle.js is. Precaching it would push the libp2p bundle onto
-// every user including solo miners who never touch it.
+// pool_client.bundle.js is deliberately NOT precached: net.js imports it lazily
+// only when a miner configures a multiaddr pool, exactly as it does
+// light_client.bundle.js. Precaching it would push the libp2p bundle onto every
+// user including solo miners who never touch it. qr_reader.bundle.js likewise
+// loads only when someone scans a QR code.
 //
 // CACHE_NAME must change whenever a precached file changes: the fetch handler
 // serves everything except HTML cache-first, so a returning user keeps running
@@ -10,10 +11,28 @@
 // changed (08-05, 08-16, 08-27 and since), so returning users never received
 // those changes. The deploy workflow now stamps the commit hash over this value
 // on every deploy; the literal here only matters when serving the repo directly.
-const CACHE_NAME = 'midstate-wallet-v100';
+const CACHE_NAME = 'midstate-wallet-v103';
 
 const ASSETS = [
   'index.html',
+  // The page (index.html) and what it imports. A module missing from here
+  // still loads, from the network; but offline it would not.
+  'app.js',
+  'ui.js',
+  'format.js',
+  'names.js',
+  'spend.js',
+  'messages.js',
+  'room.js',
+  'registrar.js',
+  'net.js',
+  'mining.js',
+  'bridge.js',
+  'qr.js',
+  'qr_scan.js',
+  'theme.js',
+  'wallet.css',
+  'icon-192.png',
   'worker.js',
   'miner.js',
   // The mining kernel, fetched at runtime by gpu_miner.js. Precached because a

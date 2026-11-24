@@ -27,7 +27,16 @@
  * @module worker
  */
 
+import { normalize as normalizeName, checkProof as checkNameProof, checkAnswer as checkNameAnswer, payAddress as namePayAddress, kemHash as nameKemHash, SIGNATURES_KEPT } from './names.js';
+import { Registrar, Stop as NameStop } from './registrar.js';
+import { addressChecksumOk } from './format.js';
+import { maxSendable } from './spend.js';
+import { Messenger, newBook } from './messages.js';
+import { merge as mergeRoom, checkOut as checkRoomOut } from './room.js';
 import init, { WebWallet, generate_phrase, compute_coin_id_hex, compute_commitment_hex, decrypt_cli_wallet, mine_commitment_pow, blake3_hash_hex, build_multisig_2of2_address, build_channel_state, build_channel_reveal, verify_mss_sig_wasm, mine_chat_pow_v2_wasm, build_htlc_bytecode_hex, build_covenant_htlc_bytecode_hex, build_limit_order_covenant_bytecode_hex, compute_p2pk_address_hex, qbolt_channel_address, qbolt_channel_bytecode_hex, qbolt_build_state, qbolt_build_refund_state, qbolt_build_close_reveal, qbolt_build_refund_reveal, qbolt_build_legacy_close_state, qbolt_build_legacy_close_reveal, address_to_checksummed_hex } from './pkg/wasm_wallet.js';
+// Sealed messages' functions, looked up when used: a build of the
+// WebAssembly without them leaves messages off rather than the wallet broken.
+import * as wasmApi from './pkg/wasm_wallet.js';
 
 /** @type {WebWallet|null} The WASM wallet instance. Null until CREATE or LOGIN. */
 let wallet = null;
@@ -1026,6 +1035,648 @@ function rpcCall(method, params) {
     });
 }
 
+/**
+ * Where an MDS payment to `name.mds` goes, checked (names.js): the node's
+ * proof of the name's leaf against the registry root and the root against a
+ * registry coin, the coin live on the wallet's node, and, for a name that
+ * pays an MSS key, the key's signatures left. The registry coin moves on
+ * whenever any name changes, so a coin that is already gone gets one more
+ * try with a fresh proof.
+ */
+async function resolveName(input) {
+    const name = normalizeName(input);
+    for (let attempt = 0; ; attempt++) {
+        const answer = await rpcCall('getNameProof', { name });
+        const checked = checkNameProof(name, answer, blake3_hash_hex);
+        const coin = await rpc.checkCoin(checked.coin);
+        if (!coin || !coin.exists) {
+            if (attempt === 0) continue;
+            throw new Error('The name registry moved on while it was being checked. Try again.');
+        }
+        const used = async (key) => {
+            const st = await rpc.getMssState(key);
+            return Number(st && st.next_index) || 0;
+        };
+        const pay = await namePayAddress(checked.records, used, compute_p2pk_address_hex);
+        if (!pay) throw new Error(`${name}.mds takes no MDS payments`);
+        return {
+            name: `${name}.mds`,
+            address: address_to_checksummed_hex(pay.address),
+            kind: pay.kind,
+            kem: nameKemHash(checked.records),
+            height: checked.height,
+        };
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Sealed messages (messages.js keeps the conversations; this gives it the
+//  wallet's keys, the chain and the chat bus)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/** @type {Messenger|null} Running while a wallet is open. */
+let messenger = null;
+let messagesTimer = null;
+let messagesWatching = false;   // the page shows Messages: read the bus more often
+let messagesBookTimer = null;
+/** Tries a chat's proof of work takes between yields. */
+const CHAT_POW_SLICE = 1 << 16;
+
+/** Whether this build's WebAssembly has the sealed-message functions. */
+function sealedBuilt() {
+    return typeof wasmApi.sealed_session_seal === 'function' && typeof wasmApi.chat_pow_search === 'function'
+        && !!wallet && typeof wallet.sealed_kem_public === 'function';
+}
+
+/** A name's records for messages: null if no one holds it (or it lapsed);
+ *  throws if that could not be told now. A name lapsing within a day still
+ *  takes messages. */
+async function messageRecords(name) {
+    for (let attempt = 0; ; attempt++) {
+        const answer = await rpcCall('getNameProof', { name });
+        let checked;
+        try {
+            checked = checkNameProof(name, answer, blake3_hash_hex, { lapsingOk: true });
+        } catch (e) {
+            if (/^No one has the name|has lapsed/.test((e && e.message) || '')) return null;
+            throw e;
+        }
+        const coin = await rpc.checkCoin(checked.coin);
+        if (coin && coin.exists) return checked.records;
+        if (attempt > 0) throw new Error('The name registry moved on while it was being checked.');
+    }
+}
+
+/** A chat's proof of work, done here a slice at a time (so the worker keeps
+ *  answering), starting well away from the nonces node miners count up from.
+ *  A build without the sliced search mines in one go, as before. */
+async function chatPow(sender, timestamp, replyTo, words, attachments) {
+    const rj = JSON.stringify(replyTo ?? null), wj = JSON.stringify(words), aj = JSON.stringify(attachments);
+    if (typeof wasmApi.chat_pow_search !== 'function') {
+        await new Promise(r => setTimeout(r, 10));
+        return Number(mine_chat_pow_v2_wasm(sender, BigInt(timestamp), rj, wj, aj));
+    }
+    let start = BigInt(Math.floor(Math.random() * 2 ** 40));
+    for (;;) {
+        const nonce = wasmApi.chat_pow_search(sender, BigInt(timestamp), rj, wj, aj, start, CHAT_POW_SLICE);
+        if (nonce !== undefined && nonce !== null) return Number(nonce);
+        start += BigInt(CHAT_POW_SLICE);
+        await new Promise(r => setTimeout(r, 0));
+    }
+}
+
+/** Puts a chat on the bus from a fresh random sender, so nothing ties two
+ *  chats to each other or to this wallet. */
+async function postSealedChat(words, attachments) {
+    const sender = normalizeHex(crypto.getRandomValues(new Uint8Array(32)));
+    const timestamp = Math.floor(Date.now() / 1000);
+    const nonce = await chatPow(sender, timestamp, null, words, attachments);
+    const r = await rpc.submitChat(sender, timestamp, nonce, null, words, attachments);
+    if (!r || !r.ok) throw new Error((r && r.body) || 'The node didn’t take the message.');
+}
+
+/** An opening made up to its stamp. Written as a name, it is signed by the
+ *  name's identity key: one of its leaves, picked and saved as
+ *  signMssAndSync does (the larger of this wallet's count and the node's),
+ *  before the opening can go anywhere. */
+async function sealedPrepare(publicHex, hashHex, asName) {
+    if (!asName) return JSON.parse(wallet.sealed_prepare_opening(publicHex, hashHex, undefined, undefined));
+    if (!mssCachesReady) await loadMssCaches();
+    const addr = compute_p2pk_address_hex(asName.identity);
+    const rec = wState.mssAddrs[addr];
+    if (!rec) throw new Error('The identity key of the name you write as is not in this wallet.');
+    let leaf = rec.next_leaf || 0;
+    try {
+        const st = await rpc.getMssState(asName.identity);
+        if (st && Number.isFinite(st.next_index)) leaf = Math.max(leaf, st.next_index);
+    } catch (_) { /* offline: this wallet's own count */ }
+    if (rec.height && leaf >= (1 << rec.height)) throw new Error('The identity key has no signatures left. Make a new address and point your name at it.');
+    rec.next_leaf = leaf;
+    wallet.set_mss_leaf_index(addr, leaf);
+    const prepared = JSON.parse(wallet.sealed_prepare_opening(publicHex, hashHex, asName.name, asName.identity));
+    rec.next_leaf = leaf + 1;
+    await idbPut(`mss_${addr}`, wallet.export_mss_bytes(addr));
+    await saveState();
+    return prepared;
+}
+
+function sealedCrypto() {
+    const W = wasmApi;
+    const json = s => JSON.parse(s);
+    const str = o => JSON.stringify(o);
+    return {
+        kemPublic: () => wallet.sealed_kem_public(),
+        kemHash: () => wallet.sealed_kem_hash(),
+        tryOpen: env => { const r = wallet.sealed_try_open(env); return r ? json(r) : null; },
+        prepare: (pub, hash, asName) => sealedPrepare(pub, hash, asName),
+        preparedKey: p => W.sealed_prepared_stamp_key(str(p)),
+        preparedRecipient: p => W.sealed_prepared_recipient(str(p)),
+        finish: (p, body, ttl, nonce) => json(W.sealed_finish_opening(str(p), body, ttl, BigInt(nonce))),
+        reserve: s => json(W.sealed_session_reserve(str(s))),
+        stampKey: (s, n) => W.sealed_session_stamp_key(str(s), n),
+        seal: (s, n, body, ttl, nonce) => W.sealed_session_seal(str(s), n, body, ttl, BigInt(nonce)),
+        routes: s => json(W.sealed_session_routes(str(s))),
+        open: (s, n, env) => { const r = W.sealed_session_open(str(s), n, env); return r ? json(r) : null; },
+        stampSearch: (key, bits, start, count) => W.sealed_stamp_search(key, bits, BigInt(start), count),
+        verifySender: (name, identity, signature, transcript, ofName) => W.sealed_verify_sender(name, identity, signature, transcript, ofName),
+        checkPublic: (pub, hash) => W.sealed_check_public(pub, hash),
+        hash: hex => blake3_hash_hex(hex),
+        random: n => normalizeHex(crypto.getRandomValues(new Uint8Array(n))),
+        checksum: hex => address_to_checksummed_hex(hex),
+    };
+}
+
+/** This wallet's MSS keys, as names' identity records give them. */
+function walletIdentities() {
+    return Object.keys(wState.mssAddrs || {}).map(a => { try { return wallet.get_mss_pubkey(a); } catch (_) { return null; } }).filter(Boolean);
+}
+
+function postMessagesBook() {
+    if (messagesBookTimer) return;
+    messagesBookTimer = setTimeout(() => {
+        messagesBookTimer = null;
+        if (messenger) self.postMessage({ type: 'MSG_BOOK', payload: messenger.state() });
+    }, 50);
+}
+
+/** Reads the chat bus once for the public room and sealed messages both.
+ *  A read that fails leaves sealed messages for the next one, as their own
+ *  read did: what waits on an answer isn't given up on while the bus can't
+ *  be heard. */
+async function readBus() {
+    if (!wallet) return;
+    let history;
+    try {
+        const r = await rpc.getChat();
+        history = (r && Array.isArray(r.messages)) ? r.messages : [];
+    } catch (e) {
+        roomError = 'The chat can’t be read right now: no node answered.';
+        postRoom();
+        return;
+    }
+    roomRead = Math.floor(Date.now() / 1000);
+    roomError = null;
+    roomIngest(history);
+    if (messenger) await messenger.tick(history);
+}
+
+/** The bus is read every 15 seconds while Messages is on screen, every
+ *  minute otherwise. */
+function scheduleMessages(ms) {
+    clearTimeout(messagesTimer);
+    messagesTimer = setTimeout(async () => {
+        try { await readBus(); } catch (_) {}
+        scheduleMessages();
+    }, ms ?? (messagesWatching ? 15000 : 60000));
+}
+
+// ── The public room (room.js says what is in it) ──────────────────────────
+
+/** Public messages, the newest room.KEEP in time order. Held while the
+ *  wallet is open, not saved: the bus keeps its own last hundred. */
+let roomHeld = [];
+let roomRead = 0;           // when the bus was last read, in seconds; 0: not yet
+let roomError = null;
+let roomPostTimer = null;
+
+/** This wallet's name in the room: random, kept with the wallet, tied to
+ *  none of its keys or coins. (The classic page used the newest MSS key,
+ *  which told the room which coins were whose.) */
+function roomSender() {
+    if (!wState.roomSender) {
+        wState.roomSender = normalizeHex(crypto.getRandomValues(new Uint8Array(32)));
+        saveState().catch(() => {});
+    }
+    return wState.roomSender;
+}
+
+function roomState() {
+    return { messages: roomHeld, sender: wState.roomSender || null, read: roomRead, error: roomError };
+}
+
+function postRoom() {
+    if (roomPostTimer) return;
+    roomPostTimer = setTimeout(() => {
+        roomPostTimer = null;
+        self.postMessage({ type: 'ROOM', payload: roomState() });
+    }, 50);
+}
+
+function roomIngest(list) {
+    const before = roomHeld;
+    roomHeld = mergeRoom(roomHeld, list);
+    if (roomHeld.length !== before.length || roomHeld.some((m, i) => m !== before[i])) postRoom();
+}
+
+/** Says something in the public room: checked as the node checks it, its
+ *  proof of work done here, sent as this wallet's room sender. */
+async function roomSend(p) {
+    const words = Array.isArray(p.words) ? p.words.map(Number) : [];
+    const attachments = (Array.isArray(p.attachments) ? p.attachments : [])
+        .map(a => ({ kind: String((a && a.kind) || ''), value: String((a && a.value) || '').toLowerCase() }));
+    const problem = checkRoomOut(words, attachments);
+    if (problem) throw new Error(problem);
+    if (attachments.some(a => !addressChecksumOk(a.value, blake3_hash_hex))) throw new Error('An attached address has a typo in it: its last 8 characters don’t match.');
+    const replyTo = p.replyTo == null ? null : Number(p.replyTo);
+    if (replyTo != null && !Number.isSafeInteger(replyTo)) throw new Error('That message can’t be replied to.');
+    const sender = roomSender();
+    const timestamp = Math.floor(Date.now() / 1000);
+    const nonce = await chatPow(sender, timestamp, replyTo, words, attachments);
+    const r = await rpc.submitChat(sender, timestamp, nonce, replyTo, words, attachments);
+    if (!r || !r.ok) throw new Error((r && r.body) || 'The node didn’t take the message.');
+    roomIngest([{ sender, timestamp, nonce, reply_to: replyTo, words, attachments }]);
+    return { nonce };
+}
+
+/** Starts sealed messages for the wallet just opened. Never throws: messages
+ *  are not what opening a wallet depends on. */
+function startMessages() {
+    try {
+        if (messenger && messenger.book === wState.sealed && messenger.wallet === wallet) return;
+        if (messenger) messenger.stop();
+        messenger = null;
+        clearTimeout(messagesTimer);
+        if (!wallet) return;
+        // The public room needs nothing but the bus.
+        scheduleMessages(4000);
+        if (!sealedBuilt()) {
+            self.postMessage({ type: 'MSG_BOOK', payload: { available: false, chats: [], unread: 0, requests: 0, blocked: [] } });
+            return;
+        }
+        if (!wState.sealed) wState.sealed = newBook();
+        messenger = new Messenger({
+            book: wState.sealed,
+            crypto: sealedCrypto(),
+            chain: {
+                height: () => networkHeight,
+                records: name => messageRecords(name),
+                history: async () => { const r = await rpc.getChat(); return (r && Array.isArray(r.messages)) ? r.messages : []; },
+                post: (words, attachments) => postSealedChat(words, attachments),
+            },
+            identities: walletIdentities,
+            save: () => saveState(),
+            changed: postMessagesBook,
+            notice: n => self.postMessage({ type: 'MSG_NOTICE', payload: n }),
+            log: t => self.postMessage({ type: 'LOG', payload: `[messages] ${t}` }),
+            now: () => Math.floor(Date.now() / 1000),
+        });
+        messenger.wallet = wallet;
+        messenger.start();
+        postMessagesBook();
+    } catch (e) {
+        messenger = null;
+        self.postMessage({ type: 'LOG', payload: `[messages] could not start: ${(e && e.message) || e}` });
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Names (registrar.js keeps the jobs; this gives it the registry, the
+//  wallet's keys and its coins)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/** @type {Registrar|null} Running while a wallet is open. */
+let registrar = null;
+let namesTimer = null;
+let namesPostTimer = null;
+let keygenSaid = 0;
+/** What fees could take beyond a name's burn, when choosing MSS coins. */
+const NAME_FEE_ROOM = 1 << 20;
+/** A name's key is an MSS tree of the height the desktop app gives its keys. */
+const NAME_KEY_HEIGHT = 10;
+/** Unused MSS indices looked through for a name's key past the wallet's
+ *  own (walletd's MSS_GAP). */
+const NAME_KEY_GAP = 4;
+
+/** Whether this build's WebAssembly plans registry spends. */
+function namesBuilt() {
+    return typeof wasmApi.name_plan === 'function' && !!wallet && typeof wallet.prepare_script_spend === 'function';
+}
+
+async function nameAnswer(name) {
+    return checkNameAnswer(name, await rpcCall('getNameProof', { name }), blake3_hash_hex);
+}
+
+const keyLeft = k => Math.max(0, 2 ** k.height - (k.next_leaf || 0));
+
+/** This wallet's MSS key with public key `pk`, or null: a name's own key,
+ *  or any other of its MSS keys (the desktop app counts every one). */
+function controlKeyOf(pk) {
+    for (const [address, k] of Object.entries(wState.nameKeys || {})) {
+        if (k.pk === pk) return { address, pk: k.pk, height: k.height, index: k.index, left: keyLeft(k) };
+    }
+    for (const [address, m] of Object.entries(wState.mssAddrs || {})) {
+        let mpk = null;
+        try { mpk = wallet.get_mss_pubkey(address); } catch (_) {}
+        if (mpk === pk) return { address, pk, height: m.height, index: m.index, left: keyLeft(m) };
+    }
+    return null;
+}
+
+function keygenProgress(name) {
+    return (current, total) => {
+        const now = Date.now();
+        if (now - keygenSaid < 150 && current !== total) return;
+        keygenSaid = now;
+        if (registrar) {
+            registrar.busy = { name, say: `Making the name’s key (${Math.round(100 * current / total)}%)…` };
+            postNames();
+        }
+    };
+}
+
+/** Puts a name's key's tree in the wallet: from storage, or made again from
+ *  the seed. */
+async function loadControlTree(address) {
+    if (wallet.has_mss_cache(address)) return;
+    const k = wState.nameKeys[address];
+    const bytes = await idbGet(`mss_${address}`);
+    if (bytes) {
+        wallet.import_mss_bytes(address, new Uint8Array(bytes));
+    } else {
+        const made = wallet.get_mss_address(k.index, k.height, keygenProgress(k.name));
+        if (made !== address) throw new Error('The name’s key came out different from the one kept: it was made from another seed.');
+        await idbPut(`mss_${address}`, wallet.export_mss_bytes(address));
+    }
+    wallet.set_mss_leaf_index(address, k.next_leaf || 0);
+}
+
+/** Keeps the MSS key at seed index `index` as a name's key. */
+async function keepNameKey(address, index, name) {
+    const pk = wallet.get_mss_pubkey(address);
+    let used = 0;
+    try { const st = await rpc.getMssState(pk); used = Number(st && st.next_index) || 0; } catch (_) {}
+    wState.nameKeys[address] = { name, index, pk, height: NAME_KEY_HEIGHT, next_leaf: used };
+    await idbPut(`mss_${address}`, wallet.export_mss_bytes(address));
+    await saveState();
+    return { address, pk, height: NAME_KEY_HEIGHT, index, left: keyLeft(wState.nameKeys[address]) };
+}
+
+/** A fresh key for a name, as the desktop app makes one: the seed's next
+ *  MSS index, the counter saved before the key is made. */
+async function nameFreshKey(name) {
+    wState.nameKeys = wState.nameKeys || {};
+    const index = wState.nextMssIndex;
+    wState.nextMssIndex = index + 1;
+    await saveState();
+    const address = wallet.get_mss_address(index, NAME_KEY_HEIGHT, keygenProgress(name));
+    return keepNameKey(address, index, name);
+}
+
+/** The key that holds a name taken elsewhere (the desktop app, or before a
+ *  restore): the seed's MSS keys past this wallet's own, a few at a time. */
+async function nameFindKey(pk) {
+    wState.nameKeys = wState.nameKeys || {};
+    const have = new Set([...Object.values(wState.mssAddrs || {}), ...Object.values(wState.nameKeys)].map(k => k.index));
+    const top = wState.nextMssIndex + NAME_KEY_GAP;
+    const look = [];
+    for (let i = 0; i < top; i++) if (!have.has(i)) look.push(i);
+    for (const [n, i] of look.entries()) {
+        if (registrar) { registrar.busy = { name: '', say: `Looking through this wallet’s keys (${n + 1} of ${look.length})…` }; postNames(); }
+        const address = wallet.get_mss_address(i, NAME_KEY_HEIGHT, null);
+        if (wallet.get_mss_pubkey(address) !== pk) continue;
+        if (i >= wState.nextMssIndex) wState.nextMssIndex = i + 1;
+        return keepNameKey(address, i, '');
+    }
+    return null;
+}
+
+/** A name's key's signature over a commitment: its leaf the larger of this
+ *  wallet's count and the node's, taken and saved before it is used. */
+async function signControl(address, commitmentHex) {
+    if (wState.mssAddrs && wState.mssAddrs[address]) {
+        // One of the wallet's other keys holds it: signed as they all are.
+        return signMssAndSync(wallet.get_mss_pubkey(address), commitmentHex);
+    }
+    const rec = wState.nameKeys && wState.nameKeys[address];
+    if (!rec) throw new NameStop('The key that holds the name is not in this wallet.');
+    await loadControlTree(address);
+    let leaf = rec.next_leaf || 0;
+    try {
+        const st = await rpc.getMssState(rec.pk);
+        if (st && Number.isFinite(st.next_index)) leaf = Math.max(leaf, st.next_index);
+    } catch (_) { /* offline: this wallet's own count */ }
+    if (leaf >= 2 ** rec.height) throw new NameStop('The key that holds the name has no signatures left.');
+    rec.next_leaf = leaf + 1;
+    await saveState();
+    wallet.set_mss_leaf_index(address, leaf);
+    const sig = wallet.sign_mss_hex(rec.pk, commitmentHex);
+    await idbPut(`mss_${address}`, wallet.export_mss_bytes(address));
+    return sig;
+}
+
+const exactGmds = units => (Number(units) / 2 ** 30).toLocaleString('en-US', { maximumFractionDigits: 9 });
+
+/** The registry spend with the wallet's coins to pay its burn and fee: MSS
+ *  coins when they cover it (a key of theirs can sign again, from a new
+ *  leaf, if the spend has to be made again). Nothing is reserved yet. */
+async function nameBuild(plan) {
+    if (!mssCachesReady) await loadMssCaches();
+    await verifyMssSafetyIndices();
+    const all = getSpendableUtxos().map(u => (u.is_mss && wState.mssAddrs[u.address]) ? { ...u, mss_leaf: wState.mssAddrs[u.address].next_leaf } : u);
+    const sum = list => list.reduce((n, u) => n + Number(u.value), 0);
+    const mss = all.filter(u => u.is_mss);
+    const pool = sum(mss) >= plan.burn + NAME_FEE_ROOM ? mss : all;
+    if (sum(all) < plan.burn) {
+        throw new NameStop(`It burns ${exactGmds(plan.burn)} gMDS, and this wallet has ${exactGmds(sum(all))} gMDS it can spend now.`);
+    }
+    const inputs = [{ coin_id: plan.thread_coin, witness: plan.items.join(','), value: 0, salt: plan.thread_salt, state: plan.thread_root }];
+    const outputs = [
+        { out_type: 'confidential', address: plan.registry, state: plan.root, salt: plan.tip_salt },
+        ...plan.burns.map(v => ({ out_type: 'data_burn', payload: plan.burn_payload, value: v })),
+    ];
+    let ctxStr;
+    try {
+        ctxStr = wallet.prepare_script_spend(JSON.stringify(pool), plan.covenant, JSON.stringify(inputs), JSON.stringify(outputs), wState.nextWotsIndex);
+    } catch (e) {
+        const m = String((e && e.message) || e);
+        if (/insufficient/i.test(m)) throw new NameStop(`This wallet has too little MDS it can spend now for that, with the fee. (${m})`);
+        throw new Error(m);
+    }
+    return { ctx: JSON.parse(ctxStr), ctxStr };
+}
+
+async function nameReserve(ctx, label) {
+    await reserveAndLock(ctx);
+    const burn = (ctx.outputs || []).reduce((n, o) => n + (o.type === 'data_burn' ? Number(o.value_burned) || 0 : 0), 0);
+    pendingSends.push({ kind: 'pending', timestamp: Math.floor(Date.now() / 1000), fee: ctx.fee, inputs: (ctx.wallet_inputs || []).map(i => i.coin_id), outputs: [], value: burn, label, nameJob: ctx.commitment });
+    self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
+}
+
+async function nameCommit(commitment) {
+    const st = await rpc.getState();
+    await new Promise(r => setTimeout(r, 20));
+    const nonce = Number(mine_commitment_pow(commitment, st.required_pow || 24, BigInt(st.height), st.header_hash));
+    const r = await rpc.commit(commitment, nonce);
+    if (!r.ok && !/already|exist|duplicate/i.test(String(r.body || r.error || ''))) throw new Error(`The node didn’t take the commit: ${r.body || r.error}`);
+}
+
+/** Whether a reveal waiting in the mempool spends the registry coin: by its
+ *  coin id (the node's /mempool lists inputs' ids) or its salt. */
+async function nameMempoolSpends(coin, salt) {
+    const mp = await rpc.getMempool();
+    const hay = JSON.stringify((mp && mp.transactions) || []).toLowerCase();
+    if (hay.includes(String(coin).toLowerCase())) return true;
+    if (!salt) return false;
+    if (hay.includes(String(salt).toLowerCase())) return true;
+    const bytes = JSON.stringify((String(salt).match(/../g) || []).map(b => parseInt(b, 16)));
+    return hay.includes(bytes);
+}
+
+/** WOTS coins whose key signed a name's spend that can't land: a second
+ *  signature from that key could let someone forge a third, so they are
+ *  kept out of every spend, as coins a reorganisation returns are. */
+function lockExposedCoins(ids, why) {
+    wState.reuseLocked = wState.reuseLocked || {};
+    wState.spentWots = wState.spentWots || {};
+    const locked = [];
+    for (const id of ids) {
+        const u = wState.utxos[id];
+        if (!u || u.is_mss) continue;
+        u.reuseLocked = true;
+        wState.reuseLocked[id] = { address: u.address, priorCommitment: (why && why.commitment) || null };
+        wState.spentWots[u.address] = { height: networkHeight, commitment: (why && why.commitment) || null, reuseLocked: true };
+        if (wState.pendingSpends) delete wState.pendingSpends[id];
+        locked.push(u);
+    }
+    pendingSends = pendingSends.filter(p => !(p.nameJob && p.inputs.some(i => ids.includes(i))));
+    saveState().catch(() => {});
+    if (!locked.length) return;
+    self.postMessage({ type: 'REUSE_LOCK_ALERT', payload: {
+        address: locked[0].address,
+        coinIds: locked.map(u => u.coin_id),
+        priorCommitment: (why && why.commitment) || null,
+        msg: `A name’s transaction was signed and sent, but another change to the registry got in first, so it can’t land. `
+            + `${locked.length === 1 ? 'The coin it was paid from sits' : `The ${locked.length} coins it was paid from sit`} on a one-time key that has now signed once, `
+            + `so ${locked.length === 1 ? 'it is' : 'they are'} locked to keep that key from signing again. Do not try to move ${locked.length === 1 ? 'it' : 'them'} by hand.`,
+    } });
+    self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
+}
+
+function nameUnlock(ids) {
+    if (!ids || !ids.length) return;
+    wState.pendingSpends = wState.pendingSpends || {};
+    for (const id of ids) delete wState.pendingSpends[id];
+    pendingSends = pendingSends.filter(p => !(p.nameJob && p.inputs.some(i => ids.includes(i))));
+    self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
+}
+
+/** Keeps a spend's coins held while it waits on blocks: held coins go free
+ *  by themselves after half an hour (getSpendableUtxos). */
+function nameTouch(ids) {
+    wState.pendingSpends = wState.pendingSpends || {};
+    const now = Date.now();
+    for (const id of ids || []) if (wState.utxos[id]) wState.pendingSpends[id] = now;
+}
+
+/** What a name this wallet takes points at: payments to its receive key
+ *  (the newest MSS key with signatures to spare), its identity (the channel
+ *  identity, as the desktop app's), and its sealed-message key. */
+function nameMine() {
+    const addrs = Object.keys(wState.mssAddrs || {});
+    const pkOf = a => { try { return wallet.get_mss_pubkey(a) || null; } catch (_) { return null; } };
+    let pay = null;
+    for (const a of [...addrs].reverse()) {
+        const m = wState.mssAddrs[a];
+        const pk = pkOf(a);
+        if (pk && m.height && 2 ** m.height - (m.next_leaf || 0) >= 2 * SIGNATURES_KEPT) { pay = { pk, height: m.height }; break; }
+    }
+    let identity = null;
+    try { identity = getPrimaryMssPk(); } catch (_) {}
+    let kem = null;
+    try { if (sealedBuilt()) kem = wallet.sealed_kem_hash(); } catch (_) {}
+    return { pay, identity, kem, keys: addrs.map(pkOf).filter(Boolean) };
+}
+
+async function nameDone(e, j) {
+    pendingSends = pendingSends.filter(p => p.nameJob !== j.commitment);
+    try { await performScan(); } catch (_) {}
+    // Activity says what the spend was: a name's burn is what went on it
+    // (the scan counts every burn as fee), and the rest is the network's.
+    const entry = (wState.history || []).find(x => (x.kind === 'sent' || x.kind === 'mixed') && Array.isArray(x.inputs) && x.inputs.some(i => (j.inputs || []).includes(i)));
+    if (entry && !entry.label) {
+        entry.label = { register: 'Registered', claim: 'Claimed', renew: 'Renewed', edit: 'Changed' }[j.op] + ` ${e.name}.mds`;
+        const burn = Number(j.burn) || 0;
+        if (burn && !entry.value && Number(entry.fee) >= burn) { entry.value = burn; entry.fee = Number(entry.fee) - burn; }
+        await saveState();
+    }
+    self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
+    // A first name: sealed messages are written as it, unless the page says otherwise.
+    if ((j.op === 'register' || j.op === 'claim') && messenger && wState.sealed && !wState.sealed.asName) {
+        setTimeout(() => {
+            if (!messenger || (wState.sealed && wState.sealed.asName)) return;
+            messenger.setName(e.name).then(() => postMessagesBook(), err => self.postMessage({ type: 'LOG', payload: `[names] messages stay anonymous: ${(err && err.message) || err}` }));
+        }, 5000);
+    }
+}
+
+function namesView() {
+    if (!registrar) return { available: wallet && namesBuilt() ? null : false, names: [], sealed: !!wallet && sealedBuilt() };
+    return { available: true, sealed: sealedBuilt(), ...registrar.view() };
+}
+
+function postNames() {
+    if (namesPostTimer) return;
+    namesPostTimer = setTimeout(() => {
+        namesPostTimer = null;
+        self.postMessage({ type: 'NAMES', payload: namesView() });
+    }, 50);
+}
+
+/** Starts names for the wallet just opened. Never throws. */
+function startNames() {
+    try {
+        if (registrar && registrar.book === wState.names && registrar.wallet === wallet) return;
+        if (registrar) registrar.stop();
+        registrar = null;
+        clearInterval(namesTimer);
+        if (!wallet || !namesBuilt()) { postNames(); return; }
+        wState.names = wState.names || {};
+        wState.nameKeys = wState.nameKeys || {};
+        // Coins a name's spend holds stay held through the time the wallet was shut.
+        for (const e of Object.values(wState.names)) if (e.job && e.job.inputs) nameTouch(e.job.inputs);
+        registrar = new Registrar({
+            book: wState.names,
+            answer: nameAnswer,
+            coinExists: async id => { const c = await rpc.checkCoin(id); return !!(c && c.exists); },
+            mempoolSpends: nameMempoolSpends,
+            plan: req => JSON.parse(wasmApi.name_plan(JSON.stringify(req))),
+            key: controlKeyOf,
+            freshKey: nameFreshKey,
+            findKey: nameFindKey,
+            signControl,
+            build: nameBuild,
+            reserve: nameReserve,
+            commit: nameCommit,
+            awaitCommit: (c, say) => awaitCommitmentMined(c, say),
+            buildReveal: (ctxStr, c, salt) => wallet.build_script_reveal(ctxStr, c, salt),
+            send: r => rpc.send(r),
+            awaitSpent: (coin, say) => awaitCoinSpent(coin, say),
+            waitBlock: () => waitForNextBlock(90_000),
+            lockExposed: lockExposedCoins,
+            unlock: nameUnlock,
+            touch: nameTouch,
+            mine: nameMine,
+            withLock: async (label, fn) => { await acquireSendLock(label); try { return await fn(); } finally { releaseSendLock(); } },
+            save: () => saveState(),
+            changed: postNames,
+            notice: n => self.postMessage({ type: 'NAMES_NOTICE', payload: n }),
+            log: t => self.postMessage({ type: 'LOG', payload: `[names] ${t}` }),
+            now: () => Math.floor(Date.now() / 1000),
+            height: () => networkHeight,
+            done: nameDone,
+        });
+        registrar.wallet = wallet;
+        postNames();
+        // What a name's records say is this wallet's is read off its keys.
+        if (!mssCachesReady) loadMssCaches().then(postNames, () => {});
+        namesTimer = setInterval(() => { if (registrar) registrar.kick(); }, 60_000);
+        setTimeout(() => { if (registrar) registrar.kick(); }, 8000);
+    } catch (e) {
+        registrar = null;
+        self.postMessage({ type: 'LOG', payload: `[names] could not start: ${(e && e.message) || e}` });
+    }
+}
+
 /** @type {Object} Thin wrappers matching the shapes callers expect. */
 const rpc = {
     getState:       ()           => rpcCall('getState'),
@@ -1516,6 +2167,8 @@ async function loadState(pwd, bundleStr) {
         await loadMssCaches();
 
         self.postMessage({ type: 'WALLET_LOADED', payload: buildDashboardPayload() });
+        startMessages();
+        startNames();
     } catch(e) {
         throw new Error("Incorrect password or corrupted wallet file");
     }
@@ -3969,6 +4622,9 @@ self.onmessage = async (e) => {
 
         else if (type === 'PUSH_NEW_BLOCK') {
             if (payload.ChatMessage) {
+                // Sealed messages and key requests, read as they come.
+                if (messenger) messenger.ingest([payload.ChatMessage]).catch(() => {});
+                roomIngest([payload.ChatMessage]);
                 if (payload.ChatMessage.words && payload.ChatMessage.words[0] === 255) {
                     handleL2Chat(payload.ChatMessage).catch(()=>{});
                 } else {
@@ -3980,6 +4636,7 @@ self.onmessage = async (e) => {
             if (!notif) return;
             
             networkHeight = notif.height;
+            if (registrar && registrar.waiting()) registrar.kick();
             self.postMessage({ type: 'REFRESH_DASHBOARD', payload: buildDashboardPayload() });
             self.postMessage({ type: 'LOG', payload: `⚡ Network Push: New block found at height ${notif.height}!` });
             
@@ -4086,6 +4743,8 @@ self.onmessage = async (e) => {
 
             await saveState();
             self.postMessage({ type: 'WALLET_LOADED', payload: buildDashboardPayload() });
+            startMessages();
+            startNames();
             self.postMessage({ type: 'AUTO_CONNECT_WEBRTC' });
         }
 
@@ -4116,6 +4775,119 @@ self.onmessage = async (e) => {
             await performScan();
         }
 
+        else if (type === 'MSG') {
+            // The page's Messages: one request type, its op saying which.
+            const id = payload && payload.id;
+            const op = payload && payload.op;
+            try {
+                let result = {};
+                if (op === 'watch') {
+                    messagesWatching = !!payload.on;
+                    if (wallet && messagesWatching) scheduleMessages(0);
+                } else if (op === 'room') {
+                    result = roomState();
+                } else if (op === 'room-send') {
+                    result = await roomSend(payload);
+                    scheduleMessages(3000);
+                } else if (!messenger) {
+                    const built = !!wallet && sealedBuilt();
+                    if (op !== 'state') throw new Error(built ? 'Messages start once the wallet is open.' : 'This build of the wallet has no sealed messages.');
+                    result = { available: built, chats: [], unread: 0, requests: 0, blocked: [] };
+                } else {
+                    if (op === 'name' && !mssCachesReady) await loadMssCaches();
+                    result = (await messenger.handle(op, payload)) || {};
+                    postMessagesBook();
+                    // Something went out: look for what comes back sooner.
+                    if (op === 'send' || op === 'reply' || op === 'timer' || op === 'retry') scheduleMessages(3000);
+                }
+                self.postMessage({ type: 'MSG_ANSWER', payload: { id, result } });
+            } catch (err) {
+                self.postMessage({ type: 'MSG_ANSWER', payload: { id, error: (err && err.message) || String(err) } });
+            }
+        }
+
+        else if (type === 'NAMES') {
+            // The page's Names: one request type, its op saying which.
+            const id = payload && payload.id;
+            const op = payload && payload.op;
+            try {
+                let result = {};
+                if (!registrar) {
+                    if (op !== 'state') throw new Error(wallet && namesBuilt() ? 'Names start once the wallet is open.' : 'This build of the wallet can’t take names yet: reload once the page updates.');
+                    result = namesView();
+                } else {
+                    if (!mssCachesReady && op !== 'state' && op !== 'look') await loadMssCaches();
+                    const p = payload || {};
+                    switch (op) {
+                        case 'state': result = namesView(); break;
+                        case 'look': result = await registrar.look(p.name); break;
+                        case 'get': result = await registrar.get(p.name, { years: Number(p.years), text: p.text || '', postage: p.postage == null ? undefined : Number(p.postage) }); break;
+                        case 'renew': result = await registrar.renew(p.name, Number(p.years)); break;
+                        case 'edit': result = await registrar.edit(p.name, { text: p.text, postage: p.postage == null ? undefined : Number(p.postage), pay: !!p.pay, messages: !!p.messages }); break;
+                        case 'adopt': result = await registrar.adopt(p.name); break;
+                        case 'cancel': result = await registrar.cancel(p.name); break;
+                        case 'retry': result = await registrar.retry(p.name); break;
+                        case 'forget': result = await registrar.forget(p.name); break;
+                        case 'refresh':
+                            for (const e of registrar.entries()) e.checked = 0;
+                            registrar.kick();
+                            break;
+                        default: throw new Error(`Not something names do: ${op}`);
+                    }
+                    postNames();
+                }
+                self.postMessage({ type: 'NAMES_ANSWER', payload: { id, result } });
+            } catch (err) {
+                if (registrar) registrar.busy = null;
+                postNames();
+                self.postMessage({ type: 'NAMES_ANSWER', payload: { id, error: (err && err.message) || String(err) } });
+            }
+        }
+
+        else if (type === 'RESOLVE_NAME') {
+            // The page asks where a name pays before the payment is reviewed.
+            try {
+                const r = await resolveName(payload.name);
+                self.postMessage({ type: 'NAME_RESOLVED', payload: { ...r, id: payload.id, typed: payload.name } });
+            } catch (err) {
+                self.postMessage({ type: 'NAME_ERROR', payload: { id: payload.id, typed: payload.name, error: (err && err.message) || String(err) } });
+            }
+        }
+        else if (type === 'CHECK_ADDRESS') {
+            // The page's send form, as an address is typed: 72 hex characters
+            // whose last 8 are BLAKE3(address)[..4], as parse_address_wasm checks.
+            const a = String(payload.address || '').toLowerCase();
+            self.postMessage({ type: 'ADDRESS_CHECKED', payload: { id: payload.id, address: a, ok: addressChecksumOk(a, blake3_hash_hex) } });
+        }
+        else if (type === 'QUOTE_SEND') {
+            // The page's review screen: the fee (and, for "send all", the amount)
+            // before anything is signed.
+            try {
+                const q = await quoteSend(payload.toAddress, payload.amount, !!payload.sendAll);
+                self.postMessage({ type: 'SEND_QUOTE', payload: { id: payload.id, ...q } });
+            } catch (err) {
+                self.postMessage({ type: 'SEND_QUOTE', payload: { id: payload.id, error: (err && err.message) || String(err) } });
+            }
+        }
+        else if (type === 'QUOTE_CONSOLIDATE') {
+            // The page's confirmation before merging an address's coins: what
+            // CONSOLIDATE_UTXOS would make of them. prepare_consolidate only
+            // builds a context, so asking it is safe.
+            try {
+                const all = getSpendableUtxos().filter(u => u.address === payload.address);
+                if (all.length < 2) throw new Error("Need at least 2 UTXOs to consolidate.");
+                const coins = all.slice(0, 5000);   // the cap CONSOLIDATE_UTXOS applies
+                const pk = getPrimaryMssPk();
+                const dest = pk ? compute_p2pk_address_hex(pk) : payload.address;
+                const ctx = JSON.parse(wallet.prepare_consolidate(JSON.stringify(coins), dest, wState.nextWotsIndex));
+                self.postMessage({ type: 'CONSOLIDATE_QUOTE', payload: {
+                    id: payload.id, coins: coins.length, left: all.length - coins.length,
+                    value: coins.reduce((s, u) => s + Number(u.value), 0), fee: Number(ctx.fee || 0), outputs: (ctx.outputs || []).length,
+                } });
+            } catch (err) {
+                self.postMessage({ type: 'CONSOLIDATE_QUOTE', payload: { id: payload.id, error: (err && err.message) || String(err) } });
+            }
+        }
         else if (type === 'SEND') {
             await acquireSendLock();
             try { await performSend(payload.toAddress, payload.amount, null, 0, !!payload.sendAll); }
@@ -4182,7 +4954,7 @@ self.onmessage = async (e) => {
                 if (!revealReq.ok) throw new Error(`Defrag rejected: ${revealReq.body || revealReq.error}`);
 
                 self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Waiting for defrag to be mined (2/2)..." } });
-                const firstCoinId = ctx.input_coin_ids[0];
+                const firstCoinId = firstInputCoin(ctx);
                 await awaitCoinSpent(firstCoinId, (m) => self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: m } }));
 
                 pendingSends = []; // Clear locks
@@ -4262,7 +5034,7 @@ self.onmessage = async (e) => {
                 if (!revealReq.ok) throw new Error(`Sweep rejected: ${revealReq.body || revealReq.error}`);
 
                 self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Waiting for sweep to be mined (2/2)..." } });
-                const firstCoinId = ctx.input_coin_ids[0];
+                const firstCoinId = firstInputCoin(ctx);
                 await awaitCoinSpent(firstCoinId, (m) => self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: m } }));
 
                 await performScan();
@@ -4476,7 +5248,13 @@ else if (type === 'L2_OPEN_CHANNEL') {
         }
 
         else if (type === 'REVEAL_SEED') {
-            if (wState.phrase) self.postMessage({ type: 'SEED_REVEALED', payload: wState.phrase });
+            // The new page asks for the password again first (someone at an
+            // unlocked tab is not necessarily its owner); the classic page
+            // sends no payload and is answered as before.
+            if (payload && typeof payload.password === 'string' && payload.password !== password) {
+                self.postMessage({ type: 'SEED_REFUSED' });
+            }
+            else if (wState.phrase) self.postMessage({ type: 'SEED_REVEALED', payload: wState.phrase });
             else self.postMessage({ type: 'ERROR', payload: "Seed phrase not found in memory." });
         }
         else if (type === 'GET_CHAT') {
@@ -4802,6 +5580,8 @@ else if (type === 'L2_OPEN_CHANNEL') {
                 mssCachesReady = true;           // populated above; loadMssCaches would short-circuit anyway
                 await saveState();
                 self.postMessage({ type: 'WALLET_LOADED', payload: buildDashboardPayload() });
+                startMessages();
+                startNames();
 
                 // Catch up from the CLI's last scanned height (picks up anything received
                 // at the — now correctly keyed — MSS address since the CLI last ran).
@@ -5057,6 +5837,9 @@ function buildDashboardPayload() {
         lastScannedHeight: wState.lastScannedHeight || 0,
         networkHeight: networkHeight || 0,
         mempoolSize: mempoolSize || 0,
+        // A from-genesis scan for a restored phrase is under way: sending
+        // waits for it (reserveAndLock), so the page says so up front.
+        restoring: !!wState.restoreScan,
         l2LeafBudget: (typeof qbLeafBudget === 'function') ? qbLeafBudget() : null,
         l2Channels: Object.entries(wState.l2_channels || {}).map(([id, c]) => {
             if (c.v !== 2) {
@@ -6059,6 +6842,49 @@ async function verifyMssSafetyIndices(onProgress) {
     }
 }
 
+/** A prepared transaction's first input coin, to watch for it being spent.
+ *  The context (SpendContext, from prepare_defrag / prepare_consolidate) has
+ *  `selected_inputs`; it never had `input_coin_ids`, so reading that threw
+ *  "Cannot read properties of undefined" after the reveal was broadcast and
+ *  every tidy-up was reported as failed. */
+function firstInputCoin(ctx) {
+    const ids = ctx.commit_payload && ctx.commit_payload.coins;
+    return (ids && ids[0]) || ctx.selected_inputs[0].coin_id;
+}
+
+/** The coins a new transaction may spend, each MSS coin with its key's next
+ *  signature leaf (prepare_spend sizes the signatures from it). */
+function spendableWithLeaves() {
+    return getSpendableUtxos().map(u => {
+        if (u.is_mss && wState.mssAddrs[u.address]) return { ...u, mss_leaf: wState.mssAddrs[u.address].next_leaf };
+        return u;
+    });
+}
+
+/** "Send all": the amount (a BigInt) the spendable coins can send, the fee on
+ *  top (spend.js has how). */
+function sendAllAmount(utxoArray, toAddress) {
+    let total = 0n;
+    for (const u of utxoArray) total += BigInt(u.value);
+    return maxSendable(total, (amount) =>
+        JSON.parse(wallet.prepare_spend(JSON.stringify(utxoArray), toAddress, amount, wState.nextWotsIndex, null, null)).fee || 0,
+        utxoArray.length);
+}
+
+/**
+ * What a send would spend and cost, without sending: the page's review screen.
+ * The same coin choice and fee as performSend; nothing is reserved, signed or
+ * saved. Returns { amount, fee, coins } (base units, numbers).
+ */
+async function quoteSend(toAddress, amount, sendAll) {
+    if (!wallet) throw new Error("The wallet is locked.");
+    if (!mssCachesReady) await loadMssCaches();
+    const utxoArray = spendableWithLeaves();
+    const amt = sendAll ? sendAllAmount(utxoArray, toAddress) : BigInt(amount);
+    const ctx = JSON.parse(wallet.prepare_spend(JSON.stringify(utxoArray), toAddress, amt, wState.nextWotsIndex, null, null));
+    return { amount: Number(amt), fee: Number(ctx.fee || 0), coins: ctx.selected_inputs.length };
+}
+
 async function performSend(toAddress, amount, burnDataHex = null, burnValue = 0, sendAll = false) {
     self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Selecting coins and building transaction..." } });
     await new Promise(r => setTimeout(r, 10));
@@ -6068,41 +6894,10 @@ async function performSend(toAddress, amount, burnDataHex = null, burnValue = 0,
     self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: "Verifying MSS safety indices..." } });
     await verifyMssSafetyIndices((m) => self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: m } }));
 
-    const utxoArray = getSpendableUtxos().map(u => {
-        if (u.is_mss && wState.mssAddrs[u.address]) return { ...u, mss_leaf: wState.mssAddrs[u.address].next_leaf };
-        return u;
-    });
+    const utxoArray = spendableWithLeaves();
 
-    // "Send all": spend the whole balance with no change. The fee is size-based, so instead
-    // of guessing it we ask the wallet (prepare_spend returns the exact fee) and back it out.
-    // The fee depends on the output count, which depends on (total - fee), so iterate to a
-    // fixed point — it settles in 1-2 rounds. prepare_spend has no side effects (it only
-    // builds a context), so probing it here is safe.
     if (sendAll) {
-        let total = 0n;
-        for (const u of utxoArray) total += BigInt(u.value);
-        if (total <= 0n) throw new Error("Nothing to send — balance is zero.");
-        let amt = total > 3000n ? total - 3000n : total;   // start under a safe fee overestimate
-        let fee = 3000n, converged = false;
-        for (let i = 0; i < 10; i++) {
-            let est;
-            try {
-                est = JSON.parse(wallet.prepare_spend(JSON.stringify(utxoArray), toAddress, amt, wState.nextWotsIndex, null, null));
-            } catch (e) {
-                amt = amt > 500n ? amt - 500n : 0n;      // fee didn't fit yet; step down and retry
-                if (amt <= 0n) throw new Error("Balance is too small to cover the network fee.");
-                continue;
-            }
-            fee = BigInt(est.fee || 0);
-            const target = total - fee;                   // spend everything minus the fee (zero change)
-            if (target === amt) { converged = true; break; }
-            amt = target > 0n ? target : 1n;
-        }
-        // If the fee wobbled by an output between rounds, leave a 2-MDS buffer so we can
-        // never tip into over-spend; when it converged exactly, send the whole balance.
-        if (!converged) amt = total - fee - 2n;
-        if (amt <= 0n) throw new Error("Balance is too small to cover the network fee.");
-        amount = amt.toString();
+        amount = sendAllAmount(utxoArray, toAddress).toString();
         self.postMessage({ type: 'SEND_PROGRESS', payload: { msg: 'Sending your full balance minus fee\u2026' } });
     }
 

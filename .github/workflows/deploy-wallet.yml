@@ -58,6 +58,13 @@ jobs:
           npm install
           npx rollup -c rollup.config.mjs
 
+      # The page's own logic (amounts, addresses, names and their registry
+      # proofs) has unit tests; they run against the WebAssembly built above.
+      - name: Test the wallet page
+        run: |
+          cd wasm-wallet
+          npm test
+
       # --- STAGING & DEPLOYMENT ---
       - name: Prepare Staging Directory
         run: |
@@ -67,12 +74,17 @@ jobs:
           # 2. Copy the Architecture Site to the ROOT of staging
           cp -r wasm-wallet/website/* staging/
           
-          # 3. Copy the Wasm Wallet files to the '/wallet' subdirectory
-          cp wasm-wallet/index.html staging/wallet/
-          cp wasm-wallet/manifest.json staging/wallet/
-          cp wasm-wallet/sw.js staging/wallet/
-          cp wasm-wallet/worker.js staging/wallet/
-          cp wasm-wallet/miner.js staging/wallet/
+          # 3. Copy the Wasm Wallet files to the '/wallet' subdirectory.
+          #    index.html is the wallet (app.js and the modules it imports);
+          #    classic.html is the page from before, which still runs trades,
+          #    Q-Bolt channels and mining bonds made with it.
+          for f in index.html classic.html manifest.json sw.js theme.js wallet.css \
+                   app.js ui.js format.js names.js spend.js messages.js room.js registrar.js net.js mining.js bridge.js \
+                   qr.js qr_scan.js qr_reader.bundle.js \
+                   icon-192.png icon-512.png \
+                   worker.js miner.js; do
+            cp "wasm-wallet/$f" staging/wallet/
+          done
           # miner.js imports gpu_miner.js, which loads pow.wgsl: without them
           # every mining thread fails to start. pool_client.bundle.js is the
           # pool's WebRTC transport.
