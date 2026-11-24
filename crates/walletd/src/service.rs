@@ -5797,6 +5797,8 @@ impl Service {
     /// Fold both chains into the book. Nothing here signs or spends.
     async fn sync_order_book(&mut self) -> Result<()> {
         let client = BaseClient::new(self.dex_cfg.clone())?;
+        // Background scans yield during endpoint cooldown; never sleep in the actor.
+        client.order_book_ready()?;
         let tip = client.block_number().await?;
         // Stay `confirmations` back: a bid read out of a block that later
         // reorgs away would show as liquidity that does not exist.

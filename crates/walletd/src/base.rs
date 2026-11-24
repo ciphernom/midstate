@@ -16,6 +16,36 @@ use crate::evm::*;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 
+// Shared by background order-book clients using the same RPC endpoint.
+// Settlement lookups and transaction submission do not consult this cooldown.
+static BOOK_COOLDOWNS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+> = std::sync::OnceLock::new();
+
+#[derive(Debug)]
+struct RpcRateLimited {
+    method: String,
+    seconds: u64,
+}
+impl std::fmt::Display for RpcRateLimited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} failed: RPC rate limited (order-book cooldown {}s)", self.method, self.seconds)
+    }
+}
+impl std::error::Error for RpcRateLimited {}
+
+fn is_rpc_rate_limit(code: Option<i64>, message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    code == Some(429) || ["request limit reached", "rate limit", "too many requests",
+        "request rate exceeded", "compute units per second", "quota exceeded"]
+        .iter().any(|needle| message.contains(*needle))
+}
+
+fn book_cooldowns() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>> {
+    BOOK_COOLDOWNS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+
 /// Where the EVM leg points. Overridable so the whole flow can be rehearsed on
 /// a testnet before real value is at stake.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -119,20 +149,52 @@ impl BaseClient {
         self.contract
     }
 
+    /// Pre: about to start an order-book scan. Post: no RPC or sleep on cooldown.
+    pub(crate) fn order_book_ready(&self) -> Result<()> {
+        let now = std::time::Instant::now();
+        let mut cooldowns = book_cooldowns().lock().unwrap_or_else(|e| e.into_inner());
+        cooldowns.retain(|_, deadline| *deadline > now);
+        if let Some(deadline) = cooldowns.get(&self.cfg.rpc_url) {
+            let seconds = deadline.saturating_duration_since(now).as_secs() + 1;
+            bail!("Base RPC rate limited; order-book retry available in {seconds}s");
+        }
+        Ok(())
+    }
+
+    fn rate_limited(&self, method: &str, retry_after: Option<u64>) -> anyhow::Error {
+        // Numeric Retry-After only; a bounded default covers absent/date headers.
+        let seconds = retry_after.unwrap_or(30).clamp(1, 86_400);
+        let now = std::time::Instant::now();
+        let until = now + std::time::Duration::from_secs(seconds);
+        let mut cooldowns = book_cooldowns().lock().unwrap_or_else(|e| e.into_inner());
+        cooldowns.retain(|_, deadline| *deadline > now);
+        let deadline = cooldowns.entry(self.cfg.rpc_url.clone()).or_insert(until);
+        *deadline = (*deadline).max(until);
+        RpcRateLimited { method: method.into(), seconds }.into()
+    }
+
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
         let body = json!({"jsonrpc":"2.0","id":1,"method":method,"params":params});
-        let resp: Value = self
+        let response = self
             .http
             .post(&self.cfg.rpc_url)
             .json(&body)
             .send()
             .await
-            .with_context(|| format!("{method}: could not reach {}", self.cfg.rpc_url))?
-            .json()
+            .with_context(|| format!("{method}: could not reach {}", self.cfg.rpc_url))?;
+        let retry_after = response.headers().get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(self.rate_limited(method, retry_after));
+        }
+        let resp: Value = response.json()
             .await
             .with_context(|| format!("{method}: response was not JSON"))?;
         if let Some(e) = resp.get("error") {
             let msg = e.get("message").and_then(|m| m.as_str()).unwrap_or("unknown");
+            if is_rpc_rate_limit(e.get("code").and_then(Value::as_i64), msg) {
+                return Err(self.rate_limited(method, retry_after));
+            }
             bail!("{method} failed: {msg}");
         }
         resp.get("result")
@@ -491,10 +553,18 @@ impl BaseClient {
     /// scan there, and `reached` says how far it got. Nothing past `reached`
     /// is in `events`, so a caller that resumes from `reached + 1` never
     /// skips a block it could not read.
+    /// Rate limiting stops the scan immediately, without shrinking the range.
     pub async fn scan(&self, from: u64, to: u64) -> ScanPart {
         let mut part = ScanPart { events: Vec::new(), raw: 0, reached: from.saturating_sub(1), error: None };
         let mut cursor = from;
-        let mut span = LOG_SPAN;
+        let max_span = if self.cfg.rpc_url.trim_end_matches('/')
+            == BASE_MAINNET_RPC.trim_end_matches('/')
+            {
+                40_000
+            } else {
+                LOG_SPAN
+            };
+            let mut span = max_span;
         while cursor <= to {
             let end = cursor.saturating_add(span - 1).min(to);
             match self.logs(cursor, end, None).await {
@@ -507,9 +577,9 @@ impl BaseClient {
                     }
                     part.reached = end;
                     cursor = end + 1;
-                    span = (span * 2).min(LOG_SPAN);
+                    span = (span * 2).min(max_span);
                 }
-                Err(_) if span > LOG_SPAN_MIN => span /= 2,
+                Err(e) if !e.is::<RpcRateLimited>() && span > LOG_SPAN_MIN => span /= 2,
                 Err(e) => {
                     part.error = Some(e);
                     break;
@@ -552,7 +622,7 @@ impl BaseClient {
                     cursor = end + 1;
                     span = (span * 2).min(LOG_SPAN);
                 }
-                Err(_) if span > LOG_SPAN_MIN => span /= 2,
+                Err(e) if !e.is::<RpcRateLimited>() && span > LOG_SPAN_MIN => span /= 2,
                 Err(e) => return Err(e),
             }
         }
@@ -993,6 +1063,30 @@ pub fn check_ordering(reveal_deadline: u64, act_deadline: u64, margin_secs: u64)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rpc_rate_limit_is_not_a_log_range_limit() {
+        assert!(is_rpc_rate_limit(Some(-32005), "request limit reached"));
+        assert!(is_rpc_rate_limit(Some(429), "unknown"));
+        assert!(is_rpc_rate_limit(None, "Too Many Requests"));
+        assert!(!is_rpc_rate_limit(Some(-32005), "query returned more than 10000 results"));
+        assert!(!is_rpc_rate_limit(None, "block range limit exceeded"));
+    }
+
+    #[test]
+    fn rpc_order_book_cooldown_is_shared_and_endpoint_specific() {
+        let cfg = ChainConfig { rpc_url: "http://127.0.0.1:1/base-cooldown-test".into(), ..ChainConfig::default() };
+        let client = BaseClient::new(cfg.clone()).unwrap();
+        let other = BaseClient::for_asset(cfg.clone(), Asset::Usdc).unwrap();
+        assert!(client.order_book_ready().is_ok());
+        assert!(client.rate_limited("eth_getLogs", Some(30)).is::<RpcRateLimited>());
+        assert!(other.order_book_ready().is_err());
+        let independent = BaseClient::new(ChainConfig {
+            rpc_url: "http://127.0.0.1:1/base-other-test".into(), ..cfg
+        }).unwrap();
+        assert!(independent.order_book_ready().is_ok());
+    }
+
 
     #[test]
     fn token_swap_calls_are_the_ones_solidity_reads() {

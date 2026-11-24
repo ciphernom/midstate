@@ -21,7 +21,9 @@ use k256::ecdsa::{RecoveryId, Signature, SigningKey};
 use sha3::{Digest, Keccak256};
 
 pub const BASE_MAINNET_CHAIN_ID: u64 = 8453;
-pub const BASE_MAINNET_RPC: &str = "https://mainnet.base.org";
+pub const BASE_MAINNET_RPC: &str = "https://base-rpc.publicnode.com";
+/// Initial maximum event scan range for the default RPC provider.
+pub const BASE_MAINNET_LOG_SPAN: u64 = 40_000;
 /// Deployed V1 `MidstateAtomicSwap` (the address the web wallet uses).
 pub const BASE_MAINNET_CONTRACT: &str = "0x409C52821EC5fE402Ab8b9bdc1474a8cD006f9C7";
 /// USDC on Base (Circle's, native).
