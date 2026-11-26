@@ -11,16 +11,18 @@ export function feeModel(inputs, outputs) {
     return BigInt(Math.floor((100 + inputs * 1636 + outputs * 100) * 100 / 1024) + 50);
 }
 
-/** prepare_spend's fee loop, modelled for a send that needs every coin: the
- *  fee it would charge to send `amount` of `total`, or null if it can't. */
+/** prepare_spend's converged fee model for a send that uses `inputs` coins:
+ *  the exact fee `plan.rs` charges to send `amount` of `total`, or null if it can't. */
 export function modelFee(total, amount, inputs) {
-    let target = 100n;
-    for (let i = 0; i < 20; i++) {
-        if (total < amount + target) return null;
-        const change = total - amount - target;
-        const required = feeModel(inputs, popcount(amount) + popcount(change));
-        if (total >= amount + required) return required;
-        target = required;
+    const payOuts = popcount(amount);
+    let nOut = payOuts;
+    for (let i = 0; i < 16; i++) {
+        const fee = feeModel(inputs, nOut);
+        if (total < amount + fee) return null;
+        const change = total - amount - fee;
+        const actualOut = payOuts + popcount(change);
+        if (actualOut <= nOut) return fee;
+        nOut = actualOut;
     }
     return null;
 }

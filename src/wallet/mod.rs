@@ -2,6 +2,7 @@ pub mod coinjoin;
 pub mod crypto;
 pub mod hd;
 pub mod defrag;
+pub mod plan;
 
 use crate::core::{hash_concat, compute_commitment, compute_coin_id, compute_address, decompose_value, wots, OutputData, InputReveal, Predicate, Witness};
 use crate::core::mss::{self, MssKeypair};
@@ -1071,7 +1072,6 @@ pub fn import_scanned(
     ///   `MAX_CONSOLIDATE_INPUTS` (8,192). We exclude them from normal selection 
     ///   and instruct the user to consolidate.
     pub fn select_coins(&self, needed: u64, live_coins: &[[u8; 32]]) -> Result<Vec<[u8; 32]>> {
-        use rand::seq::SliceRandom;
 
         let live_set: std::collections::HashSet<[u8; 32]> = live_coins.iter().copied().collect();
 
@@ -1220,46 +1220,26 @@ pub fn import_scanned(
             );
         }
 
-        // 5. Greedy "snowball" merge: opportunistically pull in extra coins whose
-        // value exactly matches a denomination of the current change, so change
-        // consolidates into fewer, larger outputs over time.
-        let selected_set: std::collections::HashSet<[u8; 32]> =
-            selected.iter().copied().collect();
-        let mut unselected_by_denom: std::collections::HashMap<u64, Vec<&Bundle>> =
-            std::collections::HashMap::new();
+        // 5. Delegate consolidation & privacy-aware expansion to the unified
+        //    self-PayJoin planner so all legacy `select_coins` callers share
+        //    the same transaction construction mechanism.
+        let spend_bundles: Vec<defrag::SpendBundle> = bundles
+            .into_iter()
+            .map(|b| defrag::SpendBundle {
+                address: b.address,
+                coin_ids: b.coin_ids,
+                total_value: b.total_value,
+            })
+            .collect();
 
-        for bundle in &bundles {
-            if bundle.coin_ids.len() == 1 && !selected_set.contains(&bundle.coin_ids[0]) {
-                unselected_by_denom.entry(bundle.total_value).or_default().push(bundle);
-            }
-        }
+        let plan = plan::plan_transaction_from_bundles(
+            &spend_bundles,
+            needed,
+            |_, _| 0,
+            &plan::PlanConfig::default(),
+        )?;
 
-        let mut rng = rand::thread_rng();
-        let mut added_new = true;
-        
-        while added_new && selected.len() < crate::core::MAX_TX_INPUTS {
-            added_new = false;
-            let change = total - needed;
-            let mut change_denoms = decompose_value(change);
-            change_denoms.shuffle(&mut rng);
-
-            for denom in change_denoms {
-                if let Some(candidates) = unselected_by_denom.get_mut(&denom) {
-                    if let Some(cand_bundle) = candidates.pop() {
-                        selected.extend(&cand_bundle.coin_ids);
-                        total = total.saturating_add(cand_bundle.total_value);
-                        added_new = true;
-                        tracing::info!(
-                            "Greedy Merge: Pulled in an extra coin of value {} to consolidate change",
-                            denom
-                        );
-                        break;
-                    }
-                }
-            }
-        }
-
-        Ok(selected)
+        Ok(plan.input_coin_ids)
     }
 
     /// Build outputs for a send: recipient outputs + change outputs.
@@ -2053,7 +2033,8 @@ pub fn maturing_in(state: &crate::core::State, ids: &[[u8; 32]]) -> std::collect
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
-
+    use std::collections::HashSet;
+    
     #[test]
     fn create_and_reopen() {
         let file = NamedTempFile::new().unwrap();
@@ -2594,21 +2575,21 @@ let c3 = w.import_coin([3; 32], 40_000, [30; 32], None).unwrap();
         std::fs::remove_file(&path).unwrap();
 
         let mut w = Wallet::create(&path, b"pass").unwrap();
-        
+
         let c8 = w.import_coin([1; 32], 8, [10; 32], None).unwrap();
         let c2_a = w.import_coin([2; 32], 2, [20; 32], None).unwrap();
         let c2_b = w.import_coin([3; 32], 2, [30; 32], None).unwrap();
 
-        let live = vec![c8, c2_a, c2_b];
-        
-        // Scenario: We need 6.
-        // Normal selection: picks `8`. Change = 2. Wallet becomes [2, 2, 2] (worse fragmentation).
-        // Greedy selection: picks `8`. Change = 2. 
-        //   - Sees an unselected `2`. Pulls it in. Total = 10. Change = 4.
-        //   - Doesn't have a `4`. Stops.
-        // New Wallet state after tx: [4, 2] (Defragmented!)
-        let selected = w.select_coins(6, &live).unwrap();
-        
+        let live_set: HashSet<[u8; 32]> = [c8, c2_a, c2_b].into_iter().collect();
+        let mut bundles = w.spendable_bundles(&live_set, true);
+        bundles.sort_by(|a, b| b.total_value.cmp(&a.total_value));
+
+        // Scenario: We need 6 (zero-fee baseline).
+        // Greedy snowball picks `8` (change = 2), sees an unselected `2`,
+        // pulls it in (total = 10, change = 4), has no `4`, stops.
+        let plan = plan::plan_snowball_baseline(&bundles, 6, |_, _| 0).unwrap();
+        let selected = plan.input_coin_ids;
+
         assert_eq!(selected.len(), 2, "Should pick the 8 and one of the 2s");
         assert!(selected.contains(&c8));
         assert!(selected.contains(&c2_a) || selected.contains(&c2_b));
@@ -2621,24 +2602,21 @@ let c3 = w.import_coin([3; 32], 40_000, [30; 32], None).unwrap();
         std::fs::remove_file(&path).unwrap();
 
         let mut w = Wallet::create(&path, b"pass").unwrap();
-        
+
         let c16 = w.import_coin([1; 32], 16, [10; 32], None).unwrap();
         let c4 = w.import_coin([2; 32], 4, [20; 32], None).unwrap();
         let c2_a = w.import_coin([3; 32], 2, [30; 32], None).unwrap();
         let c2_b = w.import_coin([4; 32], 2, [40; 32], None).unwrap();
 
-        let live = vec![c16, c4, c2_a, c2_b];
-        
-        // Scenario: We need 14.
-        // Normal selection: picks `16`. Change = 2. Wallet becomes [4, 2, 2, 2].
-        // Greedy selection:
-        //   1. Base: picks `16`. Total = 16. Change = 2.
-        //   2. Iteration 1: sees a `2`. Picks `c2_a`. Total = 18. Change = 4.
-        //   3. Iteration 2: sees a `4`. Picks `c4`. Total = 22. Change = 8.
-        //   4. Iteration 3: sees an `8`. None available. Stops.
-        // Resulting wallet state after tx: [8, 2] (Massively defragmented!)
-        let selected = w.select_coins(14, &live).unwrap();
-        
+        let live_set: HashSet<[u8; 32]> = [c16, c4, c2_a, c2_b].into_iter().collect();
+        let mut bundles = w.spendable_bundles(&live_set, true);
+        bundles.sort_by(|a, b| b.total_value.cmp(&a.total_value));
+
+        // Scenario: We need 14 (zero-fee baseline).
+        // Greedy snowball cascades: 16 (change 2) -> +2 (change 4) -> +4 (change 8) -> stop.
+        let plan = plan::plan_snowball_baseline(&bundles, 14, |_, _| 0).unwrap();
+        let selected = plan.input_coin_ids;
+
         assert_eq!(selected.len(), 3, "Should cascade and pick 16, 4, and 2");
         assert!(selected.contains(&c16));
         assert!(selected.contains(&c4));

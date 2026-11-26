@@ -2514,161 +2514,312 @@ pub fn build_solo_extension_pow(&self, pow: &str, midstate_hex: &str, nonce: u64
     }
 
 
-    /// This implements the full coin selection algorithm:
+    /// Selects coins, shapes change outputs, and builds a transaction for a
+    /// specified send amount (and optional `DataBurn` payload).
     ///
-    /// 1. **Greedy selection**: picks largest coins first until the amount + fee is covered.
-    /// 2. **WOTS co-spend grouping**: pulls in all coins at the same WOTS address
-    ///    (required by the one-time signature security model).
-    /// 3. **Snowball merge**: opportunistically pulls in coins matching change
-    ///    denominations to consolidate the UTXO set.
-    /// 4. **Fee estimation**: iterates until the fee estimate stabilizes.
+    /// Delegates value-bearing sends to [`midstate::wallet::plan::plan_transaction_from_bundles`],
+    /// which jointly optimizes:
+    ///
+    /// 1. **Security (WOTS co-spend atomicity)**: Groups all live UTXOs sharing a
+    ///    one-time WOTS address into indivisible `SpendBundle`s before selection
+    ///    (MSS UTXOs remain singletons).
+    /// 2. **Privacy (unilateral CoinJoin / self-PayJoin)**: Evaluates guided input
+    ///    expansions and controlled power-of-two change splits (`2d -> d + d`) to
+    ///    maximize address-group-aware payment/change ambiguity, routes payment
+    ///    denominations across distinct recipient addresses when a multi-address
+    ///    destination is provided, assigns fresh HD-derived WOTS addresses to
+    ///    every change output, and shuffles both inputs and outputs.
+    /// 3. **Consolidation & fee discipline**: Preserves the snowball baseline as a
+    ///    guaranteed fallback, enforces a fragmentation guardrail above the UTXO
+    ///    comfort ceiling, and converges against the exact web-wallet fee model
+    ///    (`100 units/KiB + 50`).
+    /// 4. **Restorability**: Derives every change key and deterministic salt from
+    ///    `self.master_seed` and `next_wots_index` so all change coins are
+    ///    recoverable from the seed phrase.
     ///
     /// # Arguments
     ///
     /// * `available_utxos_json` — JSON array of [`WasmUtxo`] objects.
-    /// * `to_address_hex` — recipient's 64-char or 72-char (checksummed) hex address.
-    /// * `send_amount` — total value to send.
+    /// * `to_address_hex` — recipient's 64-char or 72-char (checksummed) hex address,
+    ///   a comma-separated multi-address list (for distinct payment outputs), or
+    ///   empty for burn-only transactions.
+    /// * `send_amount` — total value to send to `to_address_hex`.
     /// * `next_wots_index` — current WOTS HD derivation counter.
+    /// * `databurn_hex` — optional hex-encoded `DataBurn` payload.
+    /// * `databurn_value` — optional value to burn with `databurn_hex`.
     ///
     /// # Returns
     ///
-    /// JSON string of [`SpendContext`] containing selected inputs, outputs,
-    /// commitment, and fee — everything needed for commit and reveal.
+    /// JSON string of [`SpendContext`] containing shuffled inputs and outputs,
+    /// commitment, fee, and updated `next_wots_index` — everything needed for
+    /// commit and reveal.
     ///
     /// # Errors
     ///
-    /// - `"Insufficient funds."` — UTXO values don't cover amount + fee.
-    /// - `"MSS signing key not loaded."` — an MSS-backed UTXO's tree is missing.
-    ///   The user should run a Network Sync to trigger cache loading.
-    /// Selects coins and builds a transaction for a specified send amount.
-    ///
-    /// This is a complex state-machine loop that balances three competing goals:
-    /// 1. Security: Strictly enforcing the "One-Time Signature" (WOTS) co-spend rule.
-    /// 2. Efficiency: Consolidating fragmented UTXOs into larger denominations (Snowball Merge).
-    /// 3. Restorability: Ensuring all change coins are discoverable from the seed phrase.
+    /// - `"Send amount must be greater than zero"` — both `send_amount + databurn_value`
+    ///   and `databurn_hex` are empty.
+    /// - `"Duplicate address in multi-address destination"` — a multi-address
+    ///   string repeats an address.
+    /// - `"Insufficient funds..."` — spendable UTXOs cannot cover amount + fee within
+    ///   `MAX_TX_INPUTS`.
+    /// - `"MSS signing key not loaded."` — an MSS-backed UTXO's tree is missing from
+    ///   the local cache; run a Network Sync first.
     pub fn prepare_spend(
-        &mut self, 
-        available_utxos_json: &str, 
-        to_address_hex: &str, 
-        send_amount: u64, 
+        &mut self,
+        available_utxos_json: &str,
+        to_address_hex: &str,
+        send_amount: u64,
         next_wots_index: u32,
         databurn_hex: Option<String>,
-        databurn_value: Option<u64>
+        databurn_value: Option<u64>,
     ) -> Result<String, JsValue> {
         let available: Vec<WasmUtxo> = serde_json::from_str(available_utxos_json)
             .map_err(|e| JsValue::from_str(&format!("Failed to parse UTXOs: {}", e)))?;
 
         for utxo in &available {
             if utxo.is_mss && !self.mss_cache.contains_key(&utxo.address) {
-                return Err(JsValue::from_str("MSS signing key not loaded. Please run a Network Sync first."));
+                return Err(JsValue::from_str(
+                    "MSS signing key not loaded. Please run a Network Sync first.",
+                ));
             }
         }
 
-        // Support empty address 
-        let recipient_addr = if to_address_hex.is_empty() {
-            [0u8; 32]
+        // Support empty address, single address, or comma-separated multi-address
+        let recipient_addrs: Vec<[u8; 32]> = if to_address_hex.trim().is_empty() {
+            vec![[0u8; 32]]
         } else {
-            parse_address_wasm(to_address_hex)?
+            let mut addrs = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for part in to_address_hex.split(',') {
+                let part = part.trim();
+                if part.is_empty() {
+                    continue;
+                }
+                let addr = parse_address_wasm(part)?;
+                if !seen.insert(addr) {
+                    return Err(JsValue::from_str(
+                        "Duplicate address in multi-address destination",
+                    ));
+                }
+                addrs.push(addr);
+            }
+            if addrs.is_empty() {
+                return Err(JsValue::from_str("No destination address provided"));
+            }
+            addrs
         };
-        let recipient_hex = hex::encode(recipient_addr);
 
-         let mut target_fee = 100u64;
         let db_val = databurn_value.unwrap_or(0);
+        let total_send = send_amount.saturating_add(db_val);
+        if total_send == 0 && databurn_hex.is_none() {
+            return Err(JsValue::from_str("Send amount must be greater than zero"));
+        }
 
-        loop {
-            let needed = send_amount + db_val + target_fee;
-            let (selected, total) = select_wasm_utxos(&available, needed)?;
+        // Group WasmUtxo into SpendBundles (WOTS siblings atomic, MSS singletons).
+        let mut wots_groups: HashMap<String, Vec<&WasmUtxo>> = HashMap::new();
+        let mut bundles: Vec<midstate::wallet::defrag::SpendBundle> = Vec::new();
+        let mut by_id: HashMap<[u8; 32], WasmUtxo> = HashMap::new();
 
-            let mut num_outputs = if send_amount > 0 { decompose_value(send_amount).len() } else { 0 };
-            if databurn_hex.is_some() { num_outputs += 1; }
-            let final_change_val = total.saturating_sub(send_amount).saturating_sub(db_val).saturating_sub(target_fee);
-            num_outputs += decompose_value(final_change_val).len();
+        for u in &available {
+            let mut cid = [0u8; 32];
+            hex::decode_to_slice(&u.coin_id, &mut cid)
+                .map_err(|_| JsValue::from_str("Invalid coin_id hex"))?;
+            let mut addr = [0u8; 32];
+            hex::decode_to_slice(&u.address, &mut addr)
+                .map_err(|_| JsValue::from_str("Invalid address hex"))?;
+            by_id.insert(cid, u.clone());
 
-            let estimated_bytes = 100 + (selected.len() as u64 * 1636) + (num_outputs as u64 * 100)
-                + databurn_hex.as_ref().map(|h| (h.len() / 2) as u64).unwrap_or(0);
-            let required_fee = (estimated_bytes * 100) / 1024 + 50;
-
-            if total >= send_amount + db_val + required_fee {
-                let final_fee = required_fee;
-                let actual_change = total - send_amount - db_val - final_fee;
-                let mut final_outputs_json = Vec::new();
-                let mut output_hashes = Vec::new();
-
-                if send_amount > 0 {
-                    for denom in decompose_value(send_amount) {
-                        let mut salt = [0u8; 32]; getrandom_02::getrandom(&mut salt).unwrap();
-                        output_hashes.push(compute_coin_id(&recipient_addr, denom, &salt));
-                        final_outputs_json.push(serde_json::json!({
-                            "type": "standard", "address": recipient_hex.clone(), "value": denom, "salt": hex::encode(salt)
-                        }));
-                    }
-                }
-
-                if let Some(ref hex_str) = databurn_hex {
-                    let payload = hex::decode(hex_str).map_err(|_| JsValue::from_str("Invalid databurn hex"))?;
-                    let mut hasher = blake3::Hasher::new();
-                    hasher.update(b"DATABURN");
-                    hasher.update(&db_val.to_le_bytes());
-                    hasher.update(&payload);
-                    output_hashes.push(*hasher.finalize().as_bytes());
-                    final_outputs_json.push(serde_json::json!({
-                        "type": "data_burn", "payload": hex_str, "value_burned": db_val
-                    }));
-                }
-
-                let mut current_wots_idx = next_wots_index;
-                if actual_change > 0 {
-                    for denom in decompose_value(actual_change) {
-                        let change_seed = derive_wots_seed(&self.master_seed, current_wots_idx as u64);
-                        let change_addr = compute_address(&wots::keygen(&change_seed));
-                        let salt = derive_deterministic_salt(&self.master_seed, current_wots_idx as u64);
-                        
-                        output_hashes.push(compute_coin_id(&change_addr, denom, &salt));
-                        final_outputs_json.push(serde_json::json!({
-                            "type": "standard", "address": hex::encode(change_addr), "value": denom, "salt": hex::encode(salt)
-                        }));
-                        current_wots_idx += 1;
-                    }
-                }
-
-                use rand::seq::SliceRandom;
-                let mut indices: Vec<usize> = (0..final_outputs_json.len()).collect();
-                indices.shuffle(&mut rand::thread_rng());
-
-                let mut shuffled_json = Vec::with_capacity(indices.len());
-                let mut shuffled_hashes = Vec::with_capacity(indices.len());
-                for &idx in &indices {
-                    shuffled_json.push(final_outputs_json[idx].clone());
-                    shuffled_hashes.push(output_hashes[idx]);
-                }
-
-                let mut input_coin_ids = Vec::new();
-                for inp in &selected {
-                    let mut buf = [0u8; 32]; hex::decode_to_slice(&inp.coin_id, &mut buf).unwrap();
-                    input_coin_ids.push(buf);
-                }
-
-                let mut tx_salt = [0u8; 32]; getrandom_02::getrandom(&mut tx_salt).unwrap();
-                let commitment = compute_commitment(&input_coin_ids, &shuffled_hashes, &tx_salt);
-
-                let ctx = SpendContext {
-                    selected_inputs: selected,
-                    outputs: shuffled_json,
-                    commit_payload: serde_json::json!({
-                        "coins": input_coin_ids.iter().map(hex::encode).collect::<Vec<_>>(),
-                        "destinations": shuffled_hashes.iter().map(hex::encode).collect::<Vec<_>>()
-                    }),
-                    tx_salt: hex::encode(tx_salt),
-                    commitment: hex::encode(commitment),
-                    fee: final_fee,
-                    next_wots_index: current_wots_idx,
-                };
-
-                return Ok(serde_json::to_string(&ctx).unwrap());
+            if u.is_mss {
+                bundles.push(midstate::wallet::defrag::SpendBundle {
+                    address: addr,
+                    coin_ids: vec![cid],
+                    total_value: u.value,
+                });
             } else {
+                wots_groups.entry(u.address.clone()).or_default().push(u);
+            }
+        }
+
+        for (addr_hex, coins) in wots_groups {
+            let mut addr = [0u8; 32];
+            hex::decode_to_slice(&addr_hex, &mut addr).unwrap();
+            let total_value = coins.iter().fold(0u64, |a, c| a.saturating_add(c.value));
+            let coin_ids = coins
+                .iter()
+                .map(|c| {
+                    let mut cid = [0u8; 32];
+                    hex::decode_to_slice(&c.coin_id, &mut cid).unwrap();
+                    cid
+                })
+                .collect();
+            bundles.push(midstate::wallet::defrag::SpendBundle {
+                address: addr,
+                coin_ids,
+                total_value,
+            });
+        }
+
+        bundles.retain(|b| b.coin_ids.len() <= midstate::core::MAX_TX_INPUTS);
+        bundles.sort_by(|a, b| {
+            let lhs = (a.total_value as u128) * (b.coin_ids.len() as u128);
+            let rhs = (b.total_value as u128) * (a.coin_ids.len() as u128);
+            rhs.cmp(&lhs).then_with(|| b.total_value.cmp(&a.total_value))
+        });
+
+        let extra_bytes = databurn_hex
+            .as_ref()
+            .map(|h| (h.len() / 2) as u64)
+            .unwrap_or(0);
+        let actual_pay_outs = (if send_amount > 0 {
+            decompose_value(send_amount).len()
+        } else {
+            0
+        }) + usize::from(databurn_hex.is_some());
+
+        // Plan inputs, fee, and privacy-shaped change denominations.
+        let (mut selected, mut input_coin_ids, change_denoms, final_fee) = if total_send > 0 {
+            let plan_pay_outs = decompose_value(total_send).len();
+            let web_fee = |n_in: usize, n_out: usize| -> u64 {
+                let real_outs = n_out.saturating_sub(plan_pay_outs) + actual_pay_outs;
+                let est = 100
+                    + (n_in as u64 * 1636)
+                    + (real_outs as u64 * 100)
+                    + extra_bytes;
+                (est * 100) / 1024 + 50
+            };
+
+            let cfg = midstate::wallet::plan::PlanConfig {
+                distinct_payment_addresses: recipient_addrs.len() > 1,
+                ..Default::default()
+            };
+
+            let plan = midstate::wallet::plan::plan_transaction_from_bundles(
+                &bundles,
+                total_send,
+                web_fee,
+                &cfg,
+            )
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+            let selected: Vec<WasmUtxo> = plan
+                .input_coin_ids
+                .iter()
+                .map(|id| by_id[id].clone())
+                .collect();
+            (selected, plan.input_coin_ids, plan.change_denoms, plan.fee)
+        } else {
+            // 0-value DataBurn only: select minimal inputs covering the fee.
+            let mut target_fee = 100u64;
+            loop {
+                let (selected, total) = select_wasm_utxos(&available, target_fee)?;
+                let change_guess = total.saturating_sub(target_fee);
+                let num_outputs = actual_pay_outs + decompose_value(change_guess).len();
+                let est = 100
+                    + (selected.len() as u64 * 1636)
+                    + (num_outputs as u64 * 100)
+                    + extra_bytes;
+                let required_fee = (est * 100) / 1024 + 50;
+                if total >= required_fee {
+                    let mut input_coin_ids = Vec::with_capacity(selected.len());
+                    for inp in &selected {
+                        let mut buf = [0u8; 32];
+                        hex::decode_to_slice(&inp.coin_id, &mut buf).unwrap();
+                        input_coin_ids.push(buf);
+                    }
+                    let change_denoms = decompose_value(total - required_fee);
+                    break (selected, input_coin_ids, change_denoms, required_fee);
+                }
                 target_fee = required_fee;
             }
+        };
+
+        // Shuffle inputs so selection order doesn't fingerprint the web wallet.
+        {
+            use rand::seq::SliceRandom;
+            let mut in_idx: Vec<usize> = (0..selected.len()).collect();
+            in_idx.shuffle(&mut rand::thread_rng());
+            selected = in_idx.iter().map(|&i| selected[i].clone()).collect();
+            input_coin_ids = in_idx.iter().map(|&i| input_coin_ids[i]).collect();
         }
+
+        let mut final_outputs_json = Vec::new();
+        let mut output_hashes = Vec::new();
+
+        if send_amount > 0 {
+            for (i, denom) in decompose_value(send_amount).into_iter().enumerate() {
+                let addr = recipient_addrs[i % recipient_addrs.len()];
+                let mut salt = [0u8; 32];
+                getrandom_02::getrandom(&mut salt).unwrap();
+                output_hashes.push(compute_coin_id(&addr, denom, &salt));
+                final_outputs_json.push(serde_json::json!({
+                    "type": "standard",
+                    "address": hex::encode(addr),
+                    "value": denom,
+                    "salt": hex::encode(salt)
+                }));
+            }
+        }
+
+        if let Some(ref hex_str) = databurn_hex {
+            let payload =
+                hex::decode(hex_str).map_err(|_| JsValue::from_str("Invalid databurn hex"))?;
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"DATABURN");
+            hasher.update(&db_val.to_le_bytes());
+            hasher.update(&payload);
+            output_hashes.push(*hasher.finalize().as_bytes());
+            final_outputs_json.push(serde_json::json!({
+                "type": "data_burn",
+                "payload": hex_str,
+                "value_burned": db_val
+            }));
+        }
+
+        let mut current_wots_idx = next_wots_index;
+        for denom in change_denoms {
+            let change_seed = derive_wots_seed(&self.master_seed, current_wots_idx as u64);
+            let change_addr = compute_address(&wots::keygen(&change_seed));
+            let salt = derive_deterministic_salt(&self.master_seed, current_wots_idx as u64);
+
+            output_hashes.push(compute_coin_id(&change_addr, denom, &salt));
+            final_outputs_json.push(serde_json::json!({
+                "type": "standard",
+                "address": hex::encode(change_addr),
+                "value": denom,
+                "salt": hex::encode(salt)
+            }));
+            current_wots_idx += 1;
+        }
+
+        use rand::seq::SliceRandom;
+        let mut indices: Vec<usize> = (0..final_outputs_json.len()).collect();
+        indices.shuffle(&mut rand::thread_rng());
+
+        let mut shuffled_json = Vec::with_capacity(indices.len());
+        let mut shuffled_hashes = Vec::with_capacity(indices.len());
+        for &idx in &indices {
+            shuffled_json.push(final_outputs_json[idx].clone());
+            shuffled_hashes.push(output_hashes[idx]);
+        }
+
+        let mut tx_salt = [0u8; 32];
+        getrandom_02::getrandom(&mut tx_salt).unwrap();
+        let commitment = compute_commitment(&input_coin_ids, &shuffled_hashes, &tx_salt);
+
+        let ctx = SpendContext {
+            selected_inputs: selected,
+            outputs: shuffled_json,
+            commit_payload: serde_json::json!({
+                "coins": input_coin_ids.iter().map(hex::encode).collect::<Vec<_>>(),
+                "destinations": shuffled_hashes.iter().map(hex::encode).collect::<Vec<_>>()
+            }),
+            tx_salt: hex::encode(tx_salt),
+            commitment: hex::encode(commitment),
+            fee: final_fee,
+            next_wots_index: current_wots_idx,
+        };
+
+        Ok(serde_json::to_string(&ctx).unwrap())
     }
 
     /// Build the reveal payload (inputs + signatures + outputs) for a committed transaction.

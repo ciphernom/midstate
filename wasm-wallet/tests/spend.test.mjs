@@ -63,7 +63,7 @@ test('many small coins: all but crumbs sent, quickly', () => {
     // each, worth less than their share of the fee, left where they are.
     const left = sum(utxos) - r.amount - r.fee;
     assert.ok(left < 1000n, `left ${left}`);
-    assert.ok(r.inputs >= utxos.length - 4);
+    assert.ok(r.inputs >= utxos.length - 6);
     assert.ok(r.probes <= 4, `${r.probes} probes`);
 });
 

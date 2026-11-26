@@ -53,92 +53,90 @@ pub struct SendPlan {
 /// Mutates the wallet only through `allocate_next_wots_seed` (change keys),
 /// which is monotone and persisted by the caller's save — an abandoned plan
 /// wastes indices but never reuses them (upstream invariant).
+/// Build a send plan to a single destination address against the wallet's live coins.
+///
+/// Mutates the wallet only through `allocate_next_wots_seeds` (change keys),
+/// which is monotone and persisted by the caller's save — an abandoned plan
+/// wastes indices but never reuses them (upstream invariant).
 pub fn plan_send(
     wallet: &mut Wallet,
     live_coins: &[[u8; 32]],
     dest: [u8; 32],
     amount: u64,
 ) -> Result<SendPlan> {
+    plan_send_multi(wallet, live_coins, &[dest], amount)
+}
+
+/// Build a send plan to one or more destination addresses against the wallet's
+/// live coins. When `dests.len() > 1`, each payment denomination is routed to
+/// its own address (`distinct_payment_addresses = true`), enabling full
+/// address-group-aware self-PayJoin ambiguity.
+pub fn plan_send_multi(
+    wallet: &mut Wallet,
+    live_coins: &[[u8; 32]],
+    dests: &[[u8; 32]],
+    amount: u64,
+) -> Result<SendPlan> {
     if amount == 0 {
         bail!("amount must be greater than zero");
     }
-
-    let mut target_fee = 100u64; // conservative starting guess, as upstream
-
-    loop {
-        let needed = amount + target_fee;
-        let selected = wallet.select_coins(needed, live_coins)?;
-
-        let in_sum: u64 = selected
-            .iter()
-            .filter_map(|id| wallet.find_coin(id))
-            .map(|c| c.value)
-            .sum();
-        if in_sum <= amount {
-            bail!(
-                "input value ({in_sum}) must exceed send amount ({amount}) to pay the fee"
-            );
-        }
-
-        // Output count at this fee guess: recipient denoms + change denoms.
-        let change_guess = in_sum.saturating_sub(amount + target_fee);
-        let num_outputs = decompose_value(amount).len() + decompose_value(change_guess).len();
-
-        let fee = required_fee(selected.len(), num_outputs);
-
-        if in_sum >= amount + fee {
-            // Locked in. Build the real outputs.
-            let change = in_sum - amount - fee;
-
-            let mut outputs: Vec<OutputData> = Vec::new();
-            let mut change_seeds: Vec<(usize, [u8; 32])> = Vec::new();
-
-            for denom in decompose_value(amount) {
-                let salt: [u8; 32] = rand::random();
-                outputs.push(OutputData::Standard { address: dest, value: denom, salt });
-            }
-            if change > 0 {
-                for denom in decompose_value(change) {
-                    let seed = wallet.allocate_next_wots_seed()?;
-                    let pk = wots::keygen(&seed);
-                    let addr = compute_address(&pk);
-                    let salt: [u8; 32] = rand::random();
-                    change_seeds.push((outputs.len(), seed));
-                    outputs.push(OutputData::Standard { address: addr, value: denom, salt });
-                }
-            }
-
-            // Shuffle so recipient vs change position leaks nothing (upstream).
-            {
-                use rand::seq::SliceRandom;
-                let mut idx: Vec<usize> = (0..outputs.len()).collect();
-                idx.shuffle(&mut rand::thread_rng());
-                let shuffled: Vec<OutputData> =
-                    idx.iter().map(|&i| outputs[i].clone()).collect();
-                let mut rev = vec![0usize; idx.len()];
-                for (new_i, &old_i) in idx.iter().enumerate() {
-                    rev[old_i] = new_i;
-                }
-                change_seeds = change_seeds
-                    .into_iter()
-                    .map(|(old, s)| (rev[old], s))
-                    .collect();
-                outputs = shuffled;
-            }
-
-            return Ok(SendPlan {
-                input_coin_ids: selected,
-                outputs,
-                change_seeds,
-                in_sum,
-                fee,
-                amount,
-            });
-        }
-
-        // Selection can't cover its own fee — raise the target and re-select.
-        target_fee = fee;
+    if dests.is_empty() {
+        bail!("at least one destination address is required");
     }
+
+    let cfg = midstate::wallet::plan::PlanConfig {
+        distinct_payment_addresses: dests.len() > 1,
+        ..Default::default()
+    };
+    let plan = wallet.plan_transaction_with_config(live_coins, amount, required_fee, &cfg)?;
+
+    let mut outputs: Vec<OutputData> = Vec::with_capacity(plan.output_count());
+    let mut change_seeds: Vec<(usize, [u8; 32])> = Vec::with_capacity(plan.change_denoms.len());
+
+    // 1. Recipient outputs (round-robin across distinct addresses when provided).
+    for (i, denom) in plan.payment_denoms.into_iter().enumerate() {
+        let address = dests[i % dests.len()];
+        let salt: [u8; 32] = rand::random();
+        outputs.push(OutputData::Standard { address, value: denom, salt });
+    }
+
+    // 2. Change outputs (one atomic HD seed allocation + save).
+    if !plan.change_denoms.is_empty() {
+        let seeds = wallet.allocate_next_wots_seeds(plan.change_denoms.len())?;
+        for (denom, seed) in plan.change_denoms.into_iter().zip(seeds) {
+            let pk = wots::keygen(&seed);
+            let addr = compute_address(&pk);
+            let salt: [u8; 32] = rand::random();
+            change_seeds.push((outputs.len(), seed));
+            outputs.push(OutputData::Standard { address: addr, value: denom, salt });
+        }
+    }
+
+    // 3. Shuffle so recipient vs change position leaks nothing.
+    {
+        use rand::seq::SliceRandom;
+        let mut idx: Vec<usize> = (0..outputs.len()).collect();
+        idx.shuffle(&mut rand::thread_rng());
+        let shuffled: Vec<OutputData> = idx.iter().map(|&i| outputs[i].clone()).collect();
+        let mut rev = vec![0usize; idx.len()];
+        for (new_i, &old_i) in idx.iter().enumerate() {
+            rev[old_i] = new_i;
+        }
+        change_seeds = change_seeds
+            .into_iter()
+            .map(|(old, s)| (rev[old], s))
+            .collect();
+        outputs = shuffled;
+    }
+
+    Ok(SendPlan {
+        input_coin_ids: plan.input_coin_ids,
+        outputs,
+        change_seeds,
+        in_sum: plan.in_sum,
+        fee: plan.fee,
+        amount: plan.amount,
+    })
 }
 
 

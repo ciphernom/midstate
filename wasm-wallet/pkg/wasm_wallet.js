@@ -901,38 +901,56 @@ export class WebWallet {
         }
     }
     /**
-     * This implements the full coin selection algorithm:
+     * Selects coins, shapes change outputs, and builds a transaction for a
+     * specified send amount (and optional `DataBurn` payload).
      *
-     * 1. **Greedy selection**: picks largest coins first until the amount + fee is covered.
-     * 2. **WOTS co-spend grouping**: pulls in all coins at the same WOTS address
-     *    (required by the one-time signature security model).
-     * 3. **Snowball merge**: opportunistically pulls in coins matching change
-     *    denominations to consolidate the UTXO set.
-     * 4. **Fee estimation**: iterates until the fee estimate stabilizes.
+     * Delegates value-bearing sends to [`midstate::wallet::plan::plan_transaction_from_bundles`],
+     * which jointly optimizes:
+     *
+     * 1. **Security (WOTS co-spend atomicity)**: Groups all live UTXOs sharing a
+     *    one-time WOTS address into indivisible `SpendBundle`s before selection
+     *    (MSS UTXOs remain singletons).
+     * 2. **Privacy (unilateral CoinJoin / self-PayJoin)**: Evaluates guided input
+     *    expansions and controlled power-of-two change splits (`2d -> d + d`) to
+     *    maximize address-group-aware payment/change ambiguity, routes payment
+     *    denominations across distinct recipient addresses when a multi-address
+     *    destination is provided, assigns fresh HD-derived WOTS addresses to
+     *    every change output, and shuffles both inputs and outputs.
+     * 3. **Consolidation & fee discipline**: Preserves the snowball baseline as a
+     *    guaranteed fallback, enforces a fragmentation guardrail above the UTXO
+     *    comfort ceiling, and converges against the exact web-wallet fee model
+     *    (`100 units/KiB + 50`).
+     * 4. **Restorability**: Derives every change key and deterministic salt from
+     *    `self.master_seed` and `next_wots_index` so all change coins are
+     *    recoverable from the seed phrase.
      *
      * # Arguments
      *
      * * `available_utxos_json` — JSON array of [`WasmUtxo`] objects.
-     * * `to_address_hex` — recipient's 64-char or 72-char (checksummed) hex address.
-     * * `send_amount` — total value to send.
+     * * `to_address_hex` — recipient's 64-char or 72-char (checksummed) hex address,
+     *   a comma-separated multi-address list (for distinct payment outputs), or
+     *   empty for burn-only transactions.
+     * * `send_amount` — total value to send to `to_address_hex`.
      * * `next_wots_index` — current WOTS HD derivation counter.
+     * * `databurn_hex` — optional hex-encoded `DataBurn` payload.
+     * * `databurn_value` — optional value to burn with `databurn_hex`.
      *
      * # Returns
      *
-     * JSON string of [`SpendContext`] containing selected inputs, outputs,
-     * commitment, and fee — everything needed for commit and reveal.
+     * JSON string of [`SpendContext`] containing shuffled inputs and outputs,
+     * commitment, fee, and updated `next_wots_index` — everything needed for
+     * commit and reveal.
      *
      * # Errors
      *
-     * - `"Insufficient funds."` — UTXO values don't cover amount + fee.
-     * - `"MSS signing key not loaded."` — an MSS-backed UTXO's tree is missing.
-     *   The user should run a Network Sync to trigger cache loading.
-     * Selects coins and builds a transaction for a specified send amount.
-     *
-     * This is a complex state-machine loop that balances three competing goals:
-     * 1. Security: Strictly enforcing the "One-Time Signature" (WOTS) co-spend rule.
-     * 2. Efficiency: Consolidating fragmented UTXOs into larger denominations (Snowball Merge).
-     * 3. Restorability: Ensuring all change coins are discoverable from the seed phrase.
+     * - `"Send amount must be greater than zero"` — both `send_amount + databurn_value`
+     *   and `databurn_hex` are empty.
+     * - `"Duplicate address in multi-address destination"` — a multi-address
+     *   string repeats an address.
+     * - `"Insufficient funds..."` — spendable UTXOs cannot cover amount + fee within
+     *   `MAX_TX_INPUTS`.
+     * - `"MSS signing key not loaded."` — an MSS-backed UTXO's tree is missing from
+     *   the local cache; run a Network Sync first.
      * @param {string} available_utxos_json
      * @param {string} to_address_hex
      * @param {bigint} send_amount

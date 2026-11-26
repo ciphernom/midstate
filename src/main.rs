@@ -1220,7 +1220,7 @@ fn parse_hex32(s: &str) -> Result<[u8; 32]> {
 }
 
 enum ParsedOutput {
-    Standard([u8; 32], u64),
+    Standard(Vec<[u8; 32]>, u64),
     Stateful([u8; 32], [u8; 32]),
     /// `burn:<payload hex>:<value>`: a `DataBurn`, as many outputs as the
     /// value has powers of two.
@@ -1229,36 +1229,62 @@ enum ParsedOutput {
 
 fn parse_output_spec(s: &str) -> Result<ParsedOutput> {
     if let Some(rest) = s.strip_prefix("burn:") {
-        let (payload, value) = rest.split_once(':').ok_or_else(|| anyhow::anyhow!("expected burn:<payload_hex>:<value>"))?;
+        let (payload, value) = rest
+            .split_once(':')
+            .ok_or_else(|| anyhow::anyhow!("expected burn:<payload_hex>:<value>"))?;
         let payload = hex::decode(payload).context("invalid burn payload hex")?;
         if payload.len() > midstate::core::types::MAX_BURN_DATA_SIZE {
-            anyhow::bail!("a burn's payload is at most {} bytes", midstate::core::types::MAX_BURN_DATA_SIZE);
+            anyhow::bail!(
+                "a burn's payload is at most {} bytes",
+                midstate::core::types::MAX_BURN_DATA_SIZE
+            );
         }
-        let value: u64 = value.parse().map_err(|_| anyhow::anyhow!("invalid value: {value}"))?;
+        let value: u64 = value
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid value: {value}"))?;
         return Ok(ParsedOutput::Burn(payload, value));
     }
+
     let parts: Vec<&str> = s.split(':').collect();
     if parts.len() < 2 || parts.len() > 3 {
-        anyhow::bail!("expected format <address>:<value>[:<state_hex>]");
+        anyhow::bail!("expected format <address>[,<address>...]:<value>[:<state_hex>]");
     }
-    
-    let addr = midstate::core::types::parse_address_flexible(parts[0])
-        .map_err(|e| anyhow::anyhow!(e))?;
-        
-    let value: u64 = parts[1].parse()
+
+    let value: u64 = parts[1]
+        .parse()
         .map_err(|_| anyhow::anyhow!("invalid value: {}", parts[1]))?;
-        
+
     if parts.len() == 3 {
         if value != 0 {
             anyhow::bail!("State threads (Confidential outputs) must have value exactly 0. To send value AND state, create two outputs.");
         }
-        let state = parse_hex32(parts[2]).map_err(|_| anyhow::anyhow!("invalid state hex: {}", parts[2]))?;
+        let addr = midstate::core::types::parse_address_flexible(parts[0])
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let state =
+            parse_hex32(parts[2]).map_err(|_| anyhow::anyhow!("invalid state hex: {}", parts[2]))?;
         Ok(ParsedOutput::Stateful(addr, state))
     } else {
         if value == 0 {
             anyhow::bail!("Standard outputs must have value > 0");
         }
-        Ok(ParsedOutput::Standard(addr, value))
+        let mut addrs = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for part in parts[0].split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let addr = midstate::core::types::parse_address_flexible(part)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            if !seen.insert(addr) {
+                anyhow::bail!("duplicate address in multi-address destination");
+            }
+            addrs.push(addr);
+        }
+        if addrs.is_empty() {
+            anyhow::bail!("no destination address provided");
+        }
+        Ok(ParsedOutput::Standard(addrs, value))
     }
 }
 
@@ -2065,16 +2091,31 @@ async fn wallet_spend_script(
     for arg in &to_args {
         let salt: [u8; 32] = rand::random();
         match parse_output_spec(arg)? {
-            ParsedOutput::Standard(addr, val) => {
-                outputs.push(midstate::core::OutputData::Standard { address: addr, value: val, salt });
+            ParsedOutput::Standard(addrs, val) => {
+                for (i, denom) in midstate::core::decompose_value(val).into_iter().enumerate() {
+                    let address = addrs[i % addrs.len()];
+                    let out_salt: [u8; 32] = rand::random();
+                    outputs.push(midstate::core::OutputData::Standard {
+                        address,
+                        value: denom,
+                        salt: out_salt,
+                    });
+                }
                 out_sum += val;
             }
             ParsedOutput::Stateful(addr, state) => {
-                outputs.push(midstate::core::OutputData::Confidential { address: addr, commitment: state, salt });
+                outputs.push(midstate::core::OutputData::Confidential {
+                    address: addr,
+                    commitment: state,
+                    salt,
+                });
             }
             ParsedOutput::Burn(payload, val) => {
                 for v in midstate::core::decompose_value(val) {
-                    outputs.push(midstate::core::OutputData::DataBurn { payload: payload.clone(), value_burned: v });
+                    outputs.push(midstate::core::OutputData::DataBurn {
+                        payload: payload.clone(),
+                        value_burned: v,
+                    });
                 }
                 out_sum += val;
             }
@@ -2560,10 +2601,10 @@ fn wallet_receive(path: &PathBuf, label: Option<String>) -> Result<()> {
     let password = read_password("Password: ")?;
     let mut wallet = Wallet::open(path, &password)?;
     let label = label.unwrap_or_else(|| format!("receive #{}", wallet.keys().len() + 1));
-    let address = wallet.generate_key(Some(label.clone()))?;
-    println!("\n  Your receiving address ({}):\n", label);
-    println!("  {}\n", midstate::core::types::encode_address_with_checksum(&address));
-    println!("  Share this with the sender.");
+    let addrs = wallet.generate_receive_bundle(4, Some(label.clone()))?;
+    println!("\n  Your receiving multi-address ({}):\n", label);
+    println!("  {}\n", midstate::wallet::plan::format_destinations(&addrs));
+    println!("  Share this with the sender (4 fresh WOTS addresses for self-PayJoin privacy).");
     Ok(())
 }
 
@@ -3405,14 +3446,22 @@ async fn wallet_send(
 
             // STRICT SAFETY: We use context() to ensure that if the node is offline,
             // the program crashes here rather than risking a reuse of the private key.
-            let response = client.post(&mss_url).json(&req).send().await
-                .context("CRITICAL: Could not connect to node. Aborting to prevent MSS key reuse.")?;
+            let response = client
+                .post(&mss_url)
+                .json(&req)
+                .send()
+                .await
+                .context(
+                    "CRITICAL: Could not connect to node. Aborting to prevent MSS key reuse.",
+                )?;
 
             if !response.status().is_success() {
                 anyhow::bail!("Safety Check Failed: Node returned error checking MSS state.");
             }
 
-            let mss_resp: rpc::GetMssStateResponse = response.json().await
+            let mss_resp: rpc::GetMssStateResponse = response
+                .json()
+                .await
                 .context("Safety Check Failed: Invalid response from node.")?;
 
             // If the node has seen more signatures than we have locally, FAST FORWARD.
@@ -3422,17 +3471,28 @@ async fn wallet_send(
                 // an implausibly large node answer as suspect, not authoritative.
                 let capacity = 1u64 << wallet.data.mss_keys[i].height;
                 if mss_resp.next_index > capacity {
-                    println!("  ⚠️  MSS Key {}: node-reported leaf {} exceeds capacity {} — clamping",
-                        hex::encode(&master_pk), mss_resp.next_index, capacity);
+                    println!(
+                        "  ⚠️  MSS Key {}: node-reported leaf {} exceeds capacity {} — clamping",
+                        hex::encode(&master_pk),
+                        mss_resp.next_index,
+                        capacity
+                    );
                 }
-                let new_leaf = mss_resp.next_index.saturating_add(SAFETY_MARGIN).min(capacity);
-                
-                println!("  ⚠️  MSS Key {}: Old state detected (Node: {}, Local: {})", 
-                    hex::encode(&master_pk), mss_resp.next_index, current_leaf);
+                let new_leaf = mss_resp
+                    .next_index
+                    .saturating_add(SAFETY_MARGIN)
+                    .min(capacity);
+
+                println!(
+                    "  ⚠️  MSS Key {}: Old state detected (Node: {}, Local: {})",
+                    hex::encode(&master_pk),
+                    mss_resp.next_index,
+                    current_leaf
+                );
                 println!("      Fast-forwarding index to {} to ensure safety.", new_leaf);
-                
+
                 wallet.data.mss_keys[i].set_next_leaf(new_leaf);
-                
+
                 // Save immediately. If save fails, we crash before signing.
                 wallet.save().context("Failed to save updated wallet state")?;
             }
@@ -3440,15 +3500,18 @@ async fn wallet_send(
         println!("  ✓ MSS indices verified safe.");
     }
 
-
-    let recipient_specs: Vec<ParsedOutput> = to_args.iter()
+    let recipient_specs: Vec<ParsedOutput> = to_args
+        .iter()
         .map(|s| parse_output_spec(s))
         .collect::<Result<Vec<_>>>()?;
 
-    let total_send: u64 = recipient_specs.iter().map(|o| match o {
-        ParsedOutput::Standard(_, v) | ParsedOutput::Burn(_, v) => *v,
-        ParsedOutput::Stateful(_, _) => 0,
-    }).sum();
+    let total_send: u64 = recipient_specs
+        .iter()
+        .map(|o| match o {
+            ParsedOutput::Standard(_, v) | ParsedOutput::Burn(_, v) => *v,
+            ParsedOutput::Stateful(_, _) => 0,
+        })
+        .sum();
     if private && recipient_specs.iter().any(|o| matches!(o, ParsedOutput::Burn(..))) {
         anyhow::bail!("a private send cannot carry a burn");
     }
@@ -3457,32 +3520,42 @@ async fn wallet_send(
 
     if private {
         // Find standard outputs for private send logic
-        let denoms: Vec<u64> = recipient_specs.iter().filter_map(|o| match o {
-            ParsedOutput::Standard(_, v) => Some(*v),
-            ParsedOutput::Stateful(_, _) | ParsedOutput::Burn(..) => None,
-        }).collect();
-        
+        let denoms: Vec<u64> = recipient_specs
+            .iter()
+            .filter_map(|o| match o {
+                ParsedOutput::Standard(_, v) => Some(*v),
+                ParsedOutput::Stateful(_, _) | ParsedOutput::Burn(..) => None,
+            })
+            .collect();
+
         let recipient_address = match &recipient_specs[0] {
-            ParsedOutput::Standard(a, _) => *a,
+            ParsedOutput::Standard(addrs, _) => addrs[0],
             ParsedOutput::Stateful(a, _) => *a,
             ParsedOutput::Burn(..) => unreachable!("refused above"),
         };
-        
+
         let pairs = wallet.plan_private_send(&live_coins, &recipient_address, &denoms)?;
         println!("Private send: {} independent transaction(s)\n", pairs.len());
 
         for (pair_idx, (inputs, outputs, change_seeds)) in pairs.iter().enumerate() {
-            let in_val: u64 = inputs.iter()
+            let in_val: u64 = inputs
+                .iter()
                 .filter_map(|id| wallet.find_coin(id))
                 .map(|c| c.value)
                 .sum();
             let out_val: u64 = outputs.iter().map(|o| o.value()).sum();
-            println!("  Pair {}: {} in (value {}) → {} out (value {}, fee {})",
-                pair_idx, inputs.len(), in_val, outputs.len(), out_val, in_val - out_val);
+            println!(
+                "  Pair {}: {} in (value {}) → {} out (value {}, fee {})",
+                pair_idx,
+                inputs.len(),
+                in_val,
+                outputs.len(),
+                out_val,
+                in_val - out_val
+            );
 
-            let (commitment, _salt) = wallet.prepare_commit(
-                inputs, outputs, change_seeds.clone(), true, false
-            )?;
+            let (commitment, _salt) =
+                wallet.prepare_commit(inputs, outputs, change_seeds.clone(), true, false)?;
 
             if let Err(e) = submit_commit(&client, rpc_port, &rpc_host, &commitment).await {
                 println!("  Pair {} commit failed: {}", pair_idx, e);
@@ -3491,7 +3564,15 @@ async fn wallet_send(
 
             println!("  ✓ Commit submitted ({})", hex::encode(&commitment));
 
-            if !wait_for_commit_mined(&client, rpc_port,&rpc_host, &hex::encode(commitment), timeout_secs).await {
+            if !wait_for_commit_mined(
+                &client,
+                rpc_port,
+                &rpc_host,
+                &hex::encode(commitment),
+                timeout_secs,
+            )
+            .await
+            {
                 println!("  ⏳ Not mined yet. Run `wallet reveal` later.");
                 continue;
             }
@@ -3503,134 +3584,180 @@ async fn wallet_send(
                 tokio::time::sleep(Duration::from_secs(delay)).await;
             }
 
-            do_reveal(&client, &mut wallet, rpc_port, &rpc_host, &commitment, timeout_secs).await?;
+            do_reveal(
+                &client,
+                &mut wallet,
+                rpc_port,
+                &rpc_host,
+                &commitment,
+                timeout_secs,
+            )
+            .await?;
         }
     } else {
-        let mut target_fee = 100u64; // Start with a conservative minimum guess
-        let  input_coin_ids;
-        let mut all_outputs;
-        let mut change_seeds;
-        let  in_sum;
-        let final_fee;
+        let actual_pay_outs: usize = recipient_specs
+            .iter()
+            .map(|spec| match spec {
+                ParsedOutput::Standard(_, value) => decompose_value(*value).len(),
+                ParsedOutput::Stateful(_, _) => 1,
+                ParsedOutput::Burn(_, value) => decompose_value(*value).len().max(1),
+            })
+            .sum();
 
-        loop {
-            // Dynamically calculate what we need based on the current fee guess
-            let needed = total_send + target_fee;
-            
-            let selected = if !coin_args.is_empty() {
-                coin_args.iter()
-                    .map(|s| wallet.resolve_coin(s))
-                    .collect::<Result<Vec<_>>>()?
+        let distinct_payment_addresses = recipient_specs
+            .iter()
+            .any(|o| matches!(o, ParsedOutput::Standard(addrs, _) if addrs.len() > 1));
+
+        let (input_coin_ids, change_denoms, in_sum, final_fee) =
+            if coin_args.is_empty() && total_send > 0 {
+                let plan_pay_outs = decompose_value(total_send).len();
+                let fee_fn = |n_in: usize, n_out: usize| -> u64 {
+                    let real_outs = n_out.saturating_sub(plan_pay_outs) + actual_pay_outs;
+                    midstate::wallet::plan::standard_fee(n_in, real_outs)
+                };
+                let cfg = midstate::wallet::plan::PlanConfig {
+                    distinct_payment_addresses,
+                    ..Default::default()
+                };
+                let plan =
+                    wallet.plan_transaction_with_config(&live_coins, total_send, fee_fn, &cfg)?;
+                (plan.input_coin_ids, plan.change_denoms, plan.in_sum, plan.fee)
             } else {
-                wallet.select_coins(needed, &live_coins)?
+                // Manual `--coin` selection or 0-value stateful/burn transaction.
+                let mut target_fee = 100u64;
+                loop {
+                    let needed = total_send + target_fee;
+                    let selected = if !coin_args.is_empty() {
+                        coin_args
+                            .iter()
+                            .map(|s| wallet.resolve_coin(s))
+                            .collect::<Result<Vec<_>>>()?
+                    } else {
+                        wallet.select_coins(needed, &live_coins)?
+                    };
+
+                    let current_in_sum: u64 = selected
+                        .iter()
+                        .filter_map(|id| wallet.find_coin(id))
+                        .map(|c| c.value)
+                        .sum();
+
+                    if current_in_sum <= total_send {
+                        anyhow::bail!(
+                            "input value ({}) must exceed output value ({}) to pay fee",
+                            current_in_sum,
+                            total_send
+                        );
+                    }
+
+                    let change_guess = current_in_sum.saturating_sub(total_send + target_fee);
+                    let num_outputs = actual_pay_outs + decompose_value(change_guess).len();
+                    let required_fee =
+                        midstate::wallet::plan::standard_fee(selected.len(), num_outputs);
+
+                    if current_in_sum >= total_send + required_fee {
+                        let final_change = current_in_sum - total_send - required_fee;
+                        break (
+                            selected,
+                            decompose_value(final_change),
+                            current_in_sum,
+                            required_fee,
+                        );
+                    } else {
+                        if !coin_args.is_empty() {
+                            anyhow::bail!(
+                                "The manually selected coins do not cover the transaction amount plus the dynamically calculated fee of {}",
+                                required_fee
+                            );
+                        }
+                        target_fee = required_fee;
+                    }
+                }
             };
 
-            let current_in_sum: u64 = selected.iter()
-                .filter_map(|id| wallet.find_coin(id))
-                .map(|c| c.value)
-                .sum();
+        let mut all_outputs = Vec::with_capacity(actual_pay_outs + change_denoms.len());
+        let mut change_seeds = Vec::with_capacity(change_denoms.len());
 
-            if current_in_sum <= total_send {
-                anyhow::bail!("input value ({}) must exceed output value ({}) to pay fee", current_in_sum, total_send);
-            }
-
-            // Estimate the number of outputs that will be created
-            let change = current_in_sum.saturating_sub(total_send + target_fee);
-            let mut num_outputs = 0;
-            for spec in &recipient_specs {
-                match spec {
-                    ParsedOutput::Standard(_, value) => num_outputs += decompose_value(*value).len(),
-                    ParsedOutput::Stateful(_, _) => num_outputs += 1,
-                    ParsedOutput::Burn(_, value) => num_outputs += decompose_value(*value).len().max(1),
-                }
-            }
-            num_outputs += decompose_value(change).len();
-            
-            // Calculate a strict upper bound for serialized byte size
-            // 1536 (WOTS sig) + 100 (input struct) = 1636 bytes per input
-            // 100 bytes per output + 100 bytes transaction base overhead
-            let estimated_bytes = 100 + (selected.len() as u64 * 1636) + (num_outputs as u64 * 100);
-            
-            // Calculate required fee based on Mempool limit (10 units per 1024 bytes)
-            let required_fee = (estimated_bytes * 10) / 1024 + 10; // +10 unit safety padding
-            
-            if current_in_sum >= total_send + required_fee {
-                // The selected coins cover the send AND the exact calculated fee! Lock it in.
-                final_fee = required_fee;
-                in_sum = current_in_sum;
-                input_coin_ids = selected;
-                
-                let final_change = current_in_sum - total_send - final_fee;
-                all_outputs = Vec::new();
-                change_seeds = Vec::new();
-
-                // 1. Build recipient outputs
-                for spec in &recipient_specs {
-                    match spec {
-                        ParsedOutput::Standard(address, value) => {
-                            for denom in midstate::core::decompose_value(*value) {
-                                let salt: [u8; 32] = rand::random();
-                                all_outputs.push(midstate::core::OutputData::Standard { address: *address, value: denom, salt });
-                            }
-                        }
-                        ParsedOutput::Stateful(address, state) => {
-                            let salt: [u8; 32] = rand::random();
-                            all_outputs.push(midstate::core::OutputData::Confidential { address: *address, commitment: *state, salt });
-                        }
-                        ParsedOutput::Burn(payload, value) => {
-                            let values = if *value == 0 { vec![0] } else { midstate::core::decompose_value(*value) };
-                            for v in values {
-                                all_outputs.push(midstate::core::OutputData::DataBurn { payload: payload.clone(), value_burned: v });
-                            }
-                        }
-                    }
-                }
-
-                // 2. Build exact change outputs
-                if final_change > 0 {
-                    for denom in midstate::core::decompose_value(final_change) {
-                        let seed = wallet.allocate_next_wots_seed()?;
-                        let pk = midstate::core::wots::keygen(&seed);
-                        let addr = midstate::core::compute_address(&pk);
+        // 1. Build recipient outputs (round-robin across distinct addresses when provided)
+        for spec in &recipient_specs {
+            match spec {
+                ParsedOutput::Standard(addrs, value) => {
+                    for (i, denom) in midstate::core::decompose_value(*value).into_iter().enumerate()
+                    {
+                        let address = addrs[i % addrs.len()];
                         let salt: [u8; 32] = rand::random();
-                        let idx = all_outputs.len();
-                        all_outputs.push(midstate::core::OutputData::Standard { address: addr, value: denom, salt });
-                        change_seeds.push((idx, seed));
+                        all_outputs.push(midstate::core::OutputData::Standard {
+                            address,
+                            value: denom,
+                            salt,
+                        });
                     }
                 }
-
-                // 3. Shuffle outputs to obfuscate which is the recipient vs change
-                {
-                    use rand::seq::SliceRandom;
-                    let mut indices: Vec<usize> = (0..all_outputs.len()).collect();
-                    indices.shuffle(&mut rand::thread_rng());
-                    let shuffled: Vec<midstate::core::OutputData> = indices.iter().map(|&i| all_outputs[i].clone()).collect();
-                    let mut rev = vec![0usize; indices.len()];
-                    for (new_i, &old_i) in indices.iter().enumerate() { rev[old_i] = new_i; }
-                    change_seeds = change_seeds.into_iter()
-                        .map(|(old_idx, s)| (rev[old_idx], s)).collect();
-                    all_outputs = shuffled;
+                ParsedOutput::Stateful(address, state) => {
+                    let salt: [u8; 32] = rand::random();
+                    all_outputs.push(midstate::core::OutputData::Confidential {
+                        address: *address,
+                        commitment: *state,
+                        salt,
+                    });
                 }
-                
-                break;
-            } else {
-                // We need more inputs to cover the real fee. Let's loop again with the new target!
-                target_fee = required_fee;
-                
-                // If the user manually provided specific coins via CLI args, we can't auto-select more.
-                if !coin_args.is_empty() {
-                    anyhow::bail!(
-                        "The manually selected coins do not cover the transaction amount plus the dynamically calculated fee of {}", 
-                        required_fee
-                    );
+                ParsedOutput::Burn(payload, value) => {
+                    let values = if *value == 0 {
+                        vec![0]
+                    } else {
+                        midstate::core::decompose_value(*value)
+                    };
+                    for v in values {
+                        all_outputs.push(midstate::core::OutputData::DataBurn {
+                            payload: payload.clone(),
+                            value_burned: v,
+                        });
+                    }
                 }
             }
+        }
+
+        // 2. Build change outputs using a single atomic HD seed batch allocation
+        if !change_denoms.is_empty() {
+            let seeds = wallet.allocate_next_wots_seeds(change_denoms.len())?;
+            for (denom, seed) in change_denoms.into_iter().zip(seeds) {
+                let pk = midstate::core::wots::keygen(&seed);
+                let addr = midstate::core::compute_address(&pk);
+                let salt: [u8; 32] = rand::random();
+                let idx = all_outputs.len();
+                all_outputs.push(midstate::core::OutputData::Standard {
+                    address: addr,
+                    value: denom,
+                    salt,
+                });
+                change_seeds.push((idx, seed));
+            }
+        }
+
+        // 3. Shuffle outputs to obfuscate which is the recipient vs change
+        {
+            use rand::seq::SliceRandom;
+            let mut indices: Vec<usize> = (0..all_outputs.len()).collect();
+            indices.shuffle(&mut rand::thread_rng());
+            let shuffled: Vec<midstate::core::OutputData> =
+                indices.iter().map(|&i| all_outputs[i].clone()).collect();
+            let mut rev = vec![0usize; indices.len()];
+            for (new_i, &old_i) in indices.iter().enumerate() {
+                rev[old_i] = new_i;
+            }
+            change_seeds = change_seeds
+                .into_iter()
+                .map(|(old_idx, s)| (rev[old_idx], s))
+                .collect();
+            all_outputs = shuffled;
         }
 
         println!(
             "Spending {} coin(s) (value {}) → {} output(s) (value {}, fee: {})",
-            input_coin_ids.len(), in_sum,
-            all_outputs.len(), in_sum - final_fee,
+            input_coin_ids.len(),
+            in_sum,
+            all_outputs.len(),
+            in_sum - final_fee,
             final_fee
         );
 
@@ -3640,37 +3767,66 @@ async fn wallet_send(
             let change: std::collections::HashSet<usize> =
                 change_seeds.iter().map(|(i, _)| *i).collect();
             for (i, out) in all_outputs.iter().enumerate() {
-                if let midstate::core::OutputData::Standard { address, value, salt } = out {
+                if let midstate::core::OutputData::Standard {
+                    address,
+                    value,
+                    salt,
+                } = out
+                {
                     if !change.contains(&i) {
                         println!(
                             "  → {}:{}  salt {}  coin {}",
                             hex::encode(address),
                             value,
                             hex::encode(salt),
-                            hex::encode(midstate::core::types::compute_coin_id(address, *value, salt))
+                            hex::encode(midstate::core::types::compute_coin_id(
+                                address, *value, salt
+                            ))
                         );
                     }
                 }
             }
         }
 
-let (commitment, _salt) = wallet.prepare_commit(
-            &input_coin_ids, &all_outputs, change_seeds.clone(), false, false
+        let (commitment, _salt) = wallet.prepare_commit(
+            &input_coin_ids,
+            &all_outputs,
+            change_seeds.clone(),
+            false,
+            false,
         )?;
 
         submit_commit(&client, rpc_port, &rpc_host, &commitment).await?;
 
-
         println!("\n✓ Commit submitted ({})", hex::encode(&commitment));
         println!("  Waiting for commit to be mined...");
 
-        if !wait_for_commit_mined(&client, rpc_port, &rpc_host, &hex::encode(commitment), timeout_secs).await {
-            println!("⏳ Not mined after {}s. Run `wallet reveal` later.", timeout_secs);
+        if !wait_for_commit_mined(
+            &client,
+            rpc_port,
+            &rpc_host,
+            &hex::encode(commitment),
+            timeout_secs,
+        )
+        .await
+        {
+            println!(
+                "⏳ Not mined after {}s. Run `wallet reveal` later.",
+                timeout_secs
+            );
             return Ok(());
         }
         println!("✓ Commit mined!");
 
-        do_reveal(&client, &mut wallet, rpc_port, &rpc_host, &commitment, timeout_secs).await?;
+        do_reveal(
+            &client,
+            &mut wallet,
+            rpc_port,
+            &rpc_host,
+            &commitment,
+            timeout_secs,
+        )
+        .await?;
     }
 
     Ok(())

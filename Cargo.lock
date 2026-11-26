@@ -4128,7 +4128,7 @@ dependencies = [
 
 [[package]]
 name = "midstate"
-version = "6.5.0"
+version = "6.6.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
