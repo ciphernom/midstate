@@ -623,6 +623,24 @@ pub fn import_scanned(
         Ok(address)
     }
 
+    pub fn generate_keys(&mut self, n: usize, label: Option<String>) -> Result<Vec<[u8; 32]>> {
+        let seeds = self.allocate_next_wots_seeds(n)?;
+        let mut addrs = Vec::with_capacity(n);
+        for seed in seeds {
+            let owner_pk = wots::keygen(&seed);
+            let address = compute_address(&owner_pk);
+            self.data.keys.push(WalletKey {
+                seed,
+                owner_pk,
+                address,
+                label: label.clone(),
+            });
+            addrs.push(address);
+        }
+        self.save()?;
+        Ok(addrs)
+    }
+
     // ======================================================================
     //  PRUNING LICENSE SUPPORT (Phase 1 — Wallet Layer Only)
     // ======================================================================

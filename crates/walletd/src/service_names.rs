@@ -296,6 +296,33 @@ impl Service {
         names::pays(&r.records, used).ok_or_else(|| anyhow!("{} has no MDS address that can take a payment", to.trim()))
     }
 
+    /// Resolve either a `.mds` name or a comma-separated list of MDS addresses.
+    pub(super) fn resolve_destinations(&self, to: &str) -> Result<Vec<[u8; 32]>> {
+        let trimmed = to.trim();
+        if trimmed.is_empty() {
+            bail!("destination address is required");
+        }
+        if names::is_name(trimmed) {
+            return Ok(vec![self.resolve_destination(trimmed)?]);
+        }
+        let mut out = Vec::new();
+        for part in trimmed.split(',') {
+            let p = part.trim();
+            if p.is_empty() {
+                bail!("empty address in comma-separated destination list");
+            }
+            let addr = sendplan::decode_address(p)?;
+            if !out.contains(&addr) {
+                out.push(addr);
+            }
+        }
+        if out.is_empty() {
+            bail!("at least one destination address is required");
+        }
+        Ok(out)
+    }
+
+
     /// A midwimble address, or the one a name's records give.
     pub(super) fn resolve_mdw(&self, to: &str) -> Result<String> {
         if !names::is_name(to) {

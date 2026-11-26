@@ -2920,14 +2920,17 @@ impl Service {
     /// signed. Same consensus lookup as the send gate, run while typing so the
     /// problem surfaces before any value moves.
     async fn validate_address(&self, addr: &str) -> Result<Option<String>> {
-        let dest = self.resolve_destination(addr)?;
-        if self.key_signed_on_chain(&dest) {
-            bail!(
-                "this address has already spent its one-time key — anything sent to it \
-                 cannot be recovered"
-            );
+        let dests = self.resolve_destinations(addr)?;
+        for dest in &dests {
+            if self.key_signed_on_chain(dest) {
+                bail!(
+                    "this address has already spent its one-time key — anything sent to it \
+                     cannot be recovered"
+                );
+            }
         }
-        Ok(midstate::core::names::is_name(addr).then(|| midstate::core::encode_address_with_checksum(&dest)))
+        Ok(midstate::core::names::is_name(addr)
+            .then(|| midstate::core::encode_address_with_checksum(&dests[0])))
     }
 
     async fn start_send(&mut self, to: &str, amount: u64, private: bool) -> Result<String> {
@@ -2937,45 +2940,55 @@ impl Service {
         if self.node.is_syncing() {
             bail!("node is still syncing — sending against a stale coin set would fail");
         }
-        let dest = self.resolve_destination(to)?;
-        self.start_send_to(to, dest, amount, private).await
+        let dests = self.resolve_destinations(to)?;
+        self.start_send_to_many(to, &dests, amount, private).await
     }
 
     /// A send to `dest`, shown as going to `to` (an address, or the name it
     /// was resolved from).
     async fn start_send_to(&mut self, to: &str, dest: [u8; 32], amount: u64, private: bool) -> Result<String> {
+        self.start_send_to_many(to, &[dest], amount, private).await
+    }
+
+    /// A send to one or more `dests`, shown as going to `to`.
+    /// When `dests.len() > 1`, routes denominations across distinct addresses
+    /// via `plan_send_multi` (full self-PayJoin ambiguity).
+    pub(super) async fn start_send_to_many(
+        &mut self,
+        to: &str,
+        dests: &[[u8; 32]],
+        amount: u64,
+        private: bool,
+    ) -> Result<String> {
         if self.wallet.is_none() {
             bail!("wallet is locked");
         }
         if self.node.is_syncing() {
             bail!("node is still syncing — sending against a stale coin set would fail");
         }
+        if dests.is_empty() {
+            bail!("at least one destination address is required");
+        }
         self.ensure_restore_done()?;
         self.verify_mss_indices().await?;
 
         let state = self.node.get_state().await;
 
-        // A one-time key that has already signed can never sign again, so
-        // coins sent to it are unspendable forever. The in-process node
-        // records every WOTS key that has signed (`key_signed_on_chain`), so
-        // this is a local lookup — no message from the recipient is needed,
-        // and nothing about the payment is revealed to anyone. (This used to
-        // read `state.burned_wots`, which nothing writes, so it never fired.)
-        if self.key_signed_on_chain(&dest) {
-            bail!(
-                "that address has already spent its one-time key — anything sent there \
-                 cannot be recovered. Ask the recipient for a fresh address."
-            );
+        for dest in dests {
+            if self.key_signed_on_chain(dest) {
+                bail!(
+                    "that address has already spent its one-time key — anything sent there \
+                     cannot be recovered. Ask the recipient for a fresh address."
+                );
+            }
         }
 
-        // Live coins: on-chain, not already promised to a pending commit, and
-        // not a reward still maturing.
         let in_flight_ids = self.in_flight_inputs();
         let w = self.wallet.as_mut().unwrap();
         let live = w.spendable_now(&state, &in_flight_ids);
 
         let SendPlan { input_coin_ids, outputs, change_seeds, in_sum: _, fee, amount } =
-            sendplan::plan_send(w, &live, dest, amount)?;
+            sendplan::plan_send_multi(w, &live, dests, amount)?;
 
         let (commitment, _salt) =
             w.prepare_commit(&input_coin_ids, &outputs, change_seeds, private, false)?;
@@ -4810,7 +4823,13 @@ impl Service {
                 if target != me {
                     return Ok(());
                 }
-                self.answer_address_request(id, tip).await?;
+                let want = f
+                    .payload
+                    .as_deref()
+                    .and_then(qb::wire::unpack_u32)
+                    .map(|(n, _)| n as usize)
+                    .unwrap_or(1);
+                self.answer_address_request(id, tip, want).await?;
             }
             w::CMD_CHAN_REQ => {
                 // A peer wants a lane from us. Only the sender can pay in a
@@ -4937,6 +4956,37 @@ impl Service {
                     bail!("address reply signature does not verify — ignoring");
                 }
                 let encoded = midstate::core::encode_address_with_checksum(&addr);
+                self.book.addr_reqs.remove(&hex::encode(id));
+                self.book
+                    .peer_addrs
+                    .insert(hex::encode(peer), (encoded.clone(), expiry));
+                self.book.save(&self.wallet_path);
+                let _ = self.events.send(WalletEvent::PeerAddress {
+                    peer: hex::encode(peer),
+                    address: encoded,
+                });
+            }
+            w::CMD_ADDR_BATCH => {
+                let Some(peer) = self.book.addr_reqs.get(&hex::encode(id)).copied() else {
+                    return Ok(());
+                };
+                let payload = f.payload.ok_or_else(|| anyhow!("address batch reply without payload"))?;
+                let (addrs, expiry, sig_bytes) = qb::wire::unpack_address_batch(&payload)
+                    .ok_or_else(|| anyhow!("unreadable address batch reply"))?;
+                if expiry <= tip {
+                    bail!("address batch reply has already expired");
+                }
+                let commit = qb::address_batch_commit(&peer, &id, &addrs, expiry);
+                let sig = midstate::core::mss::MssSignature::from_bytes(&sig_bytes)
+                    .map_err(|_| anyhow!("undecodable signature on address batch reply"))?;
+                if !midstate::core::mss::verify(&sig, &commit, &peer) {
+                    bail!("address batch reply signature does not verify — ignoring");
+                }
+                let encoded = addrs
+                    .iter()
+                    .map(midstate::core::encode_address_with_checksum)
+                    .collect::<Vec<_>>()
+                    .join(",");
                 self.book.addr_reqs.remove(&hex::encode(id));
                 self.book
                     .peer_addrs
@@ -5707,7 +5757,11 @@ impl Service {
         let req_id: [u8; 32] = rand::random();
         self.book.addr_reqs.insert(hex::encode(req_id), peer);
         self.book.save(&self.wallet_path);
-        let mut atts = channels::frame_attachments(req_id, qb::wire::pack_u32(0, &[]), None);
+        let mut atts = channels::frame_attachments(
+            req_id,
+            qb::wire::pack_u32(qb::wire::DEFAULT_ADDR_BATCH as u32, &[]),
+            None,
+        );
         atts.push(midstate::chat::ChatAttachment::Address(peer));
         self.node
             .send_chat(vec![qb::wire::MARKER, qb::wire::CMD_ADDR_REQ], None, atts)?;
@@ -5720,7 +5774,7 @@ impl Service {
 
     /// Answer a peer's request with a brand-new one-time address, signed so
     /// they can prove it came from us.
-    async fn answer_address_request(&mut self, req_id: [u8; 32], tip: u64) -> Result<()> {
+    async fn answer_address_request(&mut self, req_id: [u8; 32], tip: u64, want: usize) -> Result<()> {
         let key = hex::encode(req_id);
         if self.book.answered_addr_reqs.contains_key(&key) {
             return Ok(()); // already answered; replies are idempotent
@@ -5733,22 +5787,53 @@ impl Service {
         }
         let me = self.ensure_identity()?;
         let expiry = tip + channels::ADDRESS_TTL;
-        let addr = {
-            let w = self.wallet.as_mut().ok_or_else(|| anyhow!("wallet is locked"))?;
-            w.generate_key(Some("given out on request".into()))?
-        };
-        let sig = self.sign_commitment(&qb::address_commit(&me, &req_id, &addr, expiry))?;
-        self.book.answered_addr_reqs.insert(key, tip);
-        self.book.save(&self.wallet_path);
-        channels::send_frame(
-            &self.node,
-            qb::wire::CMD_ADDR,
-            req_id,
-            qb::wire::pack_address(&addr, expiry, &sig),
-            None,
-        )?;
-        let _ = self.events.send(WalletEvent::WalletChanged);
-        self.ch_notice("Gave a peer a fresh one-time address on request.".into());
+
+        // Keep packed payload + MSS signature within MAX_SIGNATURE_SIZE (1536 B).
+        let id_height = self
+            .wallet
+            .as_ref()
+            .and_then(|w| w.mss_keys().iter().find(|m| m.master_pk == me))
+            .map(|m| m.height as usize)
+            .unwrap_or(16);
+        let sig_est = 620 + id_height * 32;
+        let max_fit = 1536usize.saturating_sub(10 + sig_est) / 32;
+        let count = want.min(qb::wire::MAX_ADDR_BATCH).min(max_fit);
+
+        if count <= 1 {
+            let addr = {
+                let w = self.wallet.as_mut().ok_or_else(|| anyhow!("wallet is locked"))?;
+                w.generate_key(Some("given out on request".into()))?
+            };
+            let sig = self.sign_commitment(&qb::address_commit(&me, &req_id, &addr, expiry))?;
+            self.book.answered_addr_reqs.insert(key, tip);
+            self.book.save(&self.wallet_path);
+            channels::send_frame(
+                &self.node,
+                qb::wire::CMD_ADDR,
+                req_id,
+                qb::wire::pack_address(&addr, expiry, &sig),
+                None,
+            )?;
+            let _ = self.events.send(WalletEvent::WalletChanged);
+            self.ch_notice("Gave a peer a fresh one-time address on request.".into());
+        } else {
+            let addrs = {
+                let w = self.wallet.as_mut().ok_or_else(|| anyhow!("wallet is locked"))?;
+                w.generate_keys(count, Some("given out on request".into()))?
+            };
+            let sig = self.sign_commitment(&qb::address_batch_commit(&me, &req_id, &addrs, expiry))?;
+            self.book.answered_addr_reqs.insert(key, tip);
+            self.book.save(&self.wallet_path);
+            channels::send_frame(
+                &self.node,
+                qb::wire::CMD_ADDR_BATCH,
+                req_id,
+                qb::wire::pack_address_batch(&addrs, expiry, &sig),
+                None,
+            )?;
+            let _ = self.events.send(WalletEvent::WalletChanged);
+            self.ch_notice(format!("Gave a peer {count} fresh one-time addresses on request."));
+        }
         Ok(())
     }
 

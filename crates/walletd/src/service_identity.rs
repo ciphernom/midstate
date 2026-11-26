@@ -529,28 +529,55 @@ impl Service {
         handshake_with(&r.records, self.book.identity_pk, |k| self.node.storage.query_mss_leaf_index(k).unwrap_or(0))
     }
 
-    /// A fresh address `identity` handed over and that is still good, taken
-    /// so it is never paid twice.
-    fn take_fresh_address(&mut self, identity: &[u8; 32], tip: u64) -> Option<[u8; 32]> {
+    /// Unexpired fresh addresses cached from `identity`.
+    fn peek_fresh_addresses(&self, identity: &[u8; 32], tip: u64) -> Vec<[u8; 32]> {
         let key = hex::encode(identity);
-        let (addr, expiry) = self.book.peer_addrs.get(&key).cloned()?;
-        if expiry <= tip + ADDRESS_MARGIN {
-            return None;
+        let Some((raw, expiry)) = self.book.peer_addrs.get(&key) else {
+            return Vec::new();
+        };
+        if *expiry <= tip + ADDRESS_MARGIN {
+            return Vec::new();
         }
-        let a = midstate::core::parse_address_flexible(&addr).ok()?;
-        self.book.peer_addrs.remove(&key);
-        self.book.save(&self.wallet_path);
-        Some(a)
+        raw.split(',')
+            .filter_map(|s| midstate::core::parse_address_flexible(s.trim()).ok())
+            .collect()
     }
 
-    /// A send asked for by the UI. To a name whose wallet can be asked, ask
-    /// it for a fresh address and answer once it replies (or the wait runs
-    /// out and the record is paid); otherwise send now.
+    /// Drop the first `used` addresses from `identity`'s cache after a send succeeds.
+    fn consume_fresh_addresses(&mut self, identity: &[u8; 32], used: usize) {
+        let key = hex::encode(identity);
+        let Some((raw, expiry)) = self.book.peer_addrs.get(&key).cloned() else {
+            return;
+        };
+        let rest: Vec<&str> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .skip(used)
+            .collect();
+        if rest.is_empty() {
+            self.book.peer_addrs.remove(&key);
+        } else {
+            self.book.peer_addrs.insert(key, (rest.join(","), expiry));
+        }
+        self.book.save(&self.wallet_path);
+    }
+
+    fn has_pending_addr_req(&self, identity: &[u8; 32]) -> bool {
+        self.book.addr_reqs.values().any(|p| p == identity)
+    }
+
+    /// A send asked for by the UI. To a name whose wallet can be asked, use
+    /// cached fresh addresses (or ask for a fresh batch) and answer once it
+    /// replies (or the wait runs out and the record is paid); otherwise send now.
     pub(super) async fn send_or_ask(&mut self, to: String, amount: u64, private: bool, resp: oneshot::Sender<Result<String>>) {
         if let Some(identity) = self.identity_to_ask(&to) {
             let tip = self.node.get_state().await.height;
-            if let Some(dest) = self.take_fresh_address(&identity, tip) {
-                let r = self.send_fresh(&to, dest, amount, private).await;
+            let needed = midstate::core::decompose_value(amount).len().max(1);
+            let cached = self.peek_fresh_addresses(&identity, tip);
+            if cached.len() >= needed {
+                let dests = cached[..needed].to_vec();
+                let r = self.send_fresh(&to, &identity, &dests, amount, private).await;
                 let _ = resp.send(r);
                 return;
             }
@@ -560,44 +587,74 @@ impl Service {
                         self.ident.sends.push(NameSend { to, amount, private, identity, deadline: Instant::now() + HANDSHAKE_WAIT, resp });
                         return;
                     }
-                    Err(e) => tracing::debug!("could not ask {to} for a fresh address: {e:#}"),
+                    Err(e) => tracing::debug!("could not ask {to} for fresh addresses: {e:#}"),
                 }
+            }
+            if !cached.is_empty() {
+                let r = self.send_fresh(&to, &identity, &cached, amount, private).await;
+                let _ = resp.send(r);
+                return;
             }
         }
         let r = self.start_send(&to, amount, private).await;
         let _ = resp.send(r);
     }
 
-    async fn send_fresh(&mut self, to: &str, dest: [u8; 32], amount: u64, private: bool) -> Result<String> {
-        let id = self.start_send_to(to, dest, amount, private).await?;
+    async fn send_fresh(
+        &mut self,
+        to: &str,
+        identity: &[u8; 32],
+        dests: &[[u8; 32]],
+        amount: u64,
+        private: bool,
+    ) -> Result<String> {
+        let id = self.start_send_to_many(to, dests, amount, private).await?;
+        self.consume_fresh_addresses(identity, dests.len());
         if let Some(c) = hex32(&id) {
-            self.set_stage(c, SendStage::Committing, format!("paying a fresh one-time address from {}'s wallet", to.trim()));
+            let msg = if dests.len() > 1 {
+                format!("paying {} fresh one-time addresses from {}'s wallet", dests.len(), to.trim())
+            } else {
+                format!("paying a fresh one-time address from {}'s wallet", to.trim())
+            };
+            self.set_stage(c, SendStage::Committing, msg);
         }
         Ok(id)
     }
 
-    /// Each tick: finish the payments whose fresh address came, or whose
+    /// Each tick: finish the payments whose fresh address batch came, or whose
     /// wait ran out.
     pub(super) async fn tick_name_sends(&mut self, tip: u64) {
         let waiting = std::mem::take(&mut self.ident.sends);
         for s in waiting {
-            if let Some(dest) = self.take_fresh_address(&s.identity, tip) {
-                let r = self.send_fresh(&s.to, dest, s.amount, s.private).await;
+            let needed = midstate::core::decompose_value(s.amount).len().max(1);
+            let cached = self.peek_fresh_addresses(&s.identity, tip);
+            let reply_arrived = !self.has_pending_addr_req(&s.identity) && !cached.is_empty();
+
+            if reply_arrived || cached.len() >= needed {
+                let take = needed.min(cached.len());
+                let dests = cached[..take].to_vec();
+                let r = self.send_fresh(&s.to, &s.identity, &dests, s.amount, s.private).await;
                 let _ = s.resp.send(r);
             } else if Instant::now() >= s.deadline || s.resp.is_closed() {
-                let r = self.start_send(&s.to, s.amount, s.private).await;
-                if let Ok(c) = r.as_deref().map(hex32) {
-                    if let Some(c) = c {
-                        let note = format!("{}'s wallet did not answer, so this pays the address its name lists", s.to.trim());
-                        self.set_stage(c, SendStage::Committing, note);
+                if !cached.is_empty() {
+                    let r = self.send_fresh(&s.to, &s.identity, &cached, s.amount, s.private).await;
+                    let _ = s.resp.send(r);
+                } else {
+                    let r = self.start_send(&s.to, s.amount, s.private).await;
+                    if let Ok(c) = r.as_deref().map(hex32) {
+                        if let Some(c) = c {
+                            let note = format!("{}'s wallet did not answer, so this pays the address its name lists", s.to.trim());
+                            self.set_stage(c, SendStage::Committing, note);
+                        }
                     }
+                    let _ = s.resp.send(r);
                 }
-                let _ = s.resp.send(r);
             } else {
                 self.ident.sends.push(s);
             }
         }
     }
+
 
     // ── KEM keys over the handshake ─────────────────────────────────────
 

@@ -455,6 +455,24 @@ pub fn address_commit(
     hash_bytes(&b)
 }
 
+pub fn address_batch_commit(
+    responder_pk: &[u8; 32],
+    req_id: &[u8; 32],
+    addresses: &[[u8; 32]],
+    expiry: u64,
+) -> [u8; 32] {
+    let mut b = Vec::with_capacity(8 + 64 + 1 + addresses.len() * 32 + 8);
+    b.extend_from_slice(b"mdsaddr2");
+    b.extend_from_slice(responder_pk);
+    b.extend_from_slice(req_id);
+    b.push(addresses.len() as u8);
+    for addr in addresses {
+        b.extend_from_slice(addr);
+    }
+    b.extend_from_slice(&expiry.to_le_bytes());
+    hash_bytes(&b)
+}
+
 /// BLAKE3 of arbitrary bytes (the same hash the script VM's OP_HASH uses).
 pub fn hash_bytes(b: &[u8]) -> [u8; 32] {
     *blake3::Hasher::new().update(b).finalize().as_bytes()
@@ -568,6 +586,14 @@ pub mod wire {
     /// needs no signature: the requester checks it against the name's `kem`
     /// record, which only the name's holder can set.
     pub const CMD_KEM: u8 = 70;
+    
+    /// Signed reply carrying a batch of fresh one-time addresses (1..=MAX_ADDR_BATCH).
+    /// Requested via `CMD_ADDR_REQ` with `pack_u32(count, &[])` where `count > 1`.
+    pub const CMD_ADDR_BATCH: u8 = 71;
+    pub const DEFAULT_ADDR_BATCH: u8 = 16;
+    pub const MAX_ADDR_BATCH: usize = 16;
+    
+    
     pub const CMD_OPEN: u8 = 110;
 
     /// OPEN payload: [ver][expiry u64][n u8][{value u64, salt 32}×n][sig0…]
@@ -722,6 +748,38 @@ pub mod wire {
         let expiry = u64::from_le_bytes(b[1..9].try_into().ok()?);
         let address: [u8; 32] = b[9..41].try_into().ok()?;
         Some((address, expiry, b[41..].to_vec()))
+    }
+
+    /// ADDR_BATCH payload: [ver][expiry u64][n u8][addr_0 (32) ... addr_{n-1} (32)][sig...]
+    pub fn pack_address_batch(addresses: &[[u8; 32]], expiry: u64, sig: &[u8]) -> Vec<u8> {
+        let n = addresses.len().min(MAX_ADDR_BATCH);
+        let mut out = Vec::with_capacity(10 + n * 32 + sig.len());
+        out.push(VERSION);
+        out.extend_from_slice(&expiry.to_le_bytes());
+        out.push(n as u8);
+        for addr in &addresses[..n] {
+            out.extend_from_slice(addr);
+        }
+        out.extend_from_slice(sig);
+        out
+    }
+
+    pub fn unpack_address_batch(b: &[u8]) -> Option<(Vec<[u8; 32]>, u64, Vec<u8>)> {
+        if b.len() < 10 || b[0] != VERSION {
+            return None;
+        }
+        let expiry = u64::from_le_bytes(b[1..9].try_into().ok()?);
+        let n = b[9] as usize;
+        if n == 0 || n > MAX_ADDR_BATCH || b.len() < 10 + n * 32 {
+            return None;
+        }
+        let mut addrs = Vec::with_capacity(n);
+        let mut o = 10;
+        for _ in 0..n {
+            addrs.push(b[o..o + 32].try_into().ok()?);
+            o += 32;
+        }
+        Some((addrs, expiry, b[o..].to_vec()))
     }
 
     /// HUB payload: [ver][outbound u64][min_capacity u64][hop_fee u64]
