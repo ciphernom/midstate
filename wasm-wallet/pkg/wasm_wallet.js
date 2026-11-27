@@ -918,8 +918,8 @@ export class WebWallet {
      *    every change output, and shuffles both inputs and outputs.
      * 3. **Consolidation & fee discipline**: Preserves the snowball baseline as a
      *    guaranteed fallback, enforces a fragmentation guardrail above the UTXO
-     *    comfort ceiling, and converges against the exact web-wallet fee model
-     *    (`100 units/KiB + 50`).
+     *    comfort ceiling, and converges against the fee model every wallet
+     *    uses (`plan::fee_for_bytes`: 10 units/KiB + 10).
      * 4. **Restorability**: Derives every change key and deterministic salt from
      *    `self.master_seed` and `next_wots_index` so all change coins are
      *    recoverable from the seed phrase.

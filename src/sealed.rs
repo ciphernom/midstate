@@ -70,6 +70,24 @@
 //! as nodes keep chat history, and stays readable to whoever holds the
 //! session, as below: a timer is tidiness, not forward secrecy.
 //!
+//! # One-shot exchanges
+//!
+//! A request and its one reply, for handshakes that are not conversations
+//! (a payee's fresh addresses): no session, no stamp, nothing kept but the
+//! reply key while the answer is awaited.
+//!
+//! ```text
+//! request    = ct (768) ‖ XChaCha20-Poly1305(k_req, 0, body), aad = ct
+//! reply      = XChaCha20-Poly1305(k_rep, 0, body),            aad = ct
+//! k_req      = derive("…exchange.request.v1", ss ‖ ct ‖ context)
+//! k_rep      = derive("…exchange.reply.v1",   ss ‖ ct ‖ context)
+//! ```
+//!
+//! Each key seals one message, so the zero nonce is safe. `context` binds the
+//! exchange to what carries it (a request id), so neither half can be moved
+//! under another. Only the two ends hold `ss`: a reply that opens comes from
+//! the holder of the key the request was sealed to.
+//!
 //! # What this does not do
 //!
 //! No forward secrecy within a session: whoever later learns the recipient's
@@ -565,6 +583,68 @@ pub fn try_open(keys: &KemKeys, bytes: &[u8]) -> Option<Opened> {
     Some(Opened { session: Session::new(&ss, ct, false), sender, body: p.body, ttl: p.ttl, stamp_bits })
 }
 
+fn exchange_keys(ss: &[u8], ct: &[u8], context: &[u8]) -> ([u8; 32], [u8; 32]) {
+    (
+        derive("midstate.sealed.exchange.request.v1", &[ss, ct, context]),
+        derive("midstate.sealed.exchange.reply.v1", &[ss, ct, context]),
+    )
+}
+
+/// One side's hold on a one-shot exchange: what seals or opens its reply.
+/// Secret: keep it in memory while the reply is awaited, and no longer.
+pub struct Exchange {
+    ct: Vec<u8>,
+    k_rep: [u8; 32],
+}
+
+impl Exchange {
+    /// Seals the reply (the recipient's side).
+    pub fn seal_reply(&self, body: &[u8]) -> Result<Vec<u8>> {
+        XChaCha20Poly1305::new(Key::from_slice(&self.k_rep))
+            .encrypt(XNonce::from_slice(&[0; NONCE_LEN]), Payload { msg: body, aad: &self.ct })
+            .map_err(|_| anyhow!("sealing failed"))
+    }
+
+    /// Opens the reply (the requester's side), or `None`.
+    pub fn open_reply(&self, bytes: &[u8]) -> Option<Vec<u8>> {
+        XChaCha20Poly1305::new(Key::from_slice(&self.k_rep))
+            .decrypt(XNonce::from_slice(&[0; NONCE_LEN]), Payload { msg: bytes, aad: &self.ct })
+            .ok()
+    }
+}
+
+/// Seals a one-shot request to the holder of `recipient_public` (checked
+/// against `recipient_hash`, the name's `kem` record), bound to `context`.
+/// Returns its bytes and the requester's side of the exchange.
+pub fn seal_request(recipient_public: &[u8], recipient_hash: &[u8; 32], context: &[u8], body: &[u8]) -> Result<(Vec<u8>, Exchange)> {
+    check_public(recipient_public, recipient_hash)?;
+    let ek = encapsulation_key(recipient_public)?;
+    let m: [u8; 32] = rand::random();
+    let (ct, ss) = ek.encapsulate_deterministic(&m.into());
+    let (ct, ss) = (ct.to_vec(), ss.to_vec());
+    let (k_req, k_rep) = exchange_keys(&ss, &ct, context);
+    let sealed = XChaCha20Poly1305::new(Key::from_slice(&k_req))
+        .encrypt(XNonce::from_slice(&[0; NONCE_LEN]), Payload { msg: body, aad: &ct })
+        .map_err(|_| anyhow!("sealing failed"))?;
+    Ok(([ct.as_slice(), &sealed].concat(), Exchange { ct, k_rep }))
+}
+
+/// Opens a one-shot request sealed to `keys` under `context`: its body and
+/// the recipient's side of the exchange, or `None` if it is not for this key
+/// (ML-KEM rejects implicitly, so the seal fails to open).
+pub fn open_request(keys: &KemKeys, context: &[u8], bytes: &[u8]) -> Option<(Vec<u8>, Exchange)> {
+    if bytes.len() < KEM_CT_LEN + TAG_LEN {
+        return None;
+    }
+    let (ct, sealed) = bytes.split_at(KEM_CT_LEN);
+    let ss = keys.dk.decapsulate_slice(ct).ok()?.to_vec();
+    let (k_req, k_rep) = exchange_keys(&ss, ct, context);
+    let body = XChaCha20Poly1305::new(Key::from_slice(&k_req))
+        .decrypt(XNonce::from_slice(&[0; NONCE_LEN]), Payload { msg: sealed, aad: ct })
+        .ok()?;
+    Some((body, Exchange { ct: ct.to_vec(), k_rep }))
+}
+
 /// The attachments that carry `envelope` (an opening or a message).
 pub fn attachments(envelope: &[u8]) -> Result<Vec<ChatAttachment>> {
     let parts: Vec<ChatAttachment> = envelope.chunks(MAX_ENCRYPTED_MESSAGE_SIZE).map(|c| ChatAttachment::EncryptedMessage(c.to_vec())).collect();
@@ -595,6 +675,37 @@ mod tests {
     fn named<'a>(name: &'a str, key: &'a mut mss::MssKeypair) -> OpenAs<'a> {
         let identity = key.public_key();
         OpenAs { name, identity, sign: Box::new(move |t| Ok(key.sign(t)?.to_bytes())) }
+    }
+
+    #[test]
+    fn a_one_shot_exchange_opens_only_for_its_two_ends() {
+        let bob = KemKeys::from_secret(&[2; 32]);
+        let eve = KemKeys::from_secret(&[3; 32]);
+        let ctx = b"req-1";
+        let (req, alice) = seal_request(&bob.public(), &bob.public_hash(), ctx, b"two please").unwrap();
+        assert_eq!(req.len(), KEM_CT_LEN + 10 + TAG_LEN);
+        assert!(seal_request(&bob.public(), &eve.public_hash(), ctx, b"x").is_err(), "a key the name does not list");
+
+        assert!(open_request(&eve, ctx, &req).is_none(), "only its recipient opens it");
+        assert!(open_request(&bob, b"req-2", &req).is_none(), "bound to its context");
+        let mut bad = req.clone();
+        let last = bad.len() - 1;
+        bad[last] ^= 1;
+        assert!(open_request(&bob, ctx, &bad).is_none(), "tampering breaks it");
+        assert!(open_request(&bob, ctx, &req[..KEM_CT_LEN + 4]).is_none());
+        let (body, bob_side) = open_request(&bob, ctx, &req).expect("bob opens it");
+        assert_eq!(body, b"two please");
+
+        let reply = bob_side.seal_reply(b"here").unwrap();
+        assert_eq!(alice.open_reply(&reply).unwrap(), b"here");
+        let mut bad = reply.clone();
+        bad[0] ^= 1;
+        assert!(alice.open_reply(&bad).is_none());
+        // Another exchange's reply does not open under this one.
+        let (_, other) = seal_request(&bob.public(), &bob.public_hash(), ctx, b"two please").unwrap();
+        assert!(other.open_reply(&reply).is_none());
+        // And a reply is not a request: the keys differ.
+        assert!(open_request(&bob, ctx, &[&req[..KEM_CT_LEN], &reply[..]].concat()).is_none());
     }
 
     #[test]

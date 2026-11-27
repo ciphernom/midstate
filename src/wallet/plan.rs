@@ -2,9 +2,10 @@
 //
 // Privacy-aware unilateral CoinJoin (self-PayJoin) transaction planner.
 //
-// Supersedes the input-only greedy snowball in `Wallet::select_coins` by
-// jointly optimizing input selection, consolidation, and power-of-two change
-// shaping against the exact fee fixed-point.
+// Plans sends that know their own outputs (CLI `wallet send`, walletd, the
+// web wallet) by jointly optimizing input selection, consolidation, and
+// power-of-two change shaping against the fee fixed-point. `Wallet::select_coins`
+// keeps its greedy snowball for callers that build their outputs themselves.
 //
 // Tier 2 under `docs/CODING.md`: participates in one-time signature discipline
 // (WOTS co-spend atomicity) and transaction value conservation.
@@ -20,10 +21,27 @@ pub const BYTES_BASE: u64 = 100;
 pub const BYTES_PER_INPUT: u64 = 1636;
 pub const BYTES_PER_OUTPUT: u64 = 100;
 
-/// Default CLI / desktop mempool fee floor: 10 units per KiB + 10 safety padding.
+/// The fee every wallet pays for a transaction of an estimated `bytes`: the
+/// mempool floor of 10 units per KiB, plus 10 units of padding. One formula
+/// for the CLI, the desktop and the web wallet, so that a fee does not say
+/// which wallet made the transaction.
+pub fn fee_for_bytes(bytes: u64) -> u64 {
+    (bytes * 10) / 1024 + 10
+}
+
+/// [`fee_for_bytes`] for `inputs` inputs and `outputs` outputs under the
+/// standard size model.
 pub fn standard_fee(inputs: usize, outputs: usize) -> u64 {
-    let est = BYTES_BASE + inputs as u64 * BYTES_PER_INPUT + outputs as u64 * BYTES_PER_OUTPUT;
-    (est * 10) / 1024 + 10
+    fee_for_bytes(estimate_tx_bytes(inputs, outputs))
+}
+
+/// The fee for a `Consolidate` of `inputs` coins at one address, the same in
+/// every wallet: one MSS witness (~3,000 bytes) and ~125 bytes per input
+/// reveal (bincode's length prefixes and tags included), at 10 units per KiB
+/// plus 20 units of padding.
+pub fn consolidate_fee(inputs: usize) -> u64 {
+    let bytes = 600 + 3000 + 100 + inputs as u64 * 125;
+    (bytes * 10) / 1024 + 20
 }
 
 /// Estimated serialized transaction size in bytes.
@@ -69,6 +87,38 @@ impl Default for PlanConfig {
     }
 }
 
+/// What a transaction pays out besides its change.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Payment {
+    /// Values of the outputs paid to recipient addresses, each a power of two,
+    /// in the order the caller builds them. Change splits aim at these values
+    /// and ambiguity is scored against them.
+    pub denoms: Vec<u64>,
+    /// Value leaving through outputs an observer can tell from payments (data
+    /// burns): part of the amount, never matched by change.
+    pub other_value: u64,
+    /// How many such outputs there are, value-bearing or not (burns, state
+    /// threads): counted for the fee and the output limit.
+    pub other_outputs: usize,
+}
+
+impl Payment {
+    /// One payment of `amount`, in its power-of-two denominations.
+    pub fn of(amount: u64) -> Self {
+        Self { denoms: decompose_value(amount), other_value: 0, other_outputs: 0 }
+    }
+
+    /// Everything paid out (payments and burns), without change or fee.
+    pub fn amount(&self) -> u64 {
+        self.denoms.iter().fold(self.other_value, |a, &d| a.saturating_add(d))
+    }
+
+    /// Outputs besides change.
+    pub fn outputs(&self) -> usize {
+        self.denoms.len() + self.other_outputs
+    }
+}
+
 /// A pure, unsigned transaction plan produced before any WOTS key allocation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TxPlan {
@@ -77,7 +127,10 @@ pub struct TxPlan {
     pub change_denoms: Vec<u64>,
     pub in_sum: u64,
     pub fee: u64,
+    /// Everything paid out: `Σ payment_denoms` plus any burned value.
     pub amount: u64,
+    /// Non-change outputs besides `payment_denoms` (`Payment::other_outputs`).
+    pub other_outputs: usize,
 }
 
 impl TxPlan {
@@ -87,9 +140,9 @@ impl TxPlan {
         self.change_denoms.len() as isize - self.input_coin_ids.len() as isize
     }
 
-    /// Total output count (payment + change).
+    /// Total output count (payment + other + change).
     pub fn output_count(&self) -> usize {
-        self.payment_denoms.len() + self.change_denoms.len()
+        self.payment_denoms.len() + self.other_outputs + self.change_denoms.len()
     }
 }
 
@@ -126,10 +179,13 @@ impl TxPlan {
 ///     #(plan.payment_denoms ⌢ plan.change_denoms) <= MAX_TX_OUTPUTS
 ///     ∀ d ∈ plan.payment_denoms ⌢ plan.change_denoms: d.is_power_of_two()
 ///     Σ plan.payment_denoms = amount
-///     plan.fee = fee_fn(#plan.input_coin_ids, #plan.payment_denoms + #plan.change_denoms)
+///     plan.fee ≥ fee_fn(#plan.input_coin_ids, plan.output_count)
+///     plan.fee = fee_fn(#plan.input_coin_ids, m) for the least m ≥ plan.output_count
+///       at which the change left fits in m outputs (splits: m = plan.output_count)
 ///     plan.in_sum = amount + Σ plan.change_denoms + plan.fee
 ///
-///   result = Err(_) ⇒ no feasible plan exists under MAX_TX_INPUTS / fee_fn
+///   result = Err(_) ⇒ neither the snowball nor the minimal covering prefix
+///     can pay its own fee under MAX_TX_INPUTS / fee_fn
 /// ```
 ///
 /// ```zed
@@ -148,7 +204,7 @@ impl TxPlan {
 ///          ∧ #(plan!.payment_denoms ⌢ plan!.change_denoms) ≤ MAX_TX_OUTPUTS
 ///          ∧ (∀ d ∈ plan!.payment_denoms ⌢ plan!.change_denoms • is_power_of_two(d))
 ///          ∧ (∑ d ∈ plan!.payment_denoms • d) = amount?
-///          ∧ plan!.fee = fee_fn?(#plan!.input_coin_ids, plan!.output_count)
+///          ∧ plan!.fee ≥ fee_fn?(#plan!.input_coin_ids, plan!.output_count)
 ///          ∧ plan!.in_sum = amount? + (∑ d ∈ plan!.change_denoms • d) + plan!.fee
 /// ```
 ///
@@ -156,8 +212,9 @@ impl TxPlan {
 /// - **WOTS Co-Spend Atomicity**: Inputs are always unions of whole `SpendBundle`s.
 /// - **No Key Mutation**: Pure function; callers allocate fresh WOTS change keys
 ///   only after a plan is finalized (ideally in one `allocate_next_wots_seeds` call).
-/// - **Snowball Fallback**: Candidate 0 is always the exact snowball baseline, so
-///   edge cases (single UTXO, sweep-all, high fragmentation) never regress.
+/// - **Snowball Fallback**: Candidate 0 is the snowball baseline. When the
+///   snowball cannot pay its own fee, the minimal covering prefix stands in
+///   for it, so owning an extra coin never makes an affordable send fail.
 pub fn plan_transaction_from_bundles<F>(
     bundles: &[SpendBundle],
     amount: u64,
@@ -170,14 +227,48 @@ where
     if amount == 0 {
         bail!("amount must be greater than zero");
     }
+    plan_payment_from_bundles(bundles, &Payment::of(amount), fee_fn, cfg)
+}
 
-    let payment_denoms = decompose_value(amount);
-    if payment_denoms.len() > MAX_TX_OUTPUTS {
+/// [`plan_transaction_from_bundles`] for a send whose outputs are not one
+/// payment of `amount`: several recipients, burns, state threads. The fee is
+/// counted over the real outputs and change is shaped against the real
+/// payment values.
+pub fn plan_payment_from_bundles<F>(
+    bundles: &[SpendBundle],
+    payment: &Payment,
+    fee_fn: F,
+    cfg: &PlanConfig,
+) -> Result<TxPlan>
+where
+    F: Fn(usize, usize) -> u64,
+{
+    let amount = payment.amount();
+    if amount == 0 {
+        bail!("amount must be greater than zero");
+    }
+    if payment.denoms.iter().any(|d| !d.is_power_of_two()) {
+        bail!("payment outputs must be powers of two");
+    }
+    if payment.outputs() > MAX_TX_OUTPUTS {
         bail!("payment requires more than MAX_TX_OUTPUTS");
     }
+    let payment_denoms = &payment.denoms;
 
-    // Candidate 0: Snowball baseline (also serves as guaranteed fallback).
-    let baseline = plan_snowball_baseline(bundles, amount, &fee_fn)?;
+    // Candidate 0: the snowball baseline. Its merges can cost more fee than
+    // they bring; when it cannot pay its own way, the minimal covering prefix
+    // takes its place rather than failing a send other candidates can make.
+    let prefix = select_prefix_indices(bundles, payment, &fee_fn).ok();
+    let baseline = match snowball_baseline(bundles, payment, &fee_fn) {
+        Ok(plan) => plan,
+        Err(e) => match prefix
+            .as_deref()
+            .and_then(|idx| resolve_candidate(bundles, idx, payment, &fee_fn))
+        {
+            Some(plan) => plan,
+            None => return Err(e),
+        },
+    };
     let wallet_utxo_count: usize = bundles.iter().map(|b| b.coin_ids.len()).sum();
 
     let max_fee = baseline.fee.saturating_add(
@@ -190,19 +281,19 @@ where
     let mut min_inputs = baseline.input_coin_ids.len();
 
     // 1. Minimal density-greedy prefix (without snowball cascade).
-    if let Ok(prefix_idx) = select_prefix_indices(bundles, amount, &fee_fn) {
+    if let Some(prefix_idx) = prefix {
         let prefix_in: usize = prefix_idx.iter().map(|&i| bundles[i].coin_ids.len()).sum();
         min_inputs = min_inputs.min(prefix_in);
         input_sets.push(prefix_idx.clone());
 
         // 2. Ambiguity-guided single-bundle additions to the prefix.
-        add_guided_expansions(bundles, &prefix_idx, &payment_denoms, &mut input_sets, 8);
+        add_guided_expansions(bundles, &prefix_idx, payment_denoms, &mut input_sets, 8);
     }
 
-    // 3. Snowball indices + ambiguity-guided single-bundle additions to snowball.
+    // 3. Baseline indices + ambiguity-guided single-bundle additions to it.
     let base_indices = indices_for_plan(bundles, &baseline);
     if !base_indices.is_empty() {
-        add_guided_expansions(bundles, &base_indices, &payment_denoms, &mut input_sets, 6);
+        add_guided_expansions(bundles, &base_indices, payment_denoms, &mut input_sets, 6);
     }
 
     // Evaluate all candidates (plus controlled change splits) and pick the highest score.
@@ -210,8 +301,7 @@ where
     let mut best_score = score_plan(&baseline, &baseline, min_inputs, wallet_utxo_count, cfg);
 
     for idxs in input_sets {
-        let Some(base_cand) = resolve_candidate(bundles, &idxs, amount, &payment_denoms, &fee_fn)
-        else {
+        let Some(base_cand) = resolve_candidate(bundles, &idxs, payment, &fee_fn) else {
             continue;
         };
 
@@ -239,8 +329,10 @@ where
     Ok(best_plan)
 }
 
-/// Faithful baseline port of the existing density-greedy + snowball algorithm
-/// converged against `fee_fn`.
+/// The density-greedy + snowball selection of `Wallet::select_coins`,
+/// converged against `fee_fn`. Change is consolidated as before, dust
+/// included, but only by merges after which the selection still pays its own
+/// fee: a merge the send cannot afford is skipped, never made fatal.
 pub fn plan_snowball_baseline<F>(
     bundles: &[SpendBundle],
     amount: u64,
@@ -252,8 +344,16 @@ where
     if amount == 0 {
         bail!("amount must be greater than zero");
     }
-    let payment_denoms = decompose_value(amount);
-    let mut target_fee = fee_fn(1, payment_denoms.len());
+    snowball_baseline(bundles, &Payment::of(amount), &fee_fn)
+}
+
+fn snowball_baseline<F>(bundles: &[SpendBundle], payment: &Payment, fee_fn: &F) -> Result<TxPlan>
+where
+    F: Fn(usize, usize) -> u64,
+{
+    let amount = payment.amount();
+    let pay_outs = payment.outputs();
+    let mut target_fee = fee_fn(1, pay_outs);
 
     for _ in 0..32 {
         let needed = amount.saturating_add(target_fee);
@@ -274,7 +374,7 @@ where
         }
 
         if total < needed {
-            bail!("insufficient spendable funds (have {}, need {})", total, needed);
+            return Err(shortfall(bundles, needed));
         }
 
         // Greedy snowball cascade on unselected size-1 bundles.
@@ -291,55 +391,91 @@ where
             added = false;
             let change = total - needed;
             for denom in decompose_value(change) {
-                if let Some(list) = unselected_by_denom.get_mut(&denom) {
-                    if let Some(idx) = list.pop() {
-                        chosen_idx.push(idx);
-                        n_in += 1;
-                        total = total.saturating_add(bundles[idx].total_value);
-                        added = true;
-                        break;
-                    }
+                let Some(list) = unselected_by_denom.get_mut(&denom) else { continue };
+                let Some(&idx) = list.last() else { continue };
+                let value = bundles[idx].total_value;
+                // Merging dust costs more fee than it brings; worth it to keep
+                // the wallet tidy, but not at the price of the send itself.
+                if settle_fee(n_in + 1, total.saturating_add(value), amount, pay_outs, fee_fn).is_err() {
+                    continue;
                 }
+                list.pop();
+                chosen_idx.push(idx);
+                n_in += 1;
+                total = total.saturating_add(value);
+                added = true;
+                break;
             }
         }
 
-        // Converge exact output count & fee for this `n_in`, starting at 0 change.
-        let mut n_out = payment_denoms.len();
-        let mut need_more_inputs_fee = None;
-        for _ in 0..16 {
-            let fee = fee_fn(n_in, n_out);
-            if total < amount.saturating_add(fee) {
-                need_more_inputs_fee = Some(fee);
-                break;
-            }
-            let change = total - amount - fee;
-            let change_denoms = decompose_value(change);
-            let actual_out = payment_denoms.len() + change_denoms.len();
-            if actual_out > MAX_TX_OUTPUTS {
-                need_more_inputs_fee = Some(fee.saturating_add(1));
-                break;
-            }
-            if actual_out <= n_out {
+        match settle_fee(n_in, total, amount, pay_outs, fee_fn) {
+            Ok((fee, change_denoms)) => {
                 let input_coin_ids = chosen_idx
                     .iter()
                     .flat_map(|&i| bundles[i].coin_ids.iter().copied())
                     .collect();
                 return Ok(TxPlan {
                     input_coin_ids,
-                    payment_denoms,
+                    payment_denoms: payment.denoms.clone(),
                     change_denoms,
                     in_sum: total,
                     fee,
                     amount,
+                    other_outputs: payment.other_outputs,
                 });
             }
-            n_out = actual_out;
+            // This selection cannot pay its own fee: select again for at least that.
+            Err(fee) => target_fee = fee.max(target_fee.saturating_add(1)),
         }
-
-        target_fee = need_more_inputs_fee.unwrap_or_else(|| target_fee.saturating_add(1));
     }
 
     bail!("fee convergence failed in snowball baseline")
+}
+
+/// The cheapest fee the model allows `n_in` inputs worth `in_sum` paying
+/// `amount` over `pay_outs` non-change outputs: `fee_fn(n_in, pay_outs + k)`
+/// for the least `k` whose change fits in `k` outputs. With `fee_fn`
+/// non-decreasing in outputs this is start-independent, so every candidate
+/// is priced the same way. `Err(fee)`: `in_sum` cannot cover `amount + fee`.
+fn settle_fee<F>(
+    n_in: usize,
+    in_sum: u64,
+    amount: u64,
+    pay_outs: usize,
+    fee_fn: &F,
+) -> std::result::Result<(u64, Vec<u64>), u64>
+where
+    F: Fn(usize, usize) -> u64,
+{
+    let max_k = MAX_TX_OUTPUTS.saturating_sub(pay_outs).min(64);
+    for k in 0..=max_k {
+        let fee = fee_fn(n_in, pay_outs + k);
+        if in_sum < amount.saturating_add(fee) {
+            return Err(fee);
+        }
+        let change = in_sum - amount - fee;
+        if change.count_ones() as usize <= k {
+            return Ok((fee, decompose_value(change)));
+        }
+    }
+    // Change too fragmented for the output limit at any affordable fee.
+    Err(fee_fn(n_in, pay_outs + max_k).saturating_add(1))
+}
+
+/// Why no selection covers `needed`: too little, or too many coins.
+fn shortfall(bundles: &[SpendBundle], needed: u64) -> anyhow::Error {
+    let spendable = bundles.iter().fold(0u64, |a, b| a.saturating_add(b.total_value));
+    if spendable >= needed {
+        anyhow::anyhow!(
+            "insufficient consolidated funds: {} is spendable, but covering {} takes more \
+             than {} inputs. Consolidate small coins first.",
+            spendable,
+            needed,
+            MAX_TX_INPUTS
+        )
+    } else {
+        anyhow::anyhow!("insufficient funds: have {} spendable, need {}", spendable, needed)
+    }
 }
 
 impl Wallet {
@@ -370,19 +506,38 @@ impl Wallet {
     where
         F: Fn(usize, usize) -> u64,
     {
+        if amount == 0 {
+            bail!("amount must be greater than zero");
+        }
+        self.plan_payment_with_config(live_coins, &Payment::of(amount), fee_fn, cfg)
+    }
+
+    /// Plan a send with several recipients, burns or state threads
+    /// ([`plan_payment_from_bundles`]).
+    pub fn plan_payment_with_config<F>(
+        &self,
+        live_coins: &[[u8; 32]],
+        payment: &Payment,
+        fee_fn: F,
+        cfg: &PlanConfig,
+    ) -> Result<TxPlan>
+    where
+        F: Fn(usize, usize) -> u64,
+    {
         let live_set: HashSet<[u8; 32]> = live_coins.iter().copied().collect();
         let bundles = self.spendable_bundles(&live_set, true);
-        plan_transaction_from_bundles(&bundles, amount, fee_fn, cfg)
+        plan_payment_from_bundles(&bundles, payment, fee_fn, cfg)
     }
 }
 
 // ── Internal helpers ────────────────────────────────────────────────────────
 
-fn select_prefix_indices<F>(bundles: &[SpendBundle], amount: u64, fee_fn: &F) -> Result<Vec<usize>>
+fn select_prefix_indices<F>(bundles: &[SpendBundle], payment: &Payment, fee_fn: &F) -> Result<Vec<usize>>
 where
     F: Fn(usize, usize) -> u64,
 {
-    let pay_len = decompose_value(amount).len();
+    let amount = payment.amount();
+    let pay_len = payment.outputs();
     let mut target_fee = fee_fn(1, pay_len + 1);
     for _ in 0..16 {
         let needed = amount.saturating_add(target_fee);
@@ -401,14 +556,12 @@ where
             total = total.saturating_add(b.total_value);
         }
         if total < needed {
-            bail!("insufficient funds");
+            return Err(shortfall(bundles, needed));
         }
-        let ch = total.saturating_sub(amount + target_fee);
-        let req = fee_fn(n_in, pay_len + decompose_value(ch).len());
-        if total >= amount.saturating_add(req) {
-            return Ok(chosen);
+        match settle_fee(n_in, total, amount, pay_len, fee_fn) {
+            Ok(_) => return Ok(chosen),
+            Err(fee) => target_fee = fee.max(target_fee.saturating_add(1)),
         }
-        target_fee = req;
     }
     bail!("prefix fee convergence failed")
 }
@@ -469,8 +622,7 @@ fn add_guided_expansions(
 fn resolve_candidate<F>(
     bundles: &[SpendBundle],
     idxs: &[usize],
-    amount: u64,
-    payment_denoms: &[u64],
+    payment: &Payment,
     fee_fn: &F,
 ) -> Option<TxPlan>
 where
@@ -481,38 +633,21 @@ where
         return None;
     }
     let in_sum: u64 = idxs.iter().fold(0u64, |a, &i| a.saturating_add(bundles[i].total_value));
-
-    let mut n_out = payment_denoms.len() + 1;
-    for _ in 0..16 {
-        let fee = fee_fn(n_in, n_out);
-        if in_sum < amount.saturating_add(fee) {
-            return None;
-        }
-        let change = in_sum - amount - fee;
-        let change_denoms = decompose_value(change);
-        let actual_out = payment_denoms.len() + change_denoms.len();
-        if actual_out > MAX_TX_OUTPUTS {
-            return None;
-        }
-        if actual_out <= n_out {
-            // Fee is already >= required fee for `actual_out`; accept immediately
-            // rather than oscillating between (n_out, fee) and (n_out-1, fee-1).
-            let input_coin_ids = idxs
-                .iter()
-                .flat_map(|&i| bundles[i].coin_ids.iter().copied())
-                .collect();
-            return Some(TxPlan {
-                input_coin_ids,
-                payment_denoms: payment_denoms.to_vec(),
-                change_denoms,
-                in_sum,
-                fee,
-                amount,
-            });
-        }
-        n_out = actual_out;
-    }
-    None
+    let amount = payment.amount();
+    let (fee, change_denoms) = settle_fee(n_in, in_sum, amount, payment.outputs(), fee_fn).ok()?;
+    let input_coin_ids = idxs
+        .iter()
+        .flat_map(|&i| bundles[i].coin_ids.iter().copied())
+        .collect();
+    Some(TxPlan {
+        input_coin_ids,
+        payment_denoms: payment.denoms.clone(),
+        change_denoms,
+        in_sum,
+        fee,
+        amount,
+        other_outputs: payment.other_outputs,
+    })
 }
 
 /// Generate up to `max_splits` controlled power-of-two change splits (`2d -> d + d`)
@@ -555,7 +690,9 @@ where
                 let half = next_change.remove(p2) / 2;
                 next_change.push(half);
                 next_change.push(half);
-                if current.payment_denoms.len() + next_change.len() == next_n_out {
+                if current.payment_denoms.len() + current.other_outputs + next_change.len()
+                    == next_n_out
+                {
                     current.change_denoms = next_change;
                     current.fee = new_fee;
                     variants.push(current.clone());
@@ -631,10 +768,12 @@ fn score_plan(
     wallet_utxos: usize,
     cfg: &PlanConfig,
 ) -> i64 {
+    // Burns are visible as burns: only payments to addresses can be confused with change.
+    let paid: u64 = plan.payment_denoms.iter().fold(0u64, |a, &d| a.saturating_add(d));
     let interp = count_address_group_interpretations(
         &plan.payment_denoms,
         &plan.change_denoms,
-        plan.amount,
+        paid,
         cfg.distinct_payment_addresses,
     );
 
@@ -740,21 +879,7 @@ impl Wallet {
         if count == 0 {
             bail!("bundle count must be at least 1");
         }
-        let seeds = self.allocate_next_wots_seeds(count)?;
-        let mut addrs = Vec::with_capacity(count);
-        for seed in seeds {
-            let owner_pk = crate::core::wots::keygen(&seed);
-            let address = crate::core::compute_address(&owner_pk);
-            self.data.keys.push(super::WalletKey {
-                seed,
-                owner_pk,
-                address,
-                label: label.clone(),
-            });
-            addrs.push(address);
-        }
-        self.save()?;
-        Ok(addrs)
+        self.generate_keys(count, label)
     }
 }
 
@@ -794,6 +919,156 @@ mod tests {
             plan.in_sum,
             plan.amount + plan.change_denoms.iter().sum::<u64>() + plan.fee
         );
+    }
+
+    fn web_fee(n_in: usize, n_out: usize) -> u64 {
+        ((100 + n_in as u64 * 1636 + n_out as u64 * 100) * 100) / 1024 + 50
+    }
+
+    fn singles(vals: &[u64]) -> Vec<SpendBundle> {
+        let mut b: Vec<SpendBundle> = vals
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                let mut id = [0u8; 32];
+                id[..8].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+                SpendBundle { address: id, coin_ids: vec![id], total_value: v }
+            })
+            .collect();
+        b.sort_by(|x, y| y.total_value.cmp(&x.total_value));
+        b
+    }
+
+    /// Owning one more coin must never make an affordable send fail. The
+    /// snowball used to merge dust worth less than its input's fee, fail,
+    /// and take every other candidate down with it.
+    #[test]
+    fn a_dust_coin_never_blocks_an_affordable_send() {
+        let cfg = PlanConfig::default();
+        let alone = plan_transaction_from_bundles(&singles(&[1024]), 640, web_fee, &cfg).unwrap();
+        let with_dust = plan_transaction_from_bundles(&singles(&[1024, 1]), 640, web_fee, &cfg).unwrap();
+        assert_eq!(with_dust.input_coin_ids.len(), 1);
+        assert_eq!(with_dust.fee, alone.fee);
+        assert!(plan_transaction_from_bundles(&singles(&[1024, 64, 8, 2, 1]), 616, web_fee, &cfg).is_ok());
+        assert!(plan_transaction_from_bundles(&singles(&[128, 128, 64, 32, 16, 4, 2]), 253, standard_fee, &cfg).is_ok());
+
+        let mut rng: u64 = 0xD057_C01E;
+        let mut next = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rng >> 33
+        };
+        for (fee_fn, hi) in [(standard_fee as fn(usize, usize) -> u64, 8u64), (web_fee, 11)] {
+            for _ in 0..3_000 {
+                let vals: Vec<u64> = (0..2 + next() % 6).map(|_| 1u64 << (next() % hi)).collect();
+                let total: u64 = vals.iter().sum();
+                let amount = 1 + next() % total;
+                if plan_transaction_from_bundles(&singles(&vals), amount, fee_fn, &cfg).is_err() {
+                    continue;
+                }
+                for dust in [1u64, 2, 4, 8, 16] {
+                    let mut more = vals.clone();
+                    more.push(dust);
+                    assert!(
+                        plan_transaction_from_bundles(&singles(&more), amount, fee_fn, &cfg).is_ok(),
+                        "{vals:?} sends {amount}, plus a coin of {dust} does not"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Value is conserved, inputs are whole bundles, and the fee covers the
+    /// plan's own shape, for single payments and for several recipients with
+    /// a burn beside them.
+    #[test]
+    fn plans_conserve_value_and_pay_for_their_shape() {
+        let mut rng: u64 = 0x5EED_0F_F1E5;
+        let mut next = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rng >> 33
+        };
+        for iter in 0..4_000u64 {
+            let mut bundles = Vec::new();
+            for i in 0..1 + next() % 40 {
+                let k = if next() % 7 == 0 { 2 + next() % 3 } else { 1 };
+                let ids: Vec<[u8; 32]> = (0..k)
+                    .map(|j| {
+                        let mut id = [0u8; 32];
+                        id[..8].copy_from_slice(&(i * 8 + j + 1).to_le_bytes());
+                        id
+                    })
+                    .collect();
+                let total = (0..k).map(|_| 1u64 << (next() % 24)).sum();
+                bundles.push(SpendBundle { address: ids[0], coin_ids: ids, total_value: total });
+            }
+            bundles.sort_by(|a, b| {
+                let l = (a.total_value as u128) * (b.coin_ids.len() as u128);
+                let r = (b.total_value as u128) * (a.coin_ids.len() as u128);
+                r.cmp(&l)
+            });
+            let total: u64 = bundles.iter().map(|b| b.total_value).sum();
+            let payment = if iter % 3 == 0 {
+                let mut denoms = Vec::new();
+                for _ in 0..1 + next() % 3 {
+                    denoms.extend(decompose_value(1 + next() % (total / 4).max(1)));
+                }
+                let burn = next() % (total / 8).max(1);
+                Payment { denoms, other_value: burn, other_outputs: decompose_value(burn).len().max(1) }
+            } else {
+                Payment::of(1 + next() % total)
+            };
+            let fee_fn: fn(usize, usize) -> u64 = if iter % 2 == 0 { standard_fee } else { web_fee };
+            let cfg = PlanConfig { distinct_payment_addresses: iter % 4 == 0, ..Default::default() };
+            let Ok(p) = plan_payment_from_bundles(&bundles, &payment, fee_fn, &cfg) else { continue };
+
+            let ids: HashSet<[u8; 32]> = p.input_coin_ids.iter().copied().collect();
+            assert_eq!(ids.len(), p.input_coin_ids.len(), "duplicate input");
+            let mut in_sum = 0u64;
+            for b in &bundles {
+                let n = b.coin_ids.iter().filter(|c| ids.contains(*c)).count();
+                assert!(n == 0 || n == b.coin_ids.len(), "bundle split");
+                if n > 0 {
+                    in_sum += b.total_value;
+                }
+            }
+            assert_eq!(p.in_sum, in_sum);
+            assert_eq!(p.payment_denoms, payment.denoms);
+            assert_eq!(p.amount, payment.amount());
+            assert_eq!(p.other_outputs, payment.other_outputs);
+            assert!(p.change_denoms.iter().all(|d| d.is_power_of_two()));
+            assert_eq!(p.in_sum, p.amount + p.change_denoms.iter().sum::<u64>() + p.fee);
+            assert!(p.fee >= fee_fn(p.input_coin_ids.len(), p.output_count()));
+            assert!(p.input_coin_ids.len() <= MAX_TX_INPUTS && p.output_count() <= MAX_TX_OUTPUTS);
+            // Split change pairs aim at what is paid, never at a burn.
+            let mut seen = HashSet::new();
+            for &c in &p.change_denoms {
+                if !seen.insert(c) {
+                    assert!(payment.denoms.contains(&c), "change split to {c}, which nothing pays");
+                }
+            }
+        }
+    }
+
+    /// The fee is the least the model allows for the inputs chosen: a step
+    /// lower leaves change that does not fit.
+    #[test]
+    fn the_fee_is_the_cheapest_that_pays_for_itself() {
+        for (vals, amount) in [(vec![1u64 << 31], 1_000_000_000u64), (vec![1 << 20, 1 << 12, 8], 900_000), (vec![4096], 1024)] {
+            let b = singles(&vals);
+            let p = plan_transaction_from_bundles(&b, amount, web_fee, &PlanConfig { max_change_splits: 0, ..Default::default() }).unwrap();
+            let n_in = p.input_coin_ids.len();
+            let pay = p.payment_denoms.len();
+            let m = (pay..=pay + 64).find(|&m| web_fee(n_in, m) == p.fee).expect("fee is a model step");
+            assert!(m >= p.output_count(), "pays for at least its own outputs");
+            for lower in pay..m {
+                let fee = web_fee(n_in, lower);
+                if fee == p.fee {
+                    continue;
+                }
+                let change = p.in_sum - p.amount - fee;
+                assert!(pay + decompose_value(change).len() > lower, "{vals:?}: {fee} would have done");
+            }
+        }
     }
 
     #[test]

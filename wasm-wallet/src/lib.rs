@@ -768,7 +768,8 @@ impl WebWallet {
                 + (if current_state_hex.is_some() { 100 } else { 0 }) 
                 + (num_outputs as u64 * 100);
                 
-            let required_fee = (estimated_bytes * 100) / 1024 + 50;
+            // The fee every wallet pays for this size, so it does not mark this one.
+            let required_fee = midstate::wallet::plan::fee_for_bytes(estimated_bytes);
 
             if total >= extra_value + required_fee {
                 final_fee = required_fee;
@@ -1358,8 +1359,8 @@ pub fn build_solo_extension_pow(&self, pow: &str, midstate_hex: &str, nonce: u64
         // Fixed point fee resolution
         let mut n_out = 1usize;
         loop {
-            let estimated_bytes = 100 + (n_in as u64 * 1636) + (n_out as u64 * 100);
-            let fee = (estimated_bytes * 100) / 1024 + 50;
+            // The defrag fee every wallet uses, so it does not mark this one.
+            let fee = midstate::wallet::FeePolicy::STANDARD.fee(n_in, n_out);
             
             if fee >= total_in {
                 return Err(JsValue::from_str("Total value of selected dust cannot cover the required transaction fee for the resulting outputs."));
@@ -2019,7 +2020,8 @@ pub fn build_solo_extension_pow(&self, pow: &str, midstate_hex: &str, nonce: u64
             let change_for_size = wallet_in.saturating_sub(amount).saturating_sub(target_fee);
             let num_outputs = outputs_out.len() + decompose_value(change_for_size).len();
             let estimated = 100 + (selected.len() as u64 * 1636) + (num_outputs as u64 * 100);
-            let req = (estimated * 100) / 1024 + 50;
+            // The fee every wallet pays, so it does not mark this one.
+            let req = midstate::wallet::plan::fee_for_bytes(estimated);
             if wallet_in >= amount + req { final_fee = req; break; } else { target_fee = req; }
         }
 
@@ -2226,7 +2228,7 @@ pub fn build_solo_extension_pow(&self, pow: &str, midstate_hex: &str, nonce: u64
             let change_for_size = wallet_in.saturating_sub(total_amount).saturating_sub(db_val).saturating_sub(target_fee);
             let num_outputs = outputs_out.len() + decompose_value(change_for_size).len();
             let estimated = 100 + (selected.len() as u64 * 1636) + (num_outputs as u64 * 100) + burn_payload_bytes;
-            let req = (estimated * 100) / 1024 + 50;
+            let req = midstate::wallet::plan::fee_for_bytes(estimated);
             if wallet_in >= total_amount + db_val + req { final_fee = req; break; } else { target_fee = req; }
         }
 
@@ -2378,9 +2380,8 @@ pub fn build_solo_extension_pow(&self, pow: &str, midstate_hex: &str, nonce: u64
             input_coin_ids.push(cid);
         }
 
-        // Exact CLI math: 1 Signature + inputs
-        let estimated_bytes = 600 + 3000 + 100 + (available.len() as u64 * 125);
-        let final_fee = (estimated_bytes * 100) / 1024 + 50; // 50 units padding
+        // The consolidate fee every wallet uses (the CLI's and the desktop's).
+        let final_fee = midstate::wallet::plan::consolidate_fee(available.len());
 
         if total <= final_fee {
             return Err(JsValue::from_str(&format!("Total value {} is too low to pay the network fee of {}", total, final_fee)));
@@ -2531,8 +2532,8 @@ pub fn build_solo_extension_pow(&self, pow: &str, midstate_hex: &str, nonce: u64
     ///    every change output, and shuffles both inputs and outputs.
     /// 3. **Consolidation & fee discipline**: Preserves the snowball baseline as a
     ///    guaranteed fallback, enforces a fragmentation guardrail above the UTXO
-    ///    comfort ceiling, and converges against the exact web-wallet fee model
-    ///    (`100 units/KiB + 50`).
+    ///    comfort ceiling, and converges against the fee model every wallet
+    ///    uses (`plan::fee_for_bytes`: 10 units/KiB + 10).
     /// 4. **Restorability**: Derives every change key and deterministic salt from
     ///    `self.master_seed` and `next_wots_index` so all change coins are
     ///    recoverable from the seed phrase.
@@ -2575,6 +2576,13 @@ pub fn build_solo_extension_pow(&self, pow: &str, midstate_hex: &str, nonce: u64
     ) -> Result<String, JsValue> {
         let available: Vec<WasmUtxo> = serde_json::from_str(available_utxos_json)
             .map_err(|e| JsValue::from_str(&format!("Failed to parse UTXOs: {}", e)))?;
+        // The same coin listed twice must not become two inputs: the commit
+        // would be mined and no reveal could ever match it.
+        let mut seen_ids = std::collections::HashSet::new();
+        let available: Vec<WasmUtxo> = available
+            .into_iter()
+            .filter(|u| seen_ids.insert(u.coin_id.to_ascii_lowercase()))
+            .collect();
 
         for utxo in &available {
             if utxo.is_mss && !self.mss_cache.contains_key(&utxo.address) {
@@ -2627,7 +2635,9 @@ pub fn build_solo_extension_pow(&self, pow: &str, midstate_hex: &str, nonce: u64
             let mut addr = [0u8; 32];
             hex::decode_to_slice(&u.address, &mut addr)
                 .map_err(|_| JsValue::from_str("Invalid address hex"))?;
-            by_id.insert(cid, u.clone());
+            if by_id.insert(cid, u.clone()).is_some() {
+                continue; // already listed (see above)
+            }
 
             if u.is_mss {
                 bundles.push(midstate::wallet::defrag::SpendBundle {
@@ -2670,32 +2680,33 @@ pub fn build_solo_extension_pow(&self, pow: &str, midstate_hex: &str, nonce: u64
             .as_ref()
             .map(|h| (h.len() / 2) as u64)
             .unwrap_or(0);
-        let actual_pay_outs = (if send_amount > 0 {
-            decompose_value(send_amount).len()
-        } else {
-            0
-        }) + usize::from(databurn_hex.is_some());
+        let send_denoms = if send_amount > 0 { decompose_value(send_amount) } else { Vec::new() };
+        let actual_pay_outs = send_denoms.len() + usize::from(databurn_hex.is_some());
 
         // Plan inputs, fee, and privacy-shaped change denominations.
         let (mut selected, mut input_coin_ids, change_denoms, final_fee) = if total_send > 0 {
-            let plan_pay_outs = decompose_value(total_send).len();
+            // The real outputs: the payment's denominations (change is shaped
+            // against these) and the burn beside them (counted, never matched).
+            let payment = midstate::wallet::plan::Payment {
+                denoms: send_denoms.clone(),
+                other_value: db_val,
+                other_outputs: usize::from(databurn_hex.is_some()),
+            };
+            // The fee every wallet pays (`plan::fee_for_bytes`), so it does not mark this one.
             let web_fee = |n_in: usize, n_out: usize| -> u64 {
-                let real_outs = n_out.saturating_sub(plan_pay_outs) + actual_pay_outs;
-                let est = 100
-                    + (n_in as u64 * 1636)
-                    + (real_outs as u64 * 100)
-                    + extra_bytes;
-                (est * 100) / 1024 + 50
+                midstate::wallet::plan::fee_for_bytes(100 + (n_in as u64 * 1636) + (n_out as u64 * 100) + extra_bytes)
             };
 
+            // Distinct only when every denomination gets an address of its own.
             let cfg = midstate::wallet::plan::PlanConfig {
-                distinct_payment_addresses: recipient_addrs.len() > 1,
+                distinct_payment_addresses: recipient_addrs.len() > 1
+                    && recipient_addrs.len() >= send_denoms.len(),
                 ..Default::default()
             };
 
-            let plan = midstate::wallet::plan::plan_transaction_from_bundles(
+            let plan = midstate::wallet::plan::plan_payment_from_bundles(
                 &bundles,
-                total_send,
+                &payment,
                 web_fee,
                 &cfg,
             )
@@ -2718,7 +2729,7 @@ pub fn build_solo_extension_pow(&self, pow: &str, midstate_hex: &str, nonce: u64
                     + (selected.len() as u64 * 1636)
                     + (num_outputs as u64 * 100)
                     + extra_bytes;
-                let required_fee = (est * 100) / 1024 + 50;
+                let required_fee = midstate::wallet::plan::fee_for_bytes(est);
                 if total >= required_fee {
                     let mut input_coin_ids = Vec::with_capacity(selected.len());
                     for inp in &selected {

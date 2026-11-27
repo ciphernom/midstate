@@ -32,13 +32,13 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         theme::hint(ui, "Recipient address or name");
         let r = ui.add(
             TextEdit::singleline(&mut app.send_to)
-                .hint_text("72-character address, or name.mds")
+                .hint_text("72-character address (or several, comma-separated), or name.mds")
                 .font(egui::TextStyle::Monospace)
                 .desired_width(f32::INFINITY),
         );
         if r.changed() {
             let t = app.send_to.trim().to_string();
-            if t.len() == 72 || midstate_walletd::names::is_name(&t) {
+            if t.len() == 72 || midstate_walletd::names::is_name(&t) || midstate_walletd::sendplan::is_address_list(&t) {
                 app.addr_ok = None;
                 app.go(&ctx, Action::ValidateAddress { addr: t });
             } else {

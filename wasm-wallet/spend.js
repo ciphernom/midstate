@@ -4,25 +4,23 @@
 
 const popcount = (v) => { let n = 0; for (let x = v; x > 0n; x >>= 1n) n += Number(x & 1n); return n; };
 
-/** The fee prepare_spend charges (src/lib.rs): 100 base units per KiB of an
- *  estimated size, plus 50. Used only to guess where to look: what the
- *  WebAssembly says is what counts. */
+/** The fee prepare_spend charges (plan.rs `fee_for_bytes`, the same in every
+ *  wallet): 10 base units per KiB of an estimated size, plus 10. Used only
+ *  to guess where to look: what the WebAssembly says is what counts. */
 export function feeModel(inputs, outputs) {
-    return BigInt(Math.floor((100 + inputs * 1636 + outputs * 100) * 100 / 1024) + 50);
+    return BigInt(Math.floor((100 + inputs * 1636 + outputs * 100) * 10 / 1024) + 10);
 }
 
-/** prepare_spend's converged fee model for a send that uses `inputs` coins:
- *  the exact fee `plan.rs` charges to send `amount` of `total`, or null if it can't. */
+/** The fee prepare_spend charges to send `amount` of `total` with `inputs`
+ *  coins, or null if they can't cover it: the cheapest the model allows that
+ *  pays for its own outputs, feeModel(inputs, payments + k) for the least k
+ *  whose change fits in k outputs (plan.rs `settle_fee`). */
 export function modelFee(total, amount, inputs) {
     const payOuts = popcount(amount);
-    let nOut = payOuts;
-    for (let i = 0; i < 16; i++) {
-        const fee = feeModel(inputs, nOut);
+    for (let k = 0; k <= 64; k++) {
+        const fee = feeModel(inputs, payOuts + k);
         if (total < amount + fee) return null;
-        const change = total - amount - fee;
-        const actualOut = payOuts + popcount(change);
-        if (actualOut <= nOut) return fee;
-        nOut = actualOut;
+        if (popcount(total - amount - fee) <= k) return fee;
     }
     return null;
 }
@@ -32,7 +30,8 @@ export function modelFee(total, amount, inputs) {
 export function candidates(total, inputs) {
     const exact = [];
     let fits = null;
-    for (let f = 50n; f <= 60000n && f < total; f++) {
+    // No fee is below the one-output fee for these inputs.
+    for (let f = feeModel(inputs, 1); f <= 60000n && f < total; f++) {
         const a = total - f;
         const m = modelFee(total, a, inputs);
         if (m === null) continue;
@@ -47,7 +46,11 @@ export function candidates(total, inputs) {
  * The most that `total` base units of coins (`inputs` of them) can send with
  * the fee on top: a BigInt. `feeFor(amount)` builds the transaction (the
  * WebAssembly's prepare_spend, which only builds a context, so probing it is
- * safe) and returns its fee, or throws when the coins can't cover it.
+ * safe) and returns its fee, or throws when the coins can't cover it. It may
+ * instead return `{ fee, inputs, value }`: the fee and the coins the
+ * transaction spends. The wallet leaves out coins worth less than their own
+ * fee, and then an amount modelled on every coin leaves change behind; with
+ * the coins it chose, the search looks again among amounts those spend whole.
  *
  * Each probe can be slow: every change coin needs a one-time key made, about
  * a tenth of a second each. So the fee model above picks the amounts to try,
@@ -62,10 +65,27 @@ export function candidates(total, inputs) {
  */
 export function maxSendable(total, feeFor, inputs = 1) {
     if (total <= 0n) throw new Error("Nothing to send — balance is zero.");
-    const fee = (amount) => { try { return BigInt(feeFor(amount)); } catch (_) { return null; } };
+    const probe = (amount) => {
+        try {
+            const r = feeFor(amount);
+            if (r !== null && typeof r === 'object') {
+                return { fee: BigInt(r.fee), inputs: r.inputs, value: r.value === undefined ? undefined : BigInt(r.value) };
+            }
+            return { fee: BigInt(r) };
+        } catch (_) { return null; }
+    };
+    const fee = (amount) => { const p = probe(amount); return p === null ? null : p.fee; };
 
     for (const a of candidates(total, inputs)) {
-        if (fee(a) !== null) return a;
+        const p = probe(a);
+        if (p === null) continue;
+        // Coins were left out: the most is set by the ones chosen.
+        if (p.value !== undefined && p.inputs !== undefined && p.inputs < inputs && p.value < total) {
+            for (const b of candidates(p.value, p.inputs)) {
+                if (b > a && fee(b) !== null) return b;
+            }
+        }
+        return a;
     }
 
     let amount = total > 3000n ? total - 3000n : total;

@@ -109,6 +109,17 @@ export function cleanAddress(s) {
     return /^[0-9a-f]{72}$/.test(t) ? t : null;
 }
 
+/** A multi-address destination as pasted: two to sixteen comma-separated
+ *  addresses, each as cleanAddress takes it, none repeated. The addresses, or
+ *  null when it isn't one. prepare_spend pays each denomination to the next. */
+export function cleanAddressList(s) {
+    const parts = String(s || '').split(',');
+    if (parts.length < 2 || parts.length > 16) return null;
+    const out = parts.map(cleanAddress);
+    if (out.some(a => a === null) || new Set(out).size !== out.length) return null;
+    return out;
+}
+
 /** A send's steps, as the worker names them, in plain words with how far
  *  along it is. */
 export function sendStep(step) {

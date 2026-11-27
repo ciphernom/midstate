@@ -1407,7 +1407,7 @@ impl Service {
                 let _ = resp.send(self.rotate_identity());
             }
             Cmd::RequestAddress { peer, resp } => {
-                let _ = resp.send(self.request_address(&peer).await);
+                let _ = resp.send(self.request_address_for_form(&peer).await);
             }
             Cmd::EthSell { asset, mds, wei_per_gmds, min, life, resp } => {
                 let r = match crate::eth_trade::Asset::parse(&asset) {
@@ -2944,13 +2944,8 @@ impl Service {
         self.start_send_to_many(to, &dests, amount, private).await
     }
 
-    /// A send to `dest`, shown as going to `to` (an address, or the name it
-    /// was resolved from).
-    async fn start_send_to(&mut self, to: &str, dest: [u8; 32], amount: u64, private: bool) -> Result<String> {
-        self.start_send_to_many(to, &[dest], amount, private).await
-    }
-
-    /// A send to one or more `dests`, shown as going to `to`.
+    /// A send to one or more `dests`, shown as going to `to` (an address, a
+    /// comma-separated list, or the name they were resolved from).
     /// When `dests.len() > 1`, routes denominations across distinct addresses
     /// via `plan_send_multi` (full self-PayJoin ambiguity).
     pub(super) async fn start_send_to_many(
@@ -3006,6 +3001,8 @@ impl Service {
             },
         );
         self.set_stage(commitment, SendStage::Committing, "solving commit proof-of-work");
+        // Committed to paying `dests`: none of them is handed to another payment.
+        self.forget_paid_addresses(dests);
 
         self.broadcast_commit(commitment).await?;
         Ok(hex::encode(commitment))
@@ -3482,10 +3479,8 @@ impl Service {
         }
 
         let dest = w.generate_mss(DEFAULT_MSS_HEIGHT, Some("Consolidated sweep".into()))?;
-        // CLI fee model for consolidate: base 600 + ~3000-byte MSS witness +
-        // 100 overhead + ~125 bytes per InputReveal, at 10 units/KiB, +20 pad.
-        let estimated_bytes = 600 + 3000 + 100 + (live.len() as u64 * 125);
-        let fee = (estimated_bytes * 10) / 1024 + 20;
+        // The consolidate fee every wallet uses (`plan::consolidate_fee`).
+        let fee = midstate::wallet::plan::consolidate_fee(live.len());
         if total <= fee {
             bail!("total value {total} at that address cannot cover the network fee of {fee}");
         }
@@ -3569,7 +3564,7 @@ impl Service {
         };
 
         let w = self.wallet.as_mut().unwrap();
-        let policy = midstate::wallet::FeePolicy { base: 20, per_input: 17, per_output: 2 };
+        let policy = midstate::wallet::FeePolicy::STANDARD;
         let dest = w.generate_mss(DEFAULT_MSS_HEIGHT, Some("Defrag sweep".into()))?;
         let plan = match w.plan_defrag_batch(&live, dest, &policy, max_inputs)? {
             Some(p) => p,
@@ -4829,7 +4824,42 @@ impl Service {
                     .and_then(qb::wire::unpack_u32)
                     .map(|(n, _)| n as usize)
                     .unwrap_or(1);
-                self.answer_address_request(id, tip, want).await?;
+                self.answer_address_request(id, tip, want, None).await?;
+            }
+            w::CMD_ADDR_REQ_SEALED => {
+                // Sealed to a KEM key and naming no one: every wallet sees it,
+                // only the one it is sealed to opens it.
+                let payload = f.payload.ok_or_else(|| anyhow!("sealed address request without payload"))?;
+                let opened = qb::open_address_request(self.kem_keys()?, &id, &payload);
+                let Some((want, exchange)) = opened else { return Ok(()) };
+                self.answer_address_request(id, tip, want as usize, Some(exchange)).await?;
+            }
+            w::CMD_ADDR_SEALED => {
+                let key = hex::encode(id);
+                let Some((peer, exchange, _)) = self.ident.sealed_reqs.get(&key) else {
+                    return Ok(());
+                };
+                let payload = f.payload.ok_or_else(|| anyhow!("sealed address reply without payload"))?;
+                // Only the holder of the key the request was sealed to (the
+                // name's `kem` record) could seal this: no signature needed.
+                let (addrs, expiry) = qb::open_address_reply(exchange, &payload)
+                    .ok_or_else(|| anyhow!("sealed address reply does not open — ignoring"))?;
+                let peer = *peer;
+                if expiry <= tip {
+                    bail!("sealed address reply has already expired");
+                }
+                self.ident.sealed_reqs.remove(&key);
+                self.note_sealed_answerer(&peer);
+                let encoded = addrs
+                    .iter()
+                    .map(midstate::core::encode_address_with_checksum)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                self.book.peer_addrs.insert(hex::encode(peer), (encoded.clone(), expiry));
+                self.book.save(&self.wallet_path);
+                if self.ident.ui_addr_reqs.remove(&key) {
+                    let _ = self.events.send(WalletEvent::PeerAddress { peer: hex::encode(peer), address: encoded });
+                }
             }
             w::CMD_CHAN_REQ => {
                 // A peer wants a lane from us. Only the sender can pay in a
@@ -4957,14 +4987,21 @@ impl Service {
                 }
                 let encoded = midstate::core::encode_address_with_checksum(&addr);
                 self.book.addr_reqs.remove(&hex::encode(id));
-                self.book
-                    .peer_addrs
-                    .insert(hex::encode(peer), (encoded.clone(), expiry));
+                if self.clear_reply_may_cache(&peer, tip) {
+                    self.book
+                        .peer_addrs
+                        .insert(hex::encode(peer), (encoded.clone(), expiry));
+                }
                 self.book.save(&self.wallet_path);
-                let _ = self.events.send(WalletEvent::PeerAddress {
-                    peer: hex::encode(peer),
-                    address: encoded,
-                });
+                // Into the Send form only when the user asked: a name
+                // payment's reply is about to be paid, and paying it again
+                // from the form would reuse it.
+                if self.ident.ui_addr_reqs.remove(&hex::encode(id)) {
+                    let _ = self.events.send(WalletEvent::PeerAddress {
+                        peer: hex::encode(peer),
+                        address: encoded,
+                    });
+                }
             }
             w::CMD_ADDR_BATCH => {
                 let Some(peer) = self.book.addr_reqs.get(&hex::encode(id)).copied() else {
@@ -4988,14 +5025,18 @@ impl Service {
                     .collect::<Vec<_>>()
                     .join(",");
                 self.book.addr_reqs.remove(&hex::encode(id));
-                self.book
-                    .peer_addrs
-                    .insert(hex::encode(peer), (encoded.clone(), expiry));
+                if self.clear_reply_may_cache(&peer, tip) {
+                    self.book
+                        .peer_addrs
+                        .insert(hex::encode(peer), (encoded.clone(), expiry));
+                }
                 self.book.save(&self.wallet_path);
-                let _ = self.events.send(WalletEvent::PeerAddress {
-                    peer: hex::encode(peer),
-                    address: encoded,
-                });
+                if self.ident.ui_addr_reqs.remove(&hex::encode(id)) {
+                    let _ = self.events.send(WalletEvent::PeerAddress {
+                        peer: hex::encode(peer),
+                        address: encoded,
+                    });
+                }
             }
             w::CMD_KEM_REQ => {
                 let target = f.address.ok_or_else(|| anyhow!("KEM request without a target"))?;
@@ -5748,45 +5789,125 @@ impl Service {
     // request; an MSS signature over `address_commit` is what makes a reply
     // trustworthy on a public medium.
 
-    async fn request_address(&mut self, peer_hex: &str) -> Result<()> {
+    /// Ask `peer_hex` for `count` fresh addresses (one per payment
+    /// denomination); returns the request id the reply will carry. A batch
+    /// costs the peer one key per address, so ask for no more than will be paid.
+    pub(super) async fn request_address(&mut self, peer_hex: &str, count: usize) -> Result<[u8; 32]> {
         let peer = self.peer_key(peer_hex)?;
         let me = self.ensure_identity()?;
         if peer == me {
             bail!("that is this wallet's own identity key");
         }
+        let count = count.clamp(1, qb::wire::MAX_ADDR_BATCH);
         let req_id: [u8; 32] = rand::random();
         self.book.addr_reqs.insert(hex::encode(req_id), peer);
         self.book.save(&self.wallet_path);
         let mut atts = channels::frame_attachments(
             req_id,
-            qb::wire::pack_u32(qb::wire::DEFAULT_ADDR_BATCH as u32, &[]),
+            qb::wire::pack_u32(count as u32, &[]),
             None,
         );
         atts.push(midstate::chat::ChatAttachment::Address(peer));
         self.node
             .send_chat(vec![qb::wire::MARKER, qb::wire::CMD_ADDR_REQ], None, atts)?;
-        self.ch_notice(format!(
-            "Asked {} for a fresh receiving address.",
-            &peer_hex[..12.min(peer_hex.len())]
-        ));
+        let what = if count == 1 { "a fresh receiving address".to_string() } else { format!("{count} fresh receiving addresses") };
+        self.ch_notice(format!("Asked {} for {what}.", &peer_hex[..12.min(peer_hex.len())]));
+        Ok(req_id)
+    }
+
+    /// Ask `identity` for `count` fresh addresses, sealed to the KEM key its
+    /// name lists (`public`, whose hash is `kem_hash`): the bus sees neither
+    /// whom this asks nor the addresses that come back. Returns the request id.
+    pub(super) fn request_address_sealed(
+        &mut self,
+        identity: [u8; 32],
+        public: &[u8],
+        kem_hash: &[u8; 32],
+        count: usize,
+    ) -> Result<[u8; 32]> {
+        let count = count.clamp(1, qb::wire::MAX_ADDR_BATCH);
+        let req_id: [u8; 32] = rand::random();
+        let (payload, exchange) = qb::seal_address_request(public, kem_hash, &req_id, count as u32)?;
+        self.ident
+            .sealed_reqs
+            .insert(hex::encode(req_id), (identity, exchange, std::time::Instant::now()));
+        self.node.send_chat(
+            vec![qb::wire::MARKER, qb::wire::CMD_ADDR_REQ_SEALED],
+            None,
+            channels::frame_attachments(req_id, payload, None),
+        )?;
+        Ok(req_id)
+    }
+
+    /// "Ask a peer for an address" from the Send form: one address, sealed
+    /// when the peer is a name whose KEM key this wallet has and whose wallet
+    /// answers sealed requests, in the clear otherwise. Its reply fills the form.
+    async fn request_address_for_form(&mut self, peer: &str) -> Result<()> {
+        let identity = self.peer_key(peer)?;
+        let req = match self.payee_kem(peer) {
+            Some((_, hash, Some(public))) if self.answers_sealed(&identity) => {
+                let req = self.request_address_sealed(identity, &public, &hash, 1)?;
+                self.ch_notice(format!("Asked {} for a fresh receiving address (sealed).", peer.trim()));
+                req
+            }
+            _ => self.request_address(peer, 1).await?,
+        };
+        self.ident.ui_addr_reqs.insert(hex::encode(req));
         Ok(())
     }
 
-    /// Answer a peer's request with a brand-new one-time address, signed so
-    /// they can prove it came from us.
-    async fn answer_address_request(&mut self, req_id: [u8; 32], tip: u64, want: usize) -> Result<()> {
+    /// Answer a peer's request with brand-new one-time addresses: sealed
+    /// under the request's exchange when it came sealed (so only the payer
+    /// reads them, and no identity signature is spent), signed by the
+    /// identity otherwise, so the payer can prove they came from us.
+    async fn answer_address_request(
+        &mut self,
+        req_id: [u8; 32],
+        tip: u64,
+        want: usize,
+        sealed: Option<midstate::sealed::Exchange>,
+    ) -> Result<()> {
         let key = hex::encode(req_id);
         if self.book.answered_addr_reqs.contains_key(&key) {
             return Ok(()); // already answered; replies are idempotent
         }
-        if self.identity_remaining() <= channels::LEAF_RESERVE + 1 {
+        if sealed.is_none() && self.identity_remaining() <= channels::LEAF_RESERVE + 1 {
             bail!("identity key nearly exhausted — not answering address requests");
         }
         if self.book.answered_addr_reqs.len() > 200 {
             self.book.answered_addr_reqs.clear();
         }
-        let me = self.ensure_identity()?;
+        // Every address handed out is a key the restore scan must step over
+        // if it is never paid, and a one-time key made on this actor: so all
+        // requesters together get at most ADDRESSES_PER_BLOCK per block.
+        if self.ident.addrs_given.0 != tip {
+            self.ident.addrs_given = (tip, 0);
+        }
+        let budget = ident_glue::ADDRESSES_PER_BLOCK.saturating_sub(self.ident.addrs_given.1);
+        if budget == 0 {
+            bail!("handed out enough fresh addresses this block — not answering until the next");
+        }
         let expiry = tip + channels::ADDRESS_TTL;
+
+        if let Some(exchange) = sealed {
+            // `want` 0 is never sent sealed, but one address is the least.
+            let count = want.max(1).min(qb::wire::MAX_ADDR_BATCH).min(budget);
+            let addrs = {
+                let w = self.wallet.as_mut().ok_or_else(|| anyhow!("wallet is locked"))?;
+                w.generate_keys(count, Some("given out on request".into()))?
+            };
+            self.ident.addrs_given.1 += count;
+            let payload = qb::seal_address_reply(&exchange, &addrs, expiry)?;
+            self.book.answered_addr_reqs.insert(key, tip);
+            self.book.save(&self.wallet_path);
+            channels::send_frame(&self.node, qb::wire::CMD_ADDR_SEALED, req_id, payload, None)?;
+            let _ = self.events.send(WalletEvent::WalletChanged);
+            let what = if count == 1 { "a fresh one-time address".to_string() } else { format!("{count} fresh one-time addresses") };
+            self.ch_notice(format!("Gave a payer {what} on request, sealed."));
+            return Ok(());
+        }
+
+        let me = self.ensure_identity()?;
 
         // Keep packed payload + MSS signature within MAX_SIGNATURE_SIZE (1536 B).
         let id_height = self
@@ -5797,13 +5918,15 @@ impl Service {
             .unwrap_or(16);
         let sig_est = 620 + id_height * 32;
         let max_fit = 1536usize.saturating_sub(10 + sig_est) / 32;
-        let count = want.min(qb::wire::MAX_ADDR_BATCH).min(max_fit);
+        // `want` 0 is a requester from before batches: one address.
+        let count = want.max(1).min(qb::wire::MAX_ADDR_BATCH).min(max_fit).min(budget);
 
         if count <= 1 {
             let addr = {
                 let w = self.wallet.as_mut().ok_or_else(|| anyhow!("wallet is locked"))?;
                 w.generate_key(Some("given out on request".into()))?
             };
+            self.ident.addrs_given.1 += 1;
             let sig = self.sign_commitment(&qb::address_commit(&me, &req_id, &addr, expiry))?;
             self.book.answered_addr_reqs.insert(key, tip);
             self.book.save(&self.wallet_path);
@@ -5821,6 +5944,7 @@ impl Service {
                 let w = self.wallet.as_mut().ok_or_else(|| anyhow!("wallet is locked"))?;
                 w.generate_keys(count, Some("given out on request".into()))?
             };
+            self.ident.addrs_given.1 += count;
             let sig = self.sign_commitment(&qb::address_batch_commit(&me, &req_id, &addrs, expiry))?;
             self.book.answered_addr_reqs.insert(key, tip);
             self.book.save(&self.wallet_path);

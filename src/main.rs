@@ -624,6 +624,8 @@ enum WalletAction {
     },
     /// Generate one new receiving address and print it.
     /// WOTS addresses are single-use: request a fresh one for every payment.
+    /// With --bundle N, print N fresh addresses joined by commas: a sender on
+    /// this version pays each power-of-two denomination to its own address.
     Receive {
         /// Path to the encrypted wallet.dat.
         #[arg(long, default_value_os_t = default_wallet_path())]
@@ -631,6 +633,10 @@ enum WalletAction {
         /// Label stored alongside the address. Defaults to "receive #N".
         #[arg(long)]
         label: Option<String>,
+        /// Hand out a multi-address bundle of this many addresses (2-16).
+        /// Only senders that understand comma-separated destinations can pay it.
+        #[arg(long, default_value_t = 1)]
+        bundle: usize,
     },
     /// Generate one or more keys in the wallet and print their addresses.
     /// To hand a single address to a sender, `wallet receive` is friendlier.
@@ -2302,7 +2308,7 @@ async fn handle_wallet(action: WalletAction) -> Result<()> {
     match action {
         WalletAction::Create { path, legacy } => wallet_create(&path, legacy),
         WalletAction::Restore { path, phrase, rpc_port, rpc_host } => wallet_restore(&path, phrase, rpc_port, rpc_host).await,
-        WalletAction::Receive { path, label } => wallet_receive(&path, label),
+        WalletAction::Receive { path, label, bundle } => wallet_receive(&path, label, bundle),
         WalletAction::Compile { file } => wallet_compile(&file),
         WalletAction::Generate { path, count, label } => wallet_generate(&path, count, label),
         WalletAction::List { path, rpc_port, rpc_host, full, live, search, addr_type } => wallet_list(&path, rpc_port, rpc_host, full, live, search, addr_type).await,
@@ -2597,14 +2603,31 @@ fn wallet_compile(path: &std::path::Path) -> Result<()> {
     }
     Ok(())
 }
-fn wallet_receive(path: &PathBuf, label: Option<String>) -> Result<()> {
+fn wallet_receive(path: &PathBuf, label: Option<String>, bundle: usize) -> Result<()> {
+    if bundle == 0 || bundle > midstate::core::channel::wire::MAX_ADDR_BATCH {
+        anyhow::bail!(
+            "--bundle takes 1 to {} addresses",
+            midstate::core::channel::wire::MAX_ADDR_BATCH
+        );
+    }
     let password = read_password("Password: ")?;
     let mut wallet = Wallet::open(path, &password)?;
     let label = label.unwrap_or_else(|| format!("receive #{}", wallet.keys().len() + 1));
-    let addrs = wallet.generate_receive_bundle(4, Some(label.clone()))?;
+    if bundle == 1 {
+        let address = wallet.generate_key(Some(label.clone()))?;
+        println!("\n  Your receiving address ({}):\n", label);
+        println!("  {}\n", midstate::core::types::encode_address_with_checksum(&address));
+        println!("  Share this with the sender.");
+        return Ok(());
+    }
+    let addrs = wallet.generate_receive_bundle(bundle, Some(label.clone()))?;
     println!("\n  Your receiving multi-address ({}):\n", label);
     println!("  {}\n", midstate::wallet::plan::format_destinations(&addrs));
-    println!("  Share this with the sender (4 fresh WOTS addresses for self-PayJoin privacy).");
+    println!(
+        "  Share this with the sender: {} fresh one-time addresses, one per payment denomination.",
+        bundle
+    );
+    println!("  Wallets older than this version accept only a single address.");
     Ok(())
 }
 
@@ -3010,10 +3033,9 @@ async fn wallet_consolidate(
     // Create a fresh MSS tree to hold the consolidated funds safely
     let new_mss_pk = wallet.generate_mss(10, Some("Consolidated Sweeper".into()))?;
     
-    // Accurately account for bincode's hidden 8-byte Vec prefixes and 4-byte Enum tags
-    // ~125 bytes per InputReveal ensures we generously clear the mempool's MIN_FEE_PER_KB rule
-    let estimated_bytes = 600 + 3000 + 100 + (live_coins.len() as u64 * 125);
-    let fee = (estimated_bytes * 10) / 1024 + 20; // 20 units padding
+    // ~125 bytes per InputReveal (bincode's Vec prefixes and enum tags included)
+    // clears the mempool's MIN_FEE_PER_KB rule; the same formula in every wallet.
+    let fee = midstate::wallet::plan::consolidate_fee(live_coins.len());
     
     if total_val <= fee {
         anyhow::bail!("Total value {} is too low to pay the network fee of {}", total_val, fee);
@@ -3249,11 +3271,7 @@ async fn wallet_defrag(
 
     // 3. Define the Fee Policy
     use midstate::wallet::FeePolicy;
-    let policy = FeePolicy {
-        base: 20,      // Safe base padding
-        per_input: 17, // (1636 * 10 / 1024) ≈ 16 + 1 padding
-        per_output: 2, // (100 * 10 / 1024) ≈ 1 + 1 padding
-    };
+    let policy = FeePolicy::STANDARD;
 
     // 4. Generate a fresh MSS destination for the sweep
     let dest_addr = wallet.generate_mss(10, Some("Defrag Sweep Destination".into()))?;
@@ -3519,22 +3537,35 @@ async fn wallet_send(
     let live_coins = spendable_coins_rpc(&client, rpc_port, &rpc_host, &wallet).await?;
 
     if private {
-        // Find standard outputs for private send logic
-        let denoms: Vec<u64> = recipient_specs
-            .iter()
-            .filter_map(|o| match o {
-                ParsedOutput::Standard(_, v) => Some(*v),
-                ParsedOutput::Stateful(_, _) | ParsedOutput::Burn(..) => None,
-            })
-            .collect();
+        // Every power-of-two denomination of every --to is its own
+        // transaction; a multi-address bundle gives each its own address, so
+        // the transactions share neither inputs nor a recipient.
+        let mut payments: Vec<([u8; 32], u64)> = Vec::new();
+        for spec in &recipient_specs {
+            match spec {
+                ParsedOutput::Standard(addrs, value) => {
+                    for (i, denom) in decompose_value(*value).into_iter().enumerate() {
+                        payments.push((addrs[i % addrs.len()], denom));
+                    }
+                }
+                ParsedOutput::Stateful(..) => {
+                    anyhow::bail!("a private send carries no state threads; send them separately")
+                }
+                ParsedOutput::Burn(..) => unreachable!("refused above"),
+            }
+        }
+        let distinct: std::collections::HashSet<[u8; 32]> = payments.iter().map(|(a, _)| *a).collect();
+        if distinct.len() < payments.len() {
+            println!(
+                "  Note: {} transactions pay {} address(es), and payments to one address are linked by it.\n  \
+                 For unlinkable payments, ask the recipient for a bundle of at least {} addresses (`wallet receive --bundle`).\n",
+                payments.len(),
+                distinct.len(),
+                payments.len()
+            );
+        }
 
-        let recipient_address = match &recipient_specs[0] {
-            ParsedOutput::Standard(addrs, _) => addrs[0],
-            ParsedOutput::Stateful(a, _) => *a,
-            ParsedOutput::Burn(..) => unreachable!("refused above"),
-        };
-
-        let pairs = wallet.plan_private_send(&live_coins, &recipient_address, &denoms)?;
+        let pairs = wallet.plan_private_send(&live_coins, &payments, midstate::wallet::plan::standard_fee)?;
         println!("Private send: {} independent transaction(s)\n", pairs.len());
 
         for (pair_idx, (inputs, outputs, change_seeds)) in pairs.iter().enumerate() {
@@ -3604,23 +3635,44 @@ async fn wallet_send(
             })
             .sum();
 
-        let distinct_payment_addresses = recipient_specs
-            .iter()
-            .any(|o| matches!(o, ParsedOutput::Standard(addrs, _) if addrs.len() > 1));
+        // The outputs this send pays, as the planner should see them: every
+        // payment denomination (change is shaped against these), and the burns
+        // and state threads beside them (counted for the fee, never matched).
+        let mut payment = midstate::wallet::plan::Payment::default();
+        let mut paid_to: std::collections::HashMap<[u8; 32], usize> =
+            std::collections::HashMap::new();
+        for spec in &recipient_specs {
+            match spec {
+                ParsedOutput::Standard(addrs, value) => {
+                    for (i, denom) in decompose_value(*value).into_iter().enumerate() {
+                        payment.denoms.push(denom);
+                        *paid_to.entry(addrs[i % addrs.len()]).or_default() += 1;
+                    }
+                }
+                ParsedOutput::Stateful(_, _) => payment.other_outputs += 1,
+                ParsedOutput::Burn(_, value) => {
+                    payment.other_value = payment.other_value.saturating_add(*value);
+                    payment.other_outputs += decompose_value(*value).len().max(1);
+                }
+            }
+        }
+        // Distinct only when no address receives two payment outputs: round
+        // robin over fewer addresses than denominations clusters some of them.
+        let distinct_payment_addresses =
+            payment.denoms.len() > 1 && paid_to.values().all(|&n| n == 1);
 
         let (input_coin_ids, change_denoms, in_sum, final_fee) =
             if coin_args.is_empty() && total_send > 0 {
-                let plan_pay_outs = decompose_value(total_send).len();
-                let fee_fn = |n_in: usize, n_out: usize| -> u64 {
-                    let real_outs = n_out.saturating_sub(plan_pay_outs) + actual_pay_outs;
-                    midstate::wallet::plan::standard_fee(n_in, real_outs)
-                };
                 let cfg = midstate::wallet::plan::PlanConfig {
                     distinct_payment_addresses,
                     ..Default::default()
                 };
-                let plan =
-                    wallet.plan_transaction_with_config(&live_coins, total_send, fee_fn, &cfg)?;
+                let plan = wallet.plan_payment_with_config(
+                    &live_coins,
+                    &payment,
+                    midstate::wallet::plan::standard_fee,
+                    &cfg,
+                )?;
                 (plan.input_coin_ids, plan.change_denoms, plan.in_sum, plan.fee)
             } else {
                 // Manual `--coin` selection or 0-value stateful/burn transaction.

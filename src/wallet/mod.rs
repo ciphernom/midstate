@@ -1090,6 +1090,7 @@ pub fn import_scanned(
     ///   `MAX_CONSOLIDATE_INPUTS` (8,192). We exclude them from normal selection 
     ///   and instruct the user to consolidate.
     pub fn select_coins(&self, needed: u64, live_coins: &[[u8; 32]]) -> Result<Vec<[u8; 32]>> {
+        use rand::seq::SliceRandom;
 
         let live_set: std::collections::HashSet<[u8; 32]> = live_coins.iter().copied().collect();
 
@@ -1238,26 +1239,51 @@ pub fn import_scanned(
             );
         }
 
-        // 5. Delegate consolidation & privacy-aware expansion to the unified
-        //    self-PayJoin planner so all legacy `select_coins` callers share
-        //    the same transaction construction mechanism.
-        let spend_bundles: Vec<defrag::SpendBundle> = bundles
-            .into_iter()
-            .map(|b| defrag::SpendBundle {
-                address: b.address,
-                coin_ids: b.coin_ids,
-                total_value: b.total_value,
-            })
-            .collect();
+        // 5. Greedy "snowball" merge: opportunistically pull in extra coins whose
+        // value exactly matches a denomination of the current change, so change
+        // consolidates into fewer, larger outputs over time.
+        //
+        // This stays here rather than going through `plan::`: callers pass
+        // `needed = amount + fee guess` and build their own outputs, so the
+        // planner's payment/change scoring would be scoring outputs nobody
+        // builds. Sends that know their outputs use `plan_payment_with_config`.
+        let selected_set: std::collections::HashSet<[u8; 32]> =
+            selected.iter().copied().collect();
+        let mut unselected_by_denom: std::collections::HashMap<u64, Vec<&Bundle>> =
+            std::collections::HashMap::new();
 
-        let plan = plan::plan_transaction_from_bundles(
-            &spend_bundles,
-            needed,
-            |_, _| 0,
-            &plan::PlanConfig::default(),
-        )?;
+        for bundle in &bundles {
+            if bundle.coin_ids.len() == 1 && !selected_set.contains(&bundle.coin_ids[0]) {
+                unselected_by_denom.entry(bundle.total_value).or_default().push(bundle);
+            }
+        }
 
-        Ok(plan.input_coin_ids)
+        let mut rng = rand::thread_rng();
+        let mut added_new = true;
+
+        while added_new && selected.len() < crate::core::MAX_TX_INPUTS {
+            added_new = false;
+            let change = total - needed;
+            let mut change_denoms = decompose_value(change);
+            change_denoms.shuffle(&mut rng);
+
+            for denom in change_denoms {
+                if let Some(candidates) = unselected_by_denom.get_mut(&denom) {
+                    if let Some(cand_bundle) = candidates.pop() {
+                        selected.extend(&cand_bundle.coin_ids);
+                        total = total.saturating_add(cand_bundle.total_value);
+                        added_new = true;
+                        tracing::info!(
+                            "Greedy Merge: Pulled in an extra coin of value {} to consolidate change",
+                            denom
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(selected)
     }
 
     /// Build outputs for a send: recipient outputs + change outputs.
@@ -1638,84 +1664,82 @@ pub fn import_scanned(
         });
     }
 
-    /// Plan a private send: splits the transaction into independent, 
-    /// denomination-specific N-in-M-out transactions with decoy change outputs.
-    pub fn plan_private_send(
+    /// Plan a private send: each `(address, value)` of `payments`, a power
+    /// of two, as its own transaction, on inputs no other one shares (nor an
+    /// MSS address another one spends from), so the payments cannot be tied
+    /// together through their inputs. Each is planned as a normal send is
+    /// (`plan::plan_payment_from_bundles`): whole WOTS bundles, a fee that
+    /// pays for its own shape under `fee_fn`, change to fresh keys, outputs in
+    /// random order. Payments to one address are still linked by it: give
+    /// each its own address (a multi-address bundle) to keep them apart.
+    ///
+    /// Every transaction is planned before any change key is allocated, so a
+    /// shortfall spends no key.
+    pub fn plan_private_send<F>(
         &mut self,
         live_coins: &[[u8; 32]],
-        recipient_address: &[u8; 32],
-        denominations: &[u64],
-    ) -> Result<Vec<(Vec<[u8; 32]>, Vec<OutputData>, Vec<(usize, [u8; 32])>)>> {
-        // Each denomination gets its own independent transaction.
-        // Each tx: 1+ inputs → 1 recipient output + change outputs.
-        // Inputs must sum to > denomination.
-        let mut used = std::collections::HashSet::new();
-        let mut pairs = Vec::new();
+        payments: &[([u8; 32], u64)],
+        fee_fn: F,
+    ) -> Result<Vec<(Vec<[u8; 32]>, Vec<OutputData>, Vec<(usize, [u8; 32])>)>>
+    where
+        F: Fn(usize, usize) -> u64,
+    {
+        if payments.is_empty() {
+            bail!("a private send needs at least one payment");
+        }
+        if let Some((_, v)) = payments.iter().find(|(_, v)| !v.is_power_of_two()) {
+            bail!("a private send pays one power of two per transaction; {v} is not one");
+        }
+        let live_set: std::collections::HashSet<[u8; 32]> = live_coins.iter().copied().collect();
+        let mut bundles = self.spendable_bundles(&live_set, true);
 
-        for &denom in denominations {
-            // Find inputs covering denom + 10_000 (minimum fee)
-            let needed = denom + 10_000u64;
-            let mut selected = Vec::new();
-            let mut total = 0u64;
-
-            let mut available: Vec<&WalletCoin> = self.data.coins.iter()
-                .filter(|c| live_coins.contains(&c.coin_id) && !used.contains(&c.coin_id))
+        // Largest first: the big payments get first pick of the big coins.
+        let mut order: Vec<usize> = (0..payments.len()).collect();
+        order.sort_by(|&a, &b| payments[b].1.cmp(&payments[a].1));
+        let mut plans = Vec::with_capacity(order.len());
+        for i in order {
+            let (address, value) = payments[i];
+            let plan = plan::plan_payment_from_bundles(
+                &bundles,
+                &plan::Payment::of(value),
+                &fee_fn,
+                &plan::PlanConfig::default(),
+            )
+            .map_err(|e| anyhow::anyhow!("private send of {value}: {e}"))?;
+            let used: std::collections::HashSet<[u8; 32]> = plan.input_coin_ids.iter().copied().collect();
+            let used_addrs: std::collections::HashSet<[u8; 32]> = bundles
+                .iter()
+                .filter(|b| b.coin_ids.iter().any(|c| used.contains(c)))
+                .map(|b| b.address)
                 .collect();
-            available.sort_by(|a, b| b.value.cmp(&a.value));
-
-            for coin in available {
-                if total >= needed { break; }
-                selected.push(coin.coin_id);
-                used.insert(coin.coin_id);
-                total += coin.value;
-            }
-
-            if total < needed {
-                bail!("insufficient funds for private send denomination {}", denom);
-            }
-
-            // Co-spend grouping: pull in WOTS siblings
-            let selected_addrs: std::collections::HashSet<[u8; 32]> = selected.iter()
-                .filter_map(|id| self.find_coin(id))
-                .filter(|c| !self.data.mss_keys.iter().any(|k| compute_address(&k.master_pk) == c.address))
-                .map(|c| c.address)
-                .collect();
-            for coin in self.data.coins.iter() {
-                if selected_addrs.contains(&coin.address)
-                    && !used.contains(&coin.coin_id)
-                    && !selected.contains(&coin.coin_id)
-                    && live_coins.contains(&coin.coin_id)
-                {
-                    selected.push(coin.coin_id);
-                    used.insert(coin.coin_id);
-                    total += coin.value;
-                }
-            }
-
-            let change = total - denom - 1; // fee = 1
-            let salt: [u8; 32] = rand::random();
-            let mut outputs = vec![OutputData::Standard {
-                address: *recipient_address,
-                value: denom,
-                salt,
-            }];
-            let mut change_seeds = Vec::new();
-
-            if change > 0 {
-                for cd in decompose_value(change) {
-                    let seed = self.allocate_next_wots_seed()?;
-                    let pk = wots::keygen(&seed);
-                    let addr = compute_address(&pk);
-                    let cs: [u8; 32] = rand::random();
-                    let idx = outputs.len();
-                    outputs.push(OutputData::Standard { address: addr, value: cd, salt: cs });
-                    change_seeds.push((idx, seed));
-                }
-            }
-
-            pairs.push((selected, outputs, change_seeds));
+            bundles.retain(|b| !used_addrs.contains(&b.address));
+            plans.push((address, plan));
         }
 
+        let mut pairs = Vec::with_capacity(plans.len());
+        for (address, plan) in plans {
+            let mut outputs = vec![OutputData::Standard { address, value: plan.amount, salt: rand::random() }];
+            let mut change_seeds = Vec::with_capacity(plan.change_denoms.len());
+            let seeds = self.allocate_next_wots_seeds(plan.change_denoms.len())?;
+            for (&value, seed) in plan.change_denoms.iter().zip(seeds) {
+                let change_address = compute_address(&wots::keygen(&seed));
+                change_seeds.push((outputs.len(), seed));
+                outputs.push(OutputData::Standard { address: change_address, value, salt: rand::random() });
+            }
+            // Random order: the payment is not always output 0.
+            let mut order: Vec<usize> = (0..outputs.len()).collect();
+            {
+                use rand::seq::SliceRandom;
+                order.shuffle(&mut rand::thread_rng());
+            }
+            let mut moved_to = vec![0usize; order.len()];
+            for (new_i, &old_i) in order.iter().enumerate() {
+                moved_to[old_i] = new_i;
+            }
+            let outputs: Vec<OutputData> = order.iter().map(|&i| outputs[i].clone()).collect();
+            let change_seeds = change_seeds.into_iter().map(|(i, seed)| (moved_to[i], seed)).collect();
+            pairs.push((plan.input_coin_ids, outputs, change_seeds));
+        }
         Ok(pairs)
     }
 
@@ -2051,8 +2075,7 @@ pub fn maturing_in(state: &crate::core::State, ids: &[[u8; 32]]) -> std::collect
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
-    use std::collections::HashSet;
-    
+
     #[test]
     fn create_and_reopen() {
         let file = NamedTempFile::new().unwrap();
@@ -2360,7 +2383,9 @@ let c3 = w.import_coin([3; 32], 40_000, [30; 32], None).unwrap();
 
         let live = vec![c1, c2, c3];
         let dest = [0xAA; 32];
-        let pairs = w.plan_private_send(&live, &dest, &[4, 2]).unwrap();
+        let pairs = w
+            .plan_private_send(&live, &[(dest, 4), (dest, 2)], plan::standard_fee)
+            .unwrap();
 
         assert_eq!(pairs.len(), 2);
         // Each pair should have non-overlapping inputs
@@ -2381,7 +2406,58 @@ let c3 = w.import_coin([3; 32], 40_000, [30; 32], None).unwrap();
 
         let mut w = Wallet::create(&path, b"pass").unwrap();
         let c1 = w.import_coin([1; 32], 2, [10; 32], None).unwrap();
-        assert!(w.plan_private_send(&[c1], &[0xAA; 32], &[4, 4]).is_err());
+        let index = w.wots_index();
+        assert!(w.plan_private_send(&[c1], &[([0xAA; 32], 4), ([0xAA; 32], 4)], |_, _| 0).is_err());
+        assert_eq!(w.wots_index(), index, "a shortfall allocates no change key");
+    }
+
+    /// Each private transaction pays its payment exactly, a fee its own shape
+    /// requires, change to the wallet, with the payment anywhere among the
+    /// outputs; and only powers of two are accepted.
+    #[test]
+    fn plan_private_send_pays_its_fee_and_hides_the_payment() {
+        // Small coins, so few change keys: WOTS keygen is slow in debug builds.
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let live: Vec<[u8; 32]> = (0..6u8)
+            .map(|i| w.import_coin([i + 1; 32], 256, [i + 40; 32], None).unwrap())
+            .collect();
+        let (a, b) = ([0xAA; 32], [0xBB; 32]);
+        assert!(w.plan_private_send(&live, &[(a, 100)], plan::standard_fee).is_err(), "not a power of two");
+
+        let mut payment_at = std::collections::HashSet::new();
+        for round in 0..4 {
+            let pairs = w
+                .plan_private_send(&live, &[(b, 16), (a, 64)], plan::standard_fee)
+                .unwrap();
+            assert_eq!(pairs.len(), 2);
+            let mut spent = std::collections::HashSet::new();
+            for (inputs, outputs, change_seeds) in &pairs {
+                assert!(inputs.iter().all(|id| spent.insert(*id)), "no input is shared");
+                let in_sum: u64 = inputs.iter().map(|id| w.find_coin(id).unwrap().value).sum();
+                let out_sum: u64 = outputs.iter().map(|o| o.value()).sum();
+                assert!(outputs.iter().all(|o| o.value().is_power_of_two()));
+                let fee = in_sum - out_sum;
+                assert!(fee >= plan::standard_fee(inputs.len(), outputs.len()), "fee {fee} below the mempool model");
+                let paid: Vec<usize> = (0..outputs.len())
+                    .filter(|i| !change_seeds.iter().any(|(c, _)| c == i))
+                    .collect();
+                assert_eq!(paid.len(), 1, "one payment per transaction");
+                let p = &outputs[paid[0]];
+                assert!(p.address() == a && p.value() == 64 || p.address() == b && p.value() == 16);
+                if round == 0 {
+                    for (i, seed) in change_seeds {
+                        assert_eq!(outputs[*i].address(), compute_address(&wots::keygen(seed)), "change is ours");
+                    }
+                }
+                if outputs.len() > 1 {
+                    payment_at.insert(paid[0]);
+                }
+            }
+        }
+        assert!(payment_at.len() > 1, "the payment is not always in the same place");
     }
 
     // ── CoinJoin helpers ────────────────────────────────────────────────
@@ -2598,15 +2674,15 @@ let c3 = w.import_coin([3; 32], 40_000, [30; 32], None).unwrap();
         let c2_a = w.import_coin([2; 32], 2, [20; 32], None).unwrap();
         let c2_b = w.import_coin([3; 32], 2, [30; 32], None).unwrap();
 
-        let live_set: HashSet<[u8; 32]> = [c8, c2_a, c2_b].into_iter().collect();
-        let mut bundles = w.spendable_bundles(&live_set, true);
-        bundles.sort_by(|a, b| b.total_value.cmp(&a.total_value));
+        let live = vec![c8, c2_a, c2_b];
 
-        // Scenario: We need 6 (zero-fee baseline).
-        // Greedy snowball picks `8` (change = 2), sees an unselected `2`,
-        // pulls it in (total = 10, change = 4), has no `4`, stops.
-        let plan = plan::plan_snowball_baseline(&bundles, 6, |_, _| 0).unwrap();
-        let selected = plan.input_coin_ids;
+        // Scenario: We need 6.
+        // Normal selection: picks `8`. Change = 2. Wallet becomes [2, 2, 2] (worse fragmentation).
+        // Greedy selection: picks `8`. Change = 2.
+        //   - Sees an unselected `2`. Pulls it in. Total = 10. Change = 4.
+        //   - Doesn't have a `4`. Stops.
+        // New Wallet state after tx: [4, 2] (Defragmented!)
+        let selected = w.select_coins(6, &live).unwrap();
 
         assert_eq!(selected.len(), 2, "Should pick the 8 and one of the 2s");
         assert!(selected.contains(&c8));
@@ -2626,14 +2702,17 @@ let c3 = w.import_coin([3; 32], 40_000, [30; 32], None).unwrap();
         let c2_a = w.import_coin([3; 32], 2, [30; 32], None).unwrap();
         let c2_b = w.import_coin([4; 32], 2, [40; 32], None).unwrap();
 
-        let live_set: HashSet<[u8; 32]> = [c16, c4, c2_a, c2_b].into_iter().collect();
-        let mut bundles = w.spendable_bundles(&live_set, true);
-        bundles.sort_by(|a, b| b.total_value.cmp(&a.total_value));
+        let live = vec![c16, c4, c2_a, c2_b];
 
-        // Scenario: We need 14 (zero-fee baseline).
-        // Greedy snowball cascades: 16 (change 2) -> +2 (change 4) -> +4 (change 8) -> stop.
-        let plan = plan::plan_snowball_baseline(&bundles, 14, |_, _| 0).unwrap();
-        let selected = plan.input_coin_ids;
+        // Scenario: We need 14.
+        // Normal selection: picks `16`. Change = 2. Wallet becomes [4, 2, 2, 2].
+        // Greedy selection:
+        //   1. Base: picks `16`. Total = 16. Change = 2.
+        //   2. Iteration 1: sees a `2`. Picks `c2_a`. Total = 18. Change = 4.
+        //   3. Iteration 2: sees a `4`. Picks `c4`. Total = 22. Change = 8.
+        //   4. Iteration 3: sees an `8`. None available. Stops.
+        // Resulting wallet state after tx: [8, 2] (Massively defragmented!)
+        let selected = w.select_coins(14, &live).unwrap();
 
         assert_eq!(selected.len(), 3, "Should cascade and pick 16, 4, and 2");
         assert!(selected.contains(&c16));

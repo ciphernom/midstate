@@ -6866,9 +6866,13 @@ function spendableWithLeaves() {
 function sendAllAmount(utxoArray, toAddress) {
     let total = 0n;
     for (const u of utxoArray) total += BigInt(u.value);
-    return maxSendable(total, (amount) =>
-        JSON.parse(wallet.prepare_spend(JSON.stringify(utxoArray), toAddress, amount, wState.nextWotsIndex, null, null)).fee || 0,
-        utxoArray.length);
+    return maxSendable(total, (amount) => {
+        const ctx = JSON.parse(wallet.prepare_spend(JSON.stringify(utxoArray), toAddress, amount, wState.nextWotsIndex, null, null));
+        let value = 0n;
+        for (const u of ctx.selected_inputs) value += BigInt(u.value);
+        // The coins it spends too: it leaves out dust, and the most is set by what it keeps.
+        return { fee: ctx.fee || 0, inputs: ctx.selected_inputs.length, value };
+    }, utxoArray.length);
 }
 
 /**

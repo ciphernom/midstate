@@ -473,6 +473,60 @@ pub fn address_batch_commit(
     hash_bytes(&b)
 }
 
+// ── Sealed address handshake ───────────────────────────────────────────
+//
+// `CMD_ADDR_REQ` and its signed reply cross the public bus in the clear, so
+// anyone watching learns which fresh addresses a name handed out, and can
+// tell its payments from their change. With the payee's KEM key (its name's
+// `kem` record) the request is sealed to the payee and names no one, and the
+// reply is sealed under the same exchange (`crate::sealed`, one-shot): only
+// the payer can read the addresses, and only the payee could have sent them,
+// so no identity signature (and no MSS leaf) is spent on it.
+
+fn address_exchange_context(req_id: &[u8; 32]) -> Vec<u8> {
+    [b"mdsaddr3".as_slice(), req_id].concat()
+}
+
+/// A request for `count` fresh addresses, sealed to the payee's KEM key
+/// (`payee_kem_hash`: the name's `kem` record). Returns the `Signature`
+/// payload of a `CMD_ADDR_REQ_SEALED` frame and the payer's exchange.
+pub fn seal_address_request(
+    payee_kem: &[u8],
+    payee_kem_hash: &[u8; 32],
+    req_id: &[u8; 32],
+    count: u32,
+) -> Result<(Vec<u8>, crate::sealed::Exchange)> {
+    crate::sealed::seal_request(payee_kem, payee_kem_hash, &address_exchange_context(req_id), &wire::pack_u32(count, &[]))
+}
+
+/// A sealed address request meant for `keys`: how many addresses, and the
+/// exchange to answer under. `None` if it is someone else's.
+pub fn open_address_request(
+    keys: &crate::sealed::KemKeys,
+    req_id: &[u8; 32],
+    payload: &[u8],
+) -> Option<(u32, crate::sealed::Exchange)> {
+    let (body, exchange) = crate::sealed::open_request(keys, &address_exchange_context(req_id), payload)?;
+    let (count, _) = wire::unpack_u32(&body)?;
+    Some((count, exchange))
+}
+
+/// The `CMD_ADDR_SEALED` payload answering an exchange: the addresses and
+/// the height they expire at.
+pub fn seal_address_reply(exchange: &crate::sealed::Exchange, addresses: &[[u8; 32]], expiry: u64) -> Result<Vec<u8>> {
+    if addresses.is_empty() || addresses.len() > wire::MAX_ADDR_BATCH {
+        bail!("a sealed reply carries 1 to {} addresses", wire::MAX_ADDR_BATCH);
+    }
+    exchange.seal_reply(&wire::pack_address_batch(addresses, expiry, &[]))
+}
+
+/// Opens a `CMD_ADDR_SEALED` payload: the addresses and their expiry.
+pub fn open_address_reply(exchange: &crate::sealed::Exchange, payload: &[u8]) -> Option<(Vec<[u8; 32]>, u64)> {
+    let plain = exchange.open_reply(payload)?;
+    let (addresses, expiry, rest) = wire::unpack_address_batch(&plain)?;
+    rest.is_empty().then_some((addresses, expiry))
+}
+
 /// BLAKE3 of arbitrary bytes (the same hash the script VM's OP_HASH uses).
 pub fn hash_bytes(b: &[u8]) -> [u8; 32] {
     *blake3::Hasher::new().update(b).finalize().as_bytes()
@@ -588,12 +642,19 @@ pub mod wire {
     pub const CMD_KEM: u8 = 70;
     
     /// Signed reply carrying a batch of fresh one-time addresses (1..=MAX_ADDR_BATCH).
-    /// Requested via `CMD_ADDR_REQ` with `pack_u32(count, &[])` where `count > 1`.
+    /// Requested via `CMD_ADDR_REQ` with `pack_u32(count, &[])`, `count` being
+    /// how many the payer will use (one per denomination); `count` ≤ 1 (and
+    /// the 0 older wallets send) is answered with a single `CMD_ADDR`.
     pub const CMD_ADDR_BATCH: u8 = 71;
-    pub const DEFAULT_ADDR_BATCH: u8 = 16;
     pub const MAX_ADDR_BATCH: usize = 16;
-    
-    
+    /// `CMD_ADDR_REQ` sealed to the payee's KEM key (`seal_address_request`):
+    /// `CoinId(req_id)` + `Signature(sealed request)`, and no Address
+    /// attachment, so the bus does not show whom it asks. Wallets that
+    /// predate it ignore it; payers fall back to `CMD_ADDR_REQ`.
+    pub const CMD_ADDR_REQ_SEALED: u8 = 72;
+    /// Its reply (`seal_address_reply`): `CoinId(req_id)` + `Signature(sealed reply)`.
+    pub const CMD_ADDR_SEALED: u8 = 73;
+
     pub const CMD_OPEN: u8 = 110;
 
     /// OPEN payload: [ver][expiry u64][n u8][{value u64, salt 32}×n][sig0…]
@@ -868,6 +929,67 @@ mod tests {
     fn u32_codec_roundtrip() {
         let p = wire::pack_u32(77, &[1, 2, 3]);
         assert_eq!(wire::unpack_u32(&p).unwrap(), (77, vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn a_sealed_address_handshake_is_read_only_by_its_two_ends() {
+        let payee = crate::sealed::KemKeys::from_secret(&[5; 32]);
+        let other = crate::sealed::KemKeys::from_secret(&[6; 32]);
+        let req = [9u8; 32];
+        let (payload, payer) = seal_address_request(&payee.public(), &payee.public_hash(), &req, 3).unwrap();
+        assert!(payload.len() <= crate::core::MAX_SIGNATURE_SIZE);
+        assert!(open_address_request(&other, &req, &payload).is_none(), "someone else's");
+        assert!(open_address_request(&payee, &[8u8; 32], &payload).is_none(), "under another request id");
+        let (count, answer) = open_address_request(&payee, &req, &payload).unwrap();
+        assert_eq!(count, 3);
+
+        let addrs = vec![[1u8; 32], [2u8; 32], [3u8; 32]];
+        let reply = seal_address_reply(&answer, &addrs, 777).unwrap();
+        let full = seal_address_reply(&answer, &vec![[4u8; 32]; wire::MAX_ADDR_BATCH], 1).unwrap();
+        assert!(full.len() <= crate::core::MAX_SIGNATURE_SIZE, "a full batch fits one attachment");
+        assert!(seal_address_reply(&answer, &[], 1).is_err());
+        assert_eq!(open_address_reply(&payer, &reply).unwrap(), (addrs, 777));
+        // Nothing in either payload is readable: the addresses are not in it.
+        assert!(!reply.windows(32).any(|w| w == [1u8; 32]));
+        let (_, stranger) = seal_address_request(&payee.public(), &payee.public_hash(), &req, 3).unwrap();
+        assert!(open_address_reply(&stranger, &reply).is_none(), "another exchange cannot read it");
+    }
+
+    #[test]
+    fn address_batch_codec_and_commit_binding() {
+        let addrs = vec![[7u8; 32], [8u8; 32], [9u8; 32]];
+        let sig = vec![4u8; 940];
+        let packed = wire::pack_address_batch(&addrs, 900, &sig);
+        assert_eq!(packed.len(), 10 + 3 * 32 + 940);
+        assert_eq!(wire::unpack_address_batch(&packed).unwrap(), (addrs.clone(), 900, sig.clone()));
+        // A full batch and a height-10 identity signature fit one Signature attachment.
+        let full = vec![[1u8; 32]; wire::MAX_ADDR_BATCH];
+        assert!(wire::pack_address_batch(&full, 1, &vec![0u8; 620 + 10 * 32]).len() <= crate::core::MAX_SIGNATURE_SIZE);
+        // Truncated, empty, oversized and wrong-version payloads are refused.
+        // (A missing signature still unpacks; the MSS verifier refuses it.)
+        assert_eq!(wire::unpack_address_batch(&packed[..10 + 3 * 32]).unwrap().2, Vec::<u8>::new());
+        assert!(wire::unpack_address_batch(&packed[..10 + 2 * 32]).is_none(), "addresses cut short");
+        let mut zero = packed.clone();
+        zero[9] = 0;
+        assert!(wire::unpack_address_batch(&zero).is_none());
+        let mut over = packed.clone();
+        over[9] = (wire::MAX_ADDR_BATCH + 1) as u8;
+        assert!(wire::unpack_address_batch(&over).is_none());
+        let mut ver = packed.clone();
+        ver[0] = wire::VERSION + 1;
+        assert!(wire::unpack_address_batch(&ver).is_none());
+
+        // Every field changes the commitment, the order and count included,
+        // and it never collides with the single-address one.
+        let pk = [1u8; 32];
+        let req = [2u8; 32];
+        let base = address_batch_commit(&pk, &req, &addrs, 900);
+        assert_ne!(base, address_batch_commit(&[9u8; 32], &req, &addrs, 900));
+        assert_ne!(base, address_batch_commit(&pk, &[9u8; 32], &addrs, 900));
+        assert_ne!(base, address_batch_commit(&pk, &req, &addrs[..2], 900));
+        assert_ne!(base, address_batch_commit(&pk, &req, &[addrs[1], addrs[0], addrs[2]], 900));
+        assert_ne!(base, address_batch_commit(&pk, &req, &addrs, 901));
+        assert_ne!(address_batch_commit(&pk, &req, &addrs[..1], 900), address_commit(&pk, &req, &addrs[0], 900));
     }
 
     #[test]

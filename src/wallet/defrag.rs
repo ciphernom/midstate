@@ -36,6 +36,11 @@ impl FeePolicy {
     pub fn flat(f: u64) -> Self {
         FeePolicy { base: f, per_input: 0, per_output: 0 }
     }
+
+    /// The defrag fee every wallet uses (CLI, desktop, web), so it does not
+    /// say which one made the sweep: the mempool floor per input (1,636 B at
+    /// 10 units/KiB ≈ 16, +1) and per output (≈ 1, +1), on a padded base.
+    pub const STANDARD: FeePolicy = FeePolicy { base: 20, per_input: 17, per_output: 2 };
 }
 
 /// A single, fully-specified defragmentation batch ready to be executed
@@ -98,10 +103,14 @@ impl Wallet {
     /// result contains exactly the coins c where:
     ///   c.coin_id ∈ live_set
     ///   c.coin_id ∉ Pending
-    ///   c.wots_signed = false
-    ///   c.commitment = None
+    ///   c.wots_signed = false (for every wallet entry with c's coin_id)
     ///   c.value > 0
     ///   (include_mss ∨ c.address ∉ MssAddrs)
+    /// and each coin_id appears at most once.
+    ///
+    /// `c.commitment` does not mark a state thread: `complete_reveal` stores
+    /// the spending commitment on every change coin it imports. State
+    /// threads are exactly the zero-value coins.
     ///
     /// WOTS coins are grouped by address into indivisible bundles.
     /// MSS coins appear as singleton bundles when include_mss = true.
@@ -151,6 +160,19 @@ impl Wallet {
             .flat_map(|p| p.input_coin_ids.iter().copied())
             .collect();
 
+        // A wallet file can list one coin twice (see `select_coins`). Planning
+        // it twice binds a mined commit to a duplicate input, which no reveal
+        // can then satisfy, so each coin_id is offered once, and not at all
+        // if any of its entries has signed.
+        let signed_ids: std::collections::HashSet<[u8; 32]> = self
+            .data
+            .coins
+            .iter()
+            .filter(|c| c.wots_signed)
+            .map(|c| c.coin_id)
+            .collect();
+        let mut seen_ids: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+
         let mut wots_groups: std::collections::HashMap<[u8; 32], Vec<&WalletCoin>> =
             std::collections::HashMap::new();
         let mut bundles: Vec<SpendBundle> = Vec::new();
@@ -162,10 +184,15 @@ impl Wallet {
             if pending_ids.contains(&coin.coin_id) {
                 continue;
             }
-            if coin.commitment.is_some() || coin.value == 0 {
+            // State threads (licenses) are the zero-value coins. Not
+            // `commitment.is_some()`: change coins carry their commitment too.
+            if coin.value == 0 {
                 continue;
             }
-            if coin.wots_signed {
+            if coin.wots_signed || signed_ids.contains(&coin.coin_id) {
+                continue;
+            }
+            if !seen_ids.insert(coin.coin_id) {
                 continue;
             }
 
@@ -472,6 +499,66 @@ mod defrag_tests {
 
     fn live(w: &Wallet) -> Vec<[u8; 32]> {
         w.coins().iter().map(|c| c.coin_id).collect()
+    }
+
+    /// The change of a confirmed send carries its commitment (complete_reveal
+    /// stores it) and must still be spendable: by plain sends, and by defrag.
+    #[test]
+    fn change_of_a_confirmed_send_is_spendable() {
+        let (mut w, _p) = fresh();
+        let c = w.import_coin([1; 32], 1 << 20, [9; 32], None).unwrap();
+        let plan = w
+            .plan_transaction(&[c], 1000, crate::wallet::plan::standard_fee)
+            .unwrap();
+        let mut outputs: Vec<OutputData> = plan
+            .payment_denoms
+            .iter()
+            .map(|&d| OutputData::Standard { address: [0xAA; 32], value: d, salt: [3; 32] })
+            .collect();
+        let mut change_seeds = Vec::new();
+        for (i, (&d, seed)) in plan
+            .change_denoms
+            .iter()
+            .zip(w.allocate_next_wots_seeds(plan.change_denoms.len()).unwrap())
+            .enumerate()
+        {
+            let address = compute_address(&crate::core::wots::keygen(&seed));
+            change_seeds.push((outputs.len(), seed));
+            outputs.push(OutputData::Standard { address, value: d, salt: [i as u8 + 10; 32] });
+        }
+        let (commitment, _) = w
+            .prepare_commit(&plan.input_coin_ids, &outputs, change_seeds, false, false)
+            .unwrap();
+        w.complete_reveal(&commitment).unwrap();
+        assert!(w.coins().iter().all(|c| c.commitment.is_some()), "change is stamped");
+
+        let change: u64 = w.coins().iter().map(|c| c.value).sum();
+        let set: std::collections::HashSet<[u8; 32]> = live(&w).into_iter().collect();
+        let offered: u64 = w.spendable_bundles(&set, true).iter().map(|b| b.total_value).sum();
+        assert_eq!(offered, change);
+        assert!(w.plan_transaction(&live(&w), 500, crate::wallet::plan::standard_fee).is_ok());
+    }
+
+    /// A coin listed twice in the wallet file is offered once, and not at all
+    /// when either entry has signed.
+    #[test]
+    fn a_duplicate_wallet_entry_is_offered_once() {
+        let (mut w, _p) = fresh();
+        let c = w.import_coin([2; 32], 4096, [7; 32], None).unwrap();
+        let dup = w.coins()[0].clone();
+        w.data.coins.push(dup);
+        let set: std::collections::HashSet<[u8; 32]> = [c].into_iter().collect();
+
+        let bundles = w.spendable_bundles(&set, true);
+        assert_eq!(bundles.len(), 1);
+        assert_eq!(bundles[0].coin_ids, vec![c]);
+        assert_eq!(bundles[0].total_value, 4096);
+        let plan = w.plan_transaction(&[c], 1000, crate::wallet::plan::standard_fee).unwrap();
+        assert_eq!(plan.input_coin_ids, vec![c]);
+        assert_eq!(plan.in_sum, 4096);
+
+        w.data.coins[1].wots_signed = true;
+        assert!(w.spendable_bundles(&set, true).is_empty());
     }
 
     #[test]

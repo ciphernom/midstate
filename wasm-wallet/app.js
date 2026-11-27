@@ -17,7 +17,7 @@ import {
     field, dialog, sheet, confirmBox, okBox, toast, copyText, download,
 } from './ui.js';
 import {
-    UNIT, gmds, withUnit, gmdsExact, exactUnit, plainAmount, parseAmount, shortAddr, groupHex, dayLabel, clock, cleanAddress, sendStep,
+    UNIT, gmds, withUnit, gmdsExact, exactUnit, plainAmount, parseAmount, shortAddr, groupHex, dayLabel, clock, cleanAddress, cleanAddressList, sendStep,
     progressWords, speed, dateTime, cleanPhrase, priceLabel, about, timerText, lately, initial, PRICES,
 } from './format.js';
 import { isName, normalize as normalizeName } from './names.js';
@@ -1434,7 +1434,7 @@ function sendScreen() {
         const t = target;
         if (t.state === 'checking') fill(toLine, h('span', { class: 'muted' }, spinner(), ' Checking…'));
         else if (t.state === 'ok') {
-            fill(toLine, h('span', { class: 'ok-line' }, t.name || 'Valid address'),
+            fill(toLine, h('span', { class: 'ok-line' }, t.name || (t.count ? `${t.count} valid addresses` : 'Valid address')),
                 t.name ? h('span', { class: 'muted small mono' }, ` pays ${shortAddr(t.address, 8)}`) : null);
         } else if (t.state === 'bad' || (t.state === 'partial' && loud)) fill(toLine, h('span', { class: 'err' }, t.why));
         else fill(toLine);
@@ -1468,6 +1468,27 @@ function sendScreen() {
                 }
                 showTarget();
             }, 400);
+            return;
+        }
+        const list = raw.includes(',') ? cleanAddressList(raw) : null;
+        if (list) {
+            // A multi-address bundle: every address must carry its checksum.
+            target = { state: 'checking' };
+            showTarget();
+            Promise.all(list.map(address => ask('CHECK_ADDRESS', { address }))).then((rs) => {
+                if (my !== gen) return;
+                target = rs.every(r => r.ok)
+                    ? { state: 'ok', address: list.join(','), count: list.length }
+                    : { state: 'bad', why: 'One of those addresses has a typo. Check them with the person you’re paying.' };
+                showTarget();
+            }, () => {});
+            return;
+        }
+        if (raw.includes(',')) {
+            const parts = raw.split(',').map(p => p.replace(/\s+/g, '').replace(/^0x/i, ''));
+            const typing = /^[0-9a-f,\sx]*$/i.test(raw) && parts[parts.length - 1].length < 72;
+            target = { state: typing ? 'partial' : 'bad', why: 'A list of addresses takes 2 to 16 full 72-character addresses, separated by commas, none repeated.' };
+            showTarget(loud);
             return;
         }
         const addr = cleanAddress(raw);
@@ -1582,7 +1603,7 @@ function reviewScreen() {
         fill(rows, group(
             h('div', { class: 'row stacked' }, h('span', { class: 'label muted small' }, 'To'),
                 r.name ? h('b', null, r.name) : null,
-                h('span', { class: 'mono small break' + (r.name ? ' muted' : '') }, groupHex(r.address))),
+                ...r.address.split(',').map(a => h('span', { class: 'mono small break' + (r.name ? ' muted' : '') }, groupHex(a)))),
             infoRow('Amount', quote ? exactUnit(quote.amount) : r.all ? 'Everything' : exactUnit(r.amount)),
             infoRow('Network fee', quote ? exactUnit(quote.fee) : '…'),
             infoRow('Total', quote ? h('b', null, exactUnit(quote.amount + quote.fee)) : '…')));

@@ -9,15 +9,10 @@ use anyhow::{anyhow, bail, Result};
 use midstate::core::{compute_address, decompose_value, wots, OutputData};
 use midstate::wallet::Wallet;
 
-/// Upstream size model (main.rs): 1536-byte WOTS sig + ~100 bytes per input,
-/// ~100 bytes per output, ~100 bytes base.
-const BYTES_PER_INPUT: u64 = 1636;
-const BYTES_PER_OUTPUT: u64 = 100;
-const BYTES_BASE: u64 = 100;
-/// Mempool fee floor: 10 units per KiB, +10 units safety padding.
+/// Mempool fee floor: 10 units per KiB, +10 units safety padding, over the
+/// standard size model; the formula every wallet uses (`plan::standard_fee`).
 pub(crate) fn required_fee(inputs: usize, outputs: usize) -> u64 {
-    let est = BYTES_BASE + inputs as u64 * BYTES_PER_INPUT + outputs as u64 * BYTES_PER_OUTPUT;
-    (est * 10) / 1024 + 10
+    midstate::wallet::plan::standard_fee(inputs, outputs)
 }
 
 /// Decode a 72-char checksummed hex address (32-byte address ‖ 4-byte
@@ -37,6 +32,14 @@ pub fn decode_address(s: &str) -> Result<[u8; 32]> {
     Ok(addr)
 }
 
+/// Whether `s` looks like a multi-address destination (two or more
+/// comma-separated 72-character addresses), for forms that only check the
+/// shape while typing. `Service::resolve_destinations` does the real check.
+pub fn is_address_list(s: &str) -> bool {
+    let parts: Vec<&str> = s.split(',').map(str::trim).collect();
+    parts.len() > 1 && parts.iter().all(|p| p.len() == 72 && p.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 /// A fully planned (but unsigned, uncommitted) send.
 pub struct SendPlan {
     pub input_coin_ids: Vec<[u8; 32]>,
@@ -48,11 +51,6 @@ pub struct SendPlan {
     pub amount: u64,
 }
 
-/// Build a send plan against the wallet's live coins.
-///
-/// Mutates the wallet only through `allocate_next_wots_seed` (change keys),
-/// which is monotone and persisted by the caller's save — an abandoned plan
-/// wastes indices but never reuses them (upstream invariant).
 /// Build a send plan to a single destination address against the wallet's live coins.
 ///
 /// Mutates the wallet only through `allocate_next_wots_seeds` (change keys),
@@ -84,8 +82,10 @@ pub fn plan_send_multi(
         bail!("at least one destination address is required");
     }
 
+    // Distinct only when every denomination gets an address of its own: round
+    // robin over fewer addresses clusters some payment outputs together.
     let cfg = midstate::wallet::plan::PlanConfig {
-        distinct_payment_addresses: dests.len() > 1,
+        distinct_payment_addresses: dests.len() > 1 && dests.len() >= decompose_value(amount).len(),
         ..Default::default()
     };
     let plan = wallet.plan_transaction_with_config(live_coins, amount, required_fee, &cfg)?;
@@ -222,6 +222,17 @@ mod tests {
         let flip = if &enc[10..11] == "0" { "1" } else { "0" };
         enc.replace_range(10..11, flip);
         assert!(decode_address(&enc).is_err());
+    }
+
+    #[test]
+    fn address_lists_are_told_from_single_addresses() {
+        let a = midstate::core::encode_address_with_checksum(&[7u8; 32]);
+        let b = midstate::core::encode_address_with_checksum(&[8u8; 32]);
+        assert!(is_address_list(&format!("{a},{b}")));
+        assert!(is_address_list(&format!("{a}, {b}")));
+        assert!(!is_address_list(&a));
+        assert!(!is_address_list(&format!("{a},")));
+        assert!(!is_address_list("alice.mds,bob.mds"));
     }
 
     #[test]

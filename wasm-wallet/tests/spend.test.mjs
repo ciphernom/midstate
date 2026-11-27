@@ -26,7 +26,11 @@ const split = (v) => { const out = []; for (let b = 0; b < 53; b++) if (Math.flo
 /** maxSendable as the worker calls it, counting the WebAssembly's work. */
 function sendAll(utxos) {
     let probes = 0;
-    const amount = maxSendable(sum(utxos), (a) => { probes++; return prepare(utxos, a).fee; }, utxos.length);
+    const amount = maxSendable(sum(utxos), (a) => {
+        probes++;
+        const ctx = prepare(utxos, a);
+        return { fee: ctx.fee, inputs: ctx.selected_inputs.length, value: ctx.selected_inputs.reduce((s, u) => s + BigInt(u.value), 0n) };
+    }, utxos.length);
     const ctx = prepare(utxos, amount);
     const change = ctx.outputs.filter(o => o.address !== to.slice(0, 64)).reduce((s, o) => s + BigInt(o.value), 0n);
     return { amount, fee: BigInt(ctx.fee), change, inputs: ctx.selected_inputs.length, probes };
@@ -82,8 +86,30 @@ test('when the model misses, the slow way still finds an amount that fits', () =
     assert.ok(probes > 1);
 });
 
+test('send all looks again when the wallet leaves dust out', () => {
+    // A stand-in for prepare_spend that, like the planner, spends only the
+    // coins worth more than their own input's fee (here, all but 3 × 8).
+    const big = [2 ** 20, 2 ** 18], dust = [8, 8, 8];
+    const total = BigInt([...big, ...dust].reduce((s, v) => s + v, 0));
+    const kept = BigInt(big[0] + big[1]);
+    let probes = 0;
+    const feeFor = (a) => {
+        probes++;
+        const fee = modelFee(kept, a, big.length);
+        if (fee === null) throw new Error('Insufficient funds');
+        return { fee, inputs: big.length, value: kept };
+    };
+    const a = maxSendable(total, feeFor, big.length + dust.length);
+    assert.equal(a + modelFee(kept, a, big.length), kept, 'spends what it keeps, whole');
+    assert.ok(probes <= 3, `${probes} probes`);
+    // A plain fee (the old contract) still works, without the second look.
+    const plain = maxSendable(kept, (x) => { const f = modelFee(kept, x, 2); if (f === null) throw new Error('no'); return f; }, 2);
+    assert.equal(plain + modelFee(kept, plain, 2), kept);
+});
+
 test('too little to pay any fee', () => {
-    const utxos = coins([64]);
+    // 16 units: less than the 27 a one-coin, one-output send costs.
+    const utxos = coins([16]);
     assert.throws(() => maxSendable(sum(utxos), a => prepare(utxos, a).fee, 1), /too small/);
     assert.throws(() => maxSendable(0n, () => 0n), /balance is zero/);
 });

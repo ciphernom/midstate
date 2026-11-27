@@ -4,10 +4,13 @@
 //! that people reach over the chat bus (qbolt frames, `core::channel::wire`).
 //! Asked by name, it answers with
 //!
-//! * a fresh one-time address, signed by the identity (`CMD_ADDR_REQ`), which
-//!   a payment to the name now prefers over the name's fixed records — if
-//!   the wallet does not answer within [`HANDSHAKE_WAIT`] the payment goes to
-//!   the record, as before;
+//! * fresh one-time addresses, one per denomination, which a payment to the
+//!   name prefers over the name's fixed records — if the wallet does not
+//!   answer within [`HANDSHAKE_WAIT`] the payment goes to the record, as
+//!   before. When the name lists a `kem` key the request is sealed to it
+//!   (`CMD_ADDR_REQ_SEALED`): the bus sees neither whom it asks nor what
+//!   comes back. A payee that never answers sealed requests is asked in the
+//!   clear (`CMD_ADDR_REQ`, signed reply) after [`SEALED_PATIENCE`];
 //! * an invoice, or a channel, as it already did for a typed key;
 //! * its full ML-KEM public key (`CMD_KEM_REQ`), checked against the name's
 //!   `kem` record, so anyone can open a sealed session with it.
@@ -57,6 +60,17 @@ pub const HANDSHAKE_WAIT: Duration = Duration::from_secs(20);
 const ADDRESS_MARGIN: u64 = 30;
 /// KEM keys handed out per block, at most: each answer costs chat proof of work.
 const KEM_ANSWERS_PER_BLOCK: usize = 8;
+/// Fresh addresses handed out per block, at most, to all requesters together.
+/// Each is a WOTS key made on the actor and, if never paid, a key a restore
+/// from the phrase has to step over (`restore::WOTS_GAP`): this keeps a run of
+/// unpaid requests from opening that gap faster than one batch a block.
+pub(super) const ADDRESSES_PER_BLOCK: usize = 16;
+/// How long a payment waits on a sealed address request (and the KEM key it
+/// needs) before also asking in the clear, for a payee whose wallet predates
+/// sealed requests. Not for payees known to answer sealed ones.
+pub const SEALED_PATIENCE: Duration = Duration::from_secs(8);
+/// A sealed request nobody answered is forgotten after this long.
+const SEALED_REQ_TTL: Duration = Duration::from_secs(600);
 /// An unanswered KEM request is asked again after this many blocks.
 const KEM_RETRY: u64 = 3;
 /// Messages waiting for a recipient's key give up after this many seconds.
@@ -77,6 +91,13 @@ pub(super) struct NameSend {
     amount: u64,
     private: bool,
     identity: [u8; 32],
+    /// The address requests this payment waits on: sealed, and in the clear
+    /// once the sealed one has waited [`SEALED_PATIENCE`].
+    reqs: Vec<[u8; 32]>,
+    /// Waiting on the payee's KEM key before the sealed request can go.
+    kem_wait: bool,
+    /// When to ask in the clear as well, if no sealed answer has come.
+    fallback_at: Option<Instant>,
     deadline: Instant,
     resp: oneshot::Sender<Result<String>>,
 }
@@ -230,6 +251,10 @@ pub(super) struct SealedBook {
     /// without signing again. Each holds its session's secret, as `chats` do.
     #[serde(default)]
     pub openings: HashMap<String, sealed::Prepared>,
+    /// Identity keys (hex) whose wallets have answered a sealed address
+    /// request: never asked in the clear again.
+    #[serde(default)]
+    pub sealed_answerers: HashSet<String>,
 }
 
 /// The inbox's bar until its user picks another: verified names, so a
@@ -251,6 +276,7 @@ impl Default for SealedBook {
             blocked: Vec::new(),
             drop_anonymous: false,
             openings: HashMap::new(),
+            sealed_answerers: HashSet::new(),
         }
     }
 }
@@ -411,11 +437,41 @@ pub(super) struct IdentityLive {
     pub kem: Option<KemKeys>,
     /// KEM keys handed out at this height, and how many.
     pub answered: (u64, usize),
+    /// Fresh addresses handed out at this height, and how many.
+    pub addrs_given: (u64, usize),
+    /// Sealed address requests awaiting their reply: request id hex →
+    /// (payee identity, the exchange that opens the reply, asked at).
+    pub sealed_reqs: HashMap<String, ([u8; 32], sealed::Exchange, Instant)>,
+    /// Address requests the user made ("Ask a peer"), by id hex: only their
+    /// replies are dropped into the Send form. A reply to a name payment's
+    /// request is about to be paid, and paying it again would reuse it.
+    pub ui_addr_reqs: HashSet<String>,
     /// The stamp worker, started when first needed.
     pub stamper: Option<Stamper>,
     /// What each stamp being worked is for, by its job.
     pub jobs: HashMap<u64, Stamping>,
     pub next_job: u64,
+}
+
+/// Drops `paid` from every cached address list; empty lists go. Whether
+/// anything changed.
+pub(super) fn without_paid(peer_addrs: &mut HashMap<String, (String, u64)>, paid: &[[u8; 32]]) -> bool {
+    let paid: HashSet<[u8; 32]> = paid.iter().copied().collect();
+    let mut changed = false;
+    peer_addrs.retain(|_, (raw, _)| {
+        let all: Vec<String> = raw.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
+        let keep: Vec<String> = all
+            .iter()
+            .filter(|s| midstate::core::parse_address_flexible(s).map_or(true, |a| !paid.contains(&a)))
+            .cloned()
+            .collect();
+        if keep.len() != all.len() {
+            changed = true;
+            *raw = keep.join(",");
+        }
+        !keep.is_empty()
+    });
+    changed
 }
 
 /// What a stamp is being worked for.
@@ -543,28 +599,69 @@ impl Service {
             .collect()
     }
 
-    /// Drop the first `used` addresses from `identity`'s cache after a send succeeds.
-    fn consume_fresh_addresses(&mut self, identity: &[u8; 32], used: usize) {
-        let key = hex::encode(identity);
-        let Some((raw, expiry)) = self.book.peer_addrs.get(&key).cloned() else {
-            return;
-        };
-        let rest: Vec<&str> = raw
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .skip(used)
-            .collect();
-        if rest.is_empty() {
-            self.book.peer_addrs.remove(&key);
-        } else {
-            self.book.peer_addrs.insert(key, (rest.join(","), expiry));
+    /// A fresh address is paid once: after any send, drop the addresses it
+    /// paid from every peer's cache, however they reached the send (a name
+    /// payment, or an address filled into the Send form from a reply).
+    pub(super) fn forget_paid_addresses(&mut self, paid: &[[u8; 32]]) {
+        if without_paid(&mut self.book.peer_addrs, paid) {
+            self.book.save(&self.wallet_path);
         }
-        self.book.save(&self.wallet_path);
     }
 
-    fn has_pending_addr_req(&self, identity: &[u8; 32]) -> bool {
-        self.book.addr_reqs.values().any(|p| p == identity)
+    /// The bare name, `kem` hash and, if this wallet has it and it still
+    /// matches, the KEM key of `to`, a name whose records list one.
+    pub(super) fn payee_kem(&self, to: &str) -> Option<(String, [u8; 32], Option<Vec<u8>>)> {
+        let name = names::normalize(to).ok()?;
+        let r = self.live_record(to).ok()?;
+        let hash = names::kem_hash(&r.records)?;
+        let public = self
+            .ident
+            .book
+            .peer_kems
+            .get(&name)
+            .and_then(|h| hex::decode(h).ok())
+            .filter(|pk| sealed::kem_hash(pk) == hash);
+        Some((name, hash, public))
+    }
+
+    /// `identity`'s wallet answered a sealed address request: ask it that way only.
+    pub(super) fn note_sealed_answerer(&mut self, identity: &[u8; 32]) {
+        if self.ident.book.sealed_answerers.insert(hex::encode(identity)) {
+            self.sealed_save();
+        }
+    }
+
+    /// Whether `identity`'s wallet has answered a sealed address request.
+    pub(super) fn answers_sealed(&self, identity: &[u8; 32]) -> bool {
+        self.ident.book.sealed_answerers.contains(&hex::encode(identity))
+    }
+
+    /// Ask the payee of `to` (a name, its identity `identity`) for `count`
+    /// fresh addresses for a payment: sealed when the name lists a KEM key
+    /// (fetching the key first if need be), in the clear otherwise.
+    async fn ask_for_payment(&mut self, to: &str, identity: [u8; 32], count: usize) -> Result<(Vec<[u8; 32]>, bool, Option<Instant>)> {
+        let patience = (!self.answers_sealed(&identity)).then(|| Instant::now() + SEALED_PATIENCE);
+        match self.payee_kem(to) {
+            Some((_, hash, Some(public))) => {
+                let req = self.request_address_sealed(identity, &public, &hash, count)?;
+                Ok((vec![req], false, patience))
+            }
+            Some((name, hash, None)) => {
+                let tip = self.node.get_state().await.height;
+                self.ask_kem(&name, identity, hash, tip)?;
+                Ok((Vec::new(), true, patience))
+            }
+            None => Ok((vec![self.request_address(&hex::encode(identity), count).await?], false, None)),
+        }
+    }
+
+    /// Whether a reply that came in the clear may fill `peer`'s address
+    /// cache: not over unexpired addresses a sealed reply left there, which
+    /// only this wallet has seen (the clear reply to a fallback request that
+    /// lost the race). A payee whose name stopped listing a key, and so is
+    /// asked in the clear again, still gets its cache filled.
+    pub(super) fn clear_reply_may_cache(&self, peer: &[u8; 32], tip: u64) -> bool {
+        !self.answers_sealed(peer) || self.peek_fresh_addresses(peer, tip).is_empty()
     }
 
     /// A send asked for by the UI. To a name whose wallet can be asked, use
@@ -577,21 +674,24 @@ impl Service {
             let cached = self.peek_fresh_addresses(&identity, tip);
             if cached.len() >= needed {
                 let dests = cached[..needed].to_vec();
-                let r = self.send_fresh(&to, &identity, &dests, amount, private).await;
+                let r = self.send_fresh(&to, &dests, amount, private).await;
                 let _ = resp.send(r);
                 return;
             }
             if self.wallet.is_some() && !self.node.is_syncing() {
-                match self.request_address(&hex::encode(identity)).await {
-                    Ok(()) => {
-                        self.ident.sends.push(NameSend { to, amount, private, identity, deadline: Instant::now() + HANDSHAKE_WAIT, resp });
+                // One address per denomination: asking for more only burns
+                // the payee's keys (and its restore gap) for nothing.
+                match self.ask_for_payment(&to, identity, needed).await {
+                    Ok((reqs, kem_wait, fallback_at)) => {
+                        let deadline = Instant::now() + HANDSHAKE_WAIT;
+                        self.ident.sends.push(NameSend { to, amount, private, identity, reqs, kem_wait, fallback_at, deadline, resp });
                         return;
                     }
                     Err(e) => tracing::debug!("could not ask {to} for fresh addresses: {e:#}"),
                 }
             }
             if !cached.is_empty() {
-                let r = self.send_fresh(&to, &identity, &cached, amount, private).await;
+                let r = self.send_fresh(&to, &cached, amount, private).await;
                 let _ = resp.send(r);
                 return;
             }
@@ -600,16 +700,8 @@ impl Service {
         let _ = resp.send(r);
     }
 
-    async fn send_fresh(
-        &mut self,
-        to: &str,
-        identity: &[u8; 32],
-        dests: &[[u8; 32]],
-        amount: u64,
-        private: bool,
-    ) -> Result<String> {
+    async fn send_fresh(&mut self, to: &str, dests: &[[u8; 32]], amount: u64, private: bool) -> Result<String> {
         let id = self.start_send_to_many(to, dests, amount, private).await?;
-        self.consume_fresh_addresses(identity, dests.len());
         if let Some(c) = hex32(&id) {
             let msg = if dests.len() > 1 {
                 format!("paying {} fresh one-time addresses from {}'s wallet", dests.len(), to.trim())
@@ -624,20 +716,55 @@ impl Service {
     /// Each tick: finish the payments whose fresh address batch came, or whose
     /// wait ran out.
     pub(super) async fn tick_name_sends(&mut self, tip: u64) {
+        // A sealed request stays open after its payment settles, until it
+        // expires: a late answer still marks the payee as one that answers
+        // sealed requests, and leaves addresses for its next payment.
+        self.ident.sealed_reqs.retain(|_, (_, _, at)| at.elapsed() < SEALED_REQ_TTL);
         let waiting = std::mem::take(&mut self.ident.sends);
-        for s in waiting {
+        for mut s in waiting {
             let needed = midstate::core::decompose_value(s.amount).len().max(1);
+            // The payee's KEM key came: the sealed request can go.
+            if s.kem_wait {
+                if let Some((_, hash, Some(public))) = self.payee_kem(&s.to) {
+                    match self.request_address_sealed(s.identity, &public, &hash, needed) {
+                        Ok(req) => {
+                            s.reqs.push(req);
+                            // A late key: give the sealed request a moment of its own.
+                            if let Some(at) = s.fallback_at.as_mut() {
+                                *at = (*at).max(Instant::now() + SEALED_PATIENCE / 2);
+                            }
+                        }
+                        Err(e) => tracing::debug!("sealed address request to {} failed: {e:#}", s.to),
+                    }
+                    s.kem_wait = false;
+                }
+            }
+            // No sealed answer in time: a payee from before sealed requests.
+            if s.fallback_at.is_some_and(|at| Instant::now() >= at) {
+                s.fallback_at = None;
+                s.kem_wait = false;
+                match self.request_address(&hex::encode(s.identity), needed).await {
+                    Ok(req) => s.reqs.push(req),
+                    Err(e) => tracing::debug!("address request to {} failed: {e:#}", s.to),
+                }
+            }
             let cached = self.peek_fresh_addresses(&s.identity, tip);
-            let reply_arrived = !self.has_pending_addr_req(&s.identity) && !cached.is_empty();
+            // One of this payment's own requests was answered (its id is
+            // gone) — not "no request to this identity is pending", which an
+            // old unanswered one would keep false forever.
+            let answered = s.reqs.iter().map(hex::encode).any(|k| {
+                !self.book.addr_reqs.contains_key(&k) && !self.ident.sealed_reqs.contains_key(&k)
+            });
+            let reply_arrived = answered && !cached.is_empty();
 
             if reply_arrived || cached.len() >= needed {
                 let take = needed.min(cached.len());
                 let dests = cached[..take].to_vec();
-                let r = self.send_fresh(&s.to, &s.identity, &dests, s.amount, s.private).await;
+                let r = self.send_fresh(&s.to, &dests, s.amount, s.private).await;
                 let _ = s.resp.send(r);
             } else if Instant::now() >= s.deadline || s.resp.is_closed() {
                 if !cached.is_empty() {
-                    let r = self.send_fresh(&s.to, &s.identity, &cached, s.amount, s.private).await;
+                    let r = self.send_fresh(&s.to, &cached, s.amount, s.private).await;
                     let _ = s.resp.send(r);
                 } else {
                     let r = self.start_send(&s.to, s.amount, s.private).await;
@@ -1486,6 +1613,29 @@ pub(super) fn with_postage(recs: &[Rec], bits: u32) -> Result<Vec<Rec>> {
         out.push(Rec::Postage(b));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod paid_address_tests {
+    use super::without_paid;
+    use std::collections::HashMap;
+
+    #[test]
+    fn a_paid_address_leaves_every_cache() {
+        let a = midstate::core::encode_address_with_checksum(&[1; 32]);
+        let b = midstate::core::encode_address_with_checksum(&[2; 32]);
+        let c = midstate::core::encode_address_with_checksum(&[3; 32]);
+        let mut cache = HashMap::new();
+        cache.insert("alice".to_string(), (format!("{a},{b}"), 900));
+        cache.insert("bob".to_string(), (c.clone(), 900));
+        cache.insert("carol".to_string(), (a.clone(), 900));
+
+        assert!(without_paid(&mut cache, &[[1; 32]]));
+        assert_eq!(cache["alice"], (b.clone(), 900), "the rest stays, with its expiry");
+        assert!(!cache.contains_key("carol"), "an emptied list goes");
+        assert_eq!(cache["bob"].0, c);
+        assert!(!without_paid(&mut cache, &[[9; 32]]), "nothing paid, nothing changed");
+    }
 }
 
 #[cfg(test)]

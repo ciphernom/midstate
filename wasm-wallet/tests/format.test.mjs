@@ -3,7 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import {
-    gmds, withUnit, plainAmount, parseAmount, ONE, shortAddr, groupHex, cleanAddress, sendStep, dayLabel,
+    gmds, withUnit, plainAmount, parseAmount, ONE, shortAddr, groupHex, cleanAddress, cleanAddressList, sendStep, dayLabel,
     progressWords, speed, cleanPhrase, addressChecksumOk, gmdsExact, exactUnit, priceLabel, about, timerText, lately, initial, clock,
 } from '../format.js';
 import { initSync, blake3_hash_hex, address_to_checksummed_hex } from '../pkg/wasm_wallet.js';
@@ -53,6 +53,16 @@ test('addresses', () => {
     assert.equal(cleanAddress('zz' + a.slice(2)), null);
     assert.equal(shortAddr(a), 'ababab…abab');
     assert.equal(groupHex('abcdefgh'), 'abcd efgh');
+});
+
+test('multi-address lists', () => {
+    const a = 'ab'.repeat(36), b = 'cd'.repeat(36);
+    assert.deepEqual(cleanAddressList(`${a}, 0x${b.toUpperCase()}`), [a, b]);
+    assert.equal(cleanAddressList(a), null, 'one address is not a list');
+    assert.equal(cleanAddressList(`${a},${a}`), null, 'repeated');
+    assert.equal(cleanAddressList(`${a},`), null, 'empty part');
+    assert.equal(cleanAddressList(`${a},${b.slice(2)}`), null, 'short part');
+    assert.equal(cleanAddressList(Array(17).fill(0).map((_, i) => i.toString(16).padStart(2, '0').repeat(36)).join(',')), null, 'over 16');
 });
 
 test('send steps only move forward', () => {

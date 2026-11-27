@@ -52,7 +52,7 @@ fn form(app: &mut App, ui: &mut Ui) {
     if r.changed() {
         let t = app.send_to.trim().to_string();
         app.addr_resolved = None;
-        if t.len() == 72 || midstate_walletd::names::is_name(&t) {
+        if t.len() == 72 || midstate_walletd::names::is_name(&t) || midstate_walletd::sendplan::is_address_list(&t) {
             app.addr_ok = None;
             app.go(&ctx, Action::ValidateAddress { addr: t });
         } else {
