@@ -82,6 +82,7 @@ fn compute_fee_rate(fee: u64, tx_bytes: u64) -> u64 {
 /// A stored Reveal transaction with its byte size pre-computed at admission time.
 /// Eliminates repeated `bincode::serialized_size` traversals of 40 KB witness
 /// vectors during RBF checks, eviction loops, drain, and remove_reveal_internal.
+#[derive(Clone)]
 struct MempoolTx {
     tx: Arc<Transaction>,
     /// Byte size of `tx` as computed by `bincode::serialized_size` at insertion.
@@ -125,6 +126,7 @@ fn now_unix() -> u64 {
 /// being spent behind a commitment hash, preventing front-running. A subsequent
 /// **Reveal** opens the commitment and executes the spend. Commits require a
 /// Proof-of-Work nonce to resist spam; Reveals pay a fee.
+#[derive(Clone)]
 pub struct Mempool {
     /// Commit transactions keyed by their commitment hash, paired with the
     /// Unix time (secs) each was admitted (see [`MempoolTx::received`]).

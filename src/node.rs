@@ -5866,7 +5866,26 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, reply_start: u64, head
     /// # Safety / Invariants
     /// Tracks `active_burns` to ensure the node cannot be DDoS'd by an attacker
     /// spamming hundreds of key reuses, as the node will only run the salt grinder once per key.
-    async fn handle_new_transaction(&mut self, tx: Transaction, from: Option<PeerId>) -> Result<()> {
+    async fn handle_new_transaction(
+            &mut self,
+            tx: Transaction,
+            from: Option<PeerId>,
+        ) -> Result<()> {
+            let stem_peer = if from.is_none() {
+                self.network.random_peer()
+            } else {
+                None
+            };
+
+            self.handle_new_transaction_with_stem_peer(tx, from, stem_peer).await
+        }
+
+    async fn handle_new_transaction_with_stem_peer(
+            &mut self,
+            tx: Transaction,
+            from: Option<PeerId>,
+            stem_peer: Option<PeerId>,
+        ) -> Result<()> {
         // --- OPTIMIZATION: Ignore live mempool gossip while syncing ---
         if self.sync.in_progress && from.is_some() {
             return Ok(());
@@ -6006,28 +6025,50 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, reply_start: u64, head
         }
         // ───────────────────────────────────────────────────────────────────────
 
+                let tx_id = crate::core::types::hash(&bincode::serialize(&tx)?);
+
+        // Stem locally originated Commits and Reveals.
+        if from.is_none()
+            && matches!(&tx, Transaction::Commit { .. } | Transaction::Reveal { .. })
+        {
+            if self.stem_pool.contains_key(&tx_id) {
+                return Ok(());
+            }
+
+            if let Some(stem_peer) = stem_peer {
+                if self.stem_pool.len() >= MAX_STEM_POOL_SIZE {
+                    anyhow::bail!("Dandelion stem pool full; retry later");
+                }
+
+                // Check admission without exposing the transaction.
+                let mut preflight = self.mempool.clone();
+                preflight.add(tx.clone(), &self.state, &wots_oracle)?;
+
+                self.stem_pool.insert(
+                    tx_id,
+                    (tx.clone(), std::time::Instant::now()),
+                );
+                self.network.send(stem_peer, Message::StemTransaction(tx));
+                self.metrics.inc_transactions_processed();
+
+                tracing::debug!("Dandelion++ stem: sent transaction to {}", stem_peer);
+                return Ok(());
+            }
+        }
+
+        // Public gossip means the stem phase has ended.
+        if from.is_some() {
+            self.stem_pool.remove(&tx_id);
+        }
+
         match self.mempool.add(tx.clone(), &self.state, &wots_oracle) {
             Ok(_) => {
                 self.metrics.inc_transactions_processed();
 
                 if from.is_none() {
-                    if matches!(&tx, Transaction::Commit { .. }) {
-                        if let Some(stem_peer) = self.network.random_peer() {
-                            let tx_id = match &tx { Transaction::Commit { commitment, .. } => *commitment, _ => [0; 32] };
-                            self.stem_pool.insert(tx_id, (tx.clone(), std::time::Instant::now()));
-                            self.network.send(stem_peer, Message::StemTransaction(tx));
-                            tracing::debug!("Dandelion++ stem: sent commit to {}", stem_peer);
-                        } else {
-                            self.network.broadcast(Message::Transaction(tx));
-                        }
-                    } else {
-                        self.network.broadcast(Message::Transaction(tx));
-                    }
+                    self.network.broadcast(Message::Transaction(tx));
                 } else {
-                    self.network.broadcast_except(from, Message::Transaction(tx.clone()));
-                    let tx_id = tx.input_coin_ids().first().copied()
-                        .unwrap_or_else(|| match &tx { Transaction::Commit { commitment, .. } => *commitment, _ => [0; 32] });
-                    self.stem_pool.remove(&tx_id);
+                    self.network.broadcast_except(from, Message::Transaction(tx));
                 }
 
                 self.cancel_mining();
@@ -6059,8 +6100,7 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, reply_start: u64, head
         // --------------------------------------
 
         // Compute a tx identifier for dedup
-        let tx_id = tx.input_coin_ids().first().copied()
-            .unwrap_or_else(|| match &tx { Transaction::Commit { commitment, .. } => *commitment, _ => [0; 32] });
+        let tx_id = crate::core::types::hash(&bincode::serialize(&tx)?);
 
         // Already in stem pool — ignore duplicate
         if self.stem_pool.contains_key(&tx_id) {
@@ -6138,7 +6178,10 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, reply_start: u64, head
                     
                     // 2. Try to add to local mempool (might fail if our mempool is full/fee too low)
                     let wots_oracle = self.storage.query_spent_addresses_for_tx(&tx).unwrap_or_default();
-                    let _ = self.mempool.add(tx.clone(), &self.state, &wots_oracle);
+                    if self.mempool.add(tx.clone(), &self.state, &wots_oracle).is_ok() {
+                        self.cancel_mining();
+                        self.trigger_mining();
+                    }
                     
                     // 3. Broadcast to the network regardless of local mempool admission, 
                     // so the rest of the network gets a chance to mine it.
@@ -8471,6 +8514,52 @@ mod tests {
         assert_eq!(scan_txs_for_mss_index(&[tx], &pk), 0);
     }
 
+
+    pub(super) async fn assert_transaction_stems(
+        node: &mut Node,
+        tx: &Transaction,
+    ) -> [u8; 32] {
+        let peer = PeerId::random();
+        let id = hash(&bincode::serialize(tx).unwrap());
+        let before = node.mempool.transactions_cloned();
+
+        node.handle_new_transaction_with_stem_peer(
+            tx.clone(),
+            None,
+            Some(peer),
+        ).await.unwrap();
+
+        assert!(node.stem_pool.contains_key(&id));
+        assert_eq!(node.mempool.transactions_cloned(), before);
+        assert!(!before.contains(tx));
+
+        let received_at = node.stem_pool[&id].1;
+        let stem_count = node.stem_pool.len();
+
+        // A repeated local submission must not reset the timeout.
+        node.handle_new_transaction_with_stem_peer(
+            tx.clone(),
+            None,
+            Some(peer),
+        ).await.unwrap();
+
+        assert_eq!(node.stem_pool.len(), stem_count);
+        assert_eq!(node.stem_pool[&id].1, received_at);
+
+        // A duplicate returning from another stem peer is ignored.
+        node.handle_stem_transaction(
+            tx.clone(),
+            PeerId::random(),
+        ).await.unwrap();
+
+        assert_eq!(node.stem_pool.len(), stem_count);
+        assert_eq!(node.stem_pool[&id].1, received_at);
+        assert_eq!(node.mempool.transactions_cloned(), before);
+
+        id
+    }
+
+
     #[test]
     fn scan_txs_empty_returns_zero() {
         let pk = hash(b"any key");
@@ -8570,6 +8659,7 @@ mod tests {
 #[cfg(test)]
 mod complex_tests {
     use super::*;
+    use super::tests::assert_transaction_stems;
     use tempfile::tempdir;
     use crate::core::types::hash;
     use crate::sync::Syncer;
@@ -9257,6 +9347,39 @@ mod complex_tests {
         }
 
         let commit_tx = Transaction::Commit { commitment, spam_nonce };
+        // Dandelion: Commit stays private until fluff.
+        let stem_id = assert_transaction_stems(
+            &mut node,
+            &commit_tx,
+        ).await;
+
+        // A fresh stem entry must not fluff.
+        node.flush_stem_pool();
+        assert!(node.stem_pool.contains_key(&stem_id));
+
+        // Simulate timeout without sleeping for 30 seconds.
+        node.stem_pool.get_mut(&stem_id).unwrap().1 =
+            std::time::Instant::now()
+                - Duration::from_secs(STEM_TIMEOUT_SECS + 1);
+
+        node.flush_stem_pool();
+
+        assert!(!node.stem_pool.contains_key(&stem_id));
+        assert!(
+            node.mempool.transactions_cloned().contains(&commit_tx),
+            "timed-out Commit must enter public mempool"
+        );
+
+        // Admission preflight must reject an already-public Commit.
+        assert!(
+            node.handle_new_transaction_with_stem_peer(
+                commit_tx.clone(),
+                None,
+                Some(PeerId::random()),
+            ).await.is_err()
+        );
+
+        assert!(!node.stem_pool.contains_key(&stem_id));
         let commit_batch = make_valid_batch(&node.state, 10, vec![commit_tx]);
         node.handle_new_batch(commit_batch, None).await.unwrap();
         assert!(node.state.commitments.contains(&commitment));
@@ -9271,6 +9394,61 @@ mod complex_tests {
             outputs: pending.outputs.clone(),
             salt: pending.salt,
         };
+
+        // Dandelion: Reveal must also stay private until fluff.
+        let stem_id = assert_transaction_stems(
+            &mut node,
+            &reveal_tx,
+        ).await;
+
+        // A byte-distinct Reveal sharing the same inputs must
+        // reach validation rather than being silently deduplicated.
+        let mut different_reveal = reveal_tx.clone();
+
+        if let Transaction::Reveal { salt, .. } = &mut different_reveal {
+            salt[0] ^= 1;
+        } else {
+            panic!("Expected Reveal");
+        }
+
+        assert_eq!(
+            reveal_tx.input_coin_ids(),
+            different_reveal.input_coin_ids()
+        );
+
+        assert_ne!(
+            hash(&bincode::serialize(&reveal_tx).unwrap()),
+            hash(&bincode::serialize(&different_reveal).unwrap())
+        );
+
+        // The modified salt invalidates the Reveal.
+        // The old first-input dedup would silently return Ok.
+        assert!(
+            node.handle_stem_transaction(
+                different_reveal,
+                PeerId::random(),
+            ).await.is_err(),
+            "different Reveal must not bypass validation"
+        );
+
+        // Original valid stem transaction must remain intact.
+        assert!(node.stem_pool.contains_key(&stem_id));
+
+        // Simulate the transaction returning as public gossip.
+        node.handle_new_transaction(
+            reveal_tx.clone(),
+            Some(PeerId::random()),
+        ).await.unwrap();
+
+        assert!(
+            !node.stem_pool.contains_key(&stem_id),
+            "public gossip must remove the stem entry"
+        );
+
+        assert!(
+            node.mempool.transactions_cloned().contains(&reveal_tx),
+            "fluffed Reveal must enter public mempool"
+        );
 
         let reveal_batch = make_valid_batch(&node.state, 10, vec![reveal_tx]);
         node.handle_new_batch(reveal_batch, None).await.unwrap();
